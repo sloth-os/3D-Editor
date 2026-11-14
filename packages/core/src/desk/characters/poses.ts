@@ -1,5 +1,5 @@
 import type { Mat4, Vec3 } from '../../math/types';
-import { identity4, invert4, multiply4 } from '../../math/mat4';
+import { compose4, identity4, invert4, multiply4 } from '../../math/mat4';
 import { transformDirection3, transformPoint3 } from '../../math/vec3';
 import type { ArmatureData, PoseBone } from '../../doc/types';
 import { computePose } from '../../armature/pose';
@@ -185,15 +185,17 @@ export const HUMAN_POSE_SPECS: Record<string, HumanPoseSpec> = {
     lean: 8,
     ground: 'none',
   },
+  // on the ground, the legs out in front and the hands on the ground behind: the seat, the heels
+  // and the hands all touch it (the legs angled down from the hips, the seat would hover)
   sit_ground: {
-    hip: [82, 82],
+    hip: [92, 92],
     hipAbd: [6, 6],
-    knee: [28, 28],
+    knee: [14, 14],
     ankle: [12, 12],
-    arm: [-28, -28],
+    arm: [-45, -45],
     armOut: [14, 14],
     elbow: [6, 6],
-    lean: -8,
+    lean: -6,
   },
 };
 
@@ -227,8 +229,14 @@ export interface AnimalPoseSpec {
   graze?: boolean;
 }
 
-const FOLDED_FRONT: LegAngles = { upper: 42, lower: 150, foot: 20 };
 const FOLDED_BACK: LegAngles = { upper: 70, lower: 140, foot: 30 };
+/**
+ * Lying animals rest on their barrel: hoofed ones tuck the front legs under and out to the sides, and
+ * all fold the hind legs out to the sides (folded straight under, the long bones of a horse's legs
+ * hold its belly a tenth of its height off the ground).
+ */
+const TUCKED_FRONT: LegAngles = { upper: 55, lower: 150, foot: 20, abd: 30 };
+const TUCKED_BACK: LegAngles = { ...FOLDED_BACK, abd: 40 };
 
 export const ANIMAL_POSE_SPECS: Record<string, AnimalPoseSpec> = {
   stand: {},
@@ -277,10 +285,11 @@ export const ANIMAL_POSE_SPECS: Record<string, AnimalPoseSpec> = {
     tail: [-30, -20, -10],
   },
   lie: {
-    legs: { FL: FOLDED_FRONT, FR: FOLDED_FRONT, BL: FOLDED_BACK, BR: FOLDED_BACK },
+    legs: { FL: TUCKED_FRONT, FR: TUCKED_FRONT, BL: TUCKED_BACK, BR: TUCKED_BACK },
     neck: -6,
     head: 4,
-    tail: [-10, -10, 0],
+    // laid back from the rump (hanging, a long tail would prop the rump up off the ground)
+    tail: [10, 30, 20],
   },
   eat: {
     legs: { FL: { upper: 6, abd: 4 }, FR: { upper: -4, abd: 4 } },
@@ -291,13 +300,13 @@ export const ANIMAL_POSE_SPECS: Record<string, AnimalPoseSpec> = {
   look_up: { neck: 18, head: 26, tail: [12, 0, 0] },
 };
 
-/** Dogs, cats and bears lie with their front legs stretched out in front. */
+/** Dogs, cats and bears lie with their front legs stretched out in front, the hind legs folded to the sides. */
 const PAW_LIE: AnimalPoseSpec = {
   legs: {
     FL: { upper: 62, lower: -28, foot: -6, abd: 3 },
     FR: { upper: 58, lower: -30, foot: -6, abd: 3 },
-    BL: FOLDED_BACK,
-    BR: FOLDED_BACK,
+    BL: TUCKED_BACK,
+    BR: TUCKED_BACK,
   },
   neck: 4,
   head: -4,
@@ -412,6 +421,7 @@ export function animalRotations(spec: AnimalPoseSpec): { rot: Record<string, Vec
 interface RestCache {
   rest: Map<string, { matrix: Mat4; length: number }>;
   inv: Map<string, Mat4>;
+  bones: Map<string, ArmatureData['bones'][number]>;
 }
 
 const restCache = new WeakMap<ArmatureData, RestCache>();
@@ -422,7 +432,7 @@ function restOf(arm: ArmatureData): RestCache {
     const rest = restMatrices(arm.bones);
     const inv = new Map<string, Mat4>();
     for (const [n, m] of rest) inv.set(n, invert4(m.matrix));
-    c = { rest, inv };
+    c = { rest, inv, bones: new Map(arm.bones.map((b) => [b.name, b])) };
     restCache.set(arm, c);
   }
   return c;
@@ -465,14 +475,70 @@ export function probePoints(
 
 /** Per bone, the armature-space matrix taking rest (character) space points to where a pose puts them. */
 function poseDeltas(arm: ArmatureData, bones: Record<string, PoseBone>): Map<string, Mat4> {
+  return posedArmature(arm, bones).deltas;
+}
+
+/** A pose's bone matrices (armature space) and their deltas (rest points to posed points). */
+export interface PosedArmature {
+  matrices: Map<string, Mat4>;
+  deltas: Map<string, Mat4>;
+}
+
+/** An armature posed by the pose evaluator (its constraints included). */
+export function posedArmature(arm: ArmatureData, bones: Record<string, PoseBone>): PosedArmature {
   const pose = computePose(arm, bones, { frame: 0, armatureMatrix: identity4(), getWorldMatrix: () => null });
   const { inv } = restOf(arm);
-  const out = new Map<string, Mat4>();
+  const matrices = new Map<string, Mat4>();
+  const deltas = new Map<string, Mat4>();
   for (const [name, b] of pose.bones) {
+    matrices.set(name, b.matrix);
     const i = inv.get(name);
-    if (i) out.set(name, multiply4(b.matrix, i));
+    if (i) deltas.set(name, multiply4(b.matrix, i));
   }
-  return out;
+  return { matrices, deltas };
+}
+
+/**
+ * The deltas of `posed` with the bones of `chain` (each a child of a bone before it or of one
+ * `posed` has) posed again from their channels in `bones`, as the pose evaluator poses a bone
+ * without constraints: its parent's matrix, its rest frame under its parent, its own location,
+ * rotation and scale. Much cheaper than posing the whole armature again to try a few angles.
+ */
+export function reposeChain(
+  arm: ArmatureData,
+  posed: PosedArmature,
+  bones: Record<string, PoseBone>,
+  chain: readonly string[],
+): Map<string, Mat4> {
+  const { rest, inv, bones: data } = restOf(arm);
+  const matrices = new Map(posed.matrices);
+  const deltas = new Map(posed.deltas);
+  for (const name of chain) {
+    const b = data.get(name);
+    const r = rest.get(name)?.matrix;
+    const i = inv.get(name);
+    const pb = bones[name];
+    if (!b || !r || !i || !pb) continue;
+    const parent = b.parent ? matrices.get(b.parent) : undefined;
+    const pi = b.parent ? inv.get(b.parent) : undefined;
+    const frame = parent && pi ? multiply4(parent, multiply4(pi, r)) : r;
+    const loc: Vec3 = b.use_connect && parent ? [0, 0, 0] : (pb.location as Vec3);
+    const m = multiply4(frame, compose4(loc, pb.rotation_euler as Vec3, pb.scale as Vec3));
+    matrices.set(name, m);
+    deltas.set(name, multiply4(m, i));
+  }
+  return deltas;
+}
+
+/** Where rest point `point` of bone `bone` is under a pose (armature space). */
+export function posedPoint(
+  arm: ArmatureData,
+  bones: Record<string, PoseBone>,
+  bone: string,
+  point: Readonly<Vec3>,
+): Vec3 {
+  const d = poseDeltas(arm, bones).get(bone);
+  return d ? transformPoint3(d, point as Vec3) : [point[0], point[1], point[2]];
 }
 
 /** The lowest height (armature space) of the probes and the parts' surface under a pose. */
@@ -482,7 +548,25 @@ export function lowestPoint(
   probes: Blueprint['probes'],
   surface: readonly PartSurface[] = [],
 ): number {
+  return lowestOf(poseDeltas(arm, bones), probes, surface);
+}
+
+/** lowestPoint of several groups of probes and surfaces under one pose (posed once). */
+export function lowestPoints(
+  arm: ArmatureData,
+  bones: Record<string, PoseBone>,
+  groups: readonly { probes: Blueprint['probes']; surface: readonly PartSurface[] }[],
+): number[] {
   const deltas = poseDeltas(arm, bones);
+  return groups.map((g) => lowestOf(deltas, g.probes, g.surface));
+}
+
+/** The lowest height (armature space) of the probes and the parts' surface under pose deltas. */
+export function lowestOf(
+  deltas: ReadonlyMap<string, Mat4>,
+  probes: Blueprint['probes'],
+  surface: readonly PartSurface[],
+): number {
   let low = Infinity;
   for (const p of probes) {
     const d = deltas.get(p.bone);

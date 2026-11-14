@@ -354,20 +354,19 @@ describe("the desk's own checks", () => {
     ]);
     expect(checkShots(ins).issues.map((i) => [i.code, i.objects])).toEqual([['subject_out_of_frame', [mug]]]);
 
-    // pans, tilts and whip pans turn away from their subjects by design: their first frame counts
-    for (const [move, flagged] of [
-      ['whip_pan', false],
-      ['pan_left', false],
-      ['tilt_up', false],
-      ['dolly_right', true],
-    ] as const) {
+    // pans, tilts and whip pans turn away from their subjects by design: their first frame counts;
+    // other moves count at every sample: the solve keeps the subjects in frame through a dolly, a
+    // longer dolly keyed over the shot afterwards loses them
+    for (const move of ['whip_pan', 'pan_left', 'tilt_up', 'dolly_right'] as const) {
       const d = deskDoc();
       const ops = deskOperators(d);
       standIn(d, 'Ada', -0.8, 0, 90);
       standIn(d, 'Ben', 0.8, 0, 270);
       ops.run('desk.shot_add', { subjects: ['Ada', 'Ben'], framing: 'close_up', move });
-      const out = checkShots(d).issues.filter((i) => i.code === 'subject_out_of_frame');
-      expect(out.length > 0, move).toBe(flagged);
+      const out = () => checkShots(d).issues.filter((i) => i.code === 'subject_out_of_frame');
+      expect(out(), move).toEqual([]);
+      ops.run('desk.camera_move', { shot: getShots(d)[0].id, move, amount: 4 });
+      expect(out().length > 0, move).toBe(move === 'dolly_right');
     }
   });
 

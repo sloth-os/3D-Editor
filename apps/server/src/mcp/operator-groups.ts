@@ -154,15 +154,15 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
     name: 'Director',
     aliases: ['Desk', 'Shots'],
     description:
-      'The director desk: shots (a camera each, with framing, angle, height, lens, move and subjects, solved from the plan), continuity checks, the set (ground, sky and sun), actors and physics presets; export_video renders the shots as video files (export_status follows a job, cancel_export stops it, list_exports lists them)',
-    tools: ['export_video', 'export_status', 'cancel_export', 'list_exports'],
+      "The director's desk, previs for AI video: shots (a camera each, with framing, angle, height, lens, move, subjects and planned screen layout, solved like rideo's solver and kept on one side of the 180° line), continuity checks, the set (ground, sky and sun), actors, physics presets (drop, throw, push, bake), kites and balloons on strings, vehicles, and rideo's blocking in and out. export_video renders the shots as video files (export_status follows a job, cancel_export stops it, list_exports lists them); rideo_import and rideo_push exchange clips with a rideo server",
+    tools: ['export_video', 'export_status', 'cancel_export', 'list_exports', 'rideo_import', 'rideo_push'],
     match: prefix('desk.'),
   },
   {
     name: 'Actors',
     aliases: ['Characters'],
     description:
-      'Rigged mannequin people and animals of the director desk: add, pose, walk or run along paths, face, look at, hold props and ride',
+      "Rigged mannequin people (adult, man, woman, child, toddler, elder) and animals (horse, pony, donkey, cow, dog, small_dog, cat, sheep, pig, deer, bear) of the director's desk: add, pose (gestures over the legs they have), walk, run, trot or gallop along paths, face, look at, hold props and ride the four mounts",
     match: prefix('desk.actor_'),
   },
   {
@@ -335,9 +335,7 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   'wm.export_video': {
     instead: 'To export the shots as video use export_video (export_status follows the job).',
     use: 'export_video',
-    editor:
-      "it opens the Export Video window on the person's screen (until that window exists it only shows them " +
-      'a message that it is coming soon)',
+    editor: "it opens the Export Video window on the person's screen",
   },
   'wm.import': {
     instead: 'To import a file use import_model.',
@@ -435,8 +433,9 @@ const BROWSER_OPERATOR_ADVICE: Record<string, BrowserOperatorAdvice> = {
   },
   'view3d.toggle_follow_shots': {
     editor:
-      'it turns Follow Shots on or off in that editor: its viewport then looks through the camera of the shot ' +
-      'at its current frame',
+      'it turns Follow Shots on or off in that editor: its camera view, F12 and Render Animation (also renders ' +
+      'an agent asks of that editor) then look through the camera of the shot at the frame, and a shot pinned on ' +
+      'its Sequence strip wins at the current frame',
   },
   'view3d.toggle_camera_guides': {
     editor: "it shows or hides the rule-of-thirds and action-safe guides over that editor's camera view",

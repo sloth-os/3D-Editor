@@ -329,7 +329,10 @@ describe('dithering', () => {
               filmRowsToRGBA8(rowsFilm, W, y0, rows, out, 1.5, vt, background, dither);
             }
             const what = `${vt} ${background ? 'background' : 'none'} dither ${dither} band ${band}`;
-            expect(out.every((v, i) => v === whole[i]), what).toBe(true);
+            expect(
+              out.every((v, i) => v === whole[i]),
+              what,
+            ).toBe(true);
           }
         }
   });

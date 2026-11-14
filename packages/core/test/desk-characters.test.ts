@@ -27,6 +27,7 @@ import {
   createActor,
   defaultActorHeight,
   isActor,
+  moveAlongPath,
   type ActorKind,
 } from '../src/desk/characters';
 import { moveTiming, gaitDef } from '../src/desk/characters/gait';
@@ -264,6 +265,17 @@ describe('desk actors: poses', () => {
         for (const v of [...info.eyes, ...info.head_top, ...info.chest])
           expect(Number.isFinite(v)).toBe(true);
       }
+    }
+  });
+
+  it('every quadruped stands on its hooves or paws (nothing of the legs below the soles)', () => {
+    for (const kind of ANIMALS) {
+      const { doc, actor: id } = actor(kind);
+      const info = actorInfo(new FrameState(doc, 1), doc, id);
+      const kp = points(doc, id);
+      for (const n of ['l_front_paw', 'r_front_paw', 'l_back_paw', 'r_back_paw'])
+        expect(kp[n][2], `${kind} ${n}`).toBeLessThan(0.002 * info.height_m + 1e-4);
+      expect(info.bounds.min[2], kind).toBeGreaterThan(-1e-4);
     }
   });
 
@@ -588,10 +600,115 @@ describe('desk actors: operators and estimates', () => {
     run('desk.actor_look_at', { actor: adult, target: horse, frame: 140 });
     run('desk.actor_hold', { actor: adult, prop: cube, frame: 150, release_frame: 170 });
     run('desk.actor_mount', { rider: adult, mount: horse, frame: 200, dismount_frame: 260 });
+    // a quadruped stepping round half a turn, and a timed path cut at a U-turn (two moves, a turn
+    // on the spot between them)
+    run('desk.actor_face', { actor: horse, facing_deg: -90, frame: 330, turn_frames: 40 });
+    run('desk.actor_move', {
+      actor: dog,
+      points: [
+        [-4, -14, 0],
+        [-4, -10.5, 0],
+      ],
+      frame_start: 340,
+      frame_end: 520,
+    });
+    // sideways without facing the path: short steps, many of them
+    run('desk.actor_move', { actor: dog, points: [[1, -10.5, 0]], frame_start: 560, face_path: false });
     // a longer path keys more cycles
     const est = (x: number) =>
       DESK_ACTOR_ESTIMATES['desk.actor_move'](ctx, { actor: dog, points: [[x, 0, 0]], frame_start: 400 })!
         .keyframes!;
     expect(est(40)).toBeGreaterThan(est(5));
+  });
+});
+
+describe('desk actors: review regressions', () => {
+  const heightOf = (doc: SceneDoc, id: string) => Number(doc.getObject(id)!.custom_props!.desk_height_m);
+
+  it('grazing keeps the muzzle ahead of the front feet and pointing down, for every quadruped', () => {
+    for (const kind of ANIMALS) {
+      const { doc, actor: id } = actor(kind, { pose: 'eat' });
+      const h = heightOf(doc, id);
+      const kp = points(doc, id);
+      // facing −Y: the nose in front of both front paws, not folded back between the legs
+      for (const paw of ['l_front_paw', 'r_front_paw'])
+        expect(kp[paw][1] - kp.nose[1], `${kind} ${paw}`).toBeGreaterThan(0.08 * h);
+      // the muzzle (head to nose) points down and forward
+      const head = boneEnds(doc, id, 'head').head;
+      expect(head[2] - kp.nose[2], kind).toBeGreaterThan(0);
+      expect(head[1] - kp.nose[1], kind).toBeGreaterThan(0);
+    }
+  });
+
+  it('lying animals rest on their barrel, within 3% of their height of the ground', () => {
+    for (const kind of ANIMALS) {
+      const { doc, actor: id, parts } = actor(kind, { pose: 'lie' });
+      const h = heightOf(doc, id);
+      const fs = new FrameState(doc, 1);
+      let barrel = Infinity;
+      let lowest = Infinity;
+      for (const p of parts) {
+        const b = partBounds(doc, fs, p);
+        lowest = Math.min(lowest, b.min[2]);
+        if (['hips', 'spine', 'chest'].includes(doc.getObject(p)!.parent_bone ?? ''))
+          barrel = Math.min(barrel, b.min[2]);
+      }
+      expect(lowest, kind).toBeGreaterThan(-0.005);
+      expect(barrel, kind).toBeLessThan(0.03 * h + 0.005);
+    }
+  });
+
+  it('a pose keys only the channels it changes', () => {
+    const { doc, actor: id } = actor('adult');
+    const curves = () =>
+      [...doc.map('fcurves').values()].filter((v) => (v as { target_id?: string }).target_id === id).length;
+    applyPose(doc, id, 'wave', { frame: 10 });
+    const wave = curves();
+    expect(wave).toBeGreaterThan(0);
+    // the right arm only: no F-curve holding one value on every other channel of the body
+    expect(wave).toBeLessThanOrEqual(12);
+    applyPose(doc, id, 'stand', { frame: 30 });
+    expect(curves()).toBe(wave);
+    // and the pose still comes and goes
+    expect(points(doc, id, 10).r_wrist[2]).toBeGreaterThan(points(doc, id, 1).nose[2]);
+    expect(dist(points(doc, id, 30).r_wrist, points(doc, id, 1).r_wrist)).toBeLessThan(1e-4);
+  });
+
+  it('an actor named by one of its parts is estimated as the actor', () => {
+    const doc = scene();
+    const reg = createOperatorRegistry();
+    const ctx: OperatorContext = {
+      doc,
+      state: createEditorState(),
+      origin: doc.origin,
+      source: 'test',
+      report: () => undefined,
+    };
+    const adult = createActor(doc, { kind: 'adult', location: [0, 0, 0] });
+    const horse = createActor(doc, { kind: 'horse', location: [3, 0, 0] });
+    const ball = doc.addObject({
+      type: 'MESH',
+      name: 'Ball',
+      data: doc.addMesh('Ball', createCube({ size: 0.2 })),
+    });
+    // keys to copy again
+    moveAlongPath(doc, adult.actor, [[0, -2, 0]], { frame_start: 1 });
+    const cases: [string, Record<string, unknown>, string][] = [
+      ['desk.actor_pose', { pose: 'wave', frame: 90 }, 'actor'],
+      ['desk.actor_move', { points: [[2, -2, 0]], frame_start: 100 }, 'actor'],
+      ['desk.actor_face', { facing_deg: 120, frame: 150 }, 'actor'],
+      ['desk.actor_look_at', { target: ball, frame: 160 }, 'actor'],
+      ['desk.actor_hold', { prop: ball, frame: 170 }, 'actor'],
+      ['desk.actor_mount', { mount: horse.actor, frame: 200 }, 'rider'],
+    ];
+    const part = adult.parts.find((p) => doc.getObject(p)!.parent_bone === 'forearm.R')!;
+    for (const [op, params, key] of cases) {
+      const est = (ref: string) =>
+        DESK_ACTOR_ESTIMATES[op](
+          ctx,
+          reg.parseParams(op, { ...params, [key]: ref }) as Record<string, unknown>,
+        );
+      expect(est(part), op).toEqual(est(adult.actor));
+    }
   });
 });

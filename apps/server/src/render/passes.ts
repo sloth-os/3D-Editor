@@ -8,8 +8,8 @@ import type { Mat4, Vec3 } from '@3d-editor/core';
  * - mask: one byte per pixel, the job's palette index of the object group drawn there (0 = nothing),
  *   from the object pass through a lookup table;
  * - strings (tethers, desk_role 'string' objects): screen-space lines at least 2 px wide drawn into
- *   the mask, edges and pose passes, depth-tested against the depth pass (the beauty image gets
- *   them from the core rasterizer, SoftwareRenderOptions.lines);
+ *   the pose pass, depth-tested against the depth pass (the beauty image, the mask and the edges
+ *   get them from core drawLines, render/desk.ts);
  * - pose: RGB skeletons of the actors on black (OpenPose-18 limb colours for humanoids, a simple
  *   skeleton for quadrupeds);
  * - the camera of a frame and the subjects' screen boxes (FrameMeta).
@@ -179,34 +179,6 @@ export function rasterizeSegment(
 export function lineVisible(depth: number, surface: number | undefined): boolean {
   if (surface === undefined || !(surface > 0) || surface === Infinity) return true;
   return depth <= surface * (1 + LINE_DEPTH_TOLERANCE) + LINE_DEPTH_SLACK;
-}
-
-/**
- * Draws a line into a one-byte-per-pixel image (mask indices, edges): pixels at least half covered
- * get `value`; with `surface` (the view depth pass), only where the line is not behind a surface.
- */
-export function drawLineByte(
-  buf: Uint8Array,
-  width: number,
-  height: number,
-  a: ScreenPoint,
-  b: ScreenPoint,
-  halfWidth: number,
-  value: number,
-  surface?: ArrayLike<number>,
-  ortho = false,
-): void {
-  rasterizeSegment(
-    width,
-    height,
-    a,
-    b,
-    halfWidth,
-    (i, coverage, depth) => {
-      if (coverage >= 0.5 && lineVisible(depth, surface?.[i])) buf[i] = value;
-    },
-    ortho,
-  );
 }
 
 /**

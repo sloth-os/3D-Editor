@@ -5,12 +5,14 @@ import {
   ACTOR_KINDS,
   ACTOR_POSES,
   BUILT_KINDS,
-  applyPose,
+  POSE_LAYERS,
   createActor,
   faceTo,
   isActor,
   moveAlongPath,
+  refreshAttached,
 } from '../desk/characters';
+import { keyPose } from '../desk/characters/actor';
 import { holdObject, lookAtObject, mountActor } from '../desk/characters/attach';
 import { actorPosition } from '../desk/characters/locomotion';
 import { FrameState } from '../eval/frame-state';
@@ -23,7 +25,7 @@ import { pollObjectMode, resolveObjectIds, setSelection, vec3 } from './helpers'
  * Actor operators of the director's desk (CHARACTERS owns this module; spec §4, §8):
  *
  *   desk.actor_add       add an actor (a segmented mannequin or a quadruped on an armature)
- *   desk.actor_pose      key a pose (blended in, held)
+ *   desk.actor_pose      key a pose (blended in, held; a gesture layered over a seated or moving actor's legs)
  *   desk.actor_move      walk / run / trot / gallop along a path (gait keys for every cycle)
  *   desk.actor_face      turn to a heading or toward a point or object
  *   desk.actor_look_at   turn the head toward an object (or stop)
@@ -132,16 +134,26 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
       id: 'desk.actor_pose',
       label: 'Pose Actor',
       description:
-        "Key a pose on an actor's bones at `frame`, blended in over blend_frames and held for hold_frames. Returns " +
-        'the keyed frames.',
+        "Key a pose on an actor's bones at `frame`, blended in over blend_frames and held for hold_frames. A " +
+        'gesture made while the actor sits, kneels, crouches, lies, rides or walks moves only its upper body ' +
+        'over the legs it has (layer). Returns the keyed frames, the layer used and the parts held back ' +
+        '(held_back) because they would go into the ground, with a warning.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
       schema: z.object({
         actor: actorRef,
-        pose: poseEnum,
+        pose: poseEnum.describe(
+          "Pose: rideo's stand, walk, run, sit, crouch, kneel, lie, reach, point, wave; also idle, talk, " +
+            'arms_crossed, hands_on_hips, carry, throw, kick, jump, look_up, ride, sit_ground; quadrupeds: stand, ' +
+            'walk, trot, gallop, sit, lie, eat, look_up. The gestures reach, point, wave, talk, arms_crossed, ' +
+            "hands_on_hips, carry and look_up (an animal's look_up) move only the upper body; the others are " +
+            'full-body poses',
+        ),
         frame: frameSchema.optional().describe('Frame the pose is reached (default: the current frame)'),
-        blend_frames: blendSchema.default(6),
+        blend_frames: blendSchema
+          .default(6)
+          .describe('Frames to blend into it, each bone from what it does then'),
         hold_frames: z
           .number()
           .int()
@@ -149,14 +161,30 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           .max(100_000)
           .optional()
           .describe('Frames the pose is held after `frame` (default: until the next key)'),
+        layer: z
+          .enum(POSE_LAYERS)
+          .default('auto')
+          .describe(
+            "What the pose keys. 'auto': a gesture on an actor that sits (on a seat or the ground), kneels, " +
+              'crouches, lies, rides or walks at that frame keys only the spine, neck, head and the arms it uses, ' +
+              'and the actor keeps its hips, legs and place; any other pose, or a gesture on an actor standing still, ' +
+              "keys the whole body. 'full': always the whole body (a sitting actor stands up). 'upper': only the " +
+              'upper body, whatever the legs do',
+          ),
       }),
       execute(ctx, p) {
         const id = actorId(ctx, p.actor);
         const frame = frameOr(ctx, p.frame);
-        applyPose(ctx.doc, id, p.pose, { frame, blend_frames: p.blend_frames, hold_frames: p.hold_frames });
-        const frames = [p.blend_frames > 0 ? frame - p.blend_frames : frame - 1, frame];
-        if (p.hold_frames) frames.push(frame + p.hold_frames);
-        return { ...named(ctx, id), pose: p.pose, frames };
+        const r = keyPose(ctx.doc, id, p.pose, {
+          frame,
+          blend_frames: p.blend_frames,
+          hold_frames: p.hold_frames,
+          layer: p.layer,
+        });
+        refreshAttached(ctx.doc, id);
+        // a part the gesture would put into the ground (a lying actor's head tipped back) is held back
+        if (r.warning) ctx.report('WARNING', r.warning);
+        return { ...named(ctx, id), pose: p.pose, frames: r.frames, layer: r.layer, held_back: r.held };
       },
     }),
   );
@@ -282,6 +310,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         const id = actorId(ctx, p.actor);
         const target = p.target === null ? null : resolveObjectIds(ctx, [p.target])[0];
         const r = lookAtObject(ctx.doc, id, target, { frame: p.frame, blend_frames: p.blend_frames });
+        refreshAttached(ctx.doc, id);
         return {
           ...named(ctx, id),
           target: target === null ? null : named(ctx, target),
@@ -317,7 +346,15 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           frame: p.frame,
           release_frame: p.release_frame,
         });
-        return { ...named(ctx, id), prop: named(ctx, prop), constraint: r.constraint, bone: r.bone };
+        refreshAttached(ctx.doc, id);
+        for (const w of r.warnings) ctx.report('WARNING', w);
+        return {
+          ...named(ctx, id),
+          prop: named(ctx, prop),
+          constraint: r.constraint,
+          bone: r.bone,
+          distance_m: Math.round(r.distance_m * 1000) / 1000,
+        };
       },
     }),
   );
@@ -342,6 +379,7 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
         const rider = actorId(ctx, p.rider);
         const mountId = actorId(ctx, p.mount);
         const r = mountActor(ctx.doc, rider, mountId, { frame: p.frame, dismount_frame: p.dismount_frame });
+        refreshAttached(ctx.doc, rider);
         return { rider: named(ctx, rider), mount: named(ctx, mountId), constraint: r.constraint };
       },
     }),

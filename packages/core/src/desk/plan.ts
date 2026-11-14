@@ -13,8 +13,17 @@ import {
   viewFromPose,
   type CameraView,
 } from './layout';
-import { shotSpec, solveCamera, type SolveSpec, type SolvedCamera } from './solver';
-import { applyCameraMove, cameraHolds } from './moves';
+import { shotSpec, type SolveSpec, type SolvedCamera } from './solver';
+import {
+  applyCameraMove,
+  cameraHolds,
+  fitShotCamera,
+  fitShotCameraKeeping,
+  shotFitReport,
+  viewTarget,
+  type CameraPose,
+  type FitReport,
+} from './moves';
 
 /*
  * Plan fitting (spec §6; rideo's shotLayout, planAgreement, alignLayoutToPlan and
@@ -90,13 +99,15 @@ const thirdOf = (x: number): DeskSide => (x < -LAYOUT_THIRD ? 'left' : x > LAYOU
 
 /**
  * What camera `view` shows of shot `shot` at `frame` (rideo's shotLayout). Moves are measured to the
- * shot's last frame through the same view. Null without a view.
+ * shot's last frame through the same view. Null without a view. `subjectsOnly`: the subjects alone
+ * (no landmarks behind them, no light), all a plan is judged on.
  */
 export function layoutView(
   scene: DeskScene,
   shot: ShotData,
   frame: number,
   view: CameraView | null,
+  o: { subjectsOnly?: boolean } = {},
 ): ShotView | null {
   if (!view) return null;
   const end = Math.max(frame, shot.frame_end);
@@ -163,6 +174,8 @@ export function layoutView(
       if (c.in_frame)
         c.depth_label = c.depth < 0.72 * median ? 'foreground' : c.depth > 1.4 * median ? 'background' : null;
   }
+  // what is behind them and where the light comes from (not needed to judge a plan)
+  if (o.subjectsOnly) return { subjects, behind: [], light: 'ahead', light_side: null, interior: false };
   const far = Math.max(0, ...visible.map((c) => c.depth));
   const behind = scene
     .landmarks(frame)
@@ -313,33 +326,58 @@ export interface PlanFit {
   own: PlanAgreement;
   /** The spec of the refitted camera (null: the own camera stays). */
   spec: SolveSpec | null;
-  solved: SolvedCamera | null;
+  /** The refitted camera and how it frames the shot (null: the own camera stays). */
+  solved: (SolvedCamera & FitReport) | null;
+  /** The camera kept holds every subject in frame at the frames desk.check samples. */
+  in_frame: boolean;
+  /** Some camera tried agrees with the plan (one kept, or one given up because it loses a subject). */
+  agreeing: boolean;
 }
 
 /**
  * Fits a shot's camera to its plan at `frame` (rideo's fitCameraToPlan), without writing anything:
- * the own camera when it agrees, else the first candidate that agrees, else the one that agrees most
- * (if better than the own). Candidates: over-the-shoulder from both shoulders first when the shot is
- * one, then front, three-quarters, profiles and back around its subjects. Beyond rideo, a shot that
- * is not an over-the-shoulder with two or more actors then tries both shoulders too, taken only when
- * one agrees with the plan outright: a wide or medium shot never becomes a shoulder shot that still
- * disagrees (rideo keeps the best of its standard angles). Solved without the line. Null without a
- * plan.
+ * the own camera when it agrees, else the first candidate that agrees and keeps the shot's subjects
+ * in frame, else the one that keeps them in frame (the in-frame fit wins over the plan: a subject out
+ * of frame is an error, a plan mismatch a warning), then the one that agrees, then the one that agrees
+ * most (if better than the own). Candidates: over-the-shoulder from both shoulders first when the
+ * shot is one, then front, three-quarters, profiles and back around its subjects; each fitted over
+ * the shot from `frame` (moves.ts fitShotCamera, within its framing limit) and, when that disagrees,
+ * kept at the composition of its first frame and backed off along it to keep the subjects in frame
+ * (fitShotCameraKeeping: the plan kept and the subjects too, at the price of a wider frame). Beyond
+ * rideo, a shot that is not an over-the-shoulder with two or more actors then tries both shoulders
+ * too, taken only when one agrees with the plan outright: a wide or medium shot never becomes a
+ * shoulder shot that still disagrees (rideo keeps the best of its standard angles). Solved without the
+ * line. `pose`: the own camera's start (default: where it stands at `frame`, looking at its subjects).
+ * Null without a plan.
  */
 export function planFit(
   scene: DeskScene,
   shot: ShotData,
   index: number,
-  o: { frame?: number; lens?: number | null } = {},
+  o: { frame?: number; lens?: number | null; pose?: CameraPose } = {},
 ): PlanFit | null {
   const plan = shot.layout;
   if (!plan.length) return null;
   const frame = o.frame ?? shot.frame_start;
   const evaluate = (view: CameraView | null) =>
-    planAgreement(layoutView(scene, shot, frame, view)?.subjects ?? null, plan);
-  const own = evaluate(shotCameraView(scene, shot, frame));
-  if (own.agrees) return { agreement: own, own, spec: null, solved: null };
+    planAgreement(layoutView(scene, shot, frame, view, { subjectsOnly: true })?.subjects ?? null, plan);
+  const ownView = shotCameraView(scene, shot, frame);
+  const own = evaluate(ownView);
   const base = shotSpec(scene, shot, index, o.lens);
+  const span = { frame_start: frame, frame_end: Math.max(frame, shot.frame_end) };
+  // whether the own camera keeps the subjects in frame through the shot's move
+  const ownPose: CameraPose | null =
+    o.pose ??
+    (ownView && {
+      position: ownView.position,
+      target: viewTarget(scene, ownView, shot.subjects, frame),
+      lens: ownView.lens,
+    });
+  const ownInFrame = ownPose
+    ? shotFitReport(scene, { ...base, lens_mm: ownPose.lens }, span, ownPose).out_of_frame.length === 0
+    : false;
+  if (own.agrees)
+    return { agreement: own, own, spec: null, solved: null, in_frame: ownInFrame, agreeing: true };
   const actors = base.subjects.filter((id) => scene.isActor(id));
   const shoulders = (): SolveSpec[] => {
     if (actors.length < 2) return [];
@@ -356,14 +394,48 @@ export function planFit(
   for (const angle of FIT_ANGLES)
     specs.push({ spec: { ...base, angle, subjects: [...base.subjects] }, onlyIfAgrees: false });
   if (!shoulderShot) for (const spec of shoulders()) specs.push({ spec, onlyIfAgrees: true });
-  let best: PlanFit = { agreement: own, own, spec: null, solved: null };
+  // the camera kept: in frame first, then agreeing, then by rideo's points (the own camera on a tie)
+  const rank = (f: PlanFit): number[] => [f.in_frame ? 1 : 0, f.agreement.agrees ? 1 : 0, f.agreement.score];
+  const better = (a: PlanFit, b: PlanFit): boolean => {
+    const ra = rank(a);
+    const rb = rank(b);
+    for (let i = 0; i < ra.length; i++) if (ra[i] !== rb[i]) return ra[i] > rb[i];
+    return false;
+  };
+  const agreesView = (view: CameraView) => evaluate(view).agrees;
+  let best: PlanFit = {
+    agreement: own,
+    own,
+    spec: null,
+    solved: null,
+    in_frame: ownInFrame,
+    agreeing: false,
+  };
+  let agreeing = false;
   for (const { spec, onlyIfAgrees } of specs) {
-    const solved = solveCamera(scene, spec, frame);
-    const agreement = evaluate(viewFromPose(solved.position, solved.target, solved.lens_mm, scene.aspect));
-    if (agreement.agrees) return { agreement, own, spec, solved };
-    if (!onlyIfAgrees && agreement.score > best.agreement.score) best = { agreement, own, spec, solved };
+    const options: (SolvedCamera & FitReport)[] = [fitShotCamera(scene, spec, span)];
+    for (let i = 0; i < options.length; i++) {
+      const solved = options[i];
+      const agreement = evaluate(viewFromPose(solved.position, solved.target, solved.lens_mm, scene.aspect));
+      const fit: PlanFit = {
+        agreement,
+        own,
+        spec,
+        solved,
+        in_frame: solved.out_of_frame.length === 0,
+        agreeing: true,
+      };
+      if (agreement.agrees && fit.in_frame) return fit;
+      agreeing ||= agreement.agrees;
+      // its first frame's composition kept, backed off along it to keep the subjects in frame
+      if (i === 0 && !agreement.agrees) {
+        const kept = fitShotCameraKeeping(scene, spec, span, agreesView);
+        if (kept) options.push(kept);
+      }
+      if ((!onlyIfAgrees || agreement.agrees) && better(fit, best)) best = fit;
+    }
   }
-  return best;
+  return { ...best, agreeing };
 }
 
 /**

@@ -67,6 +67,14 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | MCP tools, instructions, scene summaries, operator groups, editor commands, bounded undo histories                                                                                    | `apps/server/src/mcp`                                         |
 | Render processes (renders and exports), their CPU priority, the server's memory checks                                                                                                | `apps/server/src/render`                                      |
 | REST API, WebDAV proxy, observability                                                                                                                                                 | `apps/server/src/api`, `dav`, `observability`                 |
+| Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, rideo blocking import and export                   | `packages/core/src/desk`                                      |
+| Actors: mannequin rigs, poses, gaits, locomotion, holding and riding, keypoints                                                                                                       | `packages/core/src/desk/characters`                           |
+| Physics presets: start frames, drop, throw, push, bake, kites and balloons, vehicles                                                                                                  | `packages/core/src/desk/physics`                              |
+| Built-in model catalog, catalog search, store inserts                                                                                                                                 | `packages/core/src/store`                                     |
+| Director workspace, Asset Browser, Export Video window, Follow Shots                                                                                                                  | `apps/web/src/ui/director`, `ui/assets`, `viewport`           |
+| Video export jobs: plan, frame loop, ffmpeg, passes, manifest, memory                                                                                                                 | `apps/server/src/video`                                       |
+| Model store: providers, search, downloads, cache, thumbnails                                                                                                                          | `apps/server/src/store`                                       |
+| rideo bridge: client, import, push, previs jobs                                                                                                                                       | `apps/server/src/rideo`                                       |
 
 ## Document model
 
@@ -849,6 +857,23 @@ rigid body caches`, names a project's cache as `'…' (…) … MB (… MB of it
   list of a datablock's users for each user, which took seconds for thousands of linked duplicates;
   now it adds to the lists, and takes 1.7–2.1 s for 30,000 linked cubes instead of 6.8–7.2 s.
 
+## Director's desk
+
+The desk's data lives in the scene document like everything else: `scene.shots` (the cut, in
+order) and `scene.desk` (set size, main pair, aspect, the video model's take limits), read and
+written only through `packages/core/src/desk/shots.ts`, which sanitizes them against the document
+(cameras and subjects that no longer exist are dropped) and caches the result by the document's
+change token; a test forbids reading them anywhere else. Actors, props, cameras and strings are
+ordinary objects marked with custom properties (`desk_role`, `desk_actor`, `desk_shot`,
+`store_id` …). Every desk feature is an operator (`operators/desk-shots.ts`, `desk-actors.ts`,
+`desk-motion.ts`, `store.ts`) with a memory estimate (`operators/memory-desk.ts`), so the
+browser, the console and agents share them, with undo. `cameraForFrame` picks the camera of the
+first enabled shot that covers a frame; the evaluator itself knows nothing of shots, and the
+viewport's Follow Shots, F12 and the server's `camera: 'shots'` renders and video exports call it.
+Rigid bodies gained a start frame (`start_frame`, `initial_*_velocity`, `inherit_velocity`): before
+it a body follows its animation, parent or constraints, and from it it is simulated with the
+velocity it had.
+
 ## Server
 
 - **Sync rooms** (`apps/server/src/sync`): one room per open project holds a server-side replica of
@@ -867,7 +892,26 @@ rigid body caches`, names a project's cache as `'…' (…) … MB (… MB of it
   Scene summaries (`scene-summary.ts`) report evaluated values next to stored ones. See
   [mcp.md](mcp.md).
 - **REST API** (`apps/server/src/api`): project listing and management, snapshots, exports,
-  `render.png` and stored renders, `/api/config`, `/healthz`, `/readyz`, `/metrics`.
+  `render.png` and stored renders, video exports, the model store, rideo previs jobs,
+  `/api/config`, `/healthz`, `/readyz`, `/metrics`. Service failures answer `{error, code}`
+  (`api/errors.ts`).
+- **Video export** (`apps/server/src/video`): background jobs, one rendering at a time (first
+  come, first served, at most `EXPORT_MAX_QUEUED` waiting), each on a snapshot of the project
+  taken when it was asked for and stored next to its `job.json` in `EXPORT_DIR`. A job measures
+  each shot (depth range, shadow box, ambient occlusion reach), decides from the memory available
+  how many render processes it leases (`video/memory.ts`), renders segments of at most 200 frames
+  (beauty and passes from one RASTER evaluation per frame, `render/desk.ts`), writes the frames in
+  order into one ffmpeg process per stream, cuts the clips by stream copy at the keyframes forced
+  at every shot start, and writes posters, the contact sheet and `manifest.json`
+  ([video-export.md](video-export.md)).
+- **Model store** (`apps/server/src/store`): provider adapters (built-in, Khronos, Poly Haven,
+  Sketchfab, Poly Pizza, JSON catalogs) searched in parallel and merged with an opaque cursor;
+  lazily fetched indexes cached for 24 hours; downloads through a guarded fetch (public hosts
+  only), checked and kept in a least-recently-used disk cache; inserts run the core operators
+  `store.add` and `store.insert_files` in the project ([model-store.md](model-store.md)).
+- **rideo bridge** (`apps/server/src/rideo`): a client of rideo's REST API, the import
+  (`desk.import_rideo_blocking` from rideo's documents), the push (blocking written back, clips
+  uploaded once per content, shots patched) and the previs jobs ([rideo.md](rideo.md)).
 
 ## Persistence & sync
 

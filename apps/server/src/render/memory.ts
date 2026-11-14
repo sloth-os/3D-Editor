@@ -8,6 +8,7 @@ import {
   SAVE_BYTES_PER_LAYER_BYTE,
   decodedMeshBytes,
   estimateModifier,
+  frameInputCacheBytes,
   isMeshMemoryError,
   layerBytes,
   modifierRuns,
@@ -398,6 +399,12 @@ export interface OpenProjectSize {
    * when they keep none.
    */
   history?: number;
+  /**
+   * Bytes its document's evaluation input keeps (core frameInputCacheBytes: the objects every frame
+   * state reads, cached until the document changes), part of `kept`; absent when none is cached. Not
+   * saved.
+   */
+  evaluation?: number;
 }
 
 /**
@@ -502,13 +509,16 @@ function baseSize(t: TrackedProject): NonNullable<TrackedProject['size']> {
 
 /**
  * What `scene` keeps and its save takes: counted once per version of its document, the frames its
- * rigid body cache holds (they change with the frames evaluated, not with the document) and what the
- * agents' undo histories keep (they change when the histories drop or collect steps).
+ * rigid body cache holds (they change with the frames evaluated, not with the document), its
+ * evaluation input (cached from its first evaluation until it changes) and what the agents' undo
+ * histories keep (they change when the histories drop or collect steps).
  */
 function sizeOf(t: TrackedProject): OpenProjectSize {
   let value = baseSize(t).value;
   const simulation = rigidBodyCacheBytes(t.scene);
   if (simulation > 0) value = { ...value, kept: value.kept + simulation, simulation };
+  const evaluation = frameInputCacheBytes(t.scene);
+  if (evaluation > 0) value = { ...value, kept: value.kept + evaluation, evaluation };
   const history = heldByHistories(t.scene);
   if (history.kept > 0)
     value = {
@@ -521,9 +531,9 @@ function sizeOf(t: TrackedProject): OpenProjectSize {
 }
 
 /**
- * What the project of `scene` keeps (its rigid body cache, `simulation`, and what the agents' undo
- * histories keep, `history`, included), what its save takes and its objects: counted once per version
- * of its document when it is an open project.
+ * What the project of `scene` keeps (its rigid body cache, `simulation`, its evaluation input and
+ * what the agents' undo histories keep, `history`, included), what its save takes and its objects:
+ * counted once per version of its document when it is an open project.
  */
 function projectSize(scene: SceneDoc): {
   stored: number;
@@ -548,9 +558,10 @@ function projectSize(scene: SceneDoc): {
     objects = project.objects;
   }
   const simulation = rigidBodyCacheBytes(scene);
+  const evaluation = frameInputCacheBytes(scene);
   const history = heldByHistories(scene);
   return {
-    stored: stored + simulation + history.kept,
+    stored: stored + simulation + evaluation + history.kept,
     save: save + history.save,
     objects,
     simulation,
@@ -711,14 +722,16 @@ const freeCacheAdvice = (held: boolean, projects = 1): string =>
     : '';
 
 /**
- * `req` with what core does not count in what its project keeps: its rigid body cache, and what the
- * agents' undo histories keep (with what a save of that takes).
+ * `req` with what core does not count in what its project keeps: its rigid body cache, its
+ * evaluation input, and what the agents' undo histories keep (with what a save of that takes).
  */
 function withHeld(req: OperatorMemoryRequest): ProjectRequest {
   if (!req.doc) return req;
   let r: ProjectRequest = req;
   const simulation = rigidBodyCacheBytes(req.doc);
   if (simulation > 0) r = { ...r, storedBytes: r.storedBytes + simulation, simulation };
+  const evaluation = frameInputCacheBytes(req.doc);
+  if (evaluation > 0) r = { ...r, storedBytes: r.storedBytes + evaluation };
   const history = heldByHistories(req.doc);
   if (history.kept > 0)
     r = {

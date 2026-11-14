@@ -10,7 +10,13 @@ import {
   deskTetherObjects,
   deskVehicleFrames,
 } from '../src/desk/physics/estimate';
-import { DESK_SETTLE_MAX_SECONDS, TETHER_TAIL_SEGMENTS } from '../src/desk/physics';
+import {
+  DESK_SETTLE_MAX_SECONDS,
+  TETHER_LAND_SECONDS,
+  TETHER_TAIL_SEGMENTS,
+  TETHER_TAIL_SETTLE_SECONDS,
+  tetherLandSeconds,
+} from '../src/desk/physics';
 import { deskScene, kiteMesh, syntheticCar } from './desk-physics-helpers';
 
 /*
@@ -131,6 +137,68 @@ describe('desk motion memory estimates', () => {
     // the part: location, rotation and scale; the loose box: location and rotation
     expect(e.keyframes).toBe((9 + 6) * frames);
     expect(s.run('desk.physics_bake', {}).keyframes).toBeLessThanOrEqual(e.keyframes!);
+  });
+
+  it("count nine keys per frame for a store model's root, and a key per channel holding its part", () => {
+    const s = deskScene();
+    s.run('store.add', { model: 'wooden_crate', location: [0, 0, 1], name: 'Crate' });
+    s.box('Loose', [3, 0, 1]);
+    s.run('desk.physics_drop', { objects: ['Crate', 'Loose'], frame: 10 });
+    const world = s.doc.getScene().rigidbody_world;
+    const frames = world.frame_end - world.frame_start + 1;
+    const e = estimateOperator('desk.physics_bake', s.ctx, {})!;
+    // the root: location, rotation and scale; the part it carries: a key per channel; the loose box: 6
+    expect(e.keyframes).toBe((9 + 6) * frames + 9);
+    expect(s.run('desk.physics_bake', {}).keyframes).toBeLessThanOrEqual(e.keyframes!);
+  });
+
+  it("count a landing's frames and the keys that hide a flight's flyer after it", () => {
+    const p = {
+      flyer: 'Kite',
+      anchor: 'Hand',
+      length_m: 10,
+      wind_dir_deg: 90,
+      wind_mps: 6,
+      frame_start: 1,
+      frame_end: 200,
+    };
+    /** A scene with a kite (the test kite, or a store kite with its own tail) and a hand. */
+    const scene = (store: boolean) => {
+      const s = deskScene();
+      if (store) s.run('store.add', { model: 'diamond_kite', location: [0.6, 0, 0.05], name: 'Kite' });
+      else
+        s.doc.addObject({
+          type: 'MESH',
+          name: 'Kite',
+          data: s.mesh('kite', kiteMesh),
+          location: [0.5, 0, 1.3],
+        });
+      s.empty('Hand', [0, 0, 1.2]);
+      return s;
+    };
+    const estimate = (s: ReturnType<typeof deskScene>, after: string) =>
+      estimateOperator('desk.tether_fly', s.ctx, s.reg.parseParams('desk.tether_fly', { ...p, after }))!;
+    const s = scene(false);
+    const t = deskTetherObjects(s.doc, s.reg.parseParams('desk.tether_fly', p) as Record<string, unknown>)!;
+    // the longest landing: from the hand (1.2 m up) and the whole string above it, 2.4 s rather than 1.5 s
+    const landingFrames = Math.ceil(tetherLandSeconds(1.2 + 10) * 24);
+    expect(landingFrames).toBeGreaterThan(Math.round(TETHER_LAND_SECONDS * 24));
+    const landing = landingFrames + Math.round(TETHER_TAIL_SETTLE_SECONDS * 24);
+    expect(estimate(s, 'hold').keyframes).toBe(t.channels * 201);
+    // the flyer's scale keyed twice (the string's and the tail's scale channels are counted already)
+    expect(estimate(s, 'hide').keyframes).toBe(t.channels * 201 + 6);
+    expect(estimate(s, 'land').keyframes).toBe(t.channels * (201 + landing));
+    expect(estimate(s, 'land').bytes).toBeGreaterThan(estimate(s, 'hold').bytes);
+    // what the flights then key stays within
+    for (const store of [false, true])
+      for (const after of ['hold', 'hide', 'land']) {
+        const run = scene(store);
+        const e = estimate(run, after);
+        expect(
+          run.run('desk.tether_fly', { ...p, after }).keyframes,
+          `${after} ${store}`,
+        ).toBeLessThanOrEqual(e.keyframes!);
+      }
   });
 
   it('count every channel of a flight on every frame, and the objects it adds', () => {

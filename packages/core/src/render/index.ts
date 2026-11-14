@@ -59,12 +59,7 @@ import {
 } from './shadows';
 import { aoBufferBytes, ambientOcclusion, applyAmbientOcclusion, linearDepths } from './ao';
 import { drawLines, type ScreenLine } from './lines';
-import {
-  renderPathTracedImage,
-  viewCameraData,
-  viewTransformOf,
-  type PathTraceProgress,
-} from './pathtrace';
+import { renderPathTracedImage, viewCameraData, viewTransformOf, type PathTraceProgress } from './pathtrace';
 import { filmRowsToRGBA8 } from './pathtrace/display';
 
 /*
@@ -203,7 +198,11 @@ export interface SoftwareRenderOptions {
    * camera-relative studio rig never casts shadows. Default false.
    */
   shadows?: boolean | 'scene';
-  /** RASTER: screen-space ambient occlusion of the ambient / environment light. Default false. */
+  /**
+   * RASTER: screen-space ambient occlusion of the ambient / environment light. From 1600 × 900
+   * output pixels on (`AO_HALF_RES_PIXELS`) it is computed on every other pixel of every other row
+   * and upsampled at each pixel's own depth. Default false.
+   */
   ao?: boolean;
   /**
    * RASTER with `ao`: how far (metres) ambient occlusion reaches. Default `defaultAoRadius` of the
@@ -1037,13 +1036,17 @@ const SPOT_MAP_BYTES = SPOT_SHADOW_MAP_SIZE * SPOT_SHADOW_MAP_SIZE * 4;
 /**
  * Upper bound of the memory outside the JavaScript heap (typed-array buffers) that a RASTER
  * `renderSceneSoftware` with these options holds when it returns: the working buffers it keeps for
- * the next render (buffers.ts; `releaseRenderBuffers` frees them) and the image and passes it
- * returns. Not counted: the meshes' render buffers and world-space vertices (about proportional to
- * the triangles drawn) and a few small helper renders. With `doc`, the shadow maps follow its suns,
- * spot lights and SKY world and the display film its view transform; without, one sun map and a
- * film are counted (the desk's SKY sun and AgX). Measured, about 330 MB at 1920 × 1080 with 2 × 2
- * samples, shadows, ambient occlusion, lines and the three passes, 750 MB at 3840 × 2160 (1 sample
- * per pixel there): `MAX_SAMPLES` caps the samples, not this.
+ * the next render (buffers.ts, one per role; `releaseRenderBuffers` frees them) and the image and
+ * passes it returns. Exact but for a sun's shadow map, fitted to the view up to 2048 texels on its
+ * longer side and counted as 2048 × 2048 (a spot light's is 1024 × 1024). Not counted: buffers that
+ * renders with other options left pooled under other roles, the meshes' render buffers and
+ * world-space vertices (about proportional to the triangles drawn), the PNG textures it decodes
+ * while it runs (4 bytes per texel) and a few small helper renders.
+ * With `doc`, the shadow maps follow its suns, spot lights and SKY world and the display film its
+ * view transform; without, one sun map and a film row are counted (the desk's SKY sun and AgX).
+ * Measured on the desk bench scene with 2 × 2 samples, shadows, ambient occlusion, lines and the
+ * three passes: 150 MiB at 1280 × 720, 311 MiB at 1920 × 1080 (264 MiB without lines and passes)
+ * and 637 MiB at 3840 × 2160, where `MAX_SAMPLES` leaves 1 sample per pixel.
  */
 export function estimateRenderBufferBytes(opts: RenderBufferOptions, doc?: SceneDoc): number {
   const width = Math.round(opts.width);

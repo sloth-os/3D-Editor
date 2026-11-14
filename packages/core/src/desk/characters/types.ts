@@ -82,6 +82,34 @@ export type AnimalPose = (typeof ANIMAL_POSES)[number];
 export const ACTOR_POSES = [...HUMAN_POSES, 'trot', 'gallop', 'eat'] as const;
 export type ActorPose = (typeof ACTOR_POSES)[number];
 
+/**
+ * Upper-body gestures: poses that move only the spine, neck, head and arms (an animal's neck and
+ * head), so they can be layered over what the hips and legs are doing. Every other pose is
+ * full-body: the stances (stand, sit, sit_ground, kneel, crouch, lie, ride), the gaits, idle's
+ * weight shift, throw, kick and jump; a quadruped's stand, gaits, sit, lie and eat.
+ */
+export const HUMAN_GESTURES: readonly HumanPose[] = [
+  'reach',
+  'point',
+  'wave',
+  'talk',
+  'arms_crossed',
+  'hands_on_hips',
+  'carry',
+  'look_up',
+];
+export const ANIMAL_GESTURES: readonly AnimalPose[] = ['look_up'];
+
+/**
+ * How a pose is keyed (applyPose / desk.actor_pose `layer`): 'full' keys the whole body; 'upper'
+ * only the spine, neck, head and arms, over the hips and legs the actor has; 'auto' layers a
+ * gesture on an actor that sits, kneels, crouches, lies, rides or moves its legs, and keys every
+ * other pose (and a gesture on an actor standing still) in full. desk.actor_pose defaults to
+ * 'auto'; applyPose, the library call (rideo's import keys its whole-figure marks with it), to 'full'.
+ */
+export const POSE_LAYERS = ['auto', 'full', 'upper'] as const;
+export type PoseLayer = (typeof POSE_LAYERS)[number];
+
 /** Gaits of desk.actor_move ('auto' picks one from the speed and the kind). */
 export const ACTOR_GAITS = ['auto', 'walk', 'run', 'trot', 'gallop'] as const;
 export type ActorGait = (typeof ACTOR_GAITS)[number];

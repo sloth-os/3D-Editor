@@ -1,7 +1,7 @@
 import type { Vec3 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
 import type { DeskAngle, DeskFraming, DeskHeight, DeskMove, ShotData } from '../doc/types';
-import { DeskScene, toEditor, toRideo, type RVec } from './layout';
+import { DeskScene, toEditor, toRideo, v3add, v3sub, type DeskSubject, type RVec } from './layout';
 
 /*
  * The camera solver (spec §6): rideo's solveCamera, moveEnd and cameraMoveOf (shared/src/blocking,
@@ -14,10 +14,19 @@ import { DeskScene, toEditor, toRideo, type RVec } from './layout';
  * straight over their marks; an actor CHARACTERS measures is framed on its posed body instead: the
  * framing's look share runs from its mark up through its chest, eyes and head (rideo's 0.72, 0.93
  * and 1 of the height), so a close-up finds the face of a seated or lying actor, or of a horse, and
- * a standing person lands where rideo's figure would. Other subjects are rideo's props: the target
- * of an insert. A shot with no actor is framed on its other subjects as if they were figures as tall
- * as their bounds (rideo has no measured props and frames a cast-less shot on a 0.3 m stand-in
- * 1.5 m from the eye); a cast-less insert follows rideo exactly.
+ * a standing person lands where rideo's figure would. An animal is framed by its length as well as
+ * its height: aimed at the middle of what the framing shows of it (all of it from a medium out, its
+ * head and chest in a close-up), far enough back for that to fill at most 90% of the frame. Other
+ * subjects are rideo's props: the target of an insert. A shot with no actor is framed on its other
+ * subjects as if they were figures as tall as their bounds (rideo has no measured props and frames a
+ * cast-less shot on a 0.3 m stand-in 1.5 m from the eye); a cast-less insert follows rideo exactly;
+ * a flying prop sets the camera's height only when no subject stands on the floor.
+ *
+ * Over a shot (F3): placeCamera takes the subjects at more frames (the shot's samples, mapped by a
+ * following move) and aims at the middle of where they go (a moving group across the frame where the
+ * camera can come nearest), far enough back for the group at every frame; subjects that stay put
+ * give rideo's camera exactly. moves.ts fitShotCamera then keeps every subject in frame through the
+ * shot's move, widening the camera when it must.
  */
 
 /** Horizontal sensor width the desk's cameras use (mm; sensor_fit HORIZONTAL). */
@@ -61,9 +70,61 @@ export const ANGLE_DEG: Readonly<Partial<Record<DeskAngle, number>>> = {
 /** Framing a shot without one is solved with. */
 export const DEFAULT_FRAMING: DeskFraming = 'medium';
 
+/**
+ * How far back a camera may stand to keep its shot's subjects in frame, as a share of the distance of
+ * rideo's camera for the shot at its first frame: about one framing step wider, so the frame still
+ * reads close to the framing rideo prompts. A close shot twice as far back reads as the next framing
+ * out (a close-up as a medium close-up, a medium as a full figure); a wide shot may become an extreme
+ * wide (its coverage, 2.4 times a wide's); an extreme wide, the widest framing, up to 4 times.
+ * Over-the-shoulder and point-of-view cameras stand where their rules put them. Subjects a camera
+ * cannot keep within this leave the frame (desk.check's subject_out_of_frame), and the solve says so.
+ */
+export const MAX_WIDEN: Readonly<Record<DeskFraming, number>> = {
+  extreme_wide: 4,
+  wide: 2.4,
+  medium: 2,
+  medium_close: 2,
+  close_up: 2,
+  extreme_close_up: 2,
+  over_shoulder: 1,
+  pov: 1,
+  insert: 2,
+};
+
+/** The framings by how much of a figure they show, from the closest to the widest. */
+const SIZE_FRAMINGS: readonly DeskFraming[] = [
+  'extreme_close_up',
+  'close_up',
+  'medium_close',
+  'medium',
+  'wide',
+  'extreme_wide',
+];
+
+/**
+ * The framing a camera `ratio` times as far back as rideo's for `framing` amounts to: the framing
+ * whose coverage is nearest (by ratio) to the one it covers, the shot's own on a tie.
+ */
+export function effectiveFraming(framing: DeskFraming, ratio: number): DeskFraming {
+  if (!(ratio > 0) || !Number.isFinite(ratio)) return framing;
+  const covers = FRAMING_TABLE[framing].coverage_m * ratio;
+  let best = framing;
+  let off = Math.abs(Math.log(ratio));
+  for (const f of SIZE_FRAMINGS) {
+    const d = Math.abs(Math.log(covers / FRAMING_TABLE[f].coverage_m));
+    if (d < off - 1e-9) {
+      best = f;
+      off = d;
+    }
+  }
+  return best;
+}
+
 /** Room kept beside each subject of a group (m, for a 1.7 m figure) and the margin on the angle it needs. */
 const GROUP_PAD_M = 0.25;
 const GROUP_MARGIN = 1.1;
+/** The share of the frame (from its middle to its edges) what a framing shows of an animal may fill. */
+const ANIMAL_ROOM = 0.9;
 /** How far a move of rideo's library goes: push/pull share, dolly metres, orbit degrees, crane metres. */
 export const PUSH_SHARE = 0.35;
 export const DOLLY_M = 1.5;
@@ -202,6 +263,96 @@ export function shotSpec(
   };
 }
 
+// ---------------------------------------------------------------- what a shot keeps in frame
+
+/**
+ * Moves that turn the camera away from the shot's subjects by design (a pan or tilt to something
+ * else, a whip pan): their subjects are checked in frame, and kept in frame by the solve, at the
+ * shot's first frame only (rideo checks every shot at its first frame).
+ */
+export const TURNING_MOVES: ReadonlySet<string> = new Set([
+  'pan_left',
+  'pan_right',
+  'tilt_up',
+  'tilt_down',
+  'whip_pan',
+]);
+
+/** Moves keyed on every frame that follow the shot's subjects (the centre of their group). */
+export const FOLLOW_MOVES: ReadonlySet<DeskMove> = new Set(['tracking_follow', 'steadicam_walk']);
+
+/** The first, middle and last frame of a shot (once each): where desk.check samples it. */
+export function shotSamples(shot: Pick<ShotData, 'frame_start' | 'frame_end'>): number[] {
+  return [
+    ...new Set([shot.frame_start, Math.round((shot.frame_start + shot.frame_end) / 2), shot.frame_end]),
+  ];
+}
+
+/**
+ * The frames a shot's subjects must be in frame at (desk.check's subject_out_of_frame, and what the
+ * solver keeps them in frame over): its first, middle and last; the first only for turning moves.
+ */
+export function inFrameSamples(shot: Pick<ShotData, 'frame_start' | 'frame_end' | 'move'>): number[] {
+  return shot.move && TURNING_MOVES.has(shot.move) ? [shot.frame_start] : shotSamples(shot);
+}
+
+/**
+ * The subjects a shot leaves out of its frame by design, by the angle and framing it is solved with
+ * (its spec, from shotSpec): the shoulder of an over-the-shoulder shot (its first actor) at the
+ * frame's edge, the viewer of a point-of-view shot (its first actor, else its first subject) behind
+ * the camera, and the cast of an insert, which frames its prop.
+ */
+export function unframedSubjects(
+  scene: DeskScene,
+  subjects: readonly string[],
+  spec: Pick<SolveSpec, 'angle' | 'framing'>,
+): Set<string> {
+  const firstActor = subjects.find((id) => scene.isActor(id));
+  const out = new Set<string>();
+  if (spec.angle === 'over_shoulder' && firstActor) out.add(firstActor);
+  if (spec.angle === 'pov' && (firstActor ?? subjects[0])) out.add(firstActor ?? subjects[0]);
+  if (spec.framing === 'insert') {
+    const prop = subjects.find((id) => !scene.isActor(id));
+    if (prop) for (const id of subjects) if (id !== prop) out.add(id);
+  }
+  return out;
+}
+
+/** Where a camera that follows a group sees a point of a later frame from the first one's place. */
+export type FollowMap = (p: Readonly<Vec3>, frame: number) => Vec3;
+
+/**
+ * How a following move (tracking_follow, steadicam_walk) carries its camera from the first frame of
+ * `span`: the camera moves with the centre of the subjects' group (and a steadicam turns with their
+ * heading; scene.groupCentre and groupHeading, as moves.ts applyCameraMove keys it), so a point at a
+ * later frame shows where the point it maps to shows at the first. Null for other moves and without
+ * subjects. One subject's centre and heading are its own.
+ */
+export function followMap(
+  scene: DeskScene,
+  subjects: readonly string[],
+  move: DeskMove | null,
+  span: { frame_start: number; frame_end: number },
+): FollowMap | null {
+  if (!move || !FOLLOW_MOVES.has(move)) return null;
+  const from = span.frame_start;
+  const c0 = scene.groupCentre(subjects, from);
+  if (!c0) return null;
+  const h0 = scene.groupHeading(subjects, from, span);
+  return (p, frame) => {
+    const c = scene.groupCentre(subjects, frame) ?? c0;
+    if (move === 'tracking_follow') return [p[0] - c[0] + c0[0], p[1] - c[1] + c0[1], p[2] - c[2] + c0[2]];
+    const h = scene.groupHeading(subjects, frame, span);
+    // the steadicam turned with the heading by `turn`: turn the point back about the centre
+    const turn = Math.atan2(h0[0] * h[1] - h0[1] * h[0], h0[0] * h[0] + h0[1] * h[1]);
+    const x = p[0] - c[0];
+    const y = p[1] - c[1];
+    const cs = Math.cos(-turn);
+    const sn = Math.sin(-turn);
+    return [c0[0] + x * cs - y * sn, c0[1] + x * sn + y * cs, p[2] - c[2] + c0[2]];
+  };
+}
+
 // ---------------------------------------------------------------- the solver
 
 interface Figure {
@@ -214,6 +365,32 @@ interface Figure {
   facing: RVec;
   /** Its posed body (an actor CHARACTERS measures); null: a figure straight over its mark (rideo's). */
   body: { chest: RVec; eyes: RVec; head: RVec } | null;
+  /** The height its framing's coverage scales with: its height; an animal's body length when longer. */
+  size: number;
+  /** An animal's body: its front and back ends at the height of its middle, that middle and its chest. */
+  animal: { front: RVec; back: RVec; middle: RVec; chest: RVec } | null;
+  /** A flying prop: the camera takes its height from the subjects on the floor while there are some. */
+  airborne: boolean;
+}
+
+/** A subject as the solver's figure (rideo coordinates), its points mapped by `map` when given. */
+function figureOf(s: DeskSubject, map: ((p: Readonly<Vec3>) => Vec3) | null): Figure {
+  const at = (p: Readonly<Vec3>) => toRideo(map ? map(p) : p);
+  const facing = map ? v3sub(map(v3add(s.feet, s.facing)), map(s.feet)) : s.facing;
+  return {
+    id: s.id,
+    feet: at(s.feet),
+    eyes: at(s.eyes),
+    head: at(s.head),
+    height: s.height,
+    facing: norm(flat(toRideo(facing))),
+    body: s.posed ? { chest: at(s.chest), eyes: at(s.eyes), head: at(s.head) } : null,
+    size: s.extent ? Math.max(s.height, s.extent.length) : s.height,
+    animal: s.extent
+      ? { front: at(s.extent.front), back: at(s.extent.back), middle: at(s.center), chest: at(s.chest) }
+      : null,
+    airborne: s.airborne,
+  };
 }
 
 /** Shares of a figure's height its mark, chest, eyes and head stand at (rideo's figurePoints). */
@@ -235,41 +412,130 @@ function bodyPoint(f: Figure, look: number): RVec | null {
 }
 
 /**
- * Places a camera from a spec at `frame` (rideo's solveCamera). With `line`, a camera that would stand
- * on the other side of the scene's line is turned back to its side. `fallbackTarget`: what a shot
- * without subjects looks at (rideo: 1 m above the origin).
+ * What a framing shows of an animal (F7; rideo frames people only): all of it, head to tail and
+ * hooves to ears, from a medium out; its head and chest in a close-up (the front of its body too in a
+ * medium close-up); its eyes and nose in an extreme close-up.
  */
-export function solveCamera(
+function animalShows(f: Figure, a: NonNullable<Figure['animal']>, framing: DeskFraming): RVec[] {
+  const level = (p: RVec, y: number) => r3(p.x, y, p.z);
+  switch (framing) {
+    case 'extreme_close_up':
+      return [f.eyes, level(a.front, f.eyes.y)];
+    case 'close_up':
+      return [f.head, f.eyes, a.chest, level(a.front, f.eyes.y)];
+    case 'medium_close':
+      return [f.head, a.chest, level(a.front, f.eyes.y), a.middle];
+    default:
+      return [f.head, a.front, a.back, level(a.front, f.feet.y), level(a.back, f.feet.y)];
+  }
+}
+
+/** The middle of the box around points. */
+function middleOf(pts: readonly RVec[]): RVec {
+  const lo = r3(Infinity, Infinity, Infinity);
+  const hi = r3(-Infinity, -Infinity, -Infinity);
+  for (const p of pts) {
+    lo.x = Math.min(lo.x, p.x);
+    lo.y = Math.min(lo.y, p.y);
+    lo.z = Math.min(lo.z, p.z);
+    hi.x = Math.max(hi.x, p.x);
+    hi.y = Math.max(hi.y, p.y);
+    hi.z = Math.max(hi.z, p.z);
+  }
+  return r3((lo.x + hi.x) / 2, (lo.y + hi.y) / 2, (lo.z + hi.z) / 2);
+}
+
+/**
+ * Where a framing aims on a figure: on a posed person where its look share falls on the body
+ * (bodyPoint); on an animal the middle of what the framing shows of it; null for a figure without a
+ * body (rideo aims at its mark, at the group's look height).
+ */
+function aimOf(f: Figure, framing: DeskFraming): RVec | null {
+  if (f.animal) return middleOf(animalShows(f, f.animal, framing));
+  return bodyPoint(f, FRAMING_TABLE[framing].look);
+}
+
+/** What a framing shows of an animal subject (editor coordinates; [] for other subjects). */
+export function animalFramePoints(s: DeskSubject, framing: DeskFraming): Vec3[] {
+  const f = figureOf(s, null);
+  return f.animal ? animalShows(f, f.animal, framing).map(toEditor) : [];
+}
+
+/**
+ * The point at share `share` of a subject's height (editor coordinates): on a posed body from its
+ * mark up through its chest, eyes and head (bodyPoint), else straight over its feet.
+ */
+export function subjectPoint(s: DeskSubject, share: number): Vec3 {
+  const p = bodyPoint(figureOf(s, null), share);
+  return p ? toEditor(p) : [s.feet[0], s.feet[1], s.feet[2] + clamp(share, 0, 1) * s.height];
+}
+
+/** Options of the solver. */
+export interface SolveOptions {
+  /** The scene's line: a camera that would stand on its other side is turned back to its side. */
+  line?: LinePoints | null;
+  /** What a shot without subjects looks at (rideo: 1 m above the origin). */
+  fallbackTarget?: Vec3;
+  /**
+   * More frames the camera frames its subjects over (F3; the shot's samples): it aims at the middle
+   * of where they are at all of them and stands back far enough for the group at each. Subjects that
+   * do not move give the camera of `frame` alone.
+   */
+  over?: readonly number[];
+  /** How a following move carries the camera from `frame` to the others (followMap). */
+  follow?: FollowMap | null;
+}
+
+/** A camera placed by the solver, before it backs out of set pieces and is rounded (editor coordinates). */
+export interface PlacedCamera {
+  position: Vec3;
+  target: Vec3;
+  /**
+   * How it stands: around its subjects by framing, angle and height ('framed'), at a subject's eyes
+   * ('pov') or over a subject's shoulder ('shoulder').
+   */
+  rule: 'framed' | 'pov' | 'shoulder';
+}
+
+/**
+ * Places a camera from a spec at `frame` (rideo's solveCamera), over `o.over` too when given (F3).
+ * With `o.line`, a camera that would stand on the other side of the scene's line is turned back to
+ * its side.
+ */
+export function placeCamera(
   scene: DeskScene,
   spec: SolveSpec,
   frame: number,
-  o: { line?: LinePoints | null; fallbackTarget?: Vec3 } = {},
-): SolvedCamera {
+  o: SolveOptions = {},
+): PlacedCamera {
   const framing = spec.framing;
   const lensMm = clamp(Math.round(spec.lens_mm), 8, 800);
-  const aspect = scene.aspect;
   const tanH = DESK_SENSOR_WIDTH_MM / 2 / Math.max(1, lensMm);
-  const tanV = tanH / Math.max(0.1, aspect);
-  const measured = spec.subjects
-    .map((id) => scene.subject(id, frame))
-    .filter((s): s is NonNullable<typeof s> => !!s);
-  const actors = measured.filter((s) => s.actor);
-  const props = measured.filter((s) => !s.actor);
-  const insertProp = framing === 'insert' ? props[0] : undefined;
-  // rideo frames characters; a cast-less shot (other than an insert) frames its props as figures
-  const figuresFrom = actors.length || insertProp ? actors : props;
-  const figures: Figure[] = figuresFrom.map((s) => ({
-    id: s.id,
-    feet: toRideo(s.feet),
-    eyes: toRideo(s.eyes),
-    head: toRideo(s.head),
-    height: s.height,
-    facing: norm(flat(toRideo(s.facing))),
-    body: s.posed ? { chest: toRideo(s.chest), eyes: toRideo(s.eyes), head: toRideo(s.head) } : null,
-  }));
-  const tallest = Math.max(0.3, ...figures.map((s) => s.height));
-  const scale = clamp(tallest / 1.7, 0.3, 3);
-  const floor = figures.length ? Math.min(...figures.map((s) => s.feet.y)) : 0;
+  const tanV = tanH / Math.max(0.1, scene.aspect);
+  // the subjects at `frame`, and where a camera fitted to the samples sees them at the others
+  const frames = [frame, ...new Set((o.over ?? []).filter((f) => f !== frame))];
+  const sets = frames.map((f, i) => {
+    const measured = spec.subjects
+      .map((id) => scene.subject(id, f))
+      .filter((s): s is NonNullable<typeof s> => !!s);
+    const map = i > 0 && o.follow ? (p: Readonly<Vec3>) => o.follow!(p, f) : null;
+    const actors = measured.filter((s) => s.actor);
+    const props = measured.filter((s) => !s.actor);
+    const insertProp = framing === 'insert' ? props[0] : undefined;
+    // rideo frames characters; a cast-less shot (other than an insert) frames its props as figures
+    const from = actors.length || insertProp ? actors : props;
+    return {
+      figures: from.map((s) => figureOf(s, map)),
+      insert: insertProp ? toRideo(map ? map(insertProp.center) : insertProp.center) : null,
+    };
+  });
+  const figures = sets[0].figures;
+  const all = sets.flatMap((s) => s.figures);
+  const tallest = Math.max(0.3, ...all.map((s) => s.height));
+  const scale = clamp(Math.max(0.3, ...all.map((s) => s.size)) / 1.7, 0.3, 3);
+  // the camera's height follows the subjects on the floor; flying props set it only on their own
+  const grounded = all.some((s) => !s.airborne) ? all.filter((s) => !s.airborne) : all;
+  const floor = grounded.length ? Math.min(...grounded.map((s) => s.feet.y)) : 0;
   const line = o.line ? { a: toRideo(o.line.a), b: toRideo(o.line.b), side: o.line.side } : null;
   const sideOf = (a: RVec, b: RVec, p: RVec) => lineSide(toEditor(a), toEditor(b), toEditor(p));
   const onSide = (dir: RVec, from: RVec): RVec => {
@@ -286,27 +552,18 @@ export function solveCamera(
     // reflect the direction across the line
     return norm(sub(mul(u, 2 * dot(dir, u)), dir));
   };
-  const finish = (pos: RVec, target: RVec): SolvedCamera => {
-    // out of a set piece it would stand in, backwards along its view (water lets cameras in), judged
-    // where the camera will stand: at least 5 cm above the floor (a low camera backing down out of a
-    // landmark's floor would be put back inside it; rideo's landmarks reach down without end)
-    let p = pos;
-    const back = norm(sub(p, target));
-    const solids = scene.solids(frame);
-    const inside = (q: RVec) =>
-      scene.insideSolid(toEditor(r3(q.x, clamp(q.y, 0.05, 200), q.z)), frame, solids);
-    for (let i = 0; i < 40 && inside(p); i++) p = add(p, mul(back, 0.5));
-    const start = placement(p, target);
-    const startEd = { position: toEditor(start.pos), target: toEditor(start.target) };
-    return { ...startEd, lens_mm: lensMm, end: moveEnd(startEd, lensMm, aspect, spec.move) };
-  };
+  const placed = (pos: RVec, target: RVec, rule: PlacedCamera['rule']): PlacedCamera => ({
+    position: toEditor(pos),
+    target: toEditor(target),
+    rule,
+  });
 
   // POV: from the first subject's eyes, where they look (at the second subject when there is one)
   if (spec.angle === 'pov' && figures[0]) {
     const s = figures[0];
     const eyes = add(s.eyes, mul(s.facing, 0.12));
     const target = figures[1] ? figures[1].eyes : add(eyes, mul(s.facing, 4));
-    return finish(eyes, target);
+    return placed(eyes, target, 'pov');
   }
   // over the shoulder: behind the first subject's shoulder on the scene's side, at the second subject
   if (spec.angle === 'over_shoulder' && figures.length >= 2) {
@@ -314,24 +571,34 @@ export function solveCamera(
     const away = norm(flat(sub(fg.feet, bg.feet)));
     const side = onSide(turnLeft(away, 90), fg.feet);
     const pos = add(add(fg.feet, mul(away, 0.55 * scale)), mul(side, 0.32 * scale));
-    return finish(r3(pos.x, fg.feet.y + fg.height * 0.86, pos.z), bg.eyes);
+    return placed(r3(pos.x, fg.feet.y + fg.height * 0.86, pos.z), bg.eyes, 'shoulder');
   }
 
   // the target: the subjects' centre at the height the framing looks at (the prop of an insert); a
   // posed body is aimed at where the look share falls on it (a lone one in height too: the face of a
-  // close-up wherever its pose puts it)
+  // close-up wherever its pose puts it), an animal at the middle of what the framing shows of it.
+  // Over several frames: the middle of where those targets are (exactly the one target when the
+  // subjects stay put)
   const look = FRAMING_TABLE[framing].look;
-  let target: RVec;
-  if (insertProp) target = toRideo(insertProp.center);
-  else if (!figures.length) target = toRideo(o.fallbackTarget ?? [0, 0, 1]);
-  else {
-    const aims = figures.map((s) => bodyPoint(s, look) ?? s.feet);
-    const cx = aims.reduce((n, a) => n + a.x, 0) / figures.length;
-    const cz = aims.reduce((n, a) => n + a.z, 0) / figures.length;
-    const cy = figures.reduce((n, s) => n + s.feet.y, 0) / figures.length;
-    const lone = figures.length === 1 ? bodyPoint(figures[0], look) : null;
-    target = r3(cx, lone ? lone.y : cy + tallest * look, cz);
-  }
+  const targetOf = (set: (typeof sets)[number]): RVec | null => {
+    if (set.insert) return set.insert;
+    const figs = set.figures;
+    if (!figs.length) return null;
+    const aims = figs.map((s) => aimOf(s, framing) ?? s.feet);
+    const cx = aims.reduce((n, a) => n + a.x, 0) / figs.length;
+    const cz = aims.reduce((n, a) => n + a.z, 0) / figs.length;
+    const cy = figs.reduce((n, s) => n + s.feet.y, 0) / figs.length;
+    const lone = figs.length === 1 ? aimOf(figs[0], framing) : null;
+    return r3(cx, lone ? lone.y : cy + tallest * look, cz);
+  };
+  const aimed = sets.map(targetOf).filter((t): t is RVec => !!t);
+  let target = aimed.length
+    ? r3(
+        (Math.min(...aimed.map((t) => t.x)) + Math.max(...aimed.map((t) => t.x))) / 2,
+        (Math.min(...aimed.map((t) => t.y)) + Math.max(...aimed.map((t) => t.y))) / 2,
+        (Math.min(...aimed.map((t) => t.z)) + Math.max(...aimed.map((t) => t.z))) / 2,
+      )
+    : toRideo(o.fallbackTarget ?? [0, 0, 1]);
 
   // the direction from the target to the camera
   const angle = spec.angle === 'over_shoulder' || spec.angle === 'pov' ? 'three_quarter_left' : spec.angle;
@@ -349,22 +616,60 @@ export function solveCamera(
     dir = line ? onSide(r3(0, 0, 1), target) : r3(0, 0, 1);
   }
 
-  // the distance: the framing's coverage, and every subject of a group inside the frame's width by
-  // angle (one nearer the camera than the group's centre covers a wider angle)
+  // across the frame, a group whose subjects move is held where it lets the camera come nearest:
+  // the subject needing the most room on the left balanced against the one on the right, nearer
+  // ones taking more of the frame (one running ahead does not leave the others small at the far
+  // edge). The target keeps the offset rideo's has from that balance at the shot's first frame, so
+  // subjects that stay put keep rideo's target
   const right = norm(cross(mul(dir, -1), UP));
+  const start = figures.length > 1 && !sets[0].insert ? targetOf(sets[0]) : null;
+  if (start) {
+    const k = GROUP_MARGIN / tanH;
+    // the lateral offset minimising the distance groupFit asks for (the max of a + k|x − s| over
+    // the subjects is least where its two sides meet)
+    const balance = (fs: readonly Figure[]) => {
+      let toLeft = -Infinity;
+      let toRight = -Infinity;
+      for (const s of fs) {
+        const rel = sub(s.feet, flat(target));
+        toLeft = Math.max(toLeft, dot(rel, dir) - k * dot(rel, right));
+        toRight = Math.max(toRight, dot(rel, dir) + k * dot(rel, right));
+      }
+      return (toRight - toLeft) / (2 * k);
+    };
+    const shift = balance(all) - balance(figures) + dot(sub(start, target), right);
+    if (shift) target = add(target, mul(right, shift));
+  }
+
+  // the distance: the framing's coverage, and every subject of a group inside the frame's width by
+  // angle (one nearer the camera than the group's centre covers a wider angle), at every frame
   const groupFit =
     figures.length > 1
       ? Math.max(
-          ...figures.map((s) => {
+          ...all.map((s) => {
             const rel = sub(s.feet, flat(target));
             return dot(rel, dir) + ((Math.abs(dot(rel, right)) + GROUP_PAD_M * scale) / tanH) * GROUP_MARGIN;
           }),
         )
       : 0;
+  // an animal: far enough back for what the framing shows of it (all of it from a medium out) to
+  // fill at most ANIMAL_ROOM of the frame, at every frame
+  const animalFit = Math.max(
+    0,
+    ...all.flatMap((s) =>
+      s.animal
+        ? animalShows(s, s.animal, framing).map((p) => {
+            const rel = sub(p, target);
+            const across = Math.abs(dot(rel, right)) / (ANIMAL_ROOM * tanH);
+            return dot(rel, dir) + Math.max(across, Math.abs(rel.y) / (ANIMAL_ROOM * tanV));
+          })
+        : [],
+    ),
+  );
   const coverage = FRAMING_TABLE[framing].coverage_m * scale;
-  const distance = Math.max(coverage / 2 / tanV, groupFit, 0.3);
-  const eyes = figures.length ? Math.max(...figures.map((s) => s.eyes.y)) : 1.5;
-  const head = figures.length ? Math.max(...figures.map((s) => s.head.y)) : 1.7;
+  const distance = Math.max(coverage / 2 / tanV, groupFit, animalFit, 0.3);
+  const eyes = grounded.length ? Math.max(...grounded.map((s) => s.eyes.y)) : 1.5;
+  const head = grounded.length ? Math.max(...grounded.map((s) => s.head.y)) : 1.7;
   const y =
     spec.height === 'low'
       ? floor + 0.4 * Math.max(0.6, scale)
@@ -378,7 +683,47 @@ export function solveCamera(
   const rise = y - target.y;
   const along = Math.sqrt(Math.max(distance * distance - rise * rise, (0.3 * distance) ** 2));
   const pos = add(flat(target), mul(dir, along));
-  return finish(r3(pos.x, y, pos.z), target);
+  return placed(r3(pos.x, y, pos.z), target, 'framed');
+}
+
+/**
+ * A placed camera made final (rideo's solveCamera ends so): backed out of a set piece it would stand
+ * in, backwards along its view (water lets cameras in), judged where it will stand: at least 5 cm
+ * above the floor (a low camera backing down out of a landmark's floor would be put back inside
+ * it; rideo's landmarks reach down without end); then rounded to the millimetre, with its lens and
+ * the end of its move.
+ */
+export function finishCamera(
+  scene: DeskScene,
+  spec: Pick<SolveSpec, 'lens_mm' | 'move'>,
+  frame: number,
+  placed: Pick<PlacedCamera, 'position' | 'target'>,
+): SolvedCamera {
+  const lensMm = clamp(Math.round(spec.lens_mm), 8, 800);
+  const target = toRideo(placed.target);
+  let p = toRideo(placed.position);
+  const back = norm(sub(p, target));
+  const solids = scene.solids(frame);
+  const inside = (q: RVec) => scene.insideSolid(toEditor(r3(q.x, clamp(q.y, 0.05, 200), q.z)), frame, solids);
+  for (let i = 0; i < 40 && inside(p); i++) p = add(p, mul(back, 0.5));
+  const start = placement(p, target);
+  const startEd = { position: toEditor(start.pos), target: toEditor(start.target) };
+  return { ...startEd, lens_mm: lensMm, end: moveEnd(startEd, lensMm, scene.aspect, spec.move) };
+}
+
+/**
+ * Places a camera from a spec at `frame` (rideo's solveCamera): placeCamera, then finishCamera. With
+ * `o.line`, a camera that would stand on the other side of the scene's line is turned back to its
+ * side; `o.fallbackTarget` is what a shot without subjects looks at (rideo: 1 m above the origin);
+ * `o.over` frames the subjects over more frames (F3).
+ */
+export function solveCamera(
+  scene: DeskScene,
+  spec: SolveSpec,
+  frame: number,
+  o: SolveOptions = {},
+): SolvedCamera {
+  return finishCamera(scene, spec, frame, placeCamera(scene, spec, frame, o));
 }
 
 /**

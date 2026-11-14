@@ -3,6 +3,8 @@ import type { Vec3 } from '../math/types';
 import type { CollisionShape } from '../doc/types';
 import {
   DESK_PHYSICS_KINDS,
+  TETHER_AFTER,
+  deskModelRoot,
   deskPhysicsBake,
   deskPhysicsDrop,
   deskPhysicsPush,
@@ -43,6 +45,23 @@ function named(ctx: OperatorContext, id: string): { object: string; name: string
   return { object: id, name: ctx.doc.getObject(id)?.name ?? id };
 }
 
+/**
+ * A rigid body as results name it: the root of the store model whose geometry it carries (what
+ * store.add returned, which shots and checks follow) with `part`, the mesh that carries the rigid body;
+ * any other body by itself.
+ */
+function bodyNamed(
+  ctx: OperatorContext,
+  id: string,
+): { object: string; name: string; part?: { object: string; name: string } } {
+  const root = deskModelRoot(ctx.doc, id);
+  return root ? { ...named(ctx, root.id), part: named(ctx, id) } : named(ctx, id);
+}
+
+/** What a model's root stands for in the presets (their descriptions). */
+const MODEL_NOTE =
+  'A store model (its root) is simulated by its mesh part (its largest, the others hang from it); results name the root, with `part` the mesh that carries the rigid body.';
+
 /** Reports a preset's warnings and returns the world range it left. */
 function finish(ctx: OperatorContext, r: { world?: DeskWorldRange | null; warnings: string[] }) {
   for (const w of r.warnings) ctx.report('WARNING', w);
@@ -66,8 +85,9 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       description:
         'Give objects rigid bodies: active (falls and collides), passive (a static collider such as a floor or a ' +
         'wall) or animated (follows its keys and pushes active bodies), with a ground collider at z = 0 when ' +
-        'none is under them. The rigid body world covers only the frames the bodies need. Returns {bodies (with ' +
-        'their collision_shape), ground, world: {frame_start, frame_end, settled}}.',
+        'none is under them. The rigid body world covers only the frames the bodies need. ' +
+        MODEL_NOTE +
+        ' Returns {bodies (with their collision_shape), ground, world: {frame_start, frame_end, settled}}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -116,7 +136,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         setSelection(ctx, r.bodies);
         return {
           bodies: r.bodies.map((id) => ({
-            ...named(ctx, id),
+            ...bodyNamed(ctx, id),
             collision_shape: ctx.doc.getObject(id)?.rigid_body?.collision_shape ?? null,
           })),
           ground: r.ground ? named(ctx, r.ground) : null,
@@ -132,7 +152,9 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       label: 'Drop',
       description:
         'Lift objects by `height` (default: where they are) and let them fall from `frame`: their rigid bodies start ' +
-        'there (start_frame), held at their keyed pose before. Returns {bodies, frame, world}.',
+        'there (start_frame), held at their keyed pose before. ' +
+        MODEL_NOTE +
+        ' Returns {bodies, frame, world}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -150,7 +172,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         const ids = [...new Set(resolveObjectIds(ctx, p.objects))];
         const r = deskPhysicsDrop(ctx.doc, ids, { frame: p.frame, height: p.height });
         const world = finish(ctx, r);
-        return { bodies: r.bodies.map((id) => named(ctx, id)), frame: p.frame, world };
+        return { bodies: r.bodies.map((id) => bodyNamed(ctx, id)), frame: p.frame, world };
       },
     }),
   );
@@ -161,8 +183,9 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       label: 'Throw',
       description:
         'Release an object at `frame` with the launch velocity that lands it on `target` after flight_s seconds ' +
-        'under gravity (its rigid body starts there with that velocity and spin). Returns {body, velocity, ' +
-        'speed_mps, landing_frame, world}.',
+        'under gravity (its rigid body starts there with that velocity and spin). ' +
+        MODEL_NOTE +
+        ' Returns {body, velocity, speed_mps, landing_frame, world}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -184,7 +207,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         });
         const world = finish(ctx, r);
         return {
-          body: named(ctx, r.body),
+          body: bodyNamed(ctx, r.body),
           velocity: round3(r.velocity),
           speed_mps: Math.round(Math.hypot(...r.velocity) * 1000) / 1000,
           landing_frame: Math.round(r.landing_frame * 1000) / 1000,
@@ -199,8 +222,9 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       id: 'desk.physics_push',
       label: 'Push',
       description:
-        'Push an object at `frame`: its rigid body starts there moving along `direction` at speed_mps. Returns ' +
-        '{body, velocity, world}.',
+        'Push an object at `frame`: its rigid body starts there moving along `direction` at speed_mps. ' +
+        MODEL_NOTE +
+        ' Returns {body, velocity, world}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -217,7 +241,7 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           frame: p.frame,
         });
         const world = finish(ctx, r);
-        return { body: named(ctx, r.body), velocity: round3(r.velocity), world };
+        return { body: bodyNamed(ctx, r.body), velocity: round3(r.velocity), world };
       },
     }),
   );
@@ -227,24 +251,34 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       id: 'desk.physics_bake',
       label: 'Bake Physics',
       description:
-        'Bake the simulation of rigid bodies to world-space keyframes over a frame range (default: the frames the ' +
-        'bodies need), so renders and exports need no simulation; the rigid bodies and the hold constraints of ' +
-        'held props are removed, and a body with a parent is unparented (its world motion keyed). Returns ' +
-        '{objects, keyframes, frame_start, frame_end, removed_constraints}.',
+        'Bake the simulation of rigid bodies to keyframes over a frame range (default: the frames the bodies ' +
+        "need), so renders and exports need no simulation. A store model's body is keyed through the model's " +
+        'root (the root moves as the simulated part did, its parts stay in it); any other body is keyed itself, ' +
+        'in world space when it had a parent (it is unparented). The rigid bodies and the hold constraints of ' +
+        'held props are removed. Returns {objects (the keyed objects, with `part` the simulated mesh of a ' +
+        'model), keyframes, frame_start, frame_end, removed_constraints}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
       schema: z.object({
         frame_start: frameSchema.optional().describe('First frame to bake (default: the simulation start)'),
         frame_end: frameSchema.optional().describe('Last frame to bake (default: the simulation end)'),
-        objects: z.array(objectRef).optional().describe('Bodies to bake (default: every simulated body)'),
+        objects: z
+          .array(objectRef)
+          .optional()
+          .describe(
+            "Bodies to bake, or objects above them such as a store model's root (its bodies): default every " +
+              'simulated body',
+          ),
       }),
       execute(ctx, p) {
         const objects = p.objects?.length ? [...new Set(resolveObjectIds(ctx, p.objects))] : undefined;
         const r = deskPhysicsBake(ctx.doc, { frame_start: p.frame_start, frame_end: p.frame_end, objects });
         for (const w of r.warnings) ctx.report('WARNING', w);
         return {
-          objects: r.objects.map((id) => named(ctx, id)),
+          objects: r.objects.map((id, i) =>
+            id === r.bodies[i] ? named(ctx, id) : { ...named(ctx, id), part: named(ctx, r.bodies[i]) },
+          ),
           keyframes: r.keyframes,
           frame_start: r.frame_start,
           frame_end: r.frame_end,
@@ -264,8 +298,10 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
       description:
         "Fly a kite or balloon on a string tied to an anchor (an actor's hand bone, a post) in the wind (phase 2): " +
         'it rises over launch_frames to the end of the string, then sways, keyed on every frame, with a string ' +
-        'from the anchor and a tail that trails. Returns {flyer, kind, string, tail, tail_objects, frame_start, ' +
-        'frame_end, seed, mean_elevation_deg, keyframes}.',
+        'from the anchor and a tail that trails. After frame_end (`after`) it stays where the flight ends, is ' +
+        'hidden with its tail and string, or (a kite) comes down to lie on the ground. Returns {flyer, kind, ' +
+        'string, tail, tail_objects, frame_start, frame_end, after, hidden_from, landed_frame, seed, ' +
+        'mean_elevation_deg, keyframes}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -300,6 +336,15 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         tail: z.boolean().default(true).describe('Add a tail that trails behind it'),
         string: z.boolean().default(true).describe('Add the string from the anchor'),
         seed: z.number().int().min(0).optional().describe('Seed of the gusts (default: from the flyer)'),
+        after: z
+          .enum(TETHER_AFTER)
+          .default('hold')
+          .describe(
+            "After frame_end: 'hold' leaves the flyer, its tail and string where the flight ends; 'hide' hides them " +
+              'from frame_end + 1 on (their keyed scale shrinks them to nothing: renders, the viewport and the ' +
+              "video export show none of them; a later flight shows the flyer again); 'land' brings a kite down " +
+              'within 1.5 s to lie on the ground downwind of the anchor, its string hidden (not for balloons)',
+          ),
       }),
       execute(ctx, p) {
         const flyer = objectId(ctx, p.flyer);
@@ -314,6 +359,9 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           tail_objects: r.tail_objects.map((id) => named(ctx, id)),
           frame_start: p.frame_start,
           frame_end: r.frame_end,
+          after: r.after,
+          hidden_from: r.hidden_from,
+          landed_frame: r.landed_frame,
           seed: r.seed,
           mean_elevation_deg: r.mean_elevation_deg,
           keyframes: r.keyframes,

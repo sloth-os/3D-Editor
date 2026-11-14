@@ -49,6 +49,8 @@ async function connect(o: { maxQueued?: number; ffmpeg?: string } = {}) {
       projects: { p1: doc },
       exportMaxQueued: o.maxQueued,
     }),
+    // whatever the memory of the machine the tests run on
+    { memory: () => ({ available: 2 ** 40, source: 'meminfo' }) },
   );
   const ctx = {
     historyLimits: { maxSteps: 10, maxBytes: 1 << 20 },

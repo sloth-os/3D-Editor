@@ -10,6 +10,7 @@ import {
   type FrameOptions,
   type ImageResult,
   type PassName,
+  type ProcessMemory,
   type RawFrame,
 } from '../../src/render/protocol';
 import { silentLog } from '../../src/observability/log';
@@ -22,7 +23,8 @@ import type { RoomManager } from '../../src/sync/room-manager';
  * service context around it (config, rooms, log) for VideoExports. Its render processes can be made
  * to die on chosen requests (`kill`), like the system's out-of-memory killer ends one: the request
  * fails, the thread is dead from then on, and the next lease gets a new thread in its place (the
- * pool starts a replacement process).
+ * pool starts a replacement process). Like the real pool, it starts its processes with the first
+ * long lease (`running` counts them from then on), and they answer `memory` with what `rss` says.
  */
 
 export interface FakeRendererStats {
@@ -42,6 +44,12 @@ export interface FakeRendererStats {
   /** Render processes that died (`kill`) and threads started in their place. */
   deaths: number;
   replacements: number;
+  /** Image requests per thread id. */
+  imagesByThread: Map<number, number>;
+  /** `memory` requests (thread ids, in order). */
+  memoryCalls: number[];
+  /** releaseBuffers calls: thread id and whether the documents went too. */
+  bufferReleases: { thread: number; documents: boolean }[];
 }
 
 export interface FakeRenderer {
@@ -57,6 +65,10 @@ export interface FakeRenderer {
    * calls to the thread fail at once.
    */
   kill: ((req: RenderRequest, thread: number) => boolean | Error) | null;
+  /** Resident memory a thread reports (`memory`; default 128 MiB, a render process's base). */
+  rss: (thread: number) => number;
+  /** The threads started and alive (the pool's `running`; none before the first long lease). */
+  started(): RenderThread[];
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -110,6 +122,9 @@ export function makeFakeRenderer(
     docs: [],
     deaths: 0,
     replacements: 0,
+    imagesByThread: new Map(),
+    memoryCalls: [],
+    bufferReleases: [],
   };
   const fake: FakeRenderer = {
     renderer: null as unknown as Renderer,
@@ -117,17 +132,29 @@ export function makeFakeRenderer(
     delayMs: 0,
     failFrame: null,
     kill: null,
+    rss: () => 128 * 1024 * 1024,
+    started: () => (started ? threads.filter((t) => t.alive) : []),
   };
   let current = -1;
-  const answer = async (req: RenderRequest): Promise<unknown> => {
+  /** The pool started its processes (the first long lease). */
+  let started = false;
+  /** Long leases not released yet. */
+  let longLeases = 0;
+  const answer = async (req: RenderRequest, thread: number): Promise<unknown> => {
     if (req.type === 'desk-shot') {
       stats.deskShots++;
       const info: DeskShotInfo = { depthRange: [1, 20], shadowFit: null, ms: 1 };
       return info;
     }
+    if (req.type === 'memory') {
+      stats.memoryCalls.push(thread);
+      const m: ProcessMemory = { rss: fake.rss(thread), heapUsed: 0, external: 0, arrayBuffers: 0 };
+      return m;
+    }
     if (req.type === 'image') {
       const o = req.options;
       stats.images.push({ frame: o.frame ?? 0, camera: o.cameraId, doc: req.doc.key });
+      stats.imagesByThread.set(thread, (stats.imagesByThread.get(thread) ?? 0) + 1);
       if (current >= 0) stats.leaseFrames[current]++;
       if (fake.delayMs) await sleep(fake.delayMs);
       if (fake.failFrame && fake.failFrame.frame === o.frame) throw fake.failFrame.error;
@@ -149,6 +176,9 @@ export function makeFakeRenderer(
       alive: true,
       pending: 0,
       release() {},
+      releaseBuffers(o: { documents?: boolean } = {}) {
+        stats.bufferReleases.push({ thread: t.id, documents: !!o.documents });
+      },
       async call(req: RenderRequest): Promise<unknown> {
         if (!t.alive) throw killedError();
         const killed = fake.kill?.(req, t.id);
@@ -157,7 +187,7 @@ export function makeFakeRenderer(
           stats.deaths++;
           throw killed instanceof Error ? killed : killedError();
         }
-        return answer(req);
+        return answer(req, t.id);
       },
     };
     return t as unknown as RenderThread & { alive: boolean };
@@ -167,6 +197,14 @@ export function makeFakeRenderer(
     pool: {
       mode: opts.mode ?? 'processes',
       capacity: threads.length,
+      /** Live render processes (started by the first long lease, as the real pool does). */
+      get running() {
+        return fake.started().length;
+      },
+      /** Long leases held now. */
+      get activeLongRenders() {
+        return longLeases;
+      },
       async lease(
         max = Infinity,
         signal?: AbortSignal,
@@ -181,6 +219,8 @@ export function makeFakeRenderer(
           return thread();
         });
         if (!o.interactive) {
+          started = true;
+          longLeases++;
           stats.leases++;
           stats.leaseFrames.push(0);
           current = stats.leaseFrames.length - 1;
@@ -192,6 +232,7 @@ export function makeFakeRenderer(
             if (released) return;
             released = true;
             if (!o.interactive) {
+              longLeases--;
               stats.releases++;
               current = -1;
             }

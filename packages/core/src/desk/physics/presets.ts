@@ -22,6 +22,7 @@ import {
   baseName,
   descendants,
   directionIn,
+  modelRootOf,
   originOf,
   parentMatrix,
   round,
@@ -657,7 +658,8 @@ function releaseBody(doc: SceneDoc, id: string, warnings: string[]): string {
 
 /**
  * Lifts object `id` by `height` metres in world Z: its stored location, or every key of an animated
- * location channel, moves by the lift in its parent's space (at `frame`).
+ * location channel, moves by the lift in its parent's space (at `frame`). A drop lifts a store model
+ * by its root.
  */
 function lift(doc: SceneDoc, id: string, height: number, frame: number): void {
   const o = doc.getObject(id)!;
@@ -701,7 +703,8 @@ export function deskDrop(
   for (const id of objectIds) {
     const target = releaseBody(doc, id, warnings);
     if (bodies.includes(target)) continue;
-    if (o.height) lift(doc, target, o.height, o.frame);
+    // a store model is lifted whole (its root), so its parts stay where they sit in it
+    if (o.height) lift(doc, modelRootOf(doc, target)?.id ?? target, o.height, o.frame);
     patchBody(doc, target, {
       start_frame: o.frame,
       inherit_velocity: true,

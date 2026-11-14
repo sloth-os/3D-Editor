@@ -1,0 +1,335 @@
+/* Director workspace: the shot list, shot inspector, actor panel and sequence strip. */
+
+.director {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.director-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 4px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.director-tabs::-webkit-scrollbar {
+  display: none;
+}
+.director-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.director-tab .badge-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--select);
+}
+.director-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.director-body.flush {
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ---------- shot list */
+.shot-list {
+  min-height: 72px;
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--bg-input-dark);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  outline: none;
+}
+.shot-list:focus-visible {
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.shot-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  grid-template-rows: auto auto;
+  column-gap: 6px;
+  padding: 3px 6px;
+  cursor: pointer;
+  border-bottom: 1px solid #262626;
+}
+.shot-row:hover {
+  background: var(--bg-hover);
+}
+.shot-row.active {
+  background: var(--bg-active);
+}
+.shot-row.disabled {
+  opacity: 0.5;
+}
+.shot-row .num {
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: right;
+}
+.shot-row .name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shot-row .dur {
+  color: var(--text-dim);
+  font-size: 11px;
+  text-align: right;
+}
+.shot-row .meta {
+  grid-column: 2 / span 2;
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shot-row.active .meta,
+.shot-row.active .dur,
+.shot-row.active .num {
+  color: #e8eef8;
+}
+.shot-row .issues {
+  margin-left: 4px;
+  color: var(--warn);
+}
+.shot-row .issues.error {
+  color: #ff8d8d;
+}
+.shot-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.shot-actions .grow {
+  flex: 1;
+}
+
+/* ---------- continuity checks */
+.check-summary {
+  margin: 6px 0 4px;
+  color: var(--text-dim);
+}
+.check-summary.stale {
+  color: var(--warn);
+}
+.check-issues {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.check-issue {
+  display: flex;
+  gap: 6px;
+  align-items: flex-start;
+  width: 100%;
+  padding: 3px 4px;
+  border: 0;
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+}
+.check-issue:hover,
+.check-issue:focus-visible {
+  background: var(--bg-hover);
+  outline: none;
+}
+.check-issue .sev {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin-top: 4px;
+  border-radius: 50%;
+}
+.check-issue .sev.error {
+  background: var(--danger);
+}
+.check-issue .sev.warning {
+  background: var(--warn);
+}
+.check-issue .sev.info {
+  background: var(--accent);
+}
+.check-issue .code {
+  color: var(--text-faint);
+  font-size: 11px;
+}
+
+/* ---------- shot inspector */
+.subject-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 160px;
+  overflow-y: auto;
+}
+.subject-list .role {
+  margin-left: 4px;
+  color: var(--text-faint);
+  font-size: 11px;
+}
+.layout-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1fr) auto;
+  gap: 3px;
+  margin-bottom: 3px;
+}
+.layout-row select {
+  min-width: 0;
+  width: 100%;
+}
+.notes-field {
+  width: 100%;
+  min-height: 52px;
+  resize: vertical;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-input-dark);
+  color: var(--text);
+  font: inherit;
+}
+.notes-field:focus {
+  outline: 1px solid var(--accent);
+}
+.blocking-line {
+  margin: 4px 0 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-style: italic;
+}
+
+/* ---------- actor panel */
+.actor-swatch {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  border-radius: 3px;
+  vertical-align: -2px;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+}
+.actor-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.actor-kinds {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(76px, 1fr));
+  gap: 4px;
+}
+
+/* ---------- sequence strip */
+.sequence-strip {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+}
+.sequence-header {
+  gap: 6px;
+}
+.sequence-header .time {
+  font: 11px var(--mono);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.sequence-header .shot-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sequence-track {
+  position: relative;
+  flex: 1;
+  min-height: 34px;
+  margin: 6px 8px 8px;
+  background: #222;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: col-resize;
+  touch-action: none;
+  outline: none;
+  user-select: none;
+}
+.sequence-track:focus-visible {
+  box-shadow: 0 0 0 1px var(--accent);
+}
+.sequence-block {
+  position: absolute;
+  top: 3px;
+  bottom: 3px;
+  overflow: hidden;
+  padding: 2px 4px;
+  border-right: 1px solid #111;
+  border-radius: 3px;
+  background: #3b5a84;
+  color: #fff;
+  font-size: 11px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  box-sizing: border-box;
+}
+.sequence-block.alt {
+  background: #4f6d3f;
+}
+.sequence-block.selected {
+  box-shadow: inset 0 0 0 2px var(--select);
+}
+.sequence-block .dur {
+  opacity: 0.75;
+  margin-left: 4px;
+}
+.sequence-playhead {
+  position: absolute;
+  top: -4px;
+  bottom: -4px;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--select-active);
+  pointer-events: none;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+}
+.sequence-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 8px;
+  color: var(--text-faint);
+  text-align: center;
+}
+
+/* tabs only for narrow screens, where the right column is hidden */
+.director-mobile-only {
+  display: none !important;
+}
+@media (max-width: 760px) {
+  .director-mobile-only {
+    display: inline-flex !important;
+  }
+  .sequence-header .hide-narrow {
+    display: none;
+  }
+}

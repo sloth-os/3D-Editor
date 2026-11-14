@@ -2,14 +2,23 @@ import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import * as Y from 'yjs';
 import { SceneDoc, newId } from '@3d-editor/core';
-import { NotFoundError, ToolError } from '../mcp/agent';
+import { NotFoundError, ToolError, type ToolErrorCode } from '../mcp/agent';
 import type { ServiceContext } from '../services';
 import type { PassName } from '../render/protocol';
 import { errorMessage } from '../observability/tracing';
 import { ffmpegEncoders, requireFfmpeg } from './ffmpeg';
-import { mainThreadError, removeOutputs, runExport } from './exporter';
+import { exportCodec, exportNeedsOf, mainThreadError, removeOutputs, runExport } from './exporter';
 import { contentTypeOf, etagOf } from './files';
 import { JobStore, SNAPSHOT_FILE, cleanupSelection, diskUsage, finished, safeName } from './jobs';
+import {
+  exportMemory,
+  outOfMemoryMessage,
+  readMachineMemory,
+  type ExportMemory,
+  type ExportNeeds,
+  type ExportRenderInfo,
+  type MemoryReader,
+} from './memory';
 import { qualityPreset, videoExportParamsSchema, type VideoExportParams } from './params';
 import { planExport, type ExportPlan } from './plan';
 
@@ -24,6 +33,7 @@ import { planExport, type ExportPlan } from './plan';
  */
 
 export type { VideoExportParams } from './params';
+export type { ExportRenderInfo } from './memory';
 
 export type ExportStatus = 'queued' | 'running' | 'encoding' | 'done' | 'failed' | 'cancelled';
 
@@ -78,9 +88,22 @@ export interface ExportJob {
   finished_at: string | null;
   progress: ExportProgress;
   error: string | null;
+  /** The code of a failure that has one (OUT_OF_MEMORY: not even one render process fits in memory). */
+  error_code?: ToolErrorCode;
+  /**
+   * How it renders, set when it starts: render processes used (fewer than RENDER_WORKERS when the
+   * available memory is short), the estimated memory of each and of ffmpeg, the memory available.
+   */
+  render?: ExportRenderInfo;
   warnings: string[];
   files: ExportFile[];
   push?: ExportPush;
+}
+
+/** Options of {@link VideoExports} (tests). */
+export interface VideoExportsOptions {
+  /** Reads the memory available to an export (default: /proc/meminfo, the cgroup, os.freemem()). */
+  memory?: MemoryReader;
 }
 
 /** A file of an export on disk (served with Range and ETag by the REST route). */
@@ -118,6 +141,7 @@ const PROGRESS_SAVE_MS = 2000;
 const STOP_WAIT_MS = 15_000;
 /** Seconds one render process takes for a megapixel at one sample before any export measured it. */
 const DEFAULT_SECONDS_PER_MEGAPIXEL = 1.2;
+const MiB = 1024 * 1024;
 
 interface RunningJob {
   id: string;
@@ -151,7 +175,10 @@ export class VideoExports {
   /** Measured render seconds per megapixel-frame and render process (for estimates). */
   private secondsPerMegapixel = DEFAULT_SECONDS_PER_MEGAPIXEL;
 
-  constructor(protected readonly ctx: ServiceContext) {
+  constructor(
+    protected readonly ctx: ServiceContext,
+    private readonly opts: VideoExportsOptions = {},
+  ) {
     // the jobs of an earlier run are read (and the queue resumed) soon after the server starts;
     // the context's other services are read only when a job runs
     if (ctx?.config) setImmediate(() => void this.load().catch(() => undefined));
@@ -227,8 +254,10 @@ export class VideoExports {
    * Queues an export of project `project` (id, or the name of a loaded project) and returns its
    * job (status `queued`, or `running` when nothing else waits). Refuses with FFMPEG_UNAVAILABLE
    * without ffmpeg, UNAVAILABLE in main-thread render mode, NOT_FOUND / INVALID_PARAMS for unknown
-   * projects, shots or cameras (whatever the queue holds), and QUEUE_FULL when EXPORT_MAX_QUEUED
-   * jobs already wait (exports asked for at the same time included).
+   * projects, shots or cameras (whatever the queue holds), OUT_OF_MEMORY when no export runs and
+   * not even one render process of it fits in the memory available now (see `startMemory`), and
+   * QUEUE_FULL when EXPORT_MAX_QUEUED jobs already wait (exports asked for at the same time
+   * included).
    */
   async start(project: string, given: VideoExportParams): Promise<ExportJob> {
     const store = await this.ready();
@@ -242,7 +271,7 @@ export class VideoExports {
     const params = parsedParams.data;
     if (this.closed) throw new ToolError('The server is shutting down: no new video exports.', 'UNAVAILABLE');
     const cfg = this.ctx.config;
-    await requireFfmpeg(cfg.ffmpegPath);
+    const encoders = await requireFfmpeg(cfg.ffmpegPath);
     const renderer = this.ctx.services.renderer;
     if (renderer.pool.mode === 'main-thread') throw mainThreadError();
     const room = await this.openRoom(project);
@@ -252,6 +281,17 @@ export class VideoExports {
     // now (a request that can never succeed is told so, whatever the queue holds), and the snapshot
     // encoded in the same tick is that very state.
     const plan: ExportPlan = planExport(room.scene, params);
+    // the render processes it would get if it started now (the run decides again when it starts)
+    const memory = this.startMemory(
+      exportNeedsOf(room.scene, plan, params, exportCodec(params.codec, encoders), renderer.pool.capacity),
+    );
+    // (the message quotes what a render process that holds nothing yet needs: the processes were
+    // not asked what they hold, they were counted as holding all they could)
+    if (memory.processes < 1 && !this.running)
+      throw new ToolError(
+        outOfMemoryMessage({ ...memory, reuse: [] }, plan.width, plan.height),
+        'OUT_OF_MEMORY',
+      );
     // the jobs ahead of this one: running, waiting, and being started by concurrent requests (they
     // count from their check on, so simultaneous requests cannot all pass it); one of them runs
     const ahead = (this.running ? 1 : 0) + this.queue.length + this.pendingStarts;
@@ -264,7 +304,14 @@ export class VideoExports {
     }
     this.pendingStarts++;
     try {
-      return await this.enqueue(store, room.id, params, plan, Y.encodeStateAsUpdate(room.scene.ydoc));
+      return await this.enqueue(
+        store,
+        room.id,
+        params,
+        plan,
+        Y.encodeStateAsUpdate(room.scene.ydoc),
+        Math.max(1, memory.processes),
+      );
     } finally {
       this.pendingStarts--;
     }
@@ -272,7 +319,8 @@ export class VideoExports {
 
   /**
    * Writes a new job (its snapshot, then job.json) and queues it; its queue slot is reserved by
-   * the caller (`pendingStarts`) until it is in the queue.
+   * the caller (`pendingStarts`) until it is in the queue. `processes`: the render processes it
+   * is expected to render on (its first estimate).
    */
   private async enqueue(
     store: JobStore,
@@ -280,8 +328,8 @@ export class VideoExports {
     params: VideoExportParams,
     plan: ExportPlan,
     bytes: Uint8Array,
+    processes: number,
   ): Promise<ExportJob> {
-    const renderer = this.ctx.services.renderer;
     const job: ExportJob = {
       id: newId(),
       project: projectId,
@@ -296,7 +344,7 @@ export class VideoExports {
         frames_total: plan.frames,
         fraction: 0,
         fps: 0,
-        eta_s: this.estimate(plan, params, renderer.pool.capacity),
+        eta_s: this.estimate(plan, params, processes),
         shot: null,
       },
       error: null,
@@ -411,6 +459,26 @@ export class VideoExports {
     throw new NotFoundError(`Project '${project}' not found`);
   }
 
+  /**
+   * The memory decision of an export asked for now, as its run would make it if it started at once
+   * (exporter.ts `decideMemory`), but without asking the render processes: each one running is
+   * counted as holding all an export could reuse of it, and the ffmpeg encoders of an export that
+   * runs now as freed (they end with it). So it fits at least as many render processes as the run
+   * will: an export it refuses, with no export running, would be refused by its run too.
+   */
+  private startMemory(needs: ExportNeeds): ExportMemory {
+    const pool = this.ctx.services.renderer.pool;
+    const running = Math.min(needs.capacity, Math.max(0, pool.running || 0));
+    const machine = (this.opts.memory ?? readMachineMemory)();
+    const ahead = this.running ? this.jobs.get(this.running.id)?.render : undefined;
+    const freed = (ahead?.ffmpeg_mb ?? 0) * MiB;
+    return exportMemory(needs, {
+      notStarted: needs.capacity - running,
+      warm: Array.from({ length: running }, () => Infinity),
+      machine: freed ? { ...machine, available: machine.available + freed } : machine,
+    });
+  }
+
   /** The first estimate of an export's duration (seconds), from the speed measured so far. */
   private estimate(plan: ExportPlan, params: VideoExportParams, threads: number): number {
     const preset = qualityPreset(params.quality, plan.width, plan.height);
@@ -451,9 +519,16 @@ export class VideoExports {
   }
 
   /** Ends a job (status, error, finish time), saves it and tells waiters. */
-  private async finish(job: ExportJob, status: 'done' | 'failed' | 'cancelled', error: string | null) {
+  private async finish(
+    job: ExportJob,
+    status: 'done' | 'failed' | 'cancelled',
+    error: string | null,
+    code?: ToolErrorCode,
+  ) {
     job.status = status;
     job.error = error;
+    if (code) job.error_code = code;
+    else delete job.error_code;
     job.finished_at = nowIso();
     if (status !== 'done') job.files = [];
     this.ctx.metrics?.videoExports.inc({ status });
@@ -532,6 +607,7 @@ export class VideoExports {
           renderer,
           ffmpegPath: cfg.ffmpegPath,
           encoders,
+          memory: this.opts.memory,
           onFrames: (n) => this.ctx.metrics?.videoExportFrames.inc(undefined, n),
         },
         {
@@ -571,6 +647,9 @@ export class VideoExports {
           onWarning: (w) => {
             if (job.warnings.length < MAX_WARNINGS && !job.warnings.includes(w)) job.warnings.push(w);
           },
+          onRender: (info) => {
+            job.render = info;
+          },
         },
       );
       job.files = result.files;
@@ -588,8 +667,9 @@ export class VideoExports {
         const preset = qualityPreset(job.params.quality, w, h);
         const sampleCost = preset.msaa ? 1 + 0.25 * (preset.samples - 1) : preset.samples ** 2;
         const passes = 1 + 0.15 * Math.max(0, job.params.passes.length - 1);
-        const measured =
-          (seconds * Math.max(1, renderer.pool.capacity)) / frames / ((w * h) / 1e6) / sampleCost / passes;
+        // per render process: the ones it rendered on (fewer than RENDER_WORKERS when memory was short)
+        const processes = Math.max(1, job.render?.processes || renderer.pool.capacity);
+        const measured = (seconds * processes) / frames / ((w * h) / 1e6) / sampleCost / passes;
         if (Number.isFinite(measured) && measured > 0)
           this.secondsPerMegapixel = 0.5 * this.secondsPerMegapixel + 0.5 * measured;
       }
@@ -609,7 +689,8 @@ export class VideoExports {
             : run.reason === 'too-large'
               ? `the export grew larger than EXPORT_MAX_MB (${Math.round(cfg.exportMaxBytes / 1048576)} MB): export fewer frames, a smaller size or fewer passes, or raise EXPORT_MAX_MB`
               : errorMessage(err);
-        await this.finish(job, 'failed', message);
+        const code = run.reason === null && err instanceof ToolError ? err.code : undefined;
+        await this.finish(job, 'failed', message, code);
         log.warn({ job: job.id, project: job.project, err: message }, 'video export failed');
       }
     } finally {

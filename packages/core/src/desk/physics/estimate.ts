@@ -25,7 +25,12 @@ import {
 } from '../../physics/settings';
 import { deskBakePlan, deskSimulationEnd } from './bake';
 import { DESK_SETTLE_MAX_SECONDS } from './presets';
-import { TETHER_MAX_FRAMES, TETHER_TAIL_SEGMENTS } from './tether';
+import {
+  TETHER_MAX_FRAMES,
+  TETHER_TAIL_SEGMENTS,
+  TETHER_TAIL_SETTLE_SECONDS,
+  tetherLandFrames,
+} from './tether';
 import { VEHICLE_DEFAULT_MPS, VEHICLE_EASE_SECONDS, VEHICLE_MAX_FRAMES, vehiclePath } from './vehicle';
 
 /*
@@ -38,10 +43,11 @@ import { VEHICLE_DEFAULT_MPS, VEHICLE_EASE_SECONDS, VEHICLE_MAX_FRAMES, vehicleP
  *    updateDeskWorldRange); the document's cache keeps those frames (physics/memory.ts) and the
  *    matrices a body records on the frames before its release; a drop with a height rewrites the
  *    lifted location keys;
- *  - a bake keys the location and rotation (and the scale of a body that loses its parent) of each body
- *    on every frame from its release (or the start of its hold) to the end (bake.ts deskBakePlan),
- *    stepping the world where its cache has no frames;
- *  - a flight keys the flyer, its string (location, rotation and scale) and its tail on every frame;
+ *  - a bake keys the location and rotation (and the scale of a carrier that loses its parent or is a
+ *    store model's root) of each body's carrier on every frame from its release (or the start of its
+ *    hold) to the end (bake.ts deskBakePlan), stepping the world where its cache has no frames;
+ *  - a flight keys the flyer, its string (location, rotation and scale) and its tail on every frame,
+ *    and of a landing after it; hiding them after it keys their scale twice more;
  *  - a drive keys the vehicle, the spin of each wheel and the turn of each steering pivot on every
  *    frame of its path.
  */
@@ -238,12 +244,14 @@ export function deskReleaseEstimate(
 }
 
 /**
- * desk.physics_bake: six keyframes per baked body and frame, nine for a body that loses its parent
- * (from its release, hold or parent's motion to the end; the bake drops the redundant ones, which
- * cannot be known before), the keys those bodies hold rewritten,
- * and the world stepped over the range (as if nothing were cached: a cache made stale by an edit is
- * simulated again). Null when the bake fails by itself (bake.ts deskBakePlan refuses it: no world, a
- * bad range, over the DESK_BAKE_MAX_BODY_FRAMES budget).
+ * desk.physics_bake: six keyframes per baked body and frame on its carrier (the body, or the root of
+ * the store model it carries), nine for a carrier that loses its parent or a model's root (its scale
+ * too, keyed when a hold scaled it), from its release, hold or parent's motion to the end (the bake
+ * drops the redundant ones, which cannot be known before), and a key per channel holding the body a
+ * root carries in it; the keys those objects hold rewritten, and the world stepped over the range (as
+ * if nothing were cached: a cache made stale by an edit is simulated again). Null when the bake fails
+ * by itself (bake.ts deskBakePlan refuses it: no world, a bad range, over the
+ * DESK_BAKE_MAX_BODY_FRAMES budget).
  */
 export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown>): OperatorEstimate | null {
   const doc = ctx.doc;
@@ -260,12 +268,14 @@ export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown
     return null;
   }
   if (!plan.bodies.length) return null;
-  const ids = new Set(plan.bodies.map((b) => b.id));
-  // location and rotation, and the scale of a body that loses its parent (world-space keys)
-  const channels = (b: (typeof plan.bodies)[number]) => (b.unparent ? 9 : 6);
+  const ids = new Set(plan.bodies.flatMap((b) => [b.id, b.carrier]));
+  // location and rotation, and the scale of a carrier that loses its parent or is a model's root
+  const channels = (b: (typeof plan.bodies)[number]) => (b.unparent || b.carrier !== b.id ? 9 : 6);
+  // the body a model's root carries: at most a key per channel where it holds from the bake's start
+  const held = (b: (typeof plan.bodies)[number]) => (b.carrier !== b.id ? 9 : 0);
   const keys = newKeyframesWrites(
-    plan.bodies.reduce((n, b) => n + channels(b) * (plan.frame_end - b.from + 1), 0),
-    plan.bodies.reduce((n, b) => n + channels(b), 0),
+    plan.bodies.reduce((n, b) => n + channels(b) * (plan.frame_end - b.from + 1) + held(b), 0),
+    plan.bodies.reduce((n, b) => n + channels(b) + held(b), 0),
     BAKE_LOWER,
     objectKeys(doc, ids).keys,
   );
@@ -322,7 +332,11 @@ export function deskTetherObjects(
   };
 }
 
-/** desk.tether_fly: every keyed channel on every frame of the flight. Null when it fails by itself. */
+/**
+ * desk.tether_fly: every keyed channel on every frame of the flight (and of a landing, after: 'land'),
+ * a key before it, and the keys that hide the flyer, its string and its tail after it (after: 'hide';
+ * the flyer's scale then too). Null when it fails by itself.
+ */
 export function deskTetherEstimate(
   ctx: OperatorContext,
   p: Record<string, unknown>,
@@ -331,11 +345,34 @@ export function deskTetherEstimate(
   if (!(frames >= 2) || frames > TETHER_MAX_FRAMES) return null;
   const t = deskTetherObjects(ctx.doc, p);
   if (!t) return null;
-  // every frame, and the keys held (or hiding) before the flight
-  const keys = newKeyframesWrites(t.channels * (frames + 1), t.channels, TETHER_LOWER, t.rewritten);
+  const fps = Math.max(1, num(ctx.doc.getScene().fps, 24));
+  // a landing (the longest it can take: from as high as the string reaches above the anchor) and the
+  // tail settling after it, keyed for every object: an upper bound
+  const anchor = objectOf(ctx.doc, p.anchor);
+  const landing =
+    p.after === 'land'
+      ? tetherLandFrames(
+          ctx.doc,
+          anchor?.id ?? '',
+          typeof p.anchor_bone === 'string' ? p.anchor_bone : undefined,
+          Math.floor(num(p.frame_end, 0)),
+          num(p.length_m, 0),
+          fps,
+        ) + Math.round(TETHER_TAIL_SETTLE_SECONDS * fps)
+      : 0;
+  // the flyer's scale channels, keyed twice to hide it (the string's and the tail's scale channels
+  // are among their channels, whose budget of frames + 1 keys already holds two more)
+  const hide = p.after === 'hide' ? 3 : 0;
+  // every frame, and the key held (or hiding) before the flight
+  const keys = newKeyframesWrites(
+    t.channels * (frames + landing + 1) + 2 * hide,
+    t.channels + hide,
+    TETHER_LOWER,
+    t.rewritten,
+  );
   const e = keyframeEstimate({
     ...keys,
-    bytes: keys.bytes + TETHER_BYTES_PER_OBJECT_FRAME * t.objects * frames,
+    bytes: keys.bytes + TETHER_BYTES_PER_OBJECT_FRAME * t.objects * (frames + landing),
   });
   return t.added ? withObjects(e, { objects: t.added, datablocks: { meshes: t.added } }, TETHER_LOWER) : e;
 }

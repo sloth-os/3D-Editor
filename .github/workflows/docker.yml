@@ -87,6 +87,24 @@ jobs:
             -H 'content-type: application/json' -H 'accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"smoke","version":"1"}}}' \
             | grep -q '3d-editor'
+          # video export: the image's ffmpeg has libx264, and a 64x64 two-frame draft export of the
+          # default scene (cube, camera, light) gives a non-empty MP4
+          docker exec editor ffmpeg -hide_banner -encoders | grep libx264
+          curl -fsS http://127.0.0.1:8080/api/config | grep -q '"videoExport":true'
+          ID=$(curl -fsS -X POST http://127.0.0.1:8080/api/projects -H 'content-type: application/json' \
+            -d '{"name":"smoke-video"}' | jq -r .id)
+          EXPORT=$(curl -fsS -X POST "http://127.0.0.1:8080/api/projects/$ID/video-exports" \
+            -H 'content-type: application/json' \
+            -d '{"width":64,"height":64,"frame_start":1,"frame_end":2,"quality":"draft","outputs":{"sequence":true,"clips":false,"posters":false,"contact_sheet":false}}' \
+            | jq -r .id)
+          for i in $(seq 1 60); do
+            STATUS=$(curl -fsS "http://127.0.0.1:8080/api/projects/$ID/video-exports/$EXPORT?wait=5" | tee job.json | jq -r .status)
+            case "$STATUS" in done | failed | cancelled) break ;; esac
+          done
+          jq . job.json
+          test "$STATUS" = done
+          curl -fsS -o sequence.mp4 "http://127.0.0.1:8080/api/projects/$ID/video-exports/$EXPORT/files/sequence.mp4"
+          test -s sequence.mp4
           docker logs editor | tail -n 20
           docker rm -f editor
 

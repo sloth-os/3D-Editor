@@ -45,6 +45,9 @@ const params = (p: Record<string, unknown> = {}) =>
 
 const tmp = (name: string) => mkdtemp(path.join(tmpdir(), `video-jobs-${name}-`));
 
+/** A machine with 1 TB available: these tests do not depend on the memory of the one they run on. */
+const plentyMemory = () => ({ available: 2 ** 40, source: 'meminfo' as const });
+
 /** Reads a ToolError's code from a rejected promise. */
 async function codeOf(p: Promise<unknown>): Promise<string | undefined> {
   const err = await p.then(
@@ -97,7 +100,8 @@ function service(o: {
     exportTtlMs: o.exportTtlMs,
     exportMaxBytes: o.exportMaxBytes,
   });
-  return { exports: new VideoExports(ctx), ctx, renderer };
+  // memory is plenty (the leasing by available memory has its own tests: video-memory.test.ts)
+  return { exports: new VideoExports(ctx, { memory: plentyMemory }), ctx, renderer };
 }
 
 describe('cleanup policy', () => {

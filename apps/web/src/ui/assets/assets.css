@@ -1,0 +1,279 @@
+/* Asset Browser (SPEC §13): search bar, provider states, category chips, model cards. */
+.asset-browser {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-area);
+}
+/* search, provider and the providers' states: one row when it fits, the states wrap below */
+.asset-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  padding: 6px 8px 4px;
+  align-items: center;
+}
+.asset-search {
+  position: relative;
+  flex: 1 1 120px;
+  min-width: 0;
+}
+.asset-search svg {
+  position: absolute;
+  left: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.asset-search .textfield {
+  padding-left: 24px;
+}
+.asset-toolbar .select {
+  max-width: 46%;
+}
+.asset-providers {
+  display: flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+.asset-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  background: var(--bg-panel);
+  border-radius: 3px;
+  padding: 1px 5px;
+  white-space: nowrap;
+}
+.asset-status::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--text-faint);
+}
+.asset-status.ok::before {
+  background: var(--ok);
+}
+.asset-status.warn::before {
+  background: var(--warn);
+}
+.asset-status.error::before {
+  background: var(--danger);
+}
+.asset-chips {
+  display: flex;
+  gap: 4px;
+  padding: 0 8px 6px;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.asset-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  height: 20px;
+  padding: 0 8px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  cursor: pointer;
+  font: inherit;
+  font-size: 11px;
+}
+.asset-chip:hover {
+  color: var(--text);
+  background: var(--bg-hover);
+}
+.asset-chip[aria-pressed='true'] {
+  background: var(--accent);
+  color: #fff;
+}
+.asset-results {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 0 8px 8px;
+}
+.asset-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(132px, 1fr));
+  gap: 8px;
+}
+.asset-browser.compact .asset-grid {
+  grid-template-columns: repeat(auto-fill, minmax(104px, 1fr));
+  gap: 6px;
+}
+.asset-card {
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: grab;
+  outline: none;
+}
+.asset-card:hover,
+.asset-card:focus-visible {
+  border-color: var(--accent);
+}
+.asset-card.busy {
+  cursor: progress;
+}
+.asset-thumb {
+  position: relative;
+  aspect-ratio: 4 / 3;
+  background: #3a3a3a;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #7a7a7a;
+}
+/* over the category icon, shown once loaded */
+.asset-thumb img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  -webkit-user-drag: none;
+}
+.asset-thumb img.loaded {
+  opacity: 1;
+}
+.asset-progress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 3px;
+  background: var(--accent);
+  transition: width 120ms;
+}
+.asset-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 6px 0;
+  min-width: 0;
+}
+.asset-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.asset-meta {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--text-dim);
+  min-width: 0;
+}
+.asset-provider {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+.asset-licence {
+  flex: none;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 14px;
+  background: #444;
+  color: #ddd;
+  cursor: help;
+}
+.asset-licence.free {
+  background: #3d6b33;
+}
+.asset-licence.credit {
+  background: #2d5d8a;
+}
+.asset-licence.restricted {
+  background: #8a5a2d;
+}
+.asset-actions {
+  display: flex;
+  gap: 4px;
+  padding: 5px 6px 6px;
+}
+.asset-actions .btn {
+  flex: 1;
+  height: 20px;
+  font-size: 11px;
+}
+.asset-note {
+  color: var(--text-faint);
+  font-size: 11px;
+  text-align: center;
+  padding: 10px 4px;
+}
+.asset-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-dim);
+  text-align: center;
+  padding: 24px 12px;
+}
+.asset-empty .error-text {
+  max-width: 420px;
+}
+.asset-sentinel {
+  height: 1px;
+}
+
+/* a short browser (the bottom area): cards as rows of small thumbnail, name and Add */
+.asset-browser.short .asset-toolbar {
+  padding: 4px 8px 3px;
+}
+.asset-browser.short .asset-chips {
+  padding-bottom: 4px;
+}
+.asset-browser.short .asset-grid {
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 4px;
+}
+.asset-browser.short .asset-card {
+  flex-direction: row;
+  align-items: center;
+}
+.asset-browser.short .asset-thumb {
+  flex: none;
+  width: 64px;
+}
+.asset-browser.short .asset-info {
+  flex: 1;
+  padding: 4px 6px;
+}
+.asset-browser.short .asset-actions {
+  flex: none;
+  padding: 0 6px 0 0;
+}
+.asset-browser.short .asset-actions .btn {
+  min-width: 64px;
+}
+.asset-browser.short .asset-empty {
+  flex-direction: row;
+  justify-content: center;
+  padding: 8px;
+}
+.asset-browser.short .asset-note {
+  padding: 6px 4px;
+}

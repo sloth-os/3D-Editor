@@ -5,7 +5,6 @@ import {
   OPENPOSE_COLORS,
   ScreenBoxBuilder,
   cameraOfView,
-  drawLineByte,
   drawLineRGB,
   drawSkeleton,
   lineVisible,
@@ -42,6 +41,25 @@ function projection(width = 100, height = 50): Projection & { proj: Mat4; eye: V
 }
 
 const pt = (x: number, y: number, depth = 5): ScreenPoint => ({ x, y, depth });
+
+/**
+ * Sets the pixels of a one-byte image a segment covers at least half (`value`), where it is not
+ * behind `surface`: the strokes of the pose pass's strings (drawLineRGB) rasterize this way.
+ */
+function drawLineByte(
+  buf: Uint8Array,
+  width: number,
+  height: number,
+  a: ScreenPoint,
+  b: ScreenPoint,
+  halfWidth: number,
+  value: number,
+  surface?: ArrayLike<number>,
+): void {
+  rasterizeSegment(width, height, a, b, halfWidth, (i, coverage, depth) => {
+    if (coverage >= 0.5 && lineVisible(depth, surface?.[i])) buf[i] = value;
+  });
+}
 
 describe('mask bytes', () => {
   it('turns object indices into palette indices through the table', () => {

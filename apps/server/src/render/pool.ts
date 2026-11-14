@@ -62,6 +62,13 @@ export interface RenderThread {
   call<T extends WorkerResult>(req: RenderRequest): Promise<T>;
   /** Frees what a job keeps on the thread: a prepared path tracer, an APNG encoder (fire and forget). */
   release(job: number): void;
+  /**
+   * Drops the renderer's pooled working buffers in the render process, after the requests sent
+   * before (fire and forget; see `release-buffers` in protocol.ts), and with `documents` its cached
+   * documents too (`clear`, as an idle process does): a video export ends with it. Render processes
+   * only (the main thread of single-thread mode runs no video exports).
+   */
+  releaseBuffers?(o?: { documents?: boolean }): void;
   /** Requests sent and not answered yet. */
   readonly pending: number;
   readonly alive: boolean;
@@ -134,6 +141,16 @@ export const MAX_SHARED_RENDERS = 2;
  * heap), and one more for every render process a path traced render sends it to.
  */
 export const DOC_PART_BYTES = 8 * 1024 * 1024;
+
+/**
+ * glibc's malloc mmap threshold in render processes (MALLOC_MMAP_THRESHOLD_ unless the environment
+ * sets one): blocks of 1 MiB and more, the renderer's working buffers and the frames it returns, are
+ * mapped on their own and go back to the system when freed. Measured on 1280×720 export frames
+ * (beauty, depth, pose; six runs each): a render process at 170–178 MB 1.5 s after release-buffers
+ * instead of 187–353 MB, for the same CPU time per frame on average (759 against 757 ms), up to
+ * about 35 ms of it more in page faults when a collection dropped the pooled buffers between frames.
+ */
+export const RENDER_MMAP_THRESHOLD_BYTES = 1024 * 1024;
 
 /** Default number of render processes: the CPU cores, at most 8. */
 export function defaultRenderThreads(): number {
@@ -303,6 +320,15 @@ export class ProcessThread implements RenderThread {
     const env = { ...process.env };
     if (opts.heapLimitMb && env.NODE_OPTIONS)
       env.NODE_OPTIONS = env.NODE_OPTIONS.replace(heapFlags, '').replace(/\s+/g, ' ').trim();
+    // glibc's malloc raises its mmap threshold to the size of the largest block freed (up to 32
+    // MiB), so the renderer's working buffers of a 720p frame end up in its heap, and freeing them
+    // (release-buffers, clear) returned nothing to the system; a fixed threshold of 1 MiB maps each
+    // of them on its own, and unmaps it when it is freed (musl ignores the variable)
+    if (
+      env.MALLOC_MMAP_THRESHOLD_ === undefined &&
+      !/glibc\.malloc\.mmap_threshold/.test(env.GLIBC_TUNABLES ?? '')
+    )
+      env.MALLOC_MMAP_THRESHOLD_ = String(RENDER_MMAP_THRESHOLD_BYTES);
     this.child = fork(fileURLToPath(entry), [], {
       execArgv: [
         '--expose-gc',
@@ -374,6 +400,11 @@ export class ProcessThread implements RenderThread {
 
   release(job: number): void {
     if (!this.failure) this.tell({ type: 'release', job });
+  }
+
+  releaseBuffers(o: { documents?: boolean } = {}): void {
+    if (o.documents) this.clearCaches();
+    else if (!this.failure) this.tell({ type: 'release-buffers' });
   }
 
   /** Drops the process's cached documents (fire and forget). */
@@ -680,6 +711,10 @@ class MainThread implements RenderThread {
         return this.engine.exportFile(req.doc, req.format, req.options);
       case 'ping':
         return { ok: true };
+      case 'memory': {
+        const m = process.memoryUsage();
+        return { rss: m.rss, heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers };
+      }
       case 'test-allocate':
       case 'test-busy':
         throw new Error(`'${req.type}' is a test request for render processes`);

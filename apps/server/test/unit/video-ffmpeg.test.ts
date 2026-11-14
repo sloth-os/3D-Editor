@@ -1,5 +1,5 @@
 import { mkdtemp, readFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { availableParallelism, tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { ToolError } from '../../src/mcp/agent';
@@ -19,6 +19,7 @@ import {
   requireFfmpeg,
   runFfmpeg,
   streamExtension,
+  x264Threads,
   type EncodeSettings,
 } from '../../src/video/ffmpeg';
 import { makeFakeFfmpeg, type FakeFfmpeg } from '../helpers/video-fake-ffmpeg';
@@ -127,6 +128,21 @@ describe('encoder command lines', () => {
     expect(streamExtension('h264')).toBe('mp4');
     expect(streamExtension('vp9')).toBe('webm');
     expect(streamExtension('lossless')).toBe('mkv');
+  });
+
+  it("gives the x264 encoders their thread count explicitly (x264's own count for the height)", () => {
+    // 1.5 per core, at most one per two rows of macroblocks: the count memory.ts plans with
+    expect(after(encoderArgs(settings()), '-threads')).toBe(String(x264Threads(90)));
+    expect(x264Threads(90)).toBe(Math.min(Math.round(1.5 * availableParallelism()), 3));
+    const hd = encoderArgs(settings({ width: 1280, height: 720 }));
+    expect(after(hd, '-threads')).toBe(String(x264Threads(720)));
+    // after the encoder (an encoder option), before the output
+    expect(hd.indexOf('-threads')).toBeGreaterThan(hd.indexOf('-c:v'));
+    expect(after(encoderArgs(settings({ threads: 5 })), '-threads')).toBe('5');
+    const lossless = encoderArgs(settings({ codec: 'lossless', input: 'rgb24', height: 720, width: 1280 }));
+    expect(after(lossless, '-threads')).toBe(String(x264Threads(720)));
+    // VP9 keeps libvpx's own threads (its memory is not counted per thread)
+    expect(encoderArgs(settings({ codec: 'vp9', output: '/out/s.webm' }))).not.toContain('-threads');
   });
 
   it('refuses odd frame sizes', () => {

@@ -23,8 +23,11 @@ import { TransformFields } from './properties/ObjectTab';
 import { useShownObject } from './properties/shown-object';
 import { NavGizmo } from './NavGizmo';
 import { importFiles } from '../io/import-export';
+import { assetDragOver, dropAsset } from './assets/drop';
 import { fps, slowFrameCompiled, slowFrameMs } from '../telemetry/perf';
 import type { ToolId } from '../editor/state';
+import { followedShot, shotPin } from '../viewport/follow-shots';
+import { workspace } from '../app/store';
 
 function BrushSettings({ s }: { s: ProjectSession }) {
   const b = s.view.brush.value;
@@ -71,6 +74,37 @@ const TOOLS: { id: ToolId; icon: IconName; title: string; modes: string[] }[] = 
   { id: 'sculpt_grab', icon: 'hand', title: 'Grab', modes: ['SCULPT'] },
   { id: 'paint', icon: 'brush', title: 'Paint vertex colors', modes: ['VERTEX_PAINT'] },
 ];
+
+/**
+ * The camera view's toggles in the viewport header (in the camera view and the Director workspace):
+ * Follow Shots and the composition guides.
+ */
+function CameraViewButtons({ s }: { s: ProjectSession }) {
+  const follow = s.view.followShots.value;
+  const guides = s.view.cameraGuides.value;
+  return (
+    <div class="btn-group">
+      <button
+        class={`btn icon ${follow ? 'active' : ''}`}
+        title="Follow Shots: look through the camera of the shot at the current frame (View menu)"
+        aria-pressed={follow}
+        data-testid="toggle-follow-shots"
+        onClick={() => run('view3d.toggle_follow_shots', {}, 'ui')}
+      >
+        <Icon name="film" />
+      </button>
+      <button
+        class={`btn icon ${guides ? 'active' : ''}`}
+        title="Camera Guides: rule-of-thirds and action-safe guides in the camera frame (View menu)"
+        aria-pressed={guides}
+        data-testid="toggle-camera-guides"
+        onClick={() => run('view3d.toggle_camera_guides', {}, 'ui')}
+      >
+        <Icon name="guides" />
+      </button>
+    </div>
+  );
+}
 
 /** The viewport's header: mode, select mode, menus, pivot, snapping, overlays, X-ray, shading. */
 export function ViewportHeader({ s }: { s: ProjectSession }) {
@@ -163,6 +197,7 @@ export function ViewportHeader({ s }: { s: ProjectSession }) {
           </button>
         )}
       </span>
+      {(s.view.cameraView.value || workspace.value === 'Director') && <CameraViewButtons s={s} />}
       <button
         class={`btn icon ${s.view.overlays.value ? 'active' : ''}`}
         title="Overlays"
@@ -337,7 +372,74 @@ export function InfoOverlay({ s }: { s: ProjectSession }) {
   );
 }
 
-/** The camera frame and passepartout of the camera view (an overlay, hidden with the overlays). */
+/**
+ * Inset of the action-safe area on each side, as a share of the frame (EBU R 95 and Blender's
+ * default safe areas: action safe is the central 93%).
+ */
+export const ACTION_SAFE_INSET = 0.035;
+
+/** The shot name at the top of the camera frame, centred (the text info is at the top left). */
+const SHOT_LABEL = {
+  position: 'absolute',
+  left: '50%',
+  transform: 'translateX(-50%)',
+  top: '4px',
+  padding: '1px 6px',
+  borderRadius: '3px',
+  background: 'rgba(0,0,0,0.5)',
+  color: '#fff',
+  fontSize: '11px',
+  maxWidth: 'calc(100% - 8px)',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+} as const;
+
+/**
+ * Composition guides inside the camera frame (view3d.toggle_camera_guides): the rule-of-thirds lines
+ * and the action-safe rectangle. Lines stay one pixel wide whatever the frame's size.
+ */
+export function CameraGuides() {
+  const a = ACTION_SAFE_INSET * 100;
+  // on each line: vector-effect is not inherited, and without it a 1-unit stroke of the stretched
+  // 100 × 100 view box is a percent of the frame wide
+  const line = { stroke: 'rgba(255,255,255,0.55)', 'stroke-width': 1, 'vector-effect': 'non-scaling-stroke' };
+  return (
+    <svg
+      data-testid="camera-guides"
+      viewBox="0 0 100 100"
+      preserveAspectRatio="none"
+      style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', overflow: 'visible' }}
+      aria-hidden="true"
+    >
+      <g data-testid="camera-guide-thirds">
+        {[100 / 3, 200 / 3].map((t) => (
+          <g key={t}>
+            <line x1={t} y1={0} x2={t} y2={100} {...line} />
+            <line x1={0} y1={t} x2={100} y2={t} {...line} />
+          </g>
+        ))}
+      </g>
+      <rect
+        data-testid="camera-guide-action-safe"
+        x={a}
+        y={a}
+        width={100 - 2 * a}
+        height={100 - 2 * a}
+        fill="none"
+        stroke="rgba(255,214,102,0.7)"
+        stroke-width={1}
+        stroke-dasharray="4 3"
+        vector-effect="non-scaling-stroke"
+      />
+    </svg>
+  );
+}
+
+/**
+ * The camera frame and passepartout of the camera view (an overlay, hidden with the overlays), with
+ * the composition guides when they are on and, with Follow Shots, the name of the shot shown.
+ */
 export function CameraFrame({ engine }: { engine: ViewportEngine }) {
   const [, setTick] = useState(0);
   useEffect(() => {
@@ -345,9 +447,15 @@ export function CameraFrame({ engine }: { engine: ViewportEngine }) {
     engine.onAfterRender.add(cb);
     return () => engine.onAfterRender.delete(cb);
   }, [engine]);
-  if (!engine.session.view.overlays.value) return null;
+  const v = engine.session.view;
+  if (!v.overlays.value) return null;
+  const guides = v.cameraGuides.value;
+  const follow = v.followShots.value;
+  const pin = shotPin(v).value;
   const r = engine.cameraFrameRect();
   if (!r) return null;
+  const s = engine.session;
+  const shot = follow ? followedShot(s.doc, s.state.$frame.value, pin) : null;
   return (
     <div class="viewport-overlay" style={{ inset: 0 }} data-testid="camera-frame">
       <div
@@ -360,7 +468,14 @@ export function CameraFrame({ engine }: { engine: ViewportEngine }) {
           border: '1px dashed #ddd',
           boxShadow: '0 0 0 9999px rgba(0,0,0,0.45)',
         }}
-      />
+      >
+        {guides && <CameraGuides />}
+        {follow && (
+          <div style={SHOT_LABEL} data-testid="camera-frame-shot">
+            {shot ? shot.name : 'No shot at this frame'}
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -455,9 +570,14 @@ export function Viewport({ session: s }: { session: ProjectSession }) {
         tabIndex={0}
         data-testid="viewport"
         onPointerEnter={() => (hoveredArea.value = 'viewport')}
-        onDragOver={(e) => e.preventDefault()}
+        onDragOver={(e) => {
+          e.preventDefault();
+          assetDragOver(e);
+        }}
         onDrop={(e) => {
           e.preventDefault();
+          // a model dragged from the Asset Browser lands where it was dropped; files are imported
+          if (dropAsset(e)) return;
           const files = [...(e.dataTransfer?.files ?? [])];
           if (files.length) void importFiles(files);
         }}

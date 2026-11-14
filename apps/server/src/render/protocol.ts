@@ -88,6 +88,12 @@ export interface DeskFrameOptions {
   msaa: boolean;
   /** World box the sun's shadow map covers (default: fitted to the view). */
   shadowFit?: { min: Vec3Tuple; max: Vec3Tuple };
+  /**
+   * How far ambient occlusion reaches (m), the same for every frame of a shot
+   * (`DeskShotInfo.aoRadius`). Default: the renderer's own, from what each frame draws, which
+   * changes when things appear, hide or scale anywhere in the scene.
+   */
+  aoRadius?: number;
   passes: PassName[];
   /**
    * Depth pass distances (m): `[near, far]`; inverse depth between them maps to 255…0 (see
@@ -135,8 +141,26 @@ export interface DeskShotInfo {
    * nothing else.
    */
   shadowFit: { min: Vec3Tuple; max: Vec3Tuple } | null;
+  /**
+   * How far ambient occlusion reaches for the whole shot (m): core `defaultAoRadius` of what its
+   * first frame draws, so the occlusion cannot change within the shot when things appear, hide or
+   * scale (`DeskFrameOptions.aoRadius`).
+   */
+  aoRadius?: number;
   /** Milliseconds spent. */
   ms: number;
+}
+
+/**
+ * What a render process holds (request `memory`): its `process.memoryUsage()` in bytes (the
+ * renderer's buffers are typed arrays: `arrayBuffers`). A video export asks the processes it would
+ * render on: what they hold already, it needs no more of the machine (video/memory.ts).
+ */
+export interface ProcessMemory {
+  rss: number;
+  heapUsed: number;
+  external: number;
+  arrayBuffers: number;
 }
 
 /** Camera and subject boxes of a rendered frame (computed in the render process). */
@@ -285,12 +309,24 @@ export type WorkerRequest =
   /** Drops the cached documents (an idle thread frees its memory; no response). */
   | { type: 'clear' }
   /**
+   * Drops the renderer's pooled working buffers (core `releaseRenderBuffers`: about 140 MB at
+   * 1280×720, 300 MB at 1080p) and collects garbage right after, so they are freed now instead of
+   * at some later collection, which an idle process may not run for a long time: sent at the end of
+   * a video export (no response). Freed memory goes back to the system when the allocator returns
+   * it: the pool starts render processes with a fixed glibc mmap threshold of 1 MiB
+   * (MALLOC_MMAP_THRESHOLD_), so that the buffers, mapped on their own, are unmapped when freed;
+   * with glibc's default (dynamic) threshold those of a 720p frame stayed in its heap.
+   */
+  | { type: 'release-buffers' }
+  /**
    * Part of the state of document `key` at `version` (`total` bytes; this part starts at
    * `offset`; no response). The pool sends a state larger than `DOC_PART_BYTES` in such parts,
    * followed by the request that needs it, whose `doc` then has no `update`.
    */
   | { type: 'doc-part'; key: string; version: number; offset: number; total: number; bytes: Uint8Array }
   | { type: 'ping'; id: number }
+  /** What the process holds now (`ProcessMemory`). */
+  | { type: 'memory'; id: number }
   /**
    * Test-only requests, answered only by render processes started with RENDER_WORKER_TEST_JOBS=1
    * (else they fail): `test-allocate` allocates a buffer of `bytes` (to make an allocation fail),
@@ -348,6 +384,7 @@ export type WorkerResult =
   | SimulatedFrames
   | ExportedFile
   | DeskShotInfo
+  | ProcessMemory
   | { ok: true };
 
 /**

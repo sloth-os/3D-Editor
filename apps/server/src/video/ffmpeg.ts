@@ -1,4 +1,5 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
+import { availableParallelism } from 'node:os';
 import { ToolError } from '../mcp/agent';
 
 /*
@@ -137,6 +138,19 @@ export const QUALITY_ENCODING: Readonly<
 /** How a stream is encoded: H.264 or VP9 for viewing, lossless RGB H.264 for data passes. */
 export type StreamCodec = 'h264' | 'vp9' | 'lossless';
 
+/**
+ * The encoder threads of an x264 stream (libx264, libx264rgb) `height` pixels high: x264's own
+ * automatic count, 1.5 per core but at most one per two rows of 16-pixel macroblocks (6 on 4
+ * cores; 22 at most at 720p, 34 at 1080p). Exports pass it explicitly (`-threads`), so the count,
+ * and the encoders' memory the export plans with (memory.ts), is the same whatever x264 itself
+ * would see: it counts every core of the machine, also in a container whose CPU quota Node's
+ * `availableParallelism()` follows.
+ */
+export function x264Threads(height: number, cores: number = availableParallelism()): number {
+  const rows = Math.max(1, ((Math.max(1, Math.round(height)) + 15) >> 4) >> 1);
+  return Math.max(1, Math.min(Math.round(1.5 * cores), rows));
+}
+
 export interface EncodeSettings {
   width: number;
   height: number;
@@ -148,6 +162,8 @@ export interface EncodeSettings {
   /** Output frame numbers that must start with a keyframe (the shot starts). */
   keyframes: readonly number[];
   output: string;
+  /** x264 encoder threads (h264, lossless; default {@link x264Threads}); VP9 keeps libvpx's own. */
+  threads?: number;
 }
 
 /** The container of a stream (mp4, webm or mkv). */
@@ -172,6 +188,7 @@ export function keyframeExpression(frames: readonly number[]): string {
  *   every shot start, +faststart, no audio;
  * - vp9: libvpx-vp9 in WebM with the same keyframes and colour tags;
  * - lossless: libx264rgb at qp 0 in Matroska (exact RGB values, for mask and edge passes).
+ * The x264 encoders get their thread count explicitly ({@link x264Threads}).
  */
 export function encoderArgs(s: EncodeSettings): string[] {
   if (!(s.width >= 2 && s.height >= 2 && s.width % 2 === 0 && s.height % 2 === 0))
@@ -179,6 +196,7 @@ export function encoderArgs(s: EncodeSettings): string[] {
   const rate = fpsRational(s.fps);
   const gop = Math.max(1, Math.round(2 * fpsValue(rate)));
   const q = QUALITY_ENCODING[s.quality];
+  const threads = ['-threads', String(Math.max(1, Math.round(s.threads ?? x264Threads(s.height))))];
   const args = [
     '-hide_banner',
     '-loglevel',
@@ -216,6 +234,7 @@ export function encoderArgs(s: EncodeSettings): string[] {
     args.push(
       '-c:v',
       'libx264rgb',
+      ...threads,
       '-preset',
       'veryfast',
       '-qp',
@@ -247,6 +266,7 @@ export function encoderArgs(s: EncodeSettings): string[] {
     args.push(
       '-c:v',
       'libx264',
+      ...threads,
       '-preset',
       q.preset,
       '-crf',

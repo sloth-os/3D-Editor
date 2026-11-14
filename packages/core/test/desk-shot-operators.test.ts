@@ -449,12 +449,14 @@ describe('desk.shot_solve', () => {
     });
     const cam = shotNamed(doc, 'Shot 1').camera!;
     const before = viewAt(doc, cam, 1).position;
-    const r = run<{ shots: { agrees: boolean; refit: boolean }[]; issues: { code: string }[] }>(
-      'desk.shot_solve',
-    );
-    expect(r.shots[0]).toMatchObject({ agrees: false });
+    const r = run<{
+      shots: { agrees: boolean; refit: boolean; gave_up: string[] }[];
+      issues: { code: string }[];
+    }>('desk.shot_solve');
+    expect(r.shots[0]).toMatchObject({ agrees: false, gave_up: ['plan'] });
     expect(reports.filter((x) => x.level === 'WARNING').map((x) => x.message)).toEqual([
-      "The camera of shot 'Shot 1' disagrees with its planned layout (plan_mismatch)",
+      "Shot 'Shot 1' (medium): its camera disagrees with its planned layout (plan_mismatch): no camera " +
+        'around its subjects agrees with it (restage, or change the plan)',
     ]);
     expect(r.issues.map((i) => i.code)).toEqual(['plan_mismatch']);
     expect(viewAt(doc, cam, 1).position).not.toEqual(before);

@@ -1,3 +1,4 @@
+import type { Vec3 } from '../../math/types';
 import type { ArmatureData, PoseBone } from '../../doc/types';
 import { OperatorError } from '../../operators/context';
 import { HUMANOID_DEFAULT_HEIGHTS, humanoidBlueprint, humanoidStoop, type HumanoidKind } from './mannequin';
@@ -10,6 +11,7 @@ import {
   humanRotations,
   lowestPoint,
   poseBones,
+  posedPoint,
   type AnimalPoseSpec,
 } from './poses';
 import { partSurfaces, type Blueprint } from './rig';
@@ -125,42 +127,71 @@ export function posedBones(
   }
   let spec = animalPoseSpec(kind, pose);
   if (spec.seated) spec = { ...spec, body: seatedPitch(arm, bp, spec) };
-  if (spec.graze) spec = { ...spec, neck: grazingNeck(arm, bp, spec) };
+  if (spec.graze) spec = { ...spec, ...grazingNeck(arm, bp, spec) };
   const { rot, shift } = animalRotations(spec);
   return groundedPose(arm, bp.probes, rot, shift, spec.ground ?? 'lowest', 0, surface);
 }
 
+/** How steeply (degrees below the horizontal) a grazing animal's muzzle points: down, and forward. */
+const GRAZE_MUZZLE_PITCH = 70;
+
 /**
- * The neck angle (degrees, raised > 0) of a grazing quadruped pose at which the lowest point of the
- * head (the muzzle, or the jaw of a long head held steeply) is just above the ground (3% of the
- * actor's height), bisected; the lowest angle tried when the neck is too short.
+ * The neck and head angles (degrees, raised > 0) of a grazing quadruped pose: the neck lowered until
+ * the muzzle is just above the ground (3% of the actor's height), bisected, the head turned at each
+ * neck angle so the muzzle points GRAZE_MUZZLE_PITCH below the horizontal; never so low that the
+ * nose comes back to within a tenth of the height of the foremost front foot (a short neck would
+ * fold the head back between the front legs): there a short-necked animal grazes as low as it can.
  */
-function grazingNeck(arm: ArmatureData, bp: Blueprint, spec: AnimalPoseSpec): number {
+function grazingNeck(arm: ArmatureData, bp: Blueprint, spec: AnimalPoseSpec): { neck: number; head: number } {
   const surface = partSurfaces(bp);
   const isHead = (p: { bone: string }) => p.bone === 'head';
   const head = [...bp.probes.filter(isHead), { bone: 'head', point: bp.head.nose, radius: 0 }];
   const headSurface = surface.filter(isHead);
   const body = bp.probes.filter((p) => !isHead(p));
   const bodySurface = surface.filter((p) => !isHead(p));
+  const frontFeet = bp.probes.filter((p) => /^foot\.F[LR]$/.test(p.bone));
   const clearance = 0.03 * bp.height;
+  const headBone = arm.bones.find((b) => b.name === 'head');
+  const bonesAt = (neck: number, h: number) =>
+    poseBones(arm, animalRotations({ ...spec, neck, head: h }).rot, [0, 0, 0]);
+  // the head angle that points the muzzle (head bone to nose) GRAZE_MUZZLE_PITCH below the
+  // horizontal, forward (−Y): the pitch falls one for one as the head is raised
+  const headAt = (neck: number): number => {
+    if (!headBone) return spec.head ?? 0;
+    const bones = bonesAt(neck, 0);
+    const a = posedPoint(arm, bones, 'head', headBone.head as Vec3);
+    const b = posedPoint(arm, bones, 'head', bp.head.nose);
+    const pitch = (Math.atan2(a[2] - b[2], a[1] - b[1]) * 180) / Math.PI;
+    return pitch - GRAZE_MUZZLE_PITCH;
+  };
   // the head's height above the lowest point of the rest of the body, less the clearance (falls
-  // as the neck lowers)
+  // as the neck lowers), and how far the nose is ahead of the foremost front foot, less a tenth of
+  // the height (falls too)
   const above = (neck: number) => {
-    const bones = poseBones(arm, animalRotations({ ...spec, neck }).rot, [0, 0, 0]);
+    const bones = bonesAt(neck, headAt(neck));
     return (
       lowestPoint(arm, bones, head, headSurface) - lowestPoint(arm, bones, body, bodySurface) - clearance
     );
   };
+  const ahead = (neck: number) => {
+    const bones = bonesAt(neck, headAt(neck));
+    let foot = Infinity;
+    for (const p of frontFeet) foot = Math.min(foot, posedPoint(arm, bones, p.bone, p.point)[1]);
+    return foot - posedPoint(arm, bones, 'head', bp.head.nose)[1] - 0.1 * bp.height;
+  };
+  const bisect = (ok: (neck: number) => boolean, lo: number, hi: number): number => {
+    for (let i = 0; i < 14; i++) {
+      const mid = (lo + hi) / 2;
+      if (ok(mid)) hi = mid;
+      else lo = mid;
+    }
+    return hi;
+  };
   // the muzzle keeps falling until the neck points about 105° below its rest angle
-  let hi = 0;
   let lo = -105;
-  if (above(lo) > 0) return lo;
-  for (let i = 0; i < 14; i++) {
-    const mid = (lo + hi) / 2;
-    if (above(mid) > 0) hi = mid;
-    else lo = mid;
-  }
-  return hi;
+  if (ahead(lo) < 0) lo = ahead(0) < 0 ? 0 : bisect((n) => ahead(n) < 0, lo, 0);
+  const neck = above(lo) > 0 ? lo : bisect((n) => above(n) > 0, lo, 0);
+  return { neck, head: headAt(neck) };
 }
 
 /**

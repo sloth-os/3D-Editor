@@ -35,6 +35,7 @@ import { Checkbox, NumberField, Row, SelectField, TextField } from '../fields/fi
 import { Icon } from '../icons';
 import { telemetry } from '../../telemetry/telemetry';
 import { resolveWebDAV } from '../../storage/webdav';
+import { ExportVideoDialog } from './ExportVideoDialog';
 
 export function Modal(p: {
   title: string;
@@ -1111,6 +1112,8 @@ export function DialogHost() {
       return <AboutDialog />;
     case 'shortcuts':
       return <ShortcutsDialog />;
+    case 'export-video':
+      return <ExportVideoDialog />;
     default:
       return null;
   }

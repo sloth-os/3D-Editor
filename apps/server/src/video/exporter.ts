@@ -19,6 +19,7 @@ import {
   type ImageResult,
   type PassName,
   type PhysicsFrame,
+  type ProcessMemory,
   type RawFrame,
   type WorkerResult,
 } from '../render/protocol';
@@ -33,6 +34,18 @@ import {
 } from './ffmpeg';
 import { renderInOrder } from './frames';
 import { ShotTracks, buildManifest, type ManifestFile } from './manifest';
+import {
+  exportMemory,
+  exportNeeds,
+  fewerProcessesWarning,
+  outOfMemoryMessage,
+  readMachineMemory,
+  renderInfo,
+  type ExportMemory,
+  type ExportNeeds,
+  type ExportRenderInfo,
+  type MemoryReader,
+} from './memory';
 import { qualityPreset, type VideoExportParams } from './params';
 import {
   buildPalette,
@@ -63,6 +76,13 @@ import type { ExportFile, ExportProgress } from './index';
  * its frame is rendered again on another leased thread, or, when none is left, on a new lease once
  * the pool has started new processes. Only a frame (or a shot's measurement, or the contact sheet)
  * that took down MAX_PROCESS_DEATHS render processes itself fails the export.
+ *
+ * Before anything starts, the export leases only as many render processes as the machine's
+ * available memory holds next to ffmpeg and the server (memory.ts, `decideMemory`; at least one, at
+ * most RENDER_WORKERS), and fails with OUT_OF_MEMORY when not even one fits. Once its frames are
+ * rendered (or it fails), the render processes it used drop the renderer's working buffers and,
+ * unless another long render uses them, their cached documents (its snapshot is of no use to
+ * anyone after it), which they would otherwise keep until they idle out.
  */
 
 /** Frames of one lease at most (SPEC: per shot, or at most 200 frames / 2 minutes). */
@@ -96,6 +116,8 @@ export interface ExportEnvironment {
   ffmpegPath: string;
   /** The encoders ffmpeg has (libvpx-vp9 decides whether VP9 is possible). */
   encoders: ReadonlySet<string>;
+  /** Reads the memory available to the export (default: /proc/meminfo and the cgroup, else os.freemem()). */
+  memory?: MemoryReader;
   /** Frames written (metrics). */
   onFrames?(n: number): void;
 }
@@ -113,6 +135,8 @@ export interface ExportRunInput {
   fileUrl(name: string): string;
   onStatus(status: 'running' | 'encoding'): void;
   onProgress(p: ExportProgress): void;
+  /** How the export renders (job status `render`): told once, before rendering or refusing. */
+  onRender?(info: ExportRenderInfo): void;
   /** A warning (each reported once by the job). */
   onWarning(message: string): void;
 }
@@ -219,6 +243,16 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
   const lines = stringLines(snapshot, height);
   const renderer = env.renderer;
   if (renderer.pool.mode === 'main-thread') throw mainThreadError();
+  // the render processes the machine's memory holds next to ffmpeg and the server (decided before
+  // either starts)
+  const memory = await decideMemory(
+    renderer.pool,
+    exportNeedsOf(snapshot, plan, params, codec, renderer.pool.capacity),
+    { read: env.memory ?? readMachineMemory, contactSheet: outputs.contact_sheet, signal },
+  );
+  input.onRender?.(renderInfo(memory));
+  if (memory.processes < 1) throw new ToolError(outOfMemoryMessage(memory, width, height), 'OUT_OF_MEMORY');
+  if (memory.processes < memory.capacity) warn(fewerProcessesWarning(memory));
   // the snapshot's state, held for the whole run (render processes cache it by its own key)
   const doc: DocRef = renderer.docRef(input.project.id, snapshot);
 
@@ -230,6 +264,18 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
   const tile = contactTileSize(plan.shots.length * 2, width, height);
   /** Errors of the render processes that died during the export (their work was done again). */
   const processDeaths: Error[] = [];
+  /** The render threads the export leased (they drop their working buffers at its end). */
+  const used = new Set<RenderThread>();
+  let buffersReleased = false;
+  const releaseBuffers = () => {
+    if (buffersReleased) return;
+    buffersReleased = true;
+    // its snapshot (cached by every process it rendered on) is of no use after it: the documents
+    // go too, unless another long render works in the processes now (its document stays)
+    const documents = !((renderer.pool.activeLongRenders || 0) > 0);
+    // after the requests sent before (fire and forget); a dead process has nothing to give back
+    for (const t of used) if (t.alive) t.releaseBuffers?.({ documents });
+  };
   const t0 = performance.now();
   let written = 0;
   try {
@@ -323,7 +369,8 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
       };
       let k = 0;
       while (k < shot.renderFrames) {
-        const lease: RenderLease = await renderer.pool.lease(Infinity, signal);
+        const lease: RenderLease = await renderer.pool.lease(memory.processes, signal);
+        for (const t of lease.threads) used.add(t);
         try {
           if (lease.threads.some((t) => t.kind === 'main')) throw mainThreadError();
           const first: RenderThread = lease.threads.find((t) => t.alive) ?? lease.threads[0];
@@ -362,6 +409,7 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
             ao: preset.ao,
             msaa: preset.msaa,
             shadowFit: measured.shadowFit ?? undefined,
+            aoRadius: measured.aoRadius,
             passes,
             depthRange: measured.depthRange,
             objectPalette,
@@ -417,6 +465,8 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
       }
     }
 
+    // every frame is rendered: the render processes give their working buffers back
+    releaseBuffers();
     input.onStatus('encoding');
     await Promise.all(open.map((s) => s.proc.finish()));
     for (const s of open) keep.add(s.file);
@@ -496,6 +546,7 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
     await add('manifest.json', { kind: 'manifest' });
     return { files, plan };
   } catch (err) {
+    releaseBuffers();
     // stop ffmpeg (SIGKILL) and delete the partial outputs
     await Promise.allSettled(open.map((s) => s.proc.kill()));
     await Promise.allSettled(pending);
@@ -518,6 +569,90 @@ export function mainThreadError(): ToolError {
     'Video export needs render processes, and this server renders on its main thread (RENDER_WORKERS=0, or render processes could not start): set RENDER_WORKERS to 1 or more and restart the server.',
     'UNAVAILABLE',
   );
+}
+
+/** The codec an export encodes with: VP9 needs ffmpeg's libvpx-vp9 encoder, else H.264. */
+export function exportCodec(codec: 'h264' | 'vp9', encoders: ReadonlySet<string>): 'h264' | 'vp9' {
+  return codec === 'vp9' && !encoders.has('libvpx-vp9') ? 'h264' : codec;
+}
+
+/** What an export of `doc` needs (memory.ts), as `runExport` renders and encodes it. */
+export function exportNeedsOf(
+  doc: SceneDoc,
+  plan: Pick<ExportPlan, 'width' | 'height'>,
+  params: VideoExportParams,
+  codec: 'h264' | 'vp9',
+  capacity: number,
+): ExportNeeds {
+  const passes = [...new Set(params.passes)] as PassName[];
+  return exportNeeds({
+    snapshot: doc,
+    width: plan.width,
+    height: plan.height,
+    passes,
+    look: params.look,
+    preset: qualityPreset(params.quality, plan.width, plan.height),
+    strings: stringLines(doc, plan.height).length > 0,
+    streams: streamsFor(passes, codec),
+    quality: params.quality,
+    capacity,
+    maxBytesAhead: MAX_BYTES_AHEAD,
+  });
+}
+
+/**
+ * How many render processes an export renders on (memory.ts), decided before ffmpeg or any render
+ * starts. First as if no render process ran: every one still to start, nothing held (exact for an
+ * idle pool; with processes running, their memory then counts twice, which errs on the safe side).
+ * When that holds fewer than RENDER_WORKERS while render processes run, and what they could hold
+ * would change it, every render process of the pool is leased (the pool starts the missing ones,
+ * as it would for the export's first segment) and asked what it holds (`memory`), and the machine's
+ * memory read again: each process the export leases needs only what it does not hold yet, in the
+ * order the pool leases them. Processes that work for another render at the same time hold memory
+ * of that render: nothing of theirs counts then. The contact sheet may start the interactive
+ * render process at the end: its base is kept when it does not run.
+ */
+export async function decideMemory(
+  pool: Renderer['pool'],
+  needs: ExportNeeds,
+  o: { read: MemoryReader; contactSheet: boolean; signal: AbortSignal },
+): Promise<ExportMemory> {
+  const capacity = needs.capacity;
+  const cold = exportMemory(needs, { notStarted: capacity, interactive: o.contactSheet, machine: o.read() });
+  const running = Math.min(capacity, Math.max(0, pool.running || 0));
+  if (cold.processes >= capacity || running === 0) return cold;
+  // the most the running processes could hold: whether asking them can change anything
+  const best = exportMemory(needs, {
+    notStarted: capacity - running,
+    warm: Array.from({ length: running }, () => Infinity),
+    machine: cold.machine,
+  });
+  if (best.processes <= cold.processes) return cold;
+  const lease = await pool.lease(capacity, o.signal);
+  try {
+    if (lease.threads.some((t) => t.kind === 'main')) throw mainThreadError();
+    // another long render shares the processes (this lease is one): their memory is partly its own
+    const shared = (pool.activeLongRenders || 1) > 1;
+    const rss = await Promise.all(
+      lease.threads.map((t) =>
+        shared || !t.alive || t.pending > 0
+          ? 0
+          : t.call<ProcessMemory>({ type: 'memory' }).then(
+              (m) => m.rss,
+              () => 0,
+            ),
+      ),
+    );
+    return exportMemory(needs, {
+      notStarted: capacity - lease.threads.length,
+      warm: rss,
+      // every render process of long renders runs now: one more is the interactive one
+      interactive: o.contactSheet && (pool.running || 0) <= lease.threads.length,
+      machine: o.read(),
+    });
+  } finally {
+    lease.release();
+  }
 }
 
 const asError = (err: unknown): Error => (err instanceof Error ? err : new Error(String(err)));

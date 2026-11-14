@@ -1,6 +1,18 @@
 import { describe, expect, it, vi } from 'vitest';
 import * as core from '@3d-editor/core';
-import { SceneDoc, SceneEvaluator, createCube, type Vec3 } from '@3d-editor/core';
+import {
+  SceneDoc,
+  SceneEvaluator,
+  createCube,
+  createMesh,
+  createPlane,
+  defaultAoRadius,
+  lookAt4,
+  multiply4,
+  perspective4,
+  renderItems,
+  type Vec3,
+} from '@3d-editor/core';
 import { OPENPOSE_COLORS } from '../../src/render/passes';
 import type { DeskFrameOptions, PassName } from '../../src/render/protocol';
 
@@ -27,8 +39,15 @@ vi.mock('@3d-editor/core', async (importOriginal) => {
   };
 });
 
-const { renderDeskFrame, deskShotInfo, sampleShotFrames, boxDistances, deskAovs, deskRenderOptions } =
-  await import('../../src/render/desk');
+const {
+  renderDeskFrame,
+  deskShotInfo,
+  sampleShotFrames,
+  boxDistances,
+  deskAovs,
+  deskRenderOptions,
+  leftToRight,
+} = await import('../../src/render/desk');
 
 const W = 64;
 const H = 36;
@@ -104,6 +123,23 @@ const at = (buf: Uint8Array, x: number, y: number, ch = 1) => [
 /** Rows of column `x` where `buf` (one byte per pixel) has `value`. */
 const rowsWith = (buf: Uint8Array, x: number, value: number) =>
   Array.from({ length: H }, (_, y) => y).filter((y) => buf[y * W + x] === value);
+
+/** Pixels of `buf` (one byte per pixel) with `value`. */
+const countOf = (buf: Uint8Array, value: number) => buf.reduce((n, v) => n + (v === value ? 1 : 0), 0);
+
+/** A string as a wire of two vertices (no faces: only its line is drawn), from `a` to `b` in that order. */
+function wireString(s: ReturnType<typeof scene>, a: Vec3, b: Vec3): string {
+  let id = '';
+  s.doc.transact(() => {
+    id = s.doc.addObject({
+      type: 'MESH',
+      name: 'Wire string',
+      data: s.doc.addMesh('Wire string', createMesh({ positions: [...a, ...b], looseEdges: [0, 1] })),
+      custom_props: { desk_role: 'string' },
+    });
+  });
+  return id;
+}
 
 describe('desk frames', () => {
   it('renders the beauty image and every pass from one evaluation', () => {
@@ -315,6 +351,179 @@ describe('desk frames', () => {
     expect(deskAovs(new Set(['mask']), true)).toEqual(['depth', 'object']);
     expect(deskAovs(new Set(['edges']), false)).toEqual(['depth', 'normal', 'object']);
     expect(deskAovs(new Set(['pose']), true)).toEqual(['depth']);
+  });
+});
+
+describe('strings', () => {
+  it('orders a segment’s ends left to right on screen, after the near-plane clip', () => {
+    // a camera at the origin looking along +Y
+    const vp = multiply4(
+      perspective4(Math.PI / 3, 16 / 9, 0.1, 100),
+      lookAt4([0, 0, 0], [0, 1, 0], [0, 0, 1]),
+    );
+    const left: Vec3 = [-1, 5, 0];
+    const right: Vec3 = [1, 5, 0];
+    expect(leftToRight(vp, left, right)).toEqual([left, right]);
+    expect(leftToRight(vp, right, left)).toEqual([left, right]);
+    // an end behind the camera: the part drawn runs from `left` to the near plane, far to the right
+    // (projected without the clip, the end behind would land left of `left`)
+    const behind: Vec3 = [3, -5, 0];
+    expect(leftToRight(vp, behind, left)).toEqual([left, behind]);
+    expect(leftToRight(vp, left, behind)).toEqual([left, behind]);
+    // both behind (nothing drawn) or one above the other: as given
+    const behind2: Vec3 = [-3, -5, 0];
+    expect(leftToRight(vp, behind, behind2)).toEqual([behind, behind2]);
+    const top: Vec3 = [0, 5, 1];
+    const bottom: Vec3 = [0, 5, -1];
+    expect(leftToRight(vp, top, bottom)).toEqual([top, bottom]);
+  });
+
+  it('draws a string running right to left on screen as fully as one running left to right', () => {
+    // the same diagonal string in front of the cube, its vertices in either order
+    const frames = [false, true].map((reversed) => {
+      const s = scene();
+      const a: Vec3 = [-3, -3, -1.2];
+      const b: Vec3 = [3, -3, 1.4];
+      const wire = reversed ? wireString(s, b, a) : wireString(s, a, b);
+      return render(
+        s,
+        desk(s, ['beauty', 'mask', 'edges', 'pose'], {
+          objectPalette: { [s.cube]: [255, 0, 0], [wire]: [0, 255, 0] },
+          lines: [{ object: wire, width_px: 2, color: [1, 0, 0] }],
+        }),
+      );
+    });
+    const [ltr, rtl] = frames;
+    for (const pass of ['mask', 'edges', 'pose'] as const)
+      expect(Buffer.from(rtl.passes![pass]!).equals(Buffer.from(ltr.passes![pass]!)), pass).toBe(true);
+    expect(Buffer.from(rtl.data!).equals(Buffer.from(ltr.data!))).toBe(true);
+    // unbroken and 2 px wide across the frame (64 px wide, ~70 px long): mask index 2
+    const n = countOf(ltr.passes!.mask!, 2);
+    expect(n).toBeGreaterThanOrEqual(2 * 60);
+    for (let x = 1; x < W - 1; x++)
+      expect(rowsWith(ltr.passes!.mask!, x, 2).length, `column ${x}`).toBeGreaterThan(0);
+  });
+
+  it('hides strings behind surfaces in every pass, the pose pass too', () => {
+    const s = scene();
+    // a horizontal string across the frame 2 m behind the cube (the camera looks along +Y at its
+    // front face)
+    const wire = wireString(s, [-6, 2, 0.3], [6, 2, 0.3]);
+    const img = render(
+      s,
+      desk(s, ['beauty', 'mask', 'pose'], {
+        objectPalette: { [s.cube]: [255, 0, 0], [wire]: [0, 255, 0] },
+        lines: [{ object: wire, width_px: 2, color: [1, 1, 1] }],
+      }),
+    );
+    const { mask, pose } = img.passes as Record<'mask' | 'pose', Uint8Array>;
+    // beside the cube the string shows (column 2) …
+    const rows = rowsWith(mask, 2, 2);
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    expect(at(pose, 2, rows[0], 3)[0]).toBeGreaterThan(100);
+    // … behind it, it does not: the cube's index in the mask, black in the pose pass
+    for (const y of rows) {
+      expect(at(mask, W / 2, y)).toEqual([1]);
+      expect(at(pose, W / 2, y, 3)).toEqual([0, 0, 0]);
+    }
+  });
+});
+
+describe('ambient occlusion reach of a shot', () => {
+  /**
+   * A cube on a ground plane seen by a camera, and five pebbles 40 m away (out of view) shown in
+   * frame 1 and hidden from frame 2 (keyed hide_render): the renderer's own reach is a quarter of
+   * the median size of what it draws, the pebbles' at frame 1, the ground's (capped) at frame 2.
+   */
+  function pebbles() {
+    const doc = SceneDoc.create();
+    const cube = doc.listObjects().find((o) => o.type === 'MESH')!.id;
+    let cam = '';
+    doc.transact(() => {
+      for (const o of doc.listObjects()) if (o.type === 'CAMERA') doc.removeObject(o.id);
+      cam = doc.addObject({
+        type: 'CAMERA',
+        name: 'Cam',
+        data: doc.addCamera({ lens: 35 }),
+        location: [0, -6, 2.5],
+        rotation_euler: [1.2, 0, 0],
+      });
+      doc.updateScene({ camera: cam, frame_start: 1, frame_end: 2 });
+      doc.updateObject(cube, { location: [0, 0, 1] });
+      doc.addObject({ type: 'MESH', name: 'Ground', data: doc.addMesh('Ground', createPlane({ size: 10 })) });
+      for (let i = 0; i < 5; i++) {
+        const id = doc.addObject({
+          type: 'MESH',
+          name: `Pebble ${i}`,
+          data: doc.addMesh(`Pebble ${i}`, createCube({ size: 0.2 })),
+          location: [40 + i, 0, 0],
+        });
+        doc.setFCurve({
+          target_type: 'object',
+          target_id: id,
+          path: 'hide_render',
+          index: 0,
+          keyframes: [
+            { frame: 1, value: 0, interpolation: 'CONSTANT' },
+            { frame: 2, value: 1, interpolation: 'CONSTANT' },
+          ],
+          extrapolation: 'CONSTANT',
+          mute: false,
+        } as Parameters<SceneDoc['setFCurve']>[0]);
+      }
+    });
+    return { doc, cam, evaluator: new SceneEvaluator(doc) };
+  }
+  const drawnAt = (p: ReturnType<typeof pebbles>, frame: number) =>
+    renderItems(p.evaluator.evaluate(frame, { forRender: true }), { forRender: true }).filter(
+      (i) => i.mesh.faces.length > 0,
+    );
+
+  it('measures the reach of the shot’s first frame, as the renderer would choose it there', () => {
+    const p = pebbles();
+    const info = deskShotInfo(
+      { doc: p.doc, evaluator: p.evaluator },
+      { frames: [1, 2], cameraId: p.cam, aspect: 16 / 9 },
+      () => {},
+    );
+    expect(info.aoRadius).toBe(defaultAoRadius(drawnAt(p, 1)));
+    // a quarter of the pebbles' size (the median of seven items)
+    expect(info.aoRadius).toBeCloseTo(0.25 * Math.hypot(0.2, 0.2, 0.2), 6);
+    // the renderer alone would reach farther at frame 2, the pebbles hidden
+    expect(defaultAoRadius(drawnAt(p, 2))).toBe(0.5);
+    // a shot starting at frame 2 measures that reach
+    expect(
+      deskShotInfo(
+        { doc: p.doc, evaluator: p.evaluator },
+        { frames: [2], cameraId: p.cam, aspect: 1 },
+        () => {},
+      ).aoRadius,
+    ).toBe(0.5);
+    // and the desk's render options carry the shot's reach
+    expect(
+      deskRenderOptions({ width: 8, height: 8 }, { ...desk(scene(), ['beauty']), aoRadius: 0.2 }),
+    ).toMatchObject({ ao: false, aoRadius: 0.2 });
+  });
+
+  it('keeps the occlusion of what stays in view when things out of view hide within the shot', () => {
+    const p = pebbles();
+    const info = deskShotInfo(
+      { doc: p.doc, evaluator: p.evaluator },
+      { frames: [1, 2], cameraId: p.cam, aspect: 96 / 54 },
+      () => {},
+    );
+    const frame = (f: number, aoRadius?: number) =>
+      renderDeskFrame(
+        { doc: p.doc, evaluator: p.evaluator, simulated: () => null },
+        { width: 96, height: 54, frame: f, cameraId: p.cam, samples: 1 },
+        { look: 'material', shadows: false, ao: true, msaa: true, passes: ['beauty'], aoRadius },
+      ).data!;
+    // with the shot's reach both frames are the same image (nothing in view changed)
+    const first = frame(1, info.aoRadius);
+    expect(Buffer.from(frame(2, info.aoRadius)).equals(Buffer.from(first))).toBe(true);
+    // the renderer's own reach changes the occlusion around the cube although nothing in view did
+    expect(Buffer.from(frame(1)).equals(Buffer.from(first))).toBe(true);
+    expect(Buffer.from(frame(2)).equals(Buffer.from(first))).toBe(false);
   });
 });
 

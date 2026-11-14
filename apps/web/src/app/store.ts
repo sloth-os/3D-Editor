@@ -10,7 +10,8 @@ export const session = signal<ProjectSession | null>(null);
 export type Workspace = 'Layout' | 'Modeling' | 'Shading' | 'Animation' | 'Scripting' | 'Director';
 export const workspace = signal<Workspace>('Layout');
 
-export type DialogKind = 'projects' | 'preferences' | 'export' | 'about' | 'shortcuts' | 'render' | null;
+export type DialogKind =
+  'projects' | 'preferences' | 'export' | 'about' | 'shortcuts' | 'render' | 'export-video' | null;
 export const dialog = signal<DialogKind>(null);
 export const dialogProps = signal<Record<string, unknown>>({});
 

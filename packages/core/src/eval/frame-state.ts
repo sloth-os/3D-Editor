@@ -1,6 +1,6 @@
 import type { Mat4 } from '../math/types';
 import { compose4, identity4, multiply4, translation4 } from '../math/mat4';
-import type { AnimTargetType, CurveData, DriverData, FCurve, ObjectData } from '../doc/types';
+import type { AnimTargetType, CurveData, ObjectData } from '../doc/types';
 import { fcurveKey, type SceneDoc } from '../doc/scene-doc';
 import { evaluateFCurve } from '../anim/fcurve';
 import { readChannel, writeChannel } from '../anim/properties';
@@ -12,6 +12,7 @@ import { constraintContextFor, constraintObjectInfo } from '../constraints/conte
 import { dependencyGraph, inParentLoop } from '../constraints/depgraph';
 import type { ConstraintContext, ConstraintError } from '../constraints/types';
 import { buildCurvePath, type CurvePath } from '../curve/path';
+import { frameInput, type FrameInput } from './frame-input';
 
 export interface EvalError {
   /** What failed, e.g. `driver:object:<id>:location:0`, `pose:<objectId>`. */
@@ -19,24 +20,15 @@ export interface EvalError {
   message: string;
 }
 
-type CurveIndex = Map<string, FCurve[]>; // `${type}:${id}` → curves
-
 /** An object's location, rotation and scale. */
 type Channels = Pick<ObjectData, 'location' | 'rotation_euler' | 'scale'>;
-
-/** What a frame state reads from the document, once (see FrameStateOptions.base). */
-interface FrameInput {
-  raw: ObjectData[];
-  rawById: Map<string, ObjectData>;
-  curves: CurveIndex;
-  drivers: Map<string, DriverData[]>;
-}
 
 /** Options of a {@link FrameState}. */
 export interface FrameStateOptions {
   /**
    * A frame state of the same document whose reading of the document this one shares (the
-   * document must not have changed since): building it then reads nothing from the document.
+   * document must not have changed since). Every frame state of an unchanged document shares its
+   * reading anyway (eval/frame-input.ts); `base` matters for `affected`.
    */
   base?: FrameState;
   /**
@@ -80,26 +72,13 @@ interface Overlay {
   affected: ReadonlySet<string>;
 }
 
-function indexByTarget<T extends { target_type: string; target_id: string; mute: boolean }>(
-  items: T[],
-  skip: (t: T) => boolean,
-): Map<string, T[]> {
-  const idx = new Map<string, T[]>();
-  for (const it of items) {
-    if (it.mute || skip(it)) continue;
-    const k = `${it.target_type}:${it.target_id}`;
-    const list = idx.get(k);
-    if (list) list.push(it);
-    else idx.set(k, [it]);
-  }
-  return idx;
-}
-
 type Block = Record<string, unknown>;
 
 /**
  * Lazily animated datablocks of one frame: F-curves first, then drivers. A driver reading a
- * datablock that is still being resolved (e.g. its own object) sees the F-curve values.
+ * datablock that is still being resolved (e.g. its own object) sees the F-curve values. Objects
+ * are copies of the shared input's (eval/frame-input.ts): a caller changing an object it gets
+ * changes this frame state's copy only.
  */
 class AnimatedStore {
   private readonly animated = new Map<string, Block | null>();
@@ -109,9 +88,7 @@ class AnimatedStore {
   constructor(
     private readonly doc: SceneDoc,
     private readonly frame: number,
-    private readonly objects: Map<string, ObjectData>,
-    private readonly curves: CurveIndex,
-    private readonly drivers: Map<string, DriverData[]>,
+    private readonly input: FrameInput,
     private readonly errors: EvalError[],
     /** Objects' channels replacing what their F-curves and stored values give (before drivers). */
     private readonly channels: ReadonlyMap<string, Channels> | null = null,
@@ -131,7 +108,7 @@ class AnimatedStore {
     const d = this.doc;
     switch (type) {
       case 'object':
-        return (this.objects.get(id) as unknown as Block) ?? null;
+        return (this.input.rawById.get(id) as unknown as Block | undefined) ?? null;
       case 'material':
         return d.getMaterial(id) as unknown as Block | null;
       case 'light':
@@ -153,15 +130,15 @@ class AnimatedStore {
     const k = `${type}:${id}`;
     if (this.animated.has(k)) return this.animated.get(k)!;
     const raw = this.raw(type, id);
-    let out = raw;
-    const curves = this.curves.get(k);
-    if (raw && curves) {
-      out = { ...raw };
+    const curves = raw ? this.input.curves.get(k) : undefined;
+    // an object is the shared input's: this frame state's is a copy (writeChannel replaces the
+    // fields it writes, copying nested values along their paths, so the input is never written)
+    let out = raw && (curves || type === 'object') ? { ...raw } : raw;
+    if (out && curves)
       for (const fc of curves) {
-        const v = evaluateFCurve(fc, this.frame);
+        const v = evaluateFCurve(fc, this.frame, this.input.keys(fc));
         if (v !== undefined) writeChannel(out, fc.path, fc.index, v);
       }
-    }
     const c = raw && type === 'object' ? this.channels?.get(id) : undefined;
     if (out && c) out = { ...out, location: c.location, rotation_euler: c.rotation_euler, scale: c.scale };
     this.animated.set(k, out);
@@ -172,10 +149,11 @@ class AnimatedStore {
     const k = `${type}:${id}`;
     if (this.final.has(k)) return this.final.get(k) as T | null;
     const fb = this.fallback;
-    if (fb && (type === 'object' ? !fb.affected.has(id) : fb.data ? !fb.data.has(k) : !this.drivers.has(k)))
+    const drivers = this.input.drivers;
+    if (fb && (type === 'object' ? !fb.affected.has(id) : fb.data ? !fb.data.has(k) : !drivers.has(k)))
       return fb.store.get<T>(type, id);
     const base = this.animatedOnly(type, id);
-    const ds = base ? this.drivers.get(k) : undefined;
+    const ds = base ? drivers.get(k) : undefined;
     if (!base || !ds) {
       this.final.set(k, base);
       return base as T | null;
@@ -244,36 +222,18 @@ export class FrameState {
       simulated && released && [...released].some((id) => simulated.has(id))
         ? new Map([...simulated].filter(([id]) => !released.has(id)))
         : simulated;
-    let input = options.base?.input;
-    if (!input) {
-      const raw = doc.listObjects();
-      input = {
-        raw,
-        rawById: new Map(raw.map((o) => [o.id, o])),
-        curves: indexByTarget(doc.listFCurves(), (fc) => fc.keyframes.length === 0),
-        drivers: indexByTarget(doc.listDrivers(), () => false),
-      };
-    }
+    // what the document holds, read once per document state for all frame states (frame-input.ts)
+    const input = options.base?.input ?? frameInput(doc);
     this.input = input;
     const { base, affected } = options;
     this.over =
       base && affected && base.frame === frame && base.simulated === simulated ? { base, affected } : null;
-    const { rawById, curves, drivers } = input;
     const fallback = this.over && {
       store: this.over.base.store,
       affected: this.over.affected,
       data: options.affectedData ?? null,
     };
-    this.store = new AnimatedStore(
-      doc,
-      frame,
-      rawById,
-      curves,
-      drivers,
-      this.errors,
-      options.channels,
-      fallback,
-    );
+    this.store = new AnimatedStore(doc, frame, input, this.errors, options.channels, fallback);
     // an overlay lists the scene's objects only when asked for them
     if (!this.over) void this.byId;
   }

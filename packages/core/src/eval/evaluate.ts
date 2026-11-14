@@ -115,8 +115,20 @@ interface CurveCacheEntry {
 
 const fmtMatrix = (m: Mat4 | null | undefined): string => (m ? m.map((x) => x.toFixed(5)).join(',') : 'none');
 
-function hasRigidBodies(doc: SceneDoc, objects: readonly ObjectData[]): boolean {
-  return !!doc.getScene().rigidbody_world?.enabled && objects.some((o) => o.rigid_body?.enabled);
+/**
+ * Whether the scene simulates rigid bodies: its world is enabled and an object has an enabled body.
+ * The stored objects (Y.Maps of their fields, SceneDoc.createBlock) are read in place, not the frame
+ * states' input (eval/frame-input.ts): a document that has no cached input (no live Y.Doc) is then
+ * read once per evaluation, by its frame state.
+ */
+function hasRigidBodies(doc: SceneDoc): boolean {
+  if (!doc.getScene().rigidbody_world?.enabled) return false;
+  for (const y of doc.map('objects').values()) {
+    const body = (y as { get(key: string): unknown }).get('rigid_body') as
+      ObjectData['rigid_body'] | undefined;
+    if (body?.enabled) return true;
+  }
+  return false;
 }
 
 /**
@@ -169,7 +181,7 @@ export class SceneEvaluator {
     const forRender = !!opts.forRender;
     let simulated: Map<string, Mat4> | null = null;
     const physicsErrors: EvalError[] = [];
-    if (!opts.noPhysics && hasRigidBodies(doc, doc.listObjects())) {
+    if (!opts.noPhysics && hasRigidBodies(doc)) {
       try {
         simulated = this.rigidBodies.evaluate(doc, frame, {
           transformsAt: (f) => this.transformsAt(f),

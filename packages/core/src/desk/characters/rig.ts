@@ -366,6 +366,9 @@ export function partSurfaces(bp: Blueprint): readonly PartSurface[] {
 
 // ---------------------------------------------------------------- actors in a document
 
+/** Name prefix of the CHILD_OF that seats a rider on a mount's saddle ('Ride <mount>'). */
+export const RIDE_PREFIX = 'Ride ';
+
 /** What the desk stores on an actor's armature object. */
 export interface ActorMeta {
   id: string;

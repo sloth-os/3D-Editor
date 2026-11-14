@@ -3,7 +3,7 @@ import type { SceneDoc } from '../../doc/scene-doc';
 import type { CollisionShape } from '../../doc/types';
 import { deskBake, deskBakePlan, type DeskBakeResult } from './bake';
 import { deskDrop, deskPhysicsSetupBodies, deskPush, deskThrow, type DeskWorldRange } from './presets';
-import { tetherFly, type TetherResult } from './tether';
+import { tetherFly, type TetherAfter, type TetherResult } from './tether';
 import { vehicleDrive, type VehicleResult } from './vehicle';
 
 /*
@@ -38,14 +38,28 @@ export {
   updateDeskWorldRange,
   type DeskWorldRange,
 } from './presets';
-export { DESK_BAKE_MAX_BODY_FRAMES, deskBakePlan, type DeskBakePlan, type DeskBakeResult } from './bake';
 export {
+  DESK_BAKE_MAX_BODY_FRAMES,
+  deskBakePlan,
+  type DeskBakeBody,
+  type DeskBakePlan,
+  type DeskBakeResult,
+} from './bake';
+export { modelRootOf as deskModelRoot } from './common';
+export {
+  TETHER_AFTER,
+  TETHER_LAND_FALL_FACTOR,
+  TETHER_LAND_SECONDS,
   TETHER_MAX_FRAMES,
   TETHER_MAX_OBJECT_FRAMES,
   TETHER_STRING_RADIUS,
   TETHER_TAIL_SEGMENTS,
+  TETHER_TAIL_SETTLE_SECONDS,
   seedFromName as deskTetherSeed,
+  tetherLandFramesMax,
+  tetherLandSeconds,
   windModel as deskWindModel,
+  type TetherAfter,
   type TetherResult,
 } from './tether';
 export {
@@ -97,6 +111,8 @@ export interface DeskTetherFlyOptions {
   tail?: boolean;
   string?: boolean;
   seed?: number;
+  /** After frame_end: 'hold' (default) where the flight ends, 'hide' the flyer, tail and string, 'land' a kite. */
+  after?: TetherAfter;
 }
 
 /** What a preset did to the rigid body world, and what the operator reports. */
@@ -146,7 +162,11 @@ export function deskPhysicsPush(
   return deskPush(doc, objectId, o);
 }
 
-/** Bakes the simulation of `objects` (default: every simulated body) to world-space keyframes. */
+/**
+ * Bakes the simulation of `objects` (bodies, or objects above them such as a store model's root;
+ * default: every simulated body) to keyframes: a body that carries a store model's geometry is keyed
+ * through the model's root, any other body on itself (desk/physics/bake.ts).
+ */
 export function deskPhysicsBake(
   doc: SceneDoc,
   o: { frame_start?: number; frame_end?: number; objects?: readonly string[] },
@@ -156,7 +176,7 @@ export function deskPhysicsBake(
 
 /**
  * Flies `flyer` on a string from `anchor` in the wind (phase 2): keys the flyer, its string and its
- * tail on every frame of the flight (desk/physics/tether.ts).
+ * tail on every frame of the flight, then holds, hides or lands them (`after`; desk/physics/tether.ts).
  */
 export function deskTetherFly(doc: SceneDoc, o: DeskTetherFlyOptions): TetherResult {
   return tetherFly(doc, o);

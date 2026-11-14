@@ -5,9 +5,10 @@ import { OperatorError } from '../../operators/context';
 import { DESK_PROPS } from '../props';
 import { buildActor, keyPose } from './actor';
 import { holdObject, lookAtObject, mountActor, refreshDismounts, refreshReleases } from './attach';
+import { attachedTo } from './estimate';
 import { keypointsOf, measureActor } from './keypoints';
 import { actorPosition, moveActor, turnActor, yawOf } from './locomotion';
-import type { ActorInfo, ActorKeypoints, CreateActorOptions } from './types';
+import type { ActorInfo, ActorKeypoints, CreateActorOptions, PoseLayer } from './types';
 
 /*
  * Actors of the director's desk (CHARACTERS; spec §8): segmented mannequins (humanoids) and
@@ -17,16 +18,19 @@ import type { ActorInfo, ActorKeypoints, CreateActorOptions } from './types';
  * position for checks, layouts, subject tracks and rideo exports. Gaits are explicit keys for every
  * cycle of a move, planned from footsteps so planted feet stay put. Hold and mount use CHILD_OF on a
  * bone subtarget with influence keyed 0→1 at the grab (inverse set there) and 1→0 at the release;
- * a rider's dismount is keyed again whenever its mount moves, turns or changes pose.
+ * a rider's dismount and a held prop's release are keyed again whenever what carries them moves,
+ * turns or changes pose (through a mount to its riders' props, and so on).
  *
  * Modules: types (names and constants), rig (shared vocabulary), mannequin / quadruped (bodies),
- * kinds (registry), poses, actor (build, pose keys), gait / locomotion (moves, turns), attach
- * (look, hold, ride), keypoints (measures).
+ * kinds (registry), poses, actor (build, pose keys), layers (gestures over the legs' stance),
+ * blend (hands kept out of the ground while a pose blends in), gait / locomotion (moves, turns),
+ * attach (look, hold, ride), keypoints (measures).
  */
 
 export * from './types';
 export { BUILT_KINDS, defaultHeight as defaultActorHeight } from './kinds';
 export { OPENPOSE18_KEYPOINTS, QUADRUPED_KEYPOINTS } from './keypoints';
+export { isGesture } from './layers';
 export { MAX_ACTOR_HEIGHT, MIN_ACTOR_HEIGHT } from './actor';
 
 /** Whether object `id` is an actor: an ARMATURE object with desk_role 'actor'. */
@@ -65,22 +69,33 @@ export function actorKeypoints(fs: FrameState, doc: SceneDoc, actorId: string): 
 
 /**
  * Keys pose `pose` at `frame`, blended from the pose the actor has blend_frames earlier (default 6)
- * and held for hold_frames; without a frame the pose becomes the actor's unkeyed rest pose.
+ * and held for hold_frames; without a frame the pose becomes the actor's unkeyed rest pose. `layer`
+ * (default 'full'): 'full' keys the whole figure, as spec §8 has it and as rideo draws its mark
+ * poses (the rideo import keys a 'point' mark after a 'sit' mark as a standing figure); 'auto' (the
+ * default of desk.actor_pose) layers a gesture (HUMAN_GESTURES, ANIMAL_GESTURES) on an actor that
+ * sits, kneels, crouches, lies, rides or moves its legs: only the spine, neck, head and the arms it
+ * uses are keyed, and the actor keeps the hips and legs it has; 'upper' keys only the upper body.
  */
 export function applyPose(
   doc: SceneDoc,
   actorId: string,
   pose: string,
-  o?: { frame?: number; blend_frames?: number; hold_frames?: number },
+  o?: { frame?: number; blend_frames?: number; hold_frames?: number; layer?: PoseLayer },
 ): void {
-  keyPose(doc, actorId, pose, o);
+  keyPose(doc, actorId, pose, { ...o, layer: o?.layer ?? 'full' });
   refreshAttached(doc, actorId);
 }
 
-/** Keys again what depends on where an actor's bones are: its riders' dismounts and its props' releases. */
-function refreshAttached(doc: SceneDoc, actorId: string): void {
+/**
+ * Keys again what depends on where an actor's bones are: its riders' dismounts and its props'
+ * releases, then the same for each actor attached to it (a rider's props move with the mount).
+ */
+export function refreshAttached(doc: SceneDoc, actorId: string, seen = new Set<string>()): void {
+  if (seen.has(actorId)) return;
+  seen.add(actorId);
   refreshDismounts(doc, actorId);
   refreshReleases(doc, actorId);
+  for (const id of attachedTo(doc, actorId)) if (isActor(doc, id)) refreshAttached(doc, id, seen);
 }
 
 /**
@@ -136,14 +151,16 @@ export function lookAt(
   o: { frame: number; blend_frames?: number },
 ): void {
   lookAtObject(doc, actorId, target, o);
-  refreshReleases(doc, actorId);
+  refreshAttached(doc, actorId);
 }
 
 /**
  * Makes the actor hold `propId` from `frame` until release_frame: a CHILD_OF on the hand bone (an
- * animal's head), influence 0 → 1 at the grab with its inverse set there so the prop sits in the
- * hand, 1 → 0 at the release where its visual transform is keyed. A person carries it in front of
- * the body: the holding arm takes a carrying posture while it holds.
+ * animal's head), influence 0 → 1 over the frames before the grab with its inverse set there so the
+ * prop glides into the hand, 1 → 0 at the release where its visual transform is keyed. A person
+ * carries it in front of the body: the holding arm takes a carrying posture while it holds. Holding
+ * the prop again with the same hand replaces the hold; another hand still holding it lets go at the
+ * grab (a hand-off).
  */
 export function holdProp(
   doc: SceneDoc,
@@ -152,10 +169,13 @@ export function holdProp(
   o: { hand?: 'right' | 'left'; frame: number; release_frame?: number },
 ): void {
   holdObject(doc, actorId, propId, o);
-  refreshReleases(doc, actorId);
+  refreshAttached(doc, actorId);
 }
 
-/** Seats `riderId` on `mountId`'s saddle in the 'ride' pose from `frame` until dismount_frame. */
+/**
+ * Seats `riderId` on `mountId`'s saddle in the 'ride' pose from `frame` until dismount_frame (riding
+ * the same mount again replaces the ride).
+ */
 export function mount(
   doc: SceneDoc,
   riderId: string,
@@ -163,5 +183,5 @@ export function mount(
   o: { frame: number; dismount_frame?: number },
 ): void {
   mountActor(doc, riderId, mountId, o);
-  refreshReleases(doc, riderId);
+  refreshAttached(doc, riderId);
 }

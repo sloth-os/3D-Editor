@@ -2,7 +2,7 @@ import type { SceneDoc } from '../doc/scene-doc';
 import type { ShotData } from '../doc/types';
 import { MAX_SHOT_FRAME, findShotIndex, getShots } from '../desk/shots';
 import { cameraMoveKeys, isDeskMove } from '../desk/moves';
-import { attachedTo, lookKeyBound, moveKeyBound } from '../desk/characters/estimate';
+import { actorOf, attachedTo, faceKeyBound, lookKeyBound, moveKeyBound } from '../desk/characters/estimate';
 import { getCatalogEntry } from '../store/catalog';
 import {
   deskBakeEstimate,
@@ -481,25 +481,31 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       },
       lower: '',
     }),
-  /** A pose keyed on every channel (blend, pose, hold); the actor's keys rewritten. */
+  /**
+   * A pose keyed on every channel (blend, pose, hold; a gesture layered over the legs keys only
+   * the upper body's; an arm lifted out of the ground in the blend one more key on an elbow and a
+   * shoulder, within the fourth rotation channel the bound counts per bone); the actor's keys
+   * rewritten.
+   */
   'desk.actor_pose': (ctx, p) =>
     deskEstimate({
       keys: newKeyframesWrites(
         DESK_ACTOR_MAX_CHANNELS * (DESK_POSE_KEYS + (p.hold_frames !== undefined ? 1 : 0)),
         DESK_ACTOR_MAX_CHANNELS,
         POSE_LOWER,
-        actorKeys(ctx, objectId(ctx, p.actor)),
+        actorKeys(ctx, actorOf(ctx.doc, objectId(ctx, p.actor))),
       ),
       lower: POSE_LOWER,
     }),
   /**
    * The gait's channels keyed on every cycle of the move as the move times it (desk/characters/
-   * estimate.ts: on its grid, and once more in each grid step a leg swings through) and the end pose
-   * on every channel; for an object that is not an actor (the move fails), a gait keyed
-   * DESK_GAIT_KEYS_PER_SECOND times a second over the path.
+   * estimate.ts: on its grid, and once more in each grid step a leg swings through), its turns on the
+   * spot step by step, and the end pose on every channel; for an object that is not an actor (the
+   * move fails), a gait keyed DESK_GAIT_KEYS_PER_SECOND times a second over the path. A part names
+   * its actor.
    */
   'desk.actor_move': (ctx, p) => {
-    const actor = objectId(ctx, p.actor);
+    const actor = actorOf(ctx.doc, objectId(ctx, p.actor));
     const lower = 'the length of the move (a shorter path walks fewer gait cycles)';
     const bound = actor ? moveKeyBound(ctx.doc, actor, p) : null;
     let keys: number;
@@ -516,15 +522,26 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
       lower,
     });
   },
-  /** A turn: the armature object's rotation keyed before and after it. */
-  'desk.actor_face': (ctx, p) =>
-    deskEstimate({
-      keys: newKeyframesWrites(12, 4, POSE_LOWER, actorKeys(ctx, objectId(ctx, p.actor))),
+  /**
+   * A turn: an actor standing on its feet steps round (the gait's channels keyed through each step of
+   * a turn on the spot, desk/characters/estimate.ts faceKeyBound); one that does not has its heading
+   * keyed before and after it.
+   */
+  'desk.actor_face': (ctx, p) => {
+    const actor = actorOf(ctx.doc, objectId(ctx, p.actor));
+    return deskEstimate({
+      keys: newKeyframesWrites(
+        faceKeyBound(ctx.doc, actor),
+        DESK_ACTOR_MAX_CHANNELS,
+        POSE_LOWER,
+        actorKeys(ctx, actor),
+      ),
       lower: POSE_LOWER,
-    }),
+    });
+  },
   /** Neck and head constraints with their influence ramped, and the actor's other looks ramped out. */
   'desk.actor_look_at': (ctx, p) => {
-    const actor = objectId(ctx, p.actor);
+    const actor = actorOf(ctx.doc, objectId(ctx, p.actor));
     const keys = lookKeyBound(ctx.doc, actor);
     return deskEstimate({
       keys: newKeyframesWrites(keys, keys / 2, '', keysOf(ctx.doc, attachedTo(ctx.doc, actor))),
@@ -542,7 +559,7 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
         DESK_HOLD_KEYS,
         1 + 9 + 2,
         "the prop's animation",
-        keysOf(ctx.doc, [objectId(ctx, p.prop)]) + actorKeys(ctx, objectId(ctx, p.actor)),
+        keysOf(ctx.doc, [objectId(ctx, p.prop)]) + actorKeys(ctx, actorOf(ctx.doc, objectId(ctx, p.actor))),
       ),
       lower: "the prop's animation",
     }),
@@ -557,7 +574,7 @@ export const DESK_ACTOR_ESTIMATES: Readonly<Record<string, Estimator>> = {
         DESK_ACTOR_MAX_CHANNELS * poses + 4 + 6 * 3,
         DESK_ACTOR_MAX_CHANNELS + 1 + 6,
         POSE_LOWER,
-        actorKeys(ctx, objectId(ctx, p.rider)),
+        actorKeys(ctx, actorOf(ctx.doc, objectId(ctx, p.rider))),
       ),
       lower: POSE_LOWER,
     });

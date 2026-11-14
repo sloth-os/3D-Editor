@@ -220,11 +220,39 @@ export interface MoveTiming {
   turnT: number;
 }
 
+/** Legs of a family (a turn on the spot steps each once a round). */
+export const LEG_COUNT = { humanoid: 2, quadruped: 4 } as const;
+
+/**
+ * How far (radians) a planted foot may be turned from the body while the body turns on the spot over
+ * it: people a little under what a hip turns a leg (MAX_LEG_TWIST); animals less, as their feet
+ * stand far from the middle the body turns about and their legs lean over planted feet as it turns
+ * (a horse's shoulder, half a metre ahead of that middle, swings over 20 cm to the side over 25°).
+ */
+const TURN_TWIST = { humanoid: 46 * DEG, quadruped: 25 * DEG } as const;
+
+/**
+ * Rounds of steps (one step of each foot a round) a turn on the spot of dTurn (radians) takes: each
+ * step puts a foot a little further round, the body facing the mean of its feet, so a planted foot
+ * is never turned from the body by more than TURN_TWIST: with n feet and R rounds, the feet's
+ * headings spread (n − 1)·dTurn / (n·R − n + 1) and the body is half way between.
+ */
+export function turnRounds(family: 'humanoid' | 'quadruped', dTurn: number): number {
+  const n = LEG_COUNT[family];
+  const twist = TURN_TWIST[family];
+  return Math.max(1, Math.ceil(((n - 1) * Math.abs(dTurn)) / (2 * twist * n) + (n - 1) / n));
+}
+
+/** Seconds a step of a turn on the spot takes at least (an animal's quicker the smaller it is). */
+export function turnStepTime(family: 'humanoid' | 'quadruped', size: number): number {
+  return family === 'humanoid' ? 0.24 : 0.16 * Math.max(0.6, Math.min(1.2, Math.sqrt(size / ANIMAL_REF)));
+}
+
 /**
  * The gait and timing of a move of length L (m) whose first heading turns dTurn (radians) from the
- * actor's (a turn over 30° is made on the spot first): at `speed`, else arriving `total` seconds
- * after it starts (frame_end), else at the gait's own speed. `asked` is a gait that fits the family
- * (null: the speed picks one).
+ * actor's (a turn over 30° is made on the spot first, a step of each foot per round: turnRounds):
+ * at `speed`, else arriving `total` seconds after it starts (frame_end), else at the gait's own
+ * speed. `asked` is a gait that fits the family (null: the speed picks one).
  */
 export function moveTiming(
   family: 'humanoid' | 'quadruped',
@@ -236,7 +264,10 @@ export function moveTiming(
   const { asked, total } = o;
   let turnT =
     dTurn > 30 * DEG
-      ? Math.min(0.8, Math.max(0.3, (dTurn / Math.PI) * 0.8)) * (family === 'humanoid' ? 1 : 1.6)
+      ? Math.max(
+          Math.min(0.8, Math.max(0.3, (dTurn / Math.PI) * 0.8)) * (family === 'humanoid' ? 1 : 1.6),
+          LEG_COUNT[family] * turnRounds(family, dTurn) * turnStepTime(family, size),
+        )
       : 0;
   if (total !== null && turnT > total / 3) turnT = total / 3;
   const walkT = total === null ? null : total - turnT;
@@ -379,6 +410,9 @@ export interface LegSolution {
 /** How far the leg IK turns a leg about its own axis from the body's forward (radians). */
 export const MAX_LEG_TWIST = 50 * (Math.PI / 180);
 
+/** How far the leg IK rolls a foot out of the leg plane (radians). */
+const MAX_FOOT_ROLL = 25 * DEG;
+
 /**
  * Solves a leg. `frame` is the world matrix of the upper bone's rest frame under its posed parent
  * (object · parentPosed · parentRest⁻¹ · upperRest); `end` the world target of the foot's head,
@@ -425,17 +459,27 @@ export function solveLeg(
   const ey = d * Math.cos(gamma);
   const ez = d * Math.sin(gamma);
   const thL = Math.atan2(ez - mz, ey - my);
+  const planeOf = (d: Readonly<Vec3>): Vec3 => rotY(rotZ(transformDirection3(inv, d), -tilt), -yaw);
   const inPlane = (d: Readonly<Vec3>): number => {
-    const q = rotY(rotZ(transformDirection3(inv, d), -tilt), -yaw);
+    const q = planeOf(d);
     return Math.atan2(q[2], q[1]);
   };
+  // the foot bends in the leg plane to footDir and rolls out of it by what the leg's lean leaves
+  // (a planted hoof stays flat while the leg leans over it as the body turns): in the foot's rest
+  // frame footDir is (x, y, z) and the euler (a, 0, c) points the bone at (−sin c·cos a, cos c·cos a, sin a)
+  const qf = planeOf(footDir);
+  const beta = thL + leg.lam1 - leg.lam0;
+  const yf = qf[1] * Math.cos(beta) + qf[2] * Math.sin(beta);
+  const zf = qf[2] * Math.cos(beta) - qf[1] * Math.sin(beta);
+  const roll =
+    Math.abs(yf) > 1e-9 ? Math.max(-MAX_FOOT_ROLL, Math.min(MAX_FOOT_ROLL, Math.atan(-qf[0] / yf))) : 0;
+  const footRel = wrapAngle(Math.atan2(zf, yf / Math.cos(roll)));
   const thF = inPlane(footDir);
-  const footRel = wrapAngle(thF - thL - (leg.lam1 - leg.lam0));
   const toeRel = toeDir === null ? 0 : wrapAngle(inPlane(toeDir) - thF - (leg.lam2 - leg.lam1));
   return {
     upper: [thU, yaw, tilt],
     lower: [wrapAngle(thL - thU - leg.lam0), 0, 0],
-    foot: [footRel, 0, 0],
+    foot: [footRel, 0, roll],
     toe: [toeRel, 0, 0],
     miss: Math.max(0, d0 - (L1 + L2)),
   };

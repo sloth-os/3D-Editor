@@ -11,9 +11,11 @@ import {
   DRIVER_ADD_BYTES,
   FCURVE_ADD_BYTES,
   FCURVE_STORED_BYTES,
+  FRAME_STATE_BYTES_PER_CONSTRAINT,
   FRAME_STATE_BYTES_PER_DRIVER,
   FRAME_STATE_BYTES_PER_KEYFRAME,
   FRAME_STATE_BYTES_PER_OBJECT,
+  FRAME_STATE_BYTES_PER_POSE_BONE,
   INSERT_MANY_BYTES_PER_KEYFRAME,
   INSERT_MANY_REWRITE_BYTES,
   KEYFRAME_ADD_BYTES,
@@ -53,6 +55,7 @@ import {
 } from '../src/physics';
 import { SceneEvaluator } from '../src/eval';
 import { SceneDoc } from '../src/doc/scene-doc';
+import { createActor } from '../src/desk/characters';
 import { decodedMeshBytes } from '../src/mesh/memory';
 
 /*
@@ -176,7 +179,7 @@ describe('operators that write keyframes', () => {
         KEYFRAME_ADD_BYTES * keys +
         BAKE_FCURVE_BYTES * 27 +
         BAKE_BYTES_PER_OBJECT_FRAME * 3 * 100 +
-        // a frame state per sampled frame, which copies the document's three objects
+        // a frame state per sampled frame, which leaves garbage per object of the document (three)
         100 * 3 * FRAME_STATE_BYTES_PER_OBJECT,
       lower:
         'the frame range (frame_start to frame_end, or a larger step) or the number of objects to bake (objects, or the selected objects)',
@@ -216,12 +219,10 @@ describe('operators that write keyframes', () => {
     s.run('anim.bake_transforms', { frame_start: 1, frame_end: 50 });
     expect(projectStoredBytes(s.doc) - before).toBe(e.addedStoredBytes);
     // baking the same range again replaces its keyframes: the project keeps nothing more, while the
-    // curves are rewritten and every frame state copies the 1,800 keyframes
+    // curves are rewritten; the frame states read the 1,800 keyframes in place (eval/frame-input.ts)
     const again = s.estimate('anim.bake_transforms', { frame_start: 1, frame_end: 50 })!;
     expect(again).toMatchObject({ keyframes: 0, addedStoredBytes: 0, addedSaveBytes: 0 });
-    expect(again.bytes - e.bytes).toBe(
-      KEYFRAME_REWRITE_BYTES * 4 * 50 * 9 + 50 * FRAME_STATE_BYTES_PER_KEYFRAME * 4 * 50 * 9,
-    );
+    expect(again.bytes - e.bytes).toBe(KEYFRAME_REWRITE_BYTES * 4 * 50 * 9);
     const kept = projectStoredBytes(s.doc);
     s.run('anim.bake_transforms', { frame_start: 1, frame_end: 50 });
     expect(projectStoredBytes(s.doc)).toBe(kept);
@@ -369,28 +370,70 @@ describe('operators that write keyframes', () => {
 });
 
 describe('the frame states of a bake', () => {
-  it('copy the document every sampled frame: its keyframes, objects and drivers, piling up to V8 growing the heap', () => {
+  it('leave garbage per object and driver every sampled frame, whatever the keyframes, piling up to V8 growing the heap', () => {
     const s = cubes(4);
     s.run('anim.bake_transforms', { frame_start: 1, frame_end: 50 });
     s.run('anim.driver_add', { target: 'Cube', path: 'rotation_euler', index: 2, expression: 'frame' });
-    const perFrame =
-      FRAME_STATE_BYTES_PER_KEYFRAME * 4 * 50 * 9 +
-      FRAME_STATE_BYTES_PER_OBJECT * 4 +
-      FRAME_STATE_BYTES_PER_DRIVER;
+    // the 1,800 keyframes are read in place by every frame state (eval/frame-input.ts)
+    expect(FRAME_STATE_BYTES_PER_KEYFRAME).toBe(0);
+    const perFrame = FRAME_STATE_BYTES_PER_OBJECT * 4 + FRAME_STATE_BYTES_PER_DRIVER;
     expect(frameStateBytes(s.doc)).toBe(perFrame);
-    // the copies of every frame, at most what V8 lets the heap grow to over what it keeps meanwhile
+    // the garbage of every frame, at most what V8 lets the heap grow to over what it keeps meanwhile
     expect(frameSamplingBytes(s.doc, 10)).toBe(10 * perFrame);
     expect(frameSamplingBytes(s.doc, 10, 2)).toBe(20 * perFrame);
     const cap = BAKE_GARBAGE_GROWTH * (BAKE_HEAP_BYTES + projectStoredBytes(s.doc) + perFrame);
-    expect(frameSamplingBytes(s.doc, 10_000)).toBe(cap);
-    // a bake of one more object samples every frame of its range in a document that holds them
-    const solo = s.estimate('anim.bake_transforms', { objects: ['Cube'], frame_start: 51, frame_end: 350 })!;
-    const fresh = cubes(4).estimate('anim.bake_transforms', {
-      objects: ['Cube'],
-      frame_start: 51,
-      frame_end: 350,
-    })!;
-    expect(solo.bytes - fresh.bytes).toBeGreaterThanOrEqual(frameSamplingBytes(s.doc, 300) - 4 * 300 * 1_500);
+    const reach = Math.ceil(cap / perFrame);
+    expect(frameSamplingBytes(s.doc, reach - 1)).toBe((reach - 1) * perFrame);
+    expect(frameSamplingBytes(s.doc, reach)).toBe(cap);
+    expect(frameSamplingBytes(s.doc, 1_000_000)).toBe(cap);
+  });
+
+  it('do not grow with the keyframes the document holds: a bake of a fresh object costs the same', () => {
+    const baked = cubes(4);
+    baked.run('anim.bake_transforms', { frame_start: 1, frame_end: 300 });
+    const fresh = cubes(4);
+    for (const s of [baked, fresh]) s.run('mesh.primitive_cube_add', { name: 'Solo', location: [0, 0, 5] });
+    expect(baked.doc.listFCurves().reduce((n, fc) => n + fc.keyframes.length, 0)).toBe(4 * 300 * 9);
+    expect(frameStateBytes(baked.doc)).toBe(frameStateBytes(fresh.doc));
+    const params = { objects: ['Solo'], frame_start: 1, frame_end: 300 };
+    expect(baked.estimate('anim.bake_transforms', params)!.bytes).toBe(
+      fresh.estimate('anim.bake_transforms', params)!.bytes,
+    );
+  });
+
+  it('leave the most for armatures: every bone is posed, and every constraint of an object or a bone is solved', () => {
+    const s = scene();
+    const { actor } = createActor(s.doc, { kind: 'adult', location: [0, 0, 0] });
+    s.run('mesh.primitive_cube_add', { name: 'Prop', location: [1, 0, 1] });
+    s.run('object.constraint_add', {
+      object: 'Prop',
+      type: 'COPY_LOCATION',
+      target: actor,
+      subtarget: 'hand.R',
+    });
+    s.run('pose.constraint_add', { object: actor, bone: 'head', type: 'DAMPED_TRACK', target: 'Prop' });
+    s.run('anim.driver_add', { target: 'Prop', path: 'rotation_euler', index: 2, expression: 'frame' });
+    const objects = s.doc.listObjects();
+    const bones = s.doc.getArmature(s.doc.getObject(actor)!.data!)!.bones.length;
+    expect(bones).toBeGreaterThan(15);
+    // the objects are stored as Y.Maps of their fields, read in place: their armatures' bones and
+    // their constraints count, not only the objects
+    const perFrame =
+      FRAME_STATE_BYTES_PER_OBJECT * objects.length +
+      FRAME_STATE_BYTES_PER_POSE_BONE * bones +
+      FRAME_STATE_BYTES_PER_CONSTRAINT * 2 +
+      FRAME_STATE_BYTES_PER_DRIVER;
+    expect(frameStateBytes(s.doc)).toBe(perFrame);
+    // a second armature object of the same armature poses every bone again (with its copy of the
+    // head's constraint)
+    s.state.selectedIds = [actor];
+    s.state.activeId = actor;
+    s.run('object.duplicate', { linked: true });
+    expect(frameStateBytes(s.doc) - perFrame).toBe(
+      FRAME_STATE_BYTES_PER_OBJECT +
+        FRAME_STATE_BYTES_PER_POSE_BONE * bones +
+        FRAME_STATE_BYTES_PER_CONSTRAINT,
+    );
   });
 });
 
@@ -524,8 +567,8 @@ describe('the estimates of bakes hold', () => {
   }, 30_000);
 
   it('above the peak heap of a bake of one object over 300 frames in a document of 2,700 keyframes (V8 GC trace in a child process)', () => {
-    // every frame state copies the document's keyframes: 82–98 MB at the peak measured, which the
-    // bake's own keyframes (32.8 MB estimated without the copies) did not cover
+    // the frame states read the document's keyframes in place (eval/frame-input.ts): 17 MB at the
+    // peak measured; 82–98 MB when every frame state copied them
     const r = peak(
       'anim.bake_transforms',
       10,
@@ -537,8 +580,9 @@ describe('the estimates of bakes hold', () => {
   }, 30_000);
 
   it('above the peak heap of a bake of one object over 300 frames in a document of 13,500 keyframes (V8 GC trace in a child process)', () => {
-    // the frame states' copies (1.4 MB a frame) pile up until V8 collects its old generation, at about
-    // BAKE_GARBAGE_GROWTH times what the heap keeps: 172–191 MB at the peak measured
+    // the frame states' garbage (51 KB a frame) piles up until V8 collects it, at most about
+    // BAKE_GARBAGE_GROWTH times what the heap keeps: 27 MB at the peak measured; 172–191 MB when every
+    // frame state copied the document's keyframes (1.4 MB a frame)
     const r = peak(
       'anim.bake_transforms',
       50,

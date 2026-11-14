@@ -161,7 +161,9 @@ describe('desk.physics_bake', () => {
     expect(originOf(live.get(prop)![9])[0]).toBeCloseTo(0.9, 6);
     expect(originOf(live.get(prop)![35])[0]).toBeGreaterThan(2.9 + 0.5);
     const plan = deskBakePlan(s.doc, {});
-    expect(plan.bodies).toEqual([{ id: prop, from: 1, holds: ['Hold'], unparent: false }]);
+    expect(plan.bodies).toEqual([
+      { id: prop, carrier: prop, from: 1, holds: ['Hold'], body_holds: [], unparent: false },
+    ]);
     const r = s.run('desk.physics_bake', {});
     expect(r.removed_constraints).toEqual([{ object: prop, name: 'Prop', constraints: ['Hold'] }]);
     expect(s.doc.getObject(prop)!.constraints).toEqual([]);
@@ -189,7 +191,9 @@ describe('desk.physics_bake', () => {
     const frames = range(1, 130);
     const live = worlds(s.doc, [box], frames);
     // keyed from the arm's first move (frame 1), not from the world's start
-    expect(deskBakePlan(s.doc, {}).bodies).toEqual([{ id: box, from: 1, holds: [], unparent: true }]);
+    expect(deskBakePlan(s.doc, {}).bodies).toEqual([
+      { id: box, carrier: box, from: 1, holds: [], body_holds: [], unparent: true },
+    ]);
     s.run('desk.physics_bake', {});
     expect(s.doc.getObject(box)!.parent).toBeNull();
     expect(s.warnings.some((w) => w.includes("'Box' was unparented from 'Arm'"))).toBe(true);

@@ -6,7 +6,7 @@ import { findShotIndex, getDeskSettings, getShots, shotOutputFrames } from './sh
 import { DESK_PROPS } from './props';
 import { DeskScene, deskProp, inPicture, projectPoint, v3sub, type CameraView } from './layout';
 import { crossesLine, lineOfAction, pairPoints } from './line';
-import { shotSpec } from './solver';
+import { inFrameSamples, shotSamples, shotSpec, unframedSubjects } from './solver';
 import {
   alignLayoutToPlan,
   layoutView,
@@ -202,24 +202,6 @@ function issue(code: DeskIssueCode, shot: string | null, objects: string[], mess
   };
 }
 
-/** The first, middle and last frame of a shot (once each). */
-const sampleFrames = (s: ShotData): number[] => [
-  ...new Set([s.frame_start, Math.round((s.frame_start + s.frame_end) / 2), s.frame_end]),
-];
-
-/**
- * Moves that turn the camera away from the shot's subjects by design (a pan or tilt to something
- * else, a whip pan): their subjects are checked in frame at the shot's first frame only, as rideo
- * checks every shot.
- */
-export const TURNING_MOVES: ReadonlySet<string> = new Set([
-  'pan_left',
-  'pan_right',
-  'tilt_up',
-  'tilt_down',
-  'whip_pan',
-]);
-
 /** Horizontal angle (degrees) between two floor directions. */
 function angleBetween(a: Readonly<Vec3>, b: Readonly<Vec3>): number {
   const la = Math.hypot(a[0], a[1]);
@@ -385,19 +367,11 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
         ),
       );
     // subjects a shot leaves out of its frame by design (by the angle and framing the solver frames
-    // the shot with, its own or their defaults): the shoulder of an over-the-shoulder shot (its
-    // first actor) at the frame's edge, the viewer of a point-of-view shot (its first actor, else its
-    // first subject) behind the camera, and the cast of an insert, which frames its prop
-    const spec = shotSpec(scene, s, all.indexOf(s));
-    const firstActor = s.subjects.find((id) => scene.isActor(id));
-    const unframed = new Set<string>();
-    if (spec.angle === 'over_shoulder' && firstActor) unframed.add(firstActor);
-    if (spec.angle === 'pov' && (firstActor ?? s.subjects[0])) unframed.add(firstActor ?? s.subjects[0]);
-    if (spec.framing === 'insert') {
-      const prop = s.subjects.find((id) => !scene.isActor(id));
-      if (prop) for (const id of s.subjects) if (id !== prop) unframed.add(id);
-    }
-    const frames = s.move && TURNING_MOVES.has(s.move) ? [s.frame_start] : sampleFrames(s);
+    // the shot with, its own or their defaults: the shoulder, a viewer, an insert's cast), at its
+    // first, middle and last frames (its first only for moves that turn away; the solver keeps the
+    // subjects in frame over the same frames)
+    const unframed = unframedSubjects(scene, s.subjects, shotSpec(scene, s, all.indexOf(s)));
+    const frames = inFrameSamples(s);
     for (const id of s.subjects) {
       if (unframed.has(id)) continue;
       const out: number[] = [];
@@ -420,7 +394,7 @@ export function checkShots(doc: SceneDoc, o: { shots?: readonly string[] } = {})
     }
     const insideAt: number[] = [];
     let inside: { owner: string; label: string } | null = null;
-    for (const f of sampleFrames(s)) {
+    for (const f of shotSamples(s)) {
       const v = scene.camera(cam, f);
       if (!v) continue;
       const hit = scene.insideSolid(v.position, f) ?? belowGround(scene, v.position);

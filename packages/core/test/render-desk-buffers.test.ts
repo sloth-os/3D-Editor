@@ -89,7 +89,9 @@ function heldBytes(img: RenderedImage): number {
 }
 
 describe('estimateRenderBufferBytes', () => {
-  const lines: SoftwareRenderOptions['lines'] = [{ a: [0, 0, 0], b: [1, 1, 2], width_px: 2, color: [1, 1, 1] }];
+  const lines: SoftwareRenderOptions['lines'] = [
+    { a: [0, 0, 0], b: [1, 1, 2], width_px: 2, color: [1, 1, 1] },
+  ];
 
   it('is what a render without shadow maps keeps and returns, byte for byte', () => {
     const desk = deskScene({ segments: 8, people: 1 }).doc; // AgX: a row of display film
@@ -132,12 +134,20 @@ describe('estimateRenderBufferBytes', () => {
         w / h,
         null,
       );
-      const pix = { width: w, height: h, key: new Float32Array(w * h), normal: new Float32Array(w * h * 3), object: null };
+      const pix = {
+        width: w,
+        height: h,
+        key: new Float32Array(w * h),
+        normal: new Float32Array(w * h * 3),
+        object: null,
+      };
       releaseRenderBuffers();
       ambientOcclusion(pix, view, 0.5, new Float32Array(w * h).fill(Infinity));
       expect(pooledBufferBytes(), `${w} x ${h}`).toBe(aoBufferBytes(w, h));
     }
-    expect(aoBufferBytes(1600, AO_HALF_RES_PIXELS / 1600)).toBeLessThan(aoBufferBytes(1600, AO_HALF_RES_PIXELS / 1600 - 1));
+    expect(aoBufferBytes(1600, AO_HALF_RES_PIXELS / 1600)).toBeLessThan(
+      aoBufferBytes(1600, AO_HALF_RES_PIXELS / 1600 - 1),
+    );
   });
 
   it("counts a spot light's map exactly and a sun's, fitted to what the camera sees, from above", () => {
@@ -154,7 +164,9 @@ describe('estimateRenderBufferBytes', () => {
     // 'scene' follows the light's use_shadow and the render's use_shadows
     const lamp = spot.listObjects().find((x) => x.type === 'LIGHT')!;
     spot.updateLight(lamp.data!, { use_shadow: false });
-    expect(estimateRenderBufferBytes({ ...o, shadows: 'scene' }, spot)).toBe(estimateRenderBufferBytes(o, spot));
+    expect(estimateRenderBufferBytes({ ...o, shadows: 'scene' }, spot)).toBe(
+      estimateRenderBufferBytes(o, spot),
+    );
     expect(estimateRenderBufferBytes({ ...o, shadows: true }, spot)).toBeGreaterThan(
       estimateRenderBufferBytes(o, spot),
     );

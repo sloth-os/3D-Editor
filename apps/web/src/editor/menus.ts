@@ -1,4 +1,10 @@
-import { CONSTRAINT_TYPES, ROOT_COLLECTION_ID, type ConstraintCategory } from '@3d-editor/core';
+import {
+  BUILT_KINDS,
+  CONSTRAINT_TYPES,
+  HUMANOID_KINDS,
+  ROOT_COLLECTION_ID,
+  type ConstraintCategory,
+} from '@3d-editor/core';
 import { session } from '../app/store';
 import { registry } from './editor';
 import { lastRepeat } from './runner';
@@ -163,6 +169,28 @@ export function GENERATORS_MENU(): MenuItem[] {
   return out.length ? out : [note('No generators available')];
 }
 
+/** "small_dog" → "Small Dog". */
+const kindLabel = (kind: string) => kind.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+
+/**
+ * Add > Actor (director's desk): every actor kind built so far, people first, standing at the 3D
+ * cursor (desk.actor_add).
+ */
+export function ADD_ACTOR_MENU(): MenuItem[] {
+  const human = (k: string) => (HUMANOID_KINDS as readonly string[]).includes(k);
+  const item = (kind: string): MenuItem => ({
+    label: kindLabel(kind),
+    op: 'desk.actor_add',
+    params: { kind },
+  });
+  const people = BUILT_KINDS.filter(human);
+  const animals = BUILT_KINDS.filter((k) => !human(k));
+  return [
+    ...(people.length ? [{ title: 'People' }, ...people.map(item)] : []),
+    ...(animals.length ? [{ title: 'Animals' }, ...animals.map(item)] : []),
+  ];
+}
+
 export const ADD_MENU: MenuItem[] = [
   { title: 'Add' },
   { label: 'Mesh', submenu: ADD_MESH },
@@ -170,6 +198,7 @@ export const ADD_MENU: MenuItem[] = [
   { label: 'Text', op: 'object.text_add' },
   sep,
   { label: 'Armature', op: 'object.armature_add' },
+  { label: 'Actor', submenu: ADD_ACTOR_MENU },
   { label: 'Empty', submenu: ADD_EMPTY },
   sep,
   {
@@ -227,6 +256,9 @@ export const EDIT_MENU = (): MenuItem[] => [
 
 export const RENDER_MENU = (): MenuItem[] => [
   { label: 'Render Image', op: 'render.render', shortcut: 'F12' },
+  { label: 'Render Animation…', op: 'render.render', params: { animation: true }, shortcut: 'Ctrl F12' },
+  { label: 'Export Video…', op: 'wm.export_video', shortcut: 'Ctrl Shift F12' },
+  sep,
   { label: 'Rendered Shading', op: 'view3d.toggle_shading', params: { type: 'RENDERED' } },
 ];
 
@@ -254,6 +286,16 @@ export const VIEW_MENU = (): MenuItem[] => [
   sep,
   { label: 'Camera', op: 'view3d.view_camera', shortcut: 'Numpad 0' },
   { label: 'Align Active Camera to View', op: 'view3d.camera_to_view', shortcut: 'Ctrl Alt Numpad 0' },
+  {
+    label: 'Follow Shots',
+    op: 'view3d.toggle_follow_shots',
+    checked: () => !!session.value?.view.followShots.value,
+  },
+  {
+    label: 'Camera Guides',
+    op: 'view3d.toggle_camera_guides',
+    checked: () => !!session.value?.view.cameraGuides.value,
+  },
   { label: 'Perspective/Orthographic', op: 'view3d.view_persportho', shortcut: 'Numpad 5' },
   {
     label: 'Viewpoint',

@@ -345,13 +345,16 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     'view3d.toggle_follow_shots',
     'Follow Shots',
     'followShots',
-    'Look through the camera of the shot at the current frame (director desk).',
+    'Look through the cameras of the shots (director desk): in camera view the viewport shows the camera ' +
+      'of the first enabled shot in cut order that covers the current frame (the shot picked on the ' +
+      'sequence strip while it covers it), the scene camera between shots; F12 renders through the same ' +
+      "camera and Render Animation through the camera of each frame's shot.",
   );
   toggle(
     'view3d.toggle_camera_guides',
     'Camera Guides',
     'cameraGuides',
-    'Show rule-of-thirds and action-safe guides over the camera view.',
+    'Show rule-of-thirds lines and the action-safe frame (93% of the picture) over the camera view.',
   );
   reg.register(
     defineOperator({
@@ -603,12 +606,14 @@ export function registerUiOperators(reg: OperatorRegistry): void {
     defineOperator({
       id: 'wm.export_video',
       label: 'Export Video…',
-      description: 'Export the shots as video on the server (the Export Video window is coming soon).',
+      description:
+        'Open the Export Video window: render the shots of the director desk as video files on the ' +
+        'server (Ctrl+Shift+F12).',
       category: 'Render',
       ...ui,
       schema: z.object({}),
       execute() {
-        toast('Export Video is coming soon', 'info');
+        openDialog('export-video');
       },
     }),
   );

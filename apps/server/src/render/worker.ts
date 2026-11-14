@@ -1,8 +1,9 @@
 import v8 from 'node:v8';
 import { Worker } from 'node:worker_threads';
+import { releaseRenderBuffers } from '@3d-editor/core';
 import { MissingDocumentError, RenderEngine } from './engine';
 import { lowerProcessPriority, preferOomKill, renderThreadNice } from './priority';
-import type { WorkerErrorKind, WorkerRequest, WorkerResponse, WorkerResult } from './protocol';
+import type { ProcessMemory, WorkerErrorKind, WorkerRequest, WorkerResponse, WorkerResult } from './protocol';
 
 /*
  * A render process (entry point `render-worker.js` of the production bundle; the sources run
@@ -76,6 +77,34 @@ function testJob(msg: Extract<WorkerRequest, { type: 'test-allocate' | 'test-bus
   return { ok: true };
 }
 
+/** What this process holds now (request `memory`). */
+function processMemory(): ProcessMemory {
+  const m = process.memoryUsage();
+  return { rss: m.rss, heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers };
+}
+
+/** A garbage collection is due (see releaseBuffers). */
+let collecting = false;
+
+/**
+ * Gives the memory of the renderer's pooled working buffers back: they are held through WeakRefs
+ * only, so they would go with some later garbage collection, which an idle process may not run
+ * for a long time; dropping them and collecting returns about 140 MB at 720p, 300 MB at 1080p (the
+ * pool starts render processes with --expose-gc, and with a glibc mmap threshold that unmaps them
+ * when they are freed). The collection runs once the messages read with this one are handled: a
+ * buffer a render used in the same turn is kept alive until that turn ends (WeakRef semantics),
+ * and a collection before would leave it.
+ */
+function releaseBuffers(): void {
+  releaseRenderBuffers();
+  if (collecting) return;
+  collecting = true;
+  setImmediate(() => {
+    collecting = false;
+    (globalThis as { gc?: () => void }).gc?.();
+  });
+}
+
 function handle(msg: WorkerRequest): WorkerResult {
   switch (msg.type) {
     case 'prepare':
@@ -102,11 +131,14 @@ function handle(msg: WorkerRequest): WorkerResult {
       return engine.deskShot(msg.doc, msg.options);
     case 'ping':
       return { ok: true };
+    case 'memory':
+      return processMemory();
     case 'test-allocate':
     case 'test-busy':
       return testJob(msg);
     case 'release':
     case 'clear':
+    case 'release-buffers':
     case 'doc-part':
       throw new Error(`'${msg.type}' has no answer`);
   }
@@ -159,8 +191,12 @@ process.on('message', (msg: WorkerRequest) => {
   }
   if (msg.type === 'clear') {
     engine.clearDocuments();
-    // an idle process gives the memory of its documents back (the pool starts it with --expose-gc)
-    (globalThis as { gc?: () => void }).gc?.();
+    // an idle process gives the memory of its documents and render buffers back
+    releaseBuffers();
+    return;
+  }
+  if (msg.type === 'release-buffers') {
+    releaseBuffers();
     return;
   }
   try {

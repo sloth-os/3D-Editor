@@ -1,7 +1,9 @@
 import {
   FrameState,
   actorKeypoints,
+  defaultAoRadius,
   depthToBytes,
+  drawLines,
   edgesToBytes,
   encodePNG,
   evaluatedBounds,
@@ -22,7 +24,6 @@ import {
 import {
   ScreenBoxBuilder,
   cameraOfView,
-  drawLineByte,
   drawLineRGB,
   drawSkeleton,
   maskFromObjects,
@@ -109,12 +110,50 @@ export function stringPoints(scene: EvaluatedScene, objectId: string): Vec3[] {
 }
 
 /**
+ * The segment `a`–`b` with its ends in the order they appear from left to right on screen (seen
+ * through `viewProj`, after the near-plane clip core drawLines makes: z ≥ −w). Core drawLines
+ * covers only part of a segment whose screen x decreases from its first end to its second (its
+ * per-row column span is taken from the ends in the given order), so strings running right to left
+ * came out thin and broken in the beauty image and the passes; the order changes nothing else.
+ */
+export function leftToRight(viewProj: ArrayLike<number>, a: Vec3, b: Vec3): [Vec3, Vec3] {
+  const M = viewProj;
+  const clipX = (p: Vec3) => M[0] * p[0] + M[4] * p[1] + M[8] * p[2] + M[12];
+  const clipW = (p: Vec3) => M[3] * p[0] + M[7] * p[1] + M[11] * p[2] + M[15];
+  // z + w: how far in front of the near plane (negative: behind it)
+  const front = (p: Vec3) => M[2] * p[0] + M[6] * p[1] + M[10] * p[2] + M[14] + clipW(p);
+  let xa = clipX(a);
+  let wa = clipW(a);
+  let xb = clipX(b);
+  let wb = clipW(b);
+  const ea = front(a);
+  const eb = front(b);
+  if (ea < 0 && eb < 0) return [a, b];
+  if (ea < 0 || eb < 0) {
+    // the end behind the near plane moves onto it, as drawLines clips it
+    const t = ea / (ea - eb);
+    const x = xa + (xb - xa) * t;
+    const w = wa + (wb - wa) * t;
+    if (ea < 0) {
+      xa = x;
+      wa = w;
+    } else {
+      xb = x;
+      wb = w;
+    }
+  }
+  if (!(wa > 0) || !(wb > 0)) return [a, b];
+  return xa / wa > xb / wb ? [b, a] : [a, b];
+}
+
+/**
  * The core renderer options of a desk frame (RASTER, the desk look; lines and AOVs added by the
  * caller). A frame whose beauty image is not wanted (an export of depth, mask, pose… passes only)
  * is rendered without shadows and ambient occlusion: they only change the image's colours, never
  * the per-pixel passes (depth, normal, object), which stay exactly those of a frame with its
  * beauty image. The look and the samples stay: the look decides alpha clipping and bump normals,
- * the samples which surface each pixel's passes take.
+ * the samples which surface each pixel's passes take. The shot's shadow box and occlusion reach
+ * (`shadowFit`, `aoRadius`) hold shadows and occlusion still within a shot.
  */
 export function deskRenderOptions(
   base: SoftwareRenderOptions,
@@ -127,6 +166,7 @@ export function deskRenderOptions(
     look: desk.look,
     shadows: beauty && desk.shadows,
     ao: beauty && desk.ao,
+    aoRadius: desk.aoRadius,
     msaa: desk.msaa,
     shadowFit: desk.shadowFit,
     resolve: 'tonemap',
@@ -171,15 +211,20 @@ export function renderDeskFrame(
   const strings = (desk.lines ?? [])
     .map((line) => ({ line, points: stringPoints(scene, line.object) }))
     .filter((s) => s.points.length >= 2);
-  const screenLines: ScreenLine[] = [];
+  /**
+   * Every string's segments (world space, at least 2 px wide, ends left to right on screen: see
+   * `leftToRight`) with the string's object.
+   */
+  const segments: { object: string; line: ScreenLine }[] = [];
   for (const s of strings)
-    for (let i = 1; i < s.points.length; i++)
-      screenLines.push({
-        a: s.points[i - 1],
-        b: s.points[i],
-        width_px: Math.max(2, s.line.width_px),
-        color: s.line.color,
+    for (let i = 1; i < s.points.length; i++) {
+      const [a, b] = leftToRight(resolved.viewProj, s.points[i - 1], s.points[i]);
+      segments.push({
+        object: s.line.object,
+        line: { a, b, width_px: Math.max(2, s.line.width_px), color: s.line.color },
       });
+    }
+  const screenLines = segments.map((s) => s.line);
 
   const aovNames = deskAovs(passes, strings.length > 0);
   // the beauty image (and the strings drawn into it) only when it is wanted; no rasterizing at all
@@ -209,7 +254,24 @@ export function renderDeskFrame(
   const missing = (pass: PassName, what: string) =>
     warnings.add(`${pass} pass: the renderer returned no ${what} pass, so the ${pass} images are blank`);
 
-  // the strings projected into the frame (the parts in front of the near plane)
+  /**
+   * Draws the strings into a one-byte pass, each with the byte `valueOf(object)` (null: not drawn):
+   * core drawLines, as the renderer draws them into the beauty image (the same projection,
+   * near-plane clipping and depth test against the surfaces in front), setting the pixels at least
+   * half covered (the mask and edges passes hold palette indices and black, nothing to blend).
+   */
+  const drawStrings = (pass: Uint8Array, valueOf: (object: string) => number | null) => {
+    const toDraw: ScreenLine[] = [];
+    for (const s of segments) {
+      const v = valueOf(s.object);
+      if (v !== null) toDraw.push({ ...s.line, color: [v / 255, 0, 0] });
+    }
+    if (toDraw.length)
+      drawLines(pass, width, height, toDraw, view, { channels: 1, depth: aovs.depth, antialias: false });
+  };
+
+  // the strings projected into the frame for the pose pass (the parts in front of the near plane),
+  // drawn over the skeletons where no surface is in front of them (as in the beauty image)
   const lines = strings.map((s) => {
     const segs: [ScreenPoint, ScreenPoint][] = [];
     for (let i = 1; i < s.points.length; i++) {
@@ -249,21 +311,15 @@ export function renderDeskFrame(
       missing('mask', 'object');
       out.mask = new Uint8Array(n);
     }
-    for (const l of lines) {
-      const k = groupOf(l.line.object);
-      if (!k) continue;
-      for (const [a, b] of l.segs)
-        drawLineByte(out.mask, width, height, a, b, l.line.width_px / 2, k, aovs.depth, view.ortho);
-    }
+    // a string of no group is not in the mask
+    drawStrings(out.mask, (object) => groupOf(object) || null);
   }
   if (passes.has('edges')) {
     if (!aovs.depth) missing('edges', 'depth');
     out.edges = aovs.depth
       ? edgesToBytes(aovs.object ?? null, aovs.depth, aovs.normal ?? null, width, height)
       : new Uint8Array(n).fill(255);
-    for (const l of lines)
-      for (const [a, b] of l.segs)
-        drawLineByte(out.edges, width, height, a, b, l.line.width_px / 2, 0, aovs.depth, view.ortho);
+    drawStrings(out.edges, () => 0);
   }
   if (passes.has('pose')) {
     const rgb = new Uint8Array(n * 3);
@@ -288,7 +344,8 @@ export function renderDeskFrame(
         toByte(l.line.color[1]),
         toByte(l.line.color[2]),
       ];
-      for (const [a, b] of l.segs) drawLineRGB(rgb, width, height, a, b, l.line.width_px / 2, color, 1);
+      for (const [a, b] of l.segs)
+        drawLineRGB(rgb, width, height, a, b, l.line.width_px / 2, color, 1, aovs.depth, view.ortho);
     }
     out.pose = rgb;
   }
@@ -331,7 +388,10 @@ export function sampleShotFrames(frames: readonly number[], max = MAX_SHOT_SAMPL
  * Measures a shot (request `desk-shot`): the depth range from small depth renders of its sampled
  * frames (the nearest and farthest surface the camera sees, with margins), else from the rendered
  * bounds; the shadow box from the bounds of everything but huge objects, widened by the shadows'
- * reach. The rigid body simulation is not run for these samples (bodies at their animated places).
+ * reach; the ambient occlusion reach of the whole shot from what its first frame draws (core
+ * `defaultAoRadius`, as the renderer would choose for that frame). The rigid body simulation is not
+ * run for these samples (bodies at their animated places; the occlusion reach depends on sizes
+ * only).
  */
 export function deskShotInfo(
   d: Pick<DeskDocument, 'doc' | 'evaluator'>,
@@ -347,6 +407,7 @@ export function deskShotInfo(
   let clipEnd = 1000;
   let probeNear = Infinity;
   let probeFar = 0;
+  let aoRadius: number | undefined;
   const fitMin: Vec3 = [Infinity, Infinity, Infinity];
   const fitMax: Vec3 = [-Infinity, -Infinity, -Infinity];
   for (const frame of sampleShotFrames(o.frames)) {
@@ -356,8 +417,11 @@ export function deskShotInfo(
     clipStart = Math.max(1e-6, cam.camera.clip_start);
     clipEnd = Math.max(clipStart * 1.001, cam.camera.clip_end);
     const eye: Vec3 = [cam.worldMatrix[12], cam.worldMatrix[13], cam.worldMatrix[14]];
-    for (const item of renderItems(scene, { forRender: true })) {
-      if (!item.mesh.faces.length) continue;
+    // what the renderer draws (renderSceneSoftware's items: render-visible meshes with faces)
+    const drawn = renderItems(scene, { forRender: true }).filter((item) => item.mesh.faces.length > 0);
+    // the first sampled frame is the shot's first: one reach for every frame of the shot
+    aoRadius ??= defaultAoRadius(drawn);
+    for (const item of drawn) {
       const b = evaluatedBounds([item]);
       if (!b) continue;
       const [dn, df] = boxDistances(eye, b.min, b.max);
@@ -412,7 +476,12 @@ export function deskShotInfo(
       max: [fitMax[0] + reach, fitMax[1] + reach, fitMax[2] + 0.1] as Vec3Tuple,
     };
   }
-  return { depthRange: range, shadowFit, ms: Math.round(performance.now() - t0) };
+  return {
+    depthRange: range,
+    shadowFit,
+    ...(aoRadius !== undefined ? { aoRadius } : {}),
+    ms: Math.round(performance.now() - t0),
+  };
 }
 
 /** The nearest and farthest distances from `p` to the box min–max (0 nearest when inside). */

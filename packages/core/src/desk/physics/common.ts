@@ -6,6 +6,7 @@ import { createFCurve, evaluateFCurve } from '../../anim/fcurve';
 import { FrameState } from '../../eval/frame-state';
 import { worldMatrixToTransform } from '../../constraints/bake';
 import type { RigidBodyHost } from '../../physics/rigid-body';
+import { composeRigid, decomposeRigid } from '../../physics/vmath';
 
 /*
  * Helpers the desk's motion presets share (MOTION): reading the scene at many frames without
@@ -341,3 +342,44 @@ export function descendants(doc: SceneDoc, id: string): ObjectData[] {
 
 /** An object's name without the '.001' suffix the document adds to keep names unique. */
 export const baseName = (name: string): string => name.replace(/\.\d{3,}$/, '');
+
+/** Custom property of a store model's root (store.add, store.insert_files): its store id. */
+const STORE_ID_PROP = 'store_id';
+
+/** Object types with geometry of their own (what a model shows). */
+const GEOMETRY_TYPES: ReadonlySet<ObjectData['type']> = new Set(['MESH', 'CURVE', 'FONT']);
+
+/**
+ * The root of the store model whose geometry object `id` carries, or null (review F2): its nearest
+ * ancestor that is an EMPTY with a store_id (the root store.add and store.insert_files return, which
+ * shots, checks and agents follow), when every object with geometry under that root is `id` or under
+ * it: a model of one mesh (a ball, a melon), or the main part the presets hang the other parts from
+ * (presets.ts bodyObjectFor). A part simulated on its own (one wheel of a car) carries no root.
+ */
+export function modelRootOf(doc: SceneDoc, id: string): ObjectData | null {
+  const seen = new Set<string>([id]);
+  let root: ObjectData | null = null;
+  for (let cur = doc.getObject(id); cur?.parent && !seen.has(cur.parent);) {
+    seen.add(cur.parent);
+    cur = doc.getObject(cur.parent);
+    if (cur?.type === 'EMPTY' && typeof cur.custom_props?.[STORE_ID_PROP] === 'string') {
+      root = cur;
+      break;
+    }
+  }
+  if (!root) return null;
+  const carried = new Set([id, ...descendants(doc, id).map((d) => d.id)]);
+  for (const d of descendants(doc, root.id))
+    if (GEOMETRY_TYPES.has(d.type) && !carried.has(d.id)) return null;
+  return root;
+}
+
+/**
+ * The rigid frame of a world matrix: its origin and its rotation, scale and shear left out, by the
+ * simulation's own decomposition (physics/vmath.ts decomposeRigid: Gram-Schmidt, X then Y), so that
+ * the frame of a simulated body follows exactly the rotations the simulation gives it.
+ */
+export function rigidFrame(m: Readonly<Mat4>): Mat4 {
+  const { position, rotation } = decomposeRigid(m);
+  return composeRigid(position, rotation, [1, 1, 1]);
+}

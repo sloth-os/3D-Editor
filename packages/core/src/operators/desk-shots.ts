@@ -38,19 +38,27 @@ import {
 } from '../desk/shots';
 import { DESK_PROPS } from '../desk/props';
 import { DeskScene, deskProp } from '../desk/layout';
-import { DEFAULT_FRAMING, FRAMING_TABLE, shotSpec, solveCamera } from '../desk/solver';
+import { DEFAULT_FRAMING, FRAMING_TABLE, MAX_WIDEN, shotSpec, type SolveSpec } from '../desk/solver';
 import { crossesLine, lineOfAction, linePointsAt, mirrorPose, pairPoints } from '../desk/line';
 import {
   addDeskCamera,
   applyCameraMove,
   cameraHolds,
+  fitShotCamera,
+  keepShotInFrame,
   prepareDeskCamera,
   retimeCameraRange,
+  shotFitLosses,
+  shotFitReport,
+  shotOcclusions,
   type CameraPose,
+  type FitReport,
+  type Occlusion,
 } from '../desk/moves';
 import { planFit } from '../desk/plan';
 import { checkShots, type DeskIssue } from '../desk/checks';
 import { buildSet } from '../desk/set';
+import { exportRideoOperator, importRideoOperator } from '../desk/rideo/operators';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, type OperatorRegistry } from './registry';
@@ -287,7 +295,6 @@ function poseShot(
     frame_start: shot.frame_start,
     frame_end: shot.frame_end,
     seed: shot.id,
-    subject: shot.subjects[0],
     subjects: shot.subjects,
     start: pose ?? undefined,
     scene,
@@ -297,7 +304,7 @@ function poseShot(
 }
 
 /** What solving a shot came to. */
-export interface SolvedShot {
+export interface SolvedShot extends FitReport {
   id: string;
   name: string;
   camera: string;
@@ -310,15 +317,147 @@ export interface SolvedShot {
   refit: boolean;
   /** The camera agrees with the plan (true without one). */
   agrees: boolean;
+  /**
+   * What the solve gave up for the shot: its planned layout ('plan': the camera disagrees with it at
+   * the shot's first frame, plan_mismatch) or keeping its subjects in frame ('in_frame': out_of_frame
+   * names who leaves it, subject_out_of_frame); [] when it kept both.
+   */
+  gave_up: ('plan' | 'in_frame')[];
+  /** Subjects an actor the shot does not frame hides from its camera (occluded_subject); [] when none. */
+  occluded: Occlusion[];
   keyframes: number;
+}
+
+/** Angles a shot that names none may be solved at instead of its default, to keep its subjects in frame. */
+const FREE_ANGLES: readonly DeskAngle[] = [
+  'front',
+  'three_quarter_left',
+  'three_quarter_right',
+  'profile_left',
+  'profile_right',
+];
+
+/** The account of a fit alone (moves.ts FitReport), without its camera. */
+const fitOf = (f: FitReport): FitReport => ({
+  widened: f.widened,
+  distance_ratio: f.distance_ratio,
+  effective_framing: f.effective_framing,
+  out_of_frame: f.out_of_frame,
+  needed_ratio: f.needed_ratio,
+});
+
+/** How much less a camera at another angle must stand back to be taken for that alone (share of the distance). */
+const FREE_ANGLE_GAIN = 0.1;
+
+/**
+ * A shot's camera fitted over the shot (moves.ts fitShotCamera); a shot that names no angle and whose
+ * camera at its default angle lets a subject leave the frame, or stands back far enough to read as a
+ * wider framing (a subject moving along the view axis, past the camera or out of its framing), tries
+ * the others of FREE_ANGLES before keeping that: one that loses fewer of its subjects at the frames
+ * desk.check samples (moves.ts shotFitLosses: out of frame, or walking so far away along the view that
+ * they no longer read at the framing), else one that keeps the shot's framing where the default does
+ * not, else one that stands back clearly less (FREE_ANGLE_GAIN): the side angle that sees it cross
+ * the frame. The default angle is kept on a tie. Groups do not try profiles (one of the pair would
+ * hide the other, on the line of action).
+ */
+function fitFreeAngle(
+  scene: DeskScene,
+  shot: ShotData,
+  spec: SolveSpec,
+  o: Parameters<typeof fitShotCamera>[3],
+): { spec: SolveSpec; solved: ReturnType<typeof fitShotCamera> } {
+  const solved = fitShotCamera(scene, spec, shot, o);
+  const reads = (c: ReturnType<typeof fitShotCamera>) => c.effective_framing === spec.framing;
+  if (
+    shot.angle !== null ||
+    !FREE_ANGLES.includes(spec.angle) ||
+    (!solved.out_of_frame.length && reads(solved))
+  )
+    return { spec, solved };
+  const lost = (s: SolveSpec, c: ReturnType<typeof fitShotCamera>) =>
+    shotFitLosses(scene, s, shot, { position: c.position, target: c.target, lens: c.lens_mm }, o);
+  type Fit = { spec: SolveSpec; solved: ReturnType<typeof fitShotCamera>; lost: number };
+  // fewer subjects lost, then the shot's framing kept, then clearly less standing back
+  const better = (a: Fit, b: Fit): boolean =>
+    a.lost !== b.lost
+      ? a.lost < b.lost
+      : reads(a.solved) !== reads(b.solved)
+        ? reads(a.solved)
+        : a.solved.distance_ratio < b.solved.distance_ratio * (1 - FREE_ANGLE_GAIN);
+  let best: Fit = { spec, solved, lost: lost(spec, solved) };
+  const group = shot.subjects.length > 1;
+  for (const angle of FREE_ANGLES) {
+    if (angle === spec.angle || (group && angle.startsWith('profile'))) continue;
+    const s = { ...spec, angle };
+    const c = fitShotCamera(scene, s, shot, o);
+    const fit = { spec: s, solved: c, lost: lost(s, c) };
+    if (better(fit, best)) best = fit;
+  }
+  return { spec: best.spec, solved: best.solved };
+}
+
+/** 'an' before a framing that starts with a vowel ('an extreme wide'), else 'a'. */
+const article = (framing: string): string => (/^[aeiou]/.test(framing) ? 'an' : 'a');
+
+/** The warning a shot's solve reports (null when it kept its framing, its plan and its subjects). */
+function fitWarning(shot: ShotData, spec: SolveSpec, r: SolvedShot, planAgreeing: boolean): string | null {
+  const parts: string[] = [];
+  const framing = spec.framing.replace(/_/g, ' ');
+  if (r.out_of_frame.length) {
+    const who = r.out_of_frame.map(
+      (o) => `${o.name} (frame${o.frames.length > 1 ? 's' : ''} ${o.frames.join(', ')})`,
+    );
+    parts.push(
+      `${who.join(', ')} ${r.out_of_frame.length > 1 ? 'leave' : 'leaves'} its frame` +
+        (r.needed_ratio
+          ? `: keeping ${r.out_of_frame.length > 1 ? 'them' : 'it'} would take a camera ${r.needed_ratio.toFixed(1)} times as far back as ${article(spec.framing)} ${framing}'s, and the solve widens ${article(spec.framing)} ${framing} at most ${MAX_WIDEN[spec.framing]} times`
+          : '') +
+        ` (restage, choose a wider framing, or follow or pan with ${r.out_of_frame.length > 1 ? 'them' : 'it'}: tracking_follow, steadicam_walk, pan_left/right)`,
+    );
+  }
+  if (r.effective_framing !== spec.framing)
+    parts.push(
+      `its camera stands ${r.distance_ratio.toFixed(1)} times as far back as ${article(spec.framing)} ${framing}'s, so it reads as ${article(r.effective_framing)} ${r.effective_framing.replace(/_/g, ' ')} (set framing '${r.effective_framing}' to say so, or restage)`,
+    );
+  if (r.gave_up.includes('plan'))
+    parts.push(
+      `its camera disagrees with its planned layout (plan_mismatch): ${
+        planAgreeing
+          ? 'a camera that agrees with it lets a subject leave the frame, and keeping the subjects in frame comes first'
+          : 'no camera around its subjects agrees with it (restage, or change the plan)'
+      }`,
+    );
+  else if (shot.layout.length && r.gave_up.includes('in_frame'))
+    parts.push('the camera keeps its planned layout, so not all of its subjects stay in frame');
+  const at = (frames: number[]) => `frame${frames.length > 1 ? 's' : ''} ${frames.join(', ')}`;
+  for (const o of r.occluded) {
+    const by = o.by.join(' and ');
+    // its eyes hidden (it does not read), else its body below them
+    const what = o.frames.length
+      ? `${o.name} (${at(o.frames)}${o.body_frames.length ? `; the body only at ${at(o.body_frames)}` : ''})`
+      : `the body of ${o.name} (${at(o.body_frames)})`;
+    parts.push(
+      `${what} is hidden behind ${by}, who ${o.by.length > 1 ? 'are' : 'is'} not in the shot (occluded_subject: ` +
+        `restage, add ${by} to its subjects, or choose another angle or height)`,
+    );
+  }
+  return parts.length
+    ? `Shot '${shot.name}' (${framing}${shot.move ? `, ${shot.move}` : ''}): ${parts.join('; ')}`
+    : null;
 }
 
 /**
  * Solves the cameras of the shots `ids` (rideo's flow): each in cut order from its framing, angle,
  * height, subjects and lens, on the side of the line set by the cameras placed before it (cameras for
- * shots without one are added); then, with `enforce_line`, cameras of cuts that crossed the line are
- * mirrored back; then, with `fit_plan`, each shot with a planned layout is fitted to it (the plan wins
- * over the line); last each shot's move is keyed from its final pose. Writes the shots and cameras.
+ * shots without one are added), fitted over the shot to keep its subjects in frame within a framing
+ * step and to see past actors outside the shot (moves.ts fitShotCamera; a shot that names no angle may
+ * take another that needs less); then,
+ * with `enforce_line`, cameras of cuts that crossed the line are mirrored back; then, with
+ * `fit_plan`, each shot with a planned layout is fitted to it (the plan wins over the line; a camera
+ * that agrees with the plan and keeps the subjects in frame first, plan.ts planFit); last each shot's
+ * move is keyed from its final pose. Writes the shots and cameras, and reports a warning for each
+ * shot whose camera widens its framing, loses a subject, gives up its plan or has a subject hidden
+ * behind an actor outside the shot (the result says which).
  */
 export function solveShotCameras(
   ctx: OperatorContext,
@@ -347,10 +486,18 @@ export function solveShotCameras(
   const order = shots.filter((s) => targets.has(s.id) && s.camera);
   const index = (id: string) => shots.findIndex((s) => s.id === id);
   const poses = new Map<string, CameraPose>();
+  const specs = new Map<string, SolveSpec>();
   const info = new Map<string, SolvedShot>();
   const pending = new Set(order.map((s) => s.id));
+  const cursor = ctx.state.cursorLocation;
+  const fallbackTarget: Vec3 = [cursor[0], cursor[1], cursor[2] + 1];
+  // the solve keys cameras only: when nothing else depends on a camera, the subjects (and the set)
+  // are measured once and each new reading takes just the cameras afresh
+  const first = new DeskScene(doc);
+  const measured = first.camerasLeadNothing() ? first : null;
+  const reading = () => (measured ? new DeskScene(doc, { subjects: measured }) : new DeskScene(doc));
   for (const s of order) {
-    const scene = new DeskScene(doc);
+    const scene = reading();
     // rideo's normalizeBlocking: the line of the shots placed so far and this one (whose camera does
     // not count yet), so the first shot already keeps to the side facing the front of the set
     const placed = shots
@@ -358,14 +505,14 @@ export function solveShotCameras(
       .map((x) => (x.id === s.id ? { ...x, camera: null } : x));
     const line = lineOfAction(scene, placed);
     const lens = o.keep_lens && s.lens_mm === null ? scene.camera(s.camera!, s.frame_start)?.lens : null;
-    const spec = shotSpec(scene, s, index(s.id), lens);
-    const cursor = ctx.state.cursorLocation;
-    const solved = solveCamera(scene, spec, s.frame_start, {
+    // fitted to where its subjects go over the shot and kept in frame through its move (F3)
+    const { spec, solved } = fitFreeAngle(scene, s, shotSpec(scene, s, index(s.id), lens), {
       line: linePointsAt(scene, line, s.frame_start),
-      fallbackTarget: [cursor[0], cursor[1], cursor[2] + 1],
+      fallbackTarget,
     });
     const pose = { position: solved.position, target: solved.target, lens: solved.lens_mm };
     poses.set(s.id, pose);
+    specs.set(s.id, spec);
     poseShot(ctx, s, pose, (use.get(s.camera!) ?? 0) > 1, null, scene);
     pending.delete(s.id);
     info.set(s.id, {
@@ -377,12 +524,15 @@ export function solveShotCameras(
       mirrored: false,
       refit: false,
       agrees: true,
+      ...fitOf(solved),
+      gave_up: [],
+      occluded: [],
       keyframes: 0,
     });
   }
   // the 180° line: cuts on the wrong side mirrored back (orbits cross it by design)
   if (o.enforce_line) {
-    const scene = new DeskScene(doc);
+    const scene = reading();
     const line = lineOfAction(
       scene,
       shots.filter((x) => x.enabled),
@@ -391,27 +541,35 @@ export function solveShotCameras(
       for (const s of order) {
         if (!crossesLine(scene, line, s)) continue;
         const pts = pairPoints(scene, [line.a, line.b], s.frame_start)!;
-        const pose = mirrorPose(pts.a, pts.b, poses.get(s.id)!);
+        // its subjects kept in frame from the mirrored side too (staying on it)
+        const pose = keepShotInFrame(scene, specs.get(s.id)!, s, mirrorPose(pts.a, pts.b, poses.get(s.id)!), {
+          ...pts,
+          side: line.side,
+        });
         poses.set(s.id, pose);
         poseShot(ctx, s, pose, (use.get(s.camera!) ?? 0) > 1, null, scene);
         info.get(s.id)!.mirrored = true;
       }
   }
   // the plan wins over the line
+  const agreeing = new Map<string, boolean>();
   if (o.fit_plan) {
     let changed = false;
     for (const s of order) {
       if (!s.layout.length) continue;
-      const scene = new DeskScene(doc);
+      const scene = reading();
       const fit = planFit(scene, s, index(s.id), {
         lens: o.keep_lens && s.lens_mm === null ? poses.get(s.id)?.lens : null,
+        pose: poses.get(s.id),
       });
       if (!fit) continue;
       const entry = info.get(s.id)!;
       entry.agrees = fit.agreement.agrees;
+      agreeing.set(s.id, fit.agreeing);
       if (!fit.spec || !fit.solved) continue;
       const pose = { position: fit.solved.position, target: fit.solved.target, lens: fit.solved.lens_mm };
       poses.set(s.id, pose);
+      specs.set(s.id, fit.spec);
       poseShot(ctx, s, pose, (use.get(s.camera!) ?? 0) > 1, null, scene);
       entry.refit = true;
       entry.angle = fit.spec.angle;
@@ -421,12 +579,33 @@ export function solveShotCameras(
     }
     if (changed) shots = setShots(doc, shots);
   }
-  // the moves, from each shot's final pose
-  const scene = new DeskScene(doc);
+  // the moves, from each shot's final pose; what each camera came to, from that pose
+  const scene = reading();
+  const line = lineOfAction(
+    scene,
+    shots.filter((x) => x.enabled),
+  );
   for (const s of order) {
     const current = shots[index(s.id)];
-    const r = poseShot(ctx, current, poses.get(s.id)!, (use.get(s.camera!) ?? 0) > 1, current.move, scene);
-    info.get(s.id)!.keyframes = r.keyframes;
+    const pose = poses.get(s.id)!;
+    const r = poseShot(ctx, current, pose, (use.get(s.camera!) ?? 0) > 1, current.move, scene);
+    const entry = info.get(s.id)!;
+    entry.keyframes = r.keyframes;
+    const spec = { ...specs.get(s.id)!, subjects: [...current.subjects] };
+    Object.assign(
+      entry,
+      shotFitReport(scene, spec, current, pose, {
+        line: linePointsAt(scene, line, current.frame_start),
+        fallbackTarget,
+      }),
+    );
+    entry.gave_up = [
+      ...(current.layout.length && !entry.agrees ? (['plan'] as const) : []),
+      ...(entry.out_of_frame.length ? (['in_frame'] as const) : []),
+    ];
+    entry.occluded = shotOcclusions(scene, spec, current, pose);
+    const warning = fitWarning(current, spec, entry, agreeing.get(s.id) ?? false);
+    if (warning) ctx.report('WARNING', warning);
   }
   return order.map((s) => info.get(s.id)!);
 }
@@ -532,7 +711,7 @@ function shotAdd(ctx: OperatorContext, p: ShotAddParams) {
   const stored = setShots(doc, shots);
   extendScene(ctx, end);
   const saved = stored.find((s) => s.id === id)!;
-  let solved = false;
+  let solve: SolvedShot | null = null;
   if (p.from_view) {
     poseShot(
       ctx,
@@ -542,14 +721,13 @@ function shotAdd(ctx: OperatorContext, p: ShotAddParams) {
       saved.move,
     );
   } else if (p.solve && (saved.subjects.length || saved.framing)) {
-    solveShotCameras(ctx, [id], { enforce_line: false, fit_plan: true, keep_lens: false });
-    solved = true;
+    solve = solveShotCameras(ctx, [id], { enforce_line: false, fit_plan: true, keep_lens: false })[0] ?? null;
   } else if (saved.move && cameraStands(doc, saved)) {
     poseShot(ctx, saved, null, (cameraUse(stored).get(camera) ?? 0) > 1, saved.move);
   }
   if (added) setSelection(ctx, [camera], camera);
   const final = getShots(doc).find((s) => s.id === id)!;
-  return { shot: shotSummary(ctx, final), solved };
+  return { shot: shotSummary(ctx, final), solved: !!solve, solve };
 }
 
 interface ShotUpdateParams extends ShotFields {
@@ -617,7 +795,7 @@ function shotUpdate(ctx: OperatorContext, p: ShotUpdateParams) {
   extendScene(ctx, end);
   const saved = stored[i];
   const rangeChanged = saved.frame_start !== old.frame_start || saved.frame_end !== old.frame_end;
-  let solved = false;
+  let solve: SolvedShot | null = null;
   // the shot's keys follow it to its new range (a solve then replaces them there); the other shots
   // on the camera keep their views
   if (saved.camera && saved.camera === old.camera && rangeChanged)
@@ -629,14 +807,14 @@ function shotUpdate(ctx: OperatorContext, p: ShotUpdateParams) {
       cameraHolds(stored, saved.camera, saved.frame_start, saved.frame_end, saved.id),
     );
   if (resolve) {
-    solveShotCameras(ctx, [saved.id], { enforce_line: true, fit_plan: true, keep_lens: false });
-    solved = true;
+    solve =
+      solveShotCameras(ctx, [saved.id], { enforce_line: true, fit_plan: true, keep_lens: false })[0] ?? null;
   } else if (saved.camera) {
     if (p.move !== undefined && saved.move !== old.move && cameraStands(doc, saved))
       poseShot(ctx, saved, null, (cameraUse(stored).get(saved.camera) ?? 0) > 1, saved.move);
   }
   const final = getShots(doc).find((x) => x.id === saved.id)!;
-  return { shot: { ...shotSummary(ctx, final), enabled: final.enabled }, solved };
+  return { shot: { ...shotSummary(ctx, final), enabled: final.enabled }, solved: !!solve, solve };
 }
 
 function shotRemove(ctx: OperatorContext, p: { shots: string[]; delete_cameras: boolean }) {
@@ -687,13 +865,9 @@ function shotSolve(
     : shots.filter((s) => s.enabled);
   if (p.only_missing) targets = targets.filter((s) => !s.camera);
   const ids = [...new Set(targets.map((s) => s.id))];
+  // solveShotCameras warns of each shot that reads as another framing, loses a subject or its plan, or has
+  // a subject hidden behind an actor outside the shot
   const solved = solveShotCameras(ctx, ids, p);
-  for (const s of solved)
-    if (!s.agrees)
-      ctx.report(
-        'WARNING',
-        `The camera of shot '${s.name}' disagrees with its planned layout (plan_mismatch)`,
-      );
   return { shots: solved, issues: issuesOf(ctx, ids) };
 }
 
@@ -737,7 +911,6 @@ function cameraMove(
     frame_end: end,
     amount: p.amount,
     seed: shot?.id ?? camera,
-    subject: subjects[0],
     subjects,
     scene: desk,
     keyed: (use.get(camera) ?? 0) > 1,
@@ -816,7 +989,10 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
         "(rideo's framing table: coverage, lens and look-at height per framing; angle and height around the " +
         'subjects; fitted to `layout` when given; the move keyed over the shot). The range defaults to ' +
         "duration_s (5 s) after the last shot's end and extends the scene's frame_end. Returns {shot: {id, name, " +
-        'camera, camera_name, frame_start, frame_end}, solved}.',
+        'camera, camera_name, frame_start, frame_end}, solved, solve}: solve (null when not solved) is what the ' +
+        'solve came to, as desk.shot_solve reports it (angle; widened, distance_ratio and effective_framing when ' +
+        'the camera stands back to keep its subjects in frame; out_of_frame: subjects that still leave it; ' +
+        'gave_up; occluded), and a warning says what it gave up.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -887,7 +1063,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       description:
         'Change a shot: only the fields passed change (null clears framing, angle, height, move, lens_mm or the ' +
         'camera). The camera is solved again when `resolve` is true (default: when framing, angle, height, move, ' +
-        'lens_mm, subjects or layout change). Returns the shot.',
+        'lens_mm, subjects or layout change). Returns {shot, solved, solve} (solve as in desk.shot_add).',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -964,7 +1140,14 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       description:
         "Solve the cameras of shots from their framing, angle, height, subjects and lens (rideo's solver), fit them " +
         "to each shot's planned layout, key each shot's move, and keep the cameras on one side of the 180° line " +
-        '(the plan wins over the line). Returns the solved shots and the issues found.',
+        '(the plan wins over the line). Each camera is fitted over its shot to keep its subjects in frame, ' +
+        'standing back about a framing step at most (twice the distance of its framing; 2.4 times for wide, 4 for ' +
+        'extreme_wide; over_shoulder and pov not at all); a shot that names no angle may take a side angle ' +
+        'that keeps them at its framing, and a camera an actor outside the shot blocks steps up to 20° aside or ' +
+        '1 m up to see past them. Returns the solved shots (each with angle, widened, distance_ratio, ' +
+        'effective_framing, out_of_frame, gave_up: plan and/or in_frame, and occluded: subjects hidden behind ' +
+        'an actor outside the shot) and the issues found; a warning names each shot whose camera stands back ' +
+        'far enough to read as another framing, loses a subject, gives up its plan or has a subject hidden.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -1190,7 +1373,13 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
               id: z.string().describe('rideo character id'),
               name: z.string().max(200).describe('Name'),
               summary: z.string().max(4000).optional().describe('Summary (used to tell people from animals)'),
-              identity: z.string().max(4000).optional().describe('Identity text (height, species …)'),
+              identity: z
+                .union([
+                  z.string().max(4000),
+                  z.record(z.string(), z.string().max(4000).nullish().describe('An identity field')),
+                ])
+                .optional()
+                .describe("Identity: rideo's identity fields (age, gender, build, height …) or one text"),
               height_m: z.number().min(0.1).max(10).optional().describe('Standing height in metres'),
             }),
           )
@@ -1202,6 +1391,10 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
               id: z.string().describe('rideo element id'),
               name: z.string().max(200).describe('Name'),
               label: z.string().max(80).optional().describe('Short label (chooses the store model)'),
+              kind: z
+                .enum(['location', 'prop', 'style'])
+                .nullish()
+                .describe("rideo's element kind: location, prop or style"),
               summary: z.string().max(4000).optional().describe('Summary'),
             }),
           )
@@ -1212,9 +1405,29 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
             fps: z.number().int().min(1).max(240).describe('Frame rate'),
             width: z.number().int().min(16).max(16_384).describe('Width in pixels'),
             height: z.number().int().min(16).max(16_384).describe('Height in pixels'),
+            aspect_ratio: z
+              .string()
+              .max(10)
+              .nullish()
+              .describe("rideo's aspect ratio ('16:9' …; the resolution decides, as in rideo)"),
           })
           .optional()
           .describe("rideo project settings (default: the scene's own)"),
+        model_limits: z
+          .object({
+            min_s: z.number().positive().max(3600).nullish().describe("The video model's shortest take (s)"),
+            max_s: z.number().positive().max(3600).nullish().describe("The video model's longest take (s)"),
+          })
+          .nullish()
+          .describe(
+            "The video model's duration limits (desk min/max_shot_s; rideo clamps durations to them)",
+          ),
+        state: z
+          .enum(['missing', 'incomplete', 'ready'])
+          .nullish()
+          .describe(
+            "rideo's blocking state: 'missing' places the cast from the shots' planned layouts and solves every camera",
+          ),
         cast_overrides: z
           .record(z.string(), z.enum(ACTOR_KINDS))
           .optional()
@@ -1242,7 +1455,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
               'id), keeping what was added since; false: add everything anew',
           ),
       }),
-      execute: notImplemented('desk.import_rideo_blocking'),
+      execute: (ctx, p) => importRideoOperator(ctx, p, solveShotCameras),
     }),
   );
 
@@ -1257,7 +1470,7 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       category: 'Desk',
       undo: false,
       schema: z.object({}),
-      execute: notImplemented('desk.export_rideo_blocking'),
+      execute: (ctx) => exportRideoOperator(ctx),
     }),
   );
 }

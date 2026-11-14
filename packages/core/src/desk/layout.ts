@@ -1,13 +1,15 @@
 import type { Mat4, Vec3 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
-import type { CameraData, ObjectData } from '../doc/types';
-import { identity4, invert4 } from '../math/mat4';
+import type { AnimTargetType, CameraData, FCurve, ObjectData } from '../doc/types';
+import { compose4, identity4, invert4 } from '../math/mat4';
+import { evaluateFCurve } from '../anim/fcurve';
+import { writeChannel } from '../anim/properties';
 import { FrameState } from '../eval/frame-state';
 import { cameraFovY, orthoHalfExtents } from '../eval/camera';
 import { RigidBodySimulator } from '../physics/rigid-body';
 import { sanitizeRigidBodyWorld } from '../physics/settings';
 import { sunDirection } from '../render/sky';
-import { actorInfo, isActor } from './characters';
+import { HUMANOID_KINDS, actorInfo, isActor, type ActorKind } from './characters';
 import { DESK_PROPS } from './props';
 import { getDeskSettings } from './shots';
 
@@ -23,7 +25,9 @@ import { getDeskSettings } from './shots';
  *
  * A DeskScene reads one state of the document: frame states (with the rigid body simulation where
  * the scene has one) share one reading of the objects, subjects and camera views are cached per
- * frame. Make a new one after changing the document.
+ * frame. An object that is just its own animated channels (no parent, constraints, rigid body or
+ * drivers: a camera, an actor walking on its marks) is read from its own F-curves, as a frame state
+ * evaluates it, without evaluating the scene. Make a new one after changing the document.
  */
 
 /** A point or direction in rideo's coordinates (metres, y up, z towards the audience). */
@@ -38,6 +42,9 @@ export const toEditor = (r: RVec): Vec3 => [r.x, -r.z, r.y];
 
 /** Near plane of the desk's projections (m), as rideo's projectPoint. */
 export const DESK_NEAR = 0.05;
+
+/** The channels an object's world matrix is made of when nothing else moves it. */
+const TRANSFORM_PATHS: ReadonlySet<string> = new Set(['location', 'rotation_euler', 'scale']);
 
 /** rideo's default sun: azimuth 135° (front right), elevation 40°. */
 export const DEFAULT_SUN_AZIMUTH_DEG = 135;
@@ -121,6 +128,23 @@ const EPS = 1e-9;
 
 /** How far below its soles (m) an actor's body must reach to rest on it (a lying animal, hooves up). */
 const BODY_REST_M = 0.1;
+
+/**
+ * How far above the floor under it (m) the bottom of a prop must be for the prop to fly: a kite in
+ * the sky, a ball high in its flight, a balloon (a cup on a table or a lamp on a shelf rests on them).
+ */
+export const AIRBORNE_M = 1;
+
+/**
+ * A following group without actors heads where it travels over this many seconds around a frame
+ * (DeskScene.groupHeading), when it travels more than HEADING_MIN_M there.
+ */
+export const HEADING_WINDOW_S = 0.5;
+export const HEADING_MIN_M = 0.05;
+
+/** Whether an actor kind is an animal (any kind but a person's: framed by its body length too). */
+export const isAnimalKind = (kind: string): boolean =>
+  !!kind && !(HUMANOID_KINDS as readonly string[]).includes(kind as ActorKind);
 
 export const v3add = (a: Readonly<Vec3>, b: Readonly<Vec3>): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 export const v3sub = (a: Readonly<Vec3>, b: Readonly<Vec3>): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
@@ -263,6 +287,21 @@ export interface DeskSubject {
   /** World bounds of its geometry. */
   bounds: Box;
   center: Vec3;
+  /**
+   * An animal (an actor of any kind but a person's, by its desk_kind): long rather than tall, framed
+   * by its body length as well as its height.
+   */
+  animal: boolean;
+  /**
+   * An animal's body along its facing: its front (nose) and back (tail) ends at the height of the
+   * middle of its bounds, and the length between them; null for other subjects.
+   */
+  extent: { front: Vec3; back: Vec3; length: number } | null;
+  /**
+   * A prop flying: its bottom more than AIRBORNE_M above the floor under it (a kite, a ball high in
+   * its flight). It is measured where it is, as every prop is: its feet are the bottom of its bounds.
+   */
+  airborne: boolean;
 }
 
 /** A camera at one frame: its basis (no roll for the desk's cameras) and the tangents of its half field of view. */
@@ -332,6 +371,11 @@ interface Solid {
 /**
  * One reading of the document for the desk at any frame. Frames are evaluated as the viewport shows
  * them, with the rigid body simulation (from the document's shared cache) where the scene has one.
+ *
+ * A scene can take everything but its cameras from another, earlier reading (`subjects`): what the
+ * solver writes while it places shots is camera keys, so a solve measures its subjects once and reads
+ * each new camera pose afresh. Only valid while nothing else changed since that reading and nothing
+ * but cameras depends on a camera ({@link DeskScene.camerasLeadNothing}).
  */
 export class DeskScene {
   readonly aspect: number;
@@ -342,19 +386,66 @@ export class DeskScene {
   private readonly subjects = new Map<string, DeskSubject | null>();
   private readonly views = new Map<string, CameraView | null>();
   private readonly meshBoxes = new Map<string, Box | null>();
+  private readonly solidLists = new Map<number, Solid[]>();
+  /** Datablocks' own F-curves (`type:id`; null: a driver writes the datablock too). */
+  private readonly curveLists = new Map<string, FCurve[] | null>();
+  /** The datablocks drivers write (`type:id`). */
+  private driven: Set<string> | null = null;
   private childList: Map<string, string[]> | null = null;
   private readonly physics: boolean;
   private readonly sim = new RigidBodySimulator();
+  /** The reading subjects, set pieces and other objects than cameras come from (this one, or `subjects`). */
+  private readonly reading: DeskScene;
 
   constructor(
     readonly doc: SceneDoc,
-    o: { aspect?: number; physics?: boolean } = {},
+    o: { aspect?: number; physics?: boolean; subjects?: DeskScene } = {},
   ) {
-    this.aspect = o.aspect ?? deskAspect(doc);
-    this.objects = new Map(doc.listObjects().map((x) => [x.id, x]));
+    this.aspect = o.aspect ?? o.subjects?.aspect ?? deskAspect(doc);
+    this.reading = o.subjects ? o.subjects.reading : this;
+    // sharing a reading, only the cameras are read anew (in the document's order, by name)
+    const from = this.reading !== this ? this.reading.objects : null;
+    const list = from
+      ? doc
+          .objectIds()
+          .map((id) => {
+            const x = from.get(id);
+            return x && x.type !== 'CAMERA' ? x : doc.getObject(id);
+          })
+          .filter((x): x is ObjectData => !!x)
+          .sort((a, b) => a.name.localeCompare(b.name))
+      : doc.listObjects();
+    this.objects = new Map(list.map((x) => [x.id, x]));
     const world = sanitizeRigidBodyWorld(doc.getScene().rigidbody_world);
     this.physics =
       o.physics !== false && world.enabled && [...this.objects.values()].some((x) => !!x.rigid_body?.enabled);
+  }
+
+  /** Whether object `id` is read from the shared reading (everything but cameras, when there is one). */
+  private shared(id: string): boolean {
+    return this.reading !== this && this.objects.get(id)?.type !== 'CAMERA';
+  }
+
+  /**
+   * Whether nothing but cameras depends on a camera: no other object is parented to one, constrained
+   * to one (its own or its bones' constraints) or driven by one. Then a reading of the subjects stays
+   * true while cameras are keyed (see the class comment).
+   */
+  camerasLeadNothing(): boolean {
+    const cameras = [...this.objects.values()].filter((o) => o.type === 'CAMERA').map((o) => o.id);
+    if (!cameras.length) return true;
+    const names = new Set(cameras);
+    const mentions = (v: unknown) => {
+      const s = JSON.stringify(v ?? null);
+      return cameras.some((id) => s.includes(id));
+    };
+    for (const o of this.objects.values()) {
+      if (names.has(o.id)) continue;
+      if (o.parent && names.has(o.parent)) return false;
+      if (o.constraints?.some((c) => c.target && names.has(c.target))) return false;
+      if (o.pose && mentions(o.pose)) return false;
+    }
+    return !mentions(this.doc.listDrivers().filter((d) => !names.has(d.target_id)));
   }
 
   /** The frame state of `frame` (cached; at most a few hundred kept). */
@@ -393,13 +484,128 @@ export class DeskScene {
 
   /** The world matrix of object `id` at `frame` (identity when it cannot be evaluated). */
   world(id: string, frame: number): Mat4 {
-    return this.frameState(frame).world(id) ?? identity4();
+    if (this.shared(id)) return this.reading.world(id, frame);
+    return this.ownWorld(id, frame) ?? this.frameState(frame).world(id) ?? identity4();
+  }
+
+  /** A datablock's unmuted, keyed F-curves, or null when a driver writes it too. */
+  private curvesOf(type: AnimTargetType, id: string): FCurve[] | null {
+    const key = `${type}:${id}`;
+    let out = this.curveLists.get(key);
+    if (out === undefined) {
+      this.driven ??= new Set(
+        this.doc
+          .listDrivers()
+          .filter((d) => !d.mute)
+          .map((d) => `${d.target_type}:${d.target_id}`),
+      );
+      out = this.driven.has(key)
+        ? null
+        : this.doc
+            .listFCurves(id)
+            .filter((fc) => fc.target_type === type && !fc.mute && fc.keyframes.length > 0);
+      this.curveLists.set(key, out);
+    }
+    return out;
+  }
+
+  /** Datablock `id` with its F-curves applied at `frame` (a frame state's animated value), or null when driven. */
+  private ownValues<T>(
+    type: AnimTargetType,
+    id: string,
+    raw: T,
+    frame: number,
+    paths?: ReadonlySet<string>,
+  ): T | null {
+    const curves = this.curvesOf(type, id);
+    if (!curves) return null;
+    const at = Number.isFinite(frame) ? frame : 0;
+    const out = { ...raw } as Record<string, unknown>;
+    for (const fc of curves) {
+      if (paths && !paths.has(fc.path)) continue;
+      const v = evaluateFCurve(fc, at);
+      if (v !== undefined) writeChannel(out, fc.path, fc.index, v);
+    }
+    return out as T;
+  }
+
+  /**
+   * The world matrix of an object that is just its own channels (no parent, constraints, rigid body
+   * or drivers) at `frame`: its location, rotation and scale as its F-curves give them, what a frame
+   * state evaluates for it. Null for other objects.
+   */
+  private ownWorld(id: string, frame: number): Mat4 | null {
+    const o = this.objects.get(id);
+    if (!o || o.parent || o.constraints?.length || o.rigid_body?.enabled) return null;
+    const own = this.ownValues('object', id, o, frame, TRANSFORM_PATHS);
+    return own && compose4(own.location, own.rotation_euler, own.scale);
   }
 
   /** The world position of object `id`'s origin at `frame`. */
   origin(id: string, frame: number): Vec3 {
     const m = this.world(id, frame);
     return [m[12], m[13], m[14]];
+  }
+
+  /**
+   * Where a group of objects is at `frame` (the point following moves follow): across the floor the
+   * mean of their origins (a ball rolling ahead of a dog pulls the camera along); in height the mean
+   * of its actors' origins when it has actors, else of all of them, so a prop never lifts or drops
+   * the camera that follows actors (a bouncing ball, a carried basket, a kite: they move it across
+   * the floor only). One object's is its origin. Ids of objects that are gone are left out; null for
+   * none.
+   */
+  groupCentre(ids: readonly string[], frame: number): Vec3 | null {
+    const here = ids.filter((id) => this.objects.has(id));
+    if (here.length === 1) return this.origin(here[0], frame);
+    if (!here.length) return null;
+    const actors = here.filter((id) => this.isActor(id));
+    const c: Vec3 = [0, 0, 0];
+    let z = 0;
+    for (const id of here) {
+      const p = this.origin(id, frame);
+      c[0] += p[0] / here.length;
+      c[1] += p[1] / here.length;
+      if (!actors.length) z += p[2] / here.length;
+      else if (actors.includes(id)) z += p[2] / actors.length;
+    }
+    c[2] = z;
+    return c;
+  }
+
+  /**
+   * Which way a following group heads at `frame` (unit, on the floor; a steadicam turns with it): the
+   * facing of its actors (their mean; the first one's when they face every way at once), so a prop's
+   * spin never turns the camera; a group without actors heads where it travels from HEADING_WINDOW_S
+   * before `frame` to as long after it (within `span`), else where it travels over the span, else
+   * nowhere new (−Y: the camera does not turn). Ids of objects that are gone are left out.
+   */
+  groupHeading(
+    ids: readonly string[],
+    frame: number,
+    span: { frame_start: number; frame_end: number },
+  ): Vec3 {
+    const here = ids.filter((id) => this.objects.has(id));
+    const actors = here.filter((id) => this.isActor(id));
+    if (actors.length) {
+      if (actors.length === 1) return this.facing(actors[0], frame);
+      const sum = actors.map((id) => this.facing(id, frame)).reduce(v3add, [0, 0, 0] as Vec3);
+      return v3len(sum) > 1e-6 ? v3norm(sum) : this.facing(actors[0], frame);
+    }
+    if (!here.length) return [0, -1, 0];
+    const lo = Math.min(span.frame_start, span.frame_end);
+    const hi = Math.max(span.frame_start, span.frame_end);
+    const travel = (a: number, b: number): Vec3 | null => {
+      const p = this.groupCentre(here, a);
+      const q = this.groupCentre(here, b);
+      if (!p || !q) return null;
+      const d: Vec3 = [q[0] - p[0], q[1] - p[1], 0];
+      return v3len(d) > HEADING_MIN_M ? v3norm(d) : null;
+    };
+    const fps = Math.max(1, this.doc.getScene().fps || 24);
+    const w = Math.max(1, Math.round(HEADING_WINDOW_S * fps));
+    const at = (f: number) => Math.min(hi, Math.max(lo, f));
+    return travel(at(frame - w), at(frame + w)) ?? travel(lo, hi) ?? [0, -1, 0];
   }
 
   /** Children of each object (stored parenting). */
@@ -457,12 +663,11 @@ export class DeskScene {
   }
 
   /**
-   * World bounds of object `id` and its descendants at `frame`: the stored geometry of their meshes
-   * (cameras, lights, strings and other actors below it left out), else the origin of `id`.
+   * Calls `fn` with each mesh of object `id` and its descendants (cameras, lights, strings and other
+   * actors below it left out): the local box of its stored geometry and its world matrix at `frame`.
    */
-  bounds(id: string, frame: number): Box {
+  private eachMesh(id: string, frame: number, fn: (local: Box, world: Readonly<Mat4>) => void): void {
     const fs = this.frameState(frame);
-    const box = emptyBox();
     const visit = (oid: string, root: boolean) => {
       const o = this.objects.get(oid);
       if (!o) return;
@@ -472,10 +677,39 @@ export class DeskScene {
         if (role === 'actor' || role === 'string' || role === 'camera') return;
       }
       const local = this.localBox(oid);
-      if (local) growByCorners(box, local, fs.world(oid) ?? identity4());
+      if (local) fn(local, fs.world(oid) ?? identity4());
       for (const c of this.children(oid)) visit(c, false);
     };
     visit(id, true);
+  }
+
+  /**
+   * The oriented boxes of object `id`'s meshes and its descendants' at `frame` (as {@link bounds}
+   * gathers them: cameras, lights, strings and other actors below it left out), each the local box
+   * of its stored geometry and the inverse of its world matrix: an actor's body part by part, what a
+   * line of sight is tested against (moves.ts shotOcclusions). Meshes scaled to nothing are left out.
+   */
+  bodyBoxes(id: string, frame: number): { inverse: Mat4; local: Box }[] {
+    if (this.shared(id)) return this.reading.bodyBoxes(id, frame);
+    const out: { inverse: Mat4; local: Box }[] = [];
+    this.eachMesh(id, frame, (local, m) => {
+      const det =
+        m[0] * (m[5] * m[10] - m[6] * m[9]) -
+        m[4] * (m[1] * m[10] - m[2] * m[9]) +
+        m[8] * (m[1] * m[6] - m[2] * m[5]);
+      if (Math.abs(det) > 1e-12) out.push({ inverse: invert4(m as Mat4), local });
+    });
+    return out;
+  }
+
+  /**
+   * World bounds of object `id` and its descendants at `frame`: the stored geometry of their meshes
+   * (cameras, lights, strings and other actors below it left out), else the origin of `id`.
+   */
+  bounds(id: string, frame: number): Box {
+    if (this.shared(id)) return this.reading.bounds(id, frame);
+    const box = emptyBox();
+    this.eachMesh(id, frame, (local, m) => growByCorners(box, local, m));
     if (boxEmpty(box)) {
       const p = this.origin(id, frame);
       return { min: [...p], max: [...p] };
@@ -483,10 +717,72 @@ export class DeskScene {
     return box;
   }
 
+  /**
+   * The ends of object `id`'s geometry (as {@link bounds} measures it) along the horizontal unit
+   * `axis` at `frame`, at the height of the middle of `box`: an animal's nose and tail when `axis`
+   * is its facing. Null without geometry.
+   */
+  private extentAlong(id: string, frame: number, axis: Readonly<Vec3>, box: Box): DeskSubject['extent'] {
+    let lo = Infinity;
+    let hi = -Infinity;
+    this.eachMesh(id, frame, (local, m) => {
+      for (let c = 0; c < 8; c++) {
+        const d = v3dot(
+          transform(m, [
+            c & 1 ? local.max[0] : local.min[0],
+            c & 2 ? local.max[1] : local.min[1],
+            c & 4 ? local.max[2] : local.min[2],
+          ]),
+          axis,
+        );
+        if (d < lo) lo = d;
+        if (d > hi) hi = d;
+      }
+    });
+    if (!(hi >= lo)) return null;
+    const mid = boxCenter(box);
+    const at = v3dot(mid, axis);
+    return {
+      front: v3add(mid, v3mul(axis, hi - at)),
+      back: v3add(mid, v3mul(axis, lo - at)),
+      length: hi - lo,
+    };
+  }
+
   /** The horizontal direction object `id` faces at `frame`: its −Y axis on the floor. */
   facing(id: string, frame: number): Vec3 {
     const m = this.world(id, frame);
     return v3norm([-m[4], -m[5], 0], [0, -1, 0]);
+  }
+
+  /**
+   * The height of the floor under point `p` at `frame`: the top of the highest solid set piece
+   * below it (or around it) other than object `id`'s own pieces, else the ground (z = 0).
+   */
+  floorUnder(id: string, p: Readonly<Vec3>, frame: number): number {
+    let floor = 0;
+    for (const s of this.solids(frame)) {
+      if (s.owner === id) continue;
+      // a ray straight down from p in the solid's own space: where it enters the box
+      const q = transform(s.inverse, p);
+      const d: Vec3 = [-s.inverse[8], -s.inverse[9], -s.inverse[10]];
+      let t0 = -Infinity;
+      let t1 = Infinity;
+      let hit = true;
+      for (let k = 0; k < 3 && hit; k++) {
+        if (Math.abs(d[k]) < EPS) {
+          hit = q[k] >= s.local.min[k] && q[k] <= s.local.max[k];
+          continue;
+        }
+        const a = (s.local.min[k] - q[k]) / d[k];
+        const b = (s.local.max[k] - q[k]) / d[k];
+        t0 = Math.max(t0, Math.min(a, b));
+        t1 = Math.min(t1, Math.max(a, b));
+      }
+      if (!hit || t1 < Math.max(t0, 0)) continue;
+      floor = Math.max(floor, p[2] - Math.max(t0, 0));
+    }
+    return floor;
   }
 
   /**
@@ -499,6 +795,7 @@ export class DeskScene {
    * them. Null when the object is gone.
    */
   subject(id: string, frame: number): DeskSubject | null {
+    if (this.shared(id)) return this.reading.subject(id, frame);
     const key = `${id}@${frame}`;
     if (this.subjects.has(key)) return this.subjects.get(key)!;
     const s = this.measure(id, frame);
@@ -521,6 +818,8 @@ export class DeskScene {
         const height = info.head_top[2] - floor;
         if (Number.isFinite(height) && height > 0) {
           const bounds: Box = { min: [...info.bounds.min], max: [...info.bounds.max] };
+          const facing = v3norm(v3flat(info.facing), this.facing(id, frame));
+          const animal = isAnimalKind(info.kind);
           return {
             id,
             name: o.name,
@@ -531,9 +830,12 @@ export class DeskScene {
             head: [...info.head_top],
             height,
             posed: true,
-            facing: v3norm(v3flat(info.facing), this.facing(id, frame)),
+            facing,
             bounds,
             center: boxCenter(bounds),
+            animal,
+            extent: animal ? this.extentAlong(id, frame, facing, bounds) : null,
+            airborne: false,
           };
         }
       } catch {
@@ -548,6 +850,8 @@ export class DeskScene {
       const measured = bounds.max[2] - bounds.min[2];
       const height = stored && stored > 0 ? stored : measured > 0.01 ? measured : 1.7;
       const feet: Vec3 = [at[0], at[1], at[2]];
+      const facing = this.facing(id, frame);
+      const animal = isAnimalKind(deskProp(o, DESK_PROPS.kind));
       return {
         id,
         name: o.name,
@@ -558,9 +862,12 @@ export class DeskScene {
         head: [at[0], at[1], at[2] + height],
         height,
         posed: false,
-        facing: this.facing(id, frame),
+        facing,
         bounds,
         center,
+        animal,
+        extent: animal ? this.extentAlong(id, frame, facing, bounds) : null,
+        airborne: false,
       };
     }
     const height = Math.max(0, bounds.max[2] - bounds.min[2]);
@@ -578,6 +885,9 @@ export class DeskScene {
       facing: this.facing(id, frame),
       bounds,
       center,
+      animal: false,
+      extent: null,
+      airborne: feet[2] - this.floorUnder(id, feet, frame) > AIRBORNE_M,
     };
   }
 
@@ -594,12 +904,13 @@ export class DeskScene {
   }
 
   private measureCamera(id: string, frame: number): CameraView | null {
-    const fs = this.frameState(frame);
     const o = this.objects.get(id);
     if (!o || o.type !== 'CAMERA' || !o.data) return null;
-    const cam = fs.get<CameraData>('camera', o.data) ?? this.doc.getCamera(o.data);
+    const stored = this.doc.getCamera(o.data);
+    const own = stored && this.ownValues('camera', o.data, stored, frame);
+    const cam = own ?? this.frameState(frame).get<CameraData>('camera', o.data) ?? stored;
     if (!cam) return null;
-    const m = fs.world(id) ?? identity4();
+    const m = this.world(id, frame);
     const right = v3norm([m[0], m[1], m[2]], [1, 0, 0]);
     const up = v3norm([m[4], m[5], m[6]], [0, 0, 1]);
     const forward = v3norm([-m[8], -m[9], -m[10]], [0, 1, 0]);
@@ -641,6 +952,7 @@ export class DeskScene {
 
   /** Landmarks (desk_role 'landmark', visible in renders) with their labels and bounds at `frame`. */
   landmarks(frame: number): { id: string; label: string; bounds: Box }[] {
+    if (this.reading !== this) return this.reading.landmarks(frame);
     const out: { id: string; label: string; bounds: Box }[] = [];
     for (const o of this.objects.values()) {
       if (deskProp(o, DESK_PROPS.role) !== 'landmark' || o.hide_render) continue;
@@ -659,8 +971,12 @@ export class DeskScene {
    * part of a model as its own oriented box.
    */
   solids(frame: number): Solid[] {
+    if (this.reading !== this) return this.reading.solids(frame);
+    const cached = this.solidLists.get(frame);
+    if (cached) return cached;
     const fs = this.frameState(frame);
     const out: Solid[] = [];
+    this.solidLists.set(frame, out);
     for (const o of this.objects.values()) {
       const role = deskProp(o, DESK_PROPS.role);
       if (role !== 'landmark' && role !== 'prop' && role !== 'set') continue;

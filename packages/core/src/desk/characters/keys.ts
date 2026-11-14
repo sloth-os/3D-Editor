@@ -69,6 +69,11 @@ export class KeyWriter {
     for (let i = 0; i < 3; i++) this.clear(target, path, i, from, to);
   }
 
+  /** Removes the existing key of the channel at `frame` (within SAME_FRAME) when written. */
+  drop(target: string, path: string, index: number, frame: number): void {
+    this.clear(target, path, index, frame - 2 * SAME_FRAME, frame);
+  }
+
   /** Number of keys collected. */
   get size(): number {
     let n = 0;
@@ -76,22 +81,53 @@ export class KeyWriter {
     return n;
   }
 
-  /** Writes every channel (CONSTANT extrapolation). */
+  /** Whether a key or clear of the channel has been collected. */
+  has(target: string, path: string, index: number): boolean {
+    return this.channels.has(`${target}\u0000${path}\u0000${index}`);
+  }
+
+  /**
+   * The F-curve the channel will have once written (its kept keys and the collected ones, in frame
+   * order; CONSTANT extrapolation), to evaluate before committing; null when nothing was collected
+   * for it or it will have no keys.
+   */
+  curve(doc: SceneDoc, target: string, path: string, index: number): FCurve | null {
+    const c = this.channels.get(`${target}\u0000${path}\u0000${index}`);
+    if (!c) return null;
+    const fc = this.written(doc, c).fc;
+    return fc.keyframes.length ? fc : null;
+  }
+
+  private written(doc: SceneDoc, c: Channel): { fc: FCurve; old: FCurve | null } {
+    const base = { target_type: 'object' as const, target_id: c.target, path: c.path, index: c.index };
+    const old = doc.getFCurve(fcurveKey(base));
+    const fc: FCurve = old ?? createFCurve(base);
+    const kept = fc.keyframes.filter(
+      (k) =>
+        !c.clear.some(([a, b]) => k.frame > a + SAME_FRAME && k.frame <= b + SAME_FRAME) &&
+        !c.keys.some((n) => Math.abs(n.frame - k.frame) <= SAME_FRAME),
+    );
+    const keys = [...kept, ...c.keys].sort((a, b) => a.frame - b.frame);
+    return { fc: { ...fc, keyframes: keys, extrapolation: 'CONSTANT' }, old };
+  }
+
+  /** Writes every channel (CONSTANT extrapolation); a channel left without keys loses its F-curve. */
   commit(doc: SceneDoc): void {
     for (const c of this.channels.values()) {
-      const base = { target_type: 'object' as const, target_id: c.target, path: c.path, index: c.index };
-      const old = doc.getFCurve(fcurveKey(base));
-      const fc: FCurve = old ?? createFCurve(base);
-      const kept = fc.keyframes.filter(
-        (k) =>
-          !c.clear.some(([a, b]) => k.frame > a + SAME_FRAME && k.frame <= b + SAME_FRAME) &&
-          !c.keys.some((n) => Math.abs(n.frame - k.frame) <= SAME_FRAME),
-      );
-      const keys = [...kept, ...c.keys].sort((a, b) => a.frame - b.frame);
-      if (!keys.length && !old) continue;
-      doc.setFCurve({ ...fc, keyframes: keys, extrapolation: 'CONSTANT' });
+      const { fc, old } = this.written(doc, c);
+      if (!fc.keyframes.length) {
+        if (old) doc.removeFCurve(fcurveKey(fc));
+        continue;
+      }
+      doc.setFCurve(fc);
     }
   }
+}
+
+/** The keys of an object channel, sorted by frame ([] when it has none). */
+export function channelKeys(doc: SceneDoc, target: string, path: string, index: number): Keyframe[] {
+  const fc = doc.getFCurve(fcurveKey({ target_type: 'object', target_id: target, path, index }));
+  return fc ? [...fc.keyframes].sort((a, b) => a.frame - b.frame) : [];
 }
 
 /** The first key after `frame` of an object channel (null when none). */

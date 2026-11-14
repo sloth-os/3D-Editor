@@ -119,6 +119,14 @@ export const Icons = {
   fmodifier: P('M1.5 9c1.5-5 3-5 4.5 0s3 5 4.5 0 2.5-4 4-3'),
   /** Warning (evaluation problem). */
   warning: P('M8 2 14.5 13.5h-13zM8 6.5V10M8 12v.3'),
+  /** Director desk: a film strip (shots, Follow Shots). */
+  film: P('M2 3h12v10H2zM5 3v10M11 3v10M2 6h3M2 10h3M11 6h3M11 10h3'),
+  /** Director desk: rule-of-thirds guides in a frame. */
+  guides: P('M2 3h12v10H2zM6 3v10M10 3v10M2 6.3h12M2 9.7h12'),
+  /** Director desk: a camera with a plus (add a shot). */
+  cameraAdd: P('M2 5h8v6H2zM10 7l4-2v6l-4-2M6 6.5v3M4.5 8h3'),
+  /** Director desk: solve (a wand). */
+  solve: P('M3 13l7-7M11 2v2.5M13.5 4.5H11M12.8 2.2l-1.3 1.3M8.5 4l1 1'),
 };
 
 /** SVG path data of a circle (two arcs), for composing icons. */

@@ -1,12 +1,13 @@
-import type { Mat4, Vec3 } from '../../math/types';
+import type { Mat4, Quat, Vec3 } from '../../math/types';
 import { compose4, invert4, multiply4 } from '../../math/mat4';
-import type { SceneDoc } from '../../doc/scene-doc';
+import { fcurveKey, type SceneDoc } from '../../doc/scene-doc';
 import type { ObjectData } from '../../doc/types';
 import { createCube, createCylinder } from '../../mesh/primitives';
 import type { MeshData } from '../../mesh/types';
 import type { FrameState } from '../../eval/frame-state';
 import { OperatorError } from '../../operators/context';
 import { getCatalogEntry } from '../../store/catalog';
+import { mat3ToQuat, quatToMat3, slerpQ } from '../../physics/vmath';
 import {
   baseName,
   channelsFor,
@@ -81,6 +82,68 @@ export const TETHER_STRING_RADIUS = 0.0015;
  */
 export const TETHER_HIDDEN_SCALE = 1e-8;
 
+/** What a flight does with its flyer after frame_end: stays, is hidden, or comes down. */
+export const TETHER_AFTER = ['hold', 'hide', 'land'] as const;
+export type TetherAfter = (typeof TETHER_AFTER)[number];
+
+/**
+ * Seconds a kite takes at least to come down after its flight (after: 'land'); from higher up it takes
+ * longer (tetherLandSeconds).
+ */
+export const TETHER_LAND_SECONDS = 1.5;
+/**
+ * How many times as long as a stone dropped from its height a landing kite takes to come down: its
+ * sail holds it up, so it drifts down rather than falls (and touches the ground softly).
+ */
+export const TETHER_LAND_FALL_FACTOR = 1.6;
+const GRAVITY = 9.81;
+
+/**
+ * Seconds a kite takes to come down from `height` metres above where it lands (its bridle's drop):
+ * TETHER_LAND_FALL_FACTOR times a free fall's √(2h/g), at least TETHER_LAND_SECONDS. From the 17.7 m a
+ * 20 m string flies it at, about 3 s (a fixed 1.5 s reached the ground at about 24 m/s, faster than a
+ * dropped stone's 18.6 m/s).
+ */
+export function tetherLandSeconds(height: number): number {
+  return Math.max(
+    TETHER_LAND_SECONDS,
+    TETHER_LAND_FALL_FACTOR * Math.sqrt((2 * Math.max(0, height)) / GRAVITY),
+  );
+}
+
+/**
+ * The most frames a landing after a flight on a `length_m` string from an anchor `anchorHeight` metres
+ * up can take at `fps` (the kite can be no higher than the anchor and the string): what a flight
+ * reserves, and desk.tether_fly's estimate counts, before the flight shows how high it ends.
+ */
+export function tetherLandFramesMax(length_m: number, anchorHeight: number, fps: number): number {
+  return Math.max(1, Math.ceil(tetherLandSeconds(Math.max(0, anchorHeight) + Math.max(0, length_m)) * fps));
+}
+
+/**
+ * tetherLandFramesMax for a flight of `length_m` from `anchor` (its bone `bone`) ending at `frameEnd`:
+ * from the anchor's height at that frame (0 where it cannot be evaluated).
+ */
+export function tetherLandFrames(
+  doc: SceneDoc,
+  anchor: string,
+  bone: string | undefined,
+  frameEnd: number,
+  length_m: number,
+  fps: number,
+): number {
+  const a = anchorPoint(sceneSampler(doc).at(frameEnd), anchor, bone);
+  return tetherLandFramesMax(length_m, a ? a[2] : 0, fps);
+}
+/** Seconds its tail is keyed on after it lies on the ground (the tail falls and lies down too). */
+export const TETHER_TAIL_SETTLE_SECONDS = 1.5;
+/** Share of its distance from the anchor a landing kite keeps (it dives toward the anchor). */
+const LAND_REACH = 0.8;
+/** Height of a landed kite's lowest corner above the ground (m). */
+const LANDED_CLEARANCE = 0.005;
+/** Custom property of a flyer a flight hid (after: 'hide'): the first hidden frame (a later flight shows it again). */
+const HIDDEN_FROM = 'desk_tether_hidden_from';
+
 /** Custom properties that tie the objects a flight adds to their flyer (so a second flight reuses them). */
 const STRING_OF = 'desk_string_to';
 const STRING_FROM = 'desk_string_from';
@@ -99,6 +162,8 @@ export interface TetherOptions {
   tail?: boolean;
   string?: boolean;
   seed?: number;
+  /** What the flyer does after frame_end (default 'hold'; see {@link tetherFly}). */
+  after?: TetherAfter;
 }
 
 export interface TetherResult {
@@ -113,6 +178,12 @@ export interface TetherResult {
   seed: number;
   /** Mean elevation of the bridle above the anchor after the launch (degrees). */
   mean_elevation_deg: number;
+  /** What the flyer does after frame_end. */
+  after: TetherAfter;
+  /** First frame the flyer, its tail and its string are hidden (after: 'hide'), else null. */
+  hidden_from: number | null;
+  /** Last frame of a landing (after: 'land'): the kite lies on the ground from there, else null. */
+  landed_frame: number | null;
   keyframes: number;
   warnings: string[];
 }
@@ -172,6 +243,34 @@ const columnScale = (m: Readonly<Mat4>): Vec3 => [
   Math.hypot(m[4], m[5], m[6]) || 1,
   Math.hypot(m[8], m[9], m[10]) || 1,
 ];
+
+/** A matrix's first three columns as unit vectors (its rotation, when it has no shear). */
+const axesOf = (m: Readonly<Mat4>): [Vec3, Vec3, Vec3] => [
+  norm([m[0], m[1], m[2]], [1, 0, 0]),
+  norm([m[4], m[5], m[6]], [0, 1, 0]),
+  norm([m[8], m[9], m[10]], [0, 0, 1]),
+];
+
+/** The quaternion of rotation columns (a right-handed orthonormal frame). */
+const quatOfAxes = ([x, y, z]: [Vec3, Vec3, Vec3]): Quat =>
+  mat3ToQuat([x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]]);
+
+/** The rotation columns of a quaternion. */
+function axesOfQuat(q: Readonly<Quat>): [Vec3, Vec3, Vec3] {
+  const r = quatToMat3(q);
+  return [
+    [r[0], r[3], r[6]],
+    [r[1], r[4], r[7]],
+    [r[2], r[5], r[8]],
+  ];
+}
+
+/** Whether a matrix mirrors (its first three columns are left-handed). */
+const mirrors = (m: Readonly<Mat4>): boolean =>
+  m[0] * (m[5] * m[10] - m[6] * m[9]) -
+    m[4] * (m[1] * m[10] - m[2] * m[9]) +
+    m[8] * (m[1] * m[6] - m[2] * m[5]) <
+  0;
 
 // ---------------------------------------------------------------- the wind
 
@@ -236,6 +335,11 @@ interface FlyerShape {
   bridle: Vec3;
   /** Corners of the flyer's bounds (with its parts), in its object space: what the ground stops. */
   corners: Vec3[];
+  /**
+   * Corners of its main part's bounds (the mesh of largest area, its sail), in its object space: what
+   * a landed kite rests on (its bridle lines and tail fold on the ground).
+   */
+  sail: Vec3[];
   /** Sail area (kite) or cross-section (balloon), m². */
   area: number;
   mass: number;
@@ -248,29 +352,52 @@ interface FlyerShape {
   tailParts: ObjectData[];
 }
 
-/** Object-space bounds of a flyer and its mesh parts (in the flyer's object space). */
-function flyerBounds(doc: SceneDoc, fs: FrameState, flyer: ObjectData): { min: Vec3; max: Vec3 } | null {
+/** The eight corners of a box. */
+const boxCorners = (b: { min: Vec3; max: Vec3 }): Vec3[] => {
+  const out: Vec3[] = [];
+  for (const cx of [b.min[0], b.max[0]])
+    for (const cy of [b.min[1], b.max[1]]) for (const cz of [b.min[2], b.max[2]]) out.push([cx, cy, cz]);
+  return out;
+};
+
+/**
+ * Object-space bounds of a flyer and its mesh parts (in the flyer's object space), and those of its
+ * main part: the mesh whose bounds have the largest area (its two largest extents; its tail parts left
+ * out), or null without meshes.
+ */
+function flyerBounds(
+  doc: SceneDoc,
+  fs: FrameState,
+  flyer: ObjectData,
+): { min: Vec3; max: Vec3; main: { min: Vec3; max: Vec3 } } | null {
   const inv = invert4(fs.world(flyer.id)!);
   const min: Vec3 = [Infinity, Infinity, Infinity];
   const max: Vec3 = [-Infinity, -Infinity, -Infinity];
-  let any = false;
+  let main: { min: Vec3; max: Vec3; area: number } | null = null;
   for (const o of [flyer, ...descendants(doc, flyer.id)]) {
     const b = o.type === 'MESH' ? localBounds(doc, o) : null;
     const w = fs.world(o.id);
     if (!b || !w) continue;
     const m = multiply4(inv, w);
-    for (const cx of [b.min[0], b.max[0]])
-      for (const cy of [b.min[1], b.max[1]])
-        for (const cz of [b.min[2], b.max[2]]) {
-          const p = transform(m, [cx, cy, cz]);
-          for (let k = 0; k < 3; k++) {
-            min[k] = Math.min(min[k], p[k]);
-            max[k] = Math.max(max[k], p[k]);
-          }
-          any = true;
-        }
+    const lo: Vec3 = [Infinity, Infinity, Infinity];
+    const hi: Vec3 = [-Infinity, -Infinity, -Infinity];
+    for (const c of boxCorners(b)) {
+      const p = transform(m, c);
+      for (let k = 0; k < 3; k++) {
+        lo[k] = Math.min(lo[k], p[k]);
+        hi[k] = Math.max(hi[k], p[k]);
+      }
+    }
+    for (let k = 0; k < 3; k++) {
+      min[k] = Math.min(min[k], lo[k]);
+      max[k] = Math.max(max[k], hi[k]);
+    }
+    const ext = [0, 1, 2].map((k) => hi[k] - lo[k]).sort((x, y) => y - x);
+    const area = ext[0] * ext[1];
+    if (!/^tail/i.test(baseName(o.name)) && (!main || area > main.area)) main = { min: lo, max: hi, area };
   }
-  return any ? { min, max } : null;
+  if (!Number.isFinite(min[0])) return null;
+  return { min, max, main: main ?? { min, max } };
 }
 
 /** The words that say what an object is (its name, label and store entry, its parents'). */
@@ -299,21 +426,21 @@ const naturally = (a: ObjectData, b: ObjectData): number =>
   a.name.localeCompare(b.name, undefined, { numeric: true });
 
 function flyerShape(doc: SceneDoc, fs: FrameState, flyer: ObjectData): FlyerShape {
-  const kind = /balloon/i.test(identityWords(doc, flyer)) ? 'balloon' : 'kite';
+  const kind = flyerKind(doc, flyer);
   const world = fs.world(flyer.id)!;
   const inv = invert4(world);
   const parts = descendants(doc, flyer.id);
   const bridleObject = parts.find((p) => /^(bridle|string_point)$/i.test(baseName(p.name)));
   const bridleWorld = bridleObject ? fs.world(bridleObject.id) : null;
   const bridle: Vec3 = bridleWorld ? transform(inv, originOf(bridleWorld)) : [0, 0, 0];
-  const b = flyerBounds(doc, fs, flyer) ?? { min: [-0.4, -0.05, -0.5], max: [0.4, 0.05, 0.5] };
+  const fallback = { min: [-0.4, -0.05, -0.5] as Vec3, max: [0.4, 0.05, 0.5] as Vec3 };
+  const b = flyerBounds(doc, fs, flyer) ?? { ...fallback, main: fallback };
   const scale = columnScale(world);
   const ext = [0, 1, 2].map((k) => (b.max[k] - b.min[k]) * scale[k]).sort((x, y) => y - x);
-  const corners: Vec3[] = [];
-  for (const cx of [b.min[0], b.max[0]])
-    for (const cy of [b.min[1], b.max[1]]) for (const cz of [b.min[2], b.max[2]]) corners.push([cx, cy, cz]);
+  const corners = boxCorners(b);
+  const sail = boxCorners(b.main);
   const size = Math.max(0.1, ext[0]);
-  const tailParts = parts.filter((p) => /^tail/i.test(baseName(p.name))).sort(naturally);
+  const tailParts = tailPartsOf(doc, flyer);
   const tailAnchor: Vec3 = [(b.min[0] + b.max[0]) / 2, (b.min[1] + b.max[1]) / 2, b.min[2]];
   if (kind === 'kite') {
     const area = Math.max(0.05, (ext[0] * ext[1]) / 2);
@@ -321,6 +448,7 @@ function flyerShape(doc: SceneDoc, fs: FrameState, flyer: ObjectData): FlyerShap
       kind,
       bridle,
       corners,
+      sail,
       area,
       mass: KITE_AREAL_MASS * area,
       lift: 0,
@@ -337,6 +465,7 @@ function flyerShape(doc: SceneDoc, fs: FrameState, flyer: ObjectData): FlyerShap
     kind,
     bridle,
     corners,
+    sail,
     area,
     mass,
     lift: BALLOON_LIFT_PER_M3 * volume,
@@ -499,9 +628,78 @@ function previousParts(doc: SceneDoc, flyer: string): { string: ObjectData | nul
 }
 
 /**
+ * Makes the flyer of an earlier flight that hid it (after: 'hide', the HIDDEN_FROM property) shown
+ * again for a flight from `frameStart`: its hiding keys go when they are not before the flight (a
+ * flight flown again), else it is shown again from `frameStart` (a later flight), hidden in between.
+ * Returns how to put things back when the flight fails, or null when nothing changed.
+ */
+function showFlyer(doc: SceneDoc, flyer: ObjectData, frameStart: number): (() => void) | null {
+  const hiddenFrom = flyer.custom_props?.[HIDDEN_FROM];
+  if (typeof hiddenFrom !== 'number' || !Number.isFinite(hiddenFrom)) return null;
+  const saved = [0, 1, 2].map((i) => doc.getFCurve(fcurveKey(scaleRef(flyer.id, i))) ?? null);
+  const props = flyer.custom_props;
+  for (let i = 0; i < 3; i++) {
+    const fc = saved[i];
+    if (!fc) continue;
+    const at = (f: number) => fc.keyframes.find((k) => Math.abs(k.frame - f) < 1e-3);
+    if (hiddenFrom >= frameStart) {
+      const keyframes = fc.keyframes.filter((k) => k !== at(hiddenFrom - 1) && k !== at(hiddenFrom));
+      if (keyframes.length) doc.setFCurve({ ...fc, keyframes });
+      else doc.removeFCurve(fcurveKey(fc));
+    } else {
+      const shown = at(hiddenFrom - 1)?.value ?? flyer.scale[i];
+      const keyframes = fc.keyframes.filter((k) => Math.abs(k.frame - frameStart) >= 1e-3);
+      keyframes.push({ frame: frameStart, value: shown, interpolation: 'CONSTANT' });
+      doc.setFCurve({ ...fc, keyframes: keyframes.sort((a, b) => a.frame - b.frame) });
+    }
+  }
+  const rest = { ...props };
+  delete rest[HIDDEN_FROM];
+  doc.updateObject(flyer.id, { custom_props: rest });
+  return () => {
+    for (let i = 0; i < 3; i++) {
+      const fc = saved[i];
+      if (fc) doc.setFCurve(fc);
+      else doc.removeFCurve(fcurveKey(scaleRef(flyer.id, i)));
+    }
+    doc.updateObject(flyer.id, { custom_props: props });
+  };
+}
+
+/** The reference of an object's scale channel `index`. */
+const scaleRef = (id: string, index: number) =>
+  ({ target_type: 'object', target_id: id, path: 'scale', index }) as const;
+
+/**
+ * Keys object `id` hidden (TETHER_HIDDEN_SCALE on every axis, its sign kept) from frame `from` on,
+ * shown as `shown` up to it: a CONSTANT step, so no frame between shows it shrinking. Later keys of the
+ * scale (an agent's own) are kept. Returns the keys written.
+ */
+function hideFrom(doc: SceneDoc, id: string, from: number, shown: Readonly<Vec3>): number {
+  let keys = 0;
+  for (let i = 0; i < 3; i++) {
+    keys += writeChannel(
+      doc,
+      id,
+      'scale',
+      i,
+      [from - 1, from],
+      [shown[i], (shown[i] < 0 ? -1 : 1) * TETHER_HIDDEN_SCALE],
+      { interpolation: 'CONSTANT' },
+    );
+  }
+  return keys;
+}
+
+/**
  * Flies `o.flyer` on a string from `o.anchor` (see the module comment); keys the flyer, the string and
  * the tail on every frame of frame_start … frame_end (before that the flyer keeps its own animation:
- * its constraints, a hand holding it, stop acting at frame_start).
+ * its constraints, a hand holding it, stop acting at frame_start). After frame_end (`o.after`): 'hold'
+ * leaves them where the flight ends; 'hide' hides the flyer (its parts and own tail with it), the
+ * string and the tail from frame_end + 1 by their keyed scale (TETHER_HIDDEN_SCALE: renders, the
+ * viewport and the video export's string overlay show nothing of them); 'land' brings a kite down
+ * over TETHER_LAND_SECONDS (a nose-dive toward the anchor, its tail trailing downwind) to lie flat on
+ * the ground, the string hidden from frame_end + 1.
  */
 export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
   const warnings: string[] = [];
@@ -521,6 +719,9 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       'INVALID_PARAMS',
     );
   if (!(o.length_m > 0)) throw new OperatorError('length_m must be positive', 'INVALID_PARAMS');
+  const after: TetherAfter = o.after ?? 'hold';
+  if (!TETHER_AFTER.includes(after))
+    throw new OperatorError(`after must be one of ${TETHER_AFTER.join(', ')}`, 'INVALID_PARAMS');
   const frames = o.frame_end - o.frame_start + 1;
   if (frames > TETHER_MAX_FRAMES)
     throw new OperatorError(
@@ -528,6 +729,93 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       'INVALID_PARAMS',
     );
   const fps = Math.max(1, doc.getScene().fps || 24);
+  const kind = flyerKind(doc, flyer);
+  if (after === 'land' && kind === 'balloon')
+    throw new OperatorError(
+      "A balloon does not come down: after 'hide' (or 'hold') puts it away after the flight",
+      'INVALID_PARAMS',
+    );
+  // a landing takes longer from higher up: the most it can take (from the anchor's height at the
+  // flight's end and the string's length; the flight shows how long it takes)
+  const landFrames =
+    after === 'land'
+      ? tetherLandFrames(doc, anchorObject.id, o.anchor_bone, o.frame_end, o.length_m, fps)
+      : 0;
+  // a landed kite's tail falls after it and comes to lie on the ground downwind
+  const settleFrames =
+    after === 'land' && o.tail !== false ? Math.round(TETHER_TAIL_SETTLE_SECONDS * fps) : 0;
+  const total = frames + landFrames + settleFrames;
+  const wantTail = o.tail !== false && kind === 'kite';
+  const ownTailParts = wantTail ? tailPartsOf(doc, flyer) : [];
+  const segmentsPlanned = !wantTail
+    ? 0
+    : ownTailParts.length >= 2
+      ? ownTailParts.length - 1
+      : TETHER_TAIL_SEGMENTS;
+  const keyed = 1 + (o.string === false ? 0 : 1) + segmentsPlanned;
+  if (total * keyed > TETHER_MAX_OBJECT_FRAMES)
+    throw new OperatorError(
+      `Keying ${keyed} objects over ${total} frames is more than ${TETHER_MAX_OBJECT_FRAMES} object frames: fly a ` +
+        'shorter range, or without the tail (tail: false)',
+      'INVALID_PARAMS',
+    );
+  if (o.anchor_bone && !sceneSampler(doc).at(o.frame_start).boneMatrix(anchorObject.id, o.anchor_bone))
+    throw new OperatorError(`Bone '${o.anchor_bone}' not found in '${anchorObject.name}'`, 'NOT_FOUND');
+  // a flyer an earlier flight hid is shown for this one (put back when the flight fails)
+  const restore = showFlyer(doc, flyer, o.frame_start);
+  try {
+    return fly(doc, o, {
+      flyer: doc.getObject(flyer.id)!,
+      anchorObject,
+      after,
+      frames,
+      landFrames,
+      settleFrames,
+      fps,
+      warnings,
+    });
+  } catch (e) {
+    restore?.();
+    throw e;
+  }
+}
+
+/** Whether a flyer is a kite or a balloon (its name, label and store entry, or its parents'). */
+function flyerKind(doc: SceneDoc, flyer: ObjectData): 'kite' | 'balloon' {
+  return /balloon/i.test(identityWords(doc, flyer)) ? 'balloon' : 'kite';
+}
+
+/** The flyer's own tail parts ('tail…' objects under it), in their natural order. */
+function tailPartsOf(doc: SceneDoc, flyer: ObjectData): ObjectData[] {
+  return descendants(doc, flyer.id)
+    .filter((p) => /^tail/i.test(baseName(p.name)))
+    .sort(naturally);
+}
+
+/** The flight itself (see {@link tetherFly}), once its parameters are checked. */
+function fly(
+  doc: SceneDoc,
+  o: TetherOptions,
+  c: {
+    flyer: ObjectData;
+    anchorObject: ObjectData;
+    after: TetherAfter;
+    frames: number;
+    /**
+     * The most frames a landing can take (after: 'land': its time depends on the height the flight
+     * ends at), and the frames its tail settles after it.
+     */
+    landFrames: number;
+    settleFrames: number;
+    fps: number;
+    warnings: string[];
+  },
+): TetherResult {
+  const { flyer, anchorObject, after, frames, settleFrames, fps, warnings } = c;
+  // the frames keyed: the flight, its landing (as long as it turns out to take, at most c.landFrames)
+  // and the tail settling after it
+  let landFrames = 0;
+  let total = frames + c.landFrames + settleFrames;
   const seed = o.seed ?? seedFromName(flyer.name);
   const sampler = sceneSampler(doc);
   const fs0 = sampler.at(o.frame_start);
@@ -539,19 +827,14 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
   if (o.tail !== false && shape.kind === 'balloon') warnings.push('balloons fly without a tail');
   const ownTail = wantTail && shape.tailParts.length >= 2;
   const segments = !wantTail ? 0 : ownTail ? shape.tailParts.length - 1 : TETHER_TAIL_SEGMENTS;
-  const keyed = 1 + (o.string === false ? 0 : 1) + segments;
-  if (frames * keyed > TETHER_MAX_OBJECT_FRAMES)
-    throw new OperatorError(
-      `Keying ${keyed} objects over ${frames} frames is more than ${TETHER_MAX_OBJECT_FRAMES} object frames: fly a ` +
-        'shorter range, or without the tail (tail: false)',
-      'INVALID_PARAMS',
-    );
 
-  // the anchor on every frame (and one before, for the string's hidden state)
+  // the anchor on every frame of the flight, and the flyer's parent on every keyed frame
   const anchors: Vec3[] = [];
   const flyerParents: (Mat4 | null)[] = [];
-  for (let f = o.frame_start; f <= o.frame_end; f++) {
+  for (let f = o.frame_start; f < o.frame_start + total; f++) {
     const fs = f === o.frame_start ? fs0 : sampler.at(f);
+    flyerParents.push(parentMatrix(fs, flyer));
+    if (f > o.frame_end) continue;
     const a = anchorPoint(fs, anchorObject.id, o.anchor_bone);
     if (!a)
       throw new OperatorError(
@@ -561,7 +844,6 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
         o.anchor_bone ? 'NOT_FOUND' : 'FAILED',
       );
     anchors.push(a);
-    flyerParents.push(parentMatrix(fs, flyer));
   }
   const anchorAt = (t: number): Vec3 => {
     const i = Math.min(anchors.length - 1, Math.max(0, Math.floor(t)));
@@ -586,6 +868,12 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
     shape.bridle[1] * flyerScale[1],
     shape.bridle[2] * flyerScale[2],
   ];
+  /** The flyer's world matrix with rotation columns `axes` and its bridle at `at`. */
+  const placed = (axes: [Vec3, Vec3, Vec3], at: Vec3): Mat4 => {
+    const [x, y, z] = axes;
+    const rotated = add(add(mul(x, bridleOffset[0]), mul(y, bridleOffset[1])), mul(z, bridleOffset[2]));
+    return frame(x, y, z, flyerScale, sub(at, rotated));
+  };
 
   // the flyer's world matrix with its bridle at `at`, facing the anchor `a` (kite) or along the string (balloon)
   let lateral = 0;
@@ -597,9 +885,7 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       const roll = Math.max(-0.5, Math.min(0.5, (0.35 * lateral) / Math.max(1, o.wind_mps)));
       axes = kiteAxes(toAnchor, roll);
     } else axes = balloonAxes(mul(toAnchor, -1), wind(t));
-    const [x, y, z] = axes;
-    const rotated = add(add(mul(x, bridleOffset[0]), mul(y, bridleOffset[1])), mul(z, bridleOffset[2]));
-    return { world: frame(x, y, z, flyerScale, sub(at, rotated)), x };
+    return { world: placed(axes, at), x: axes[0] };
   };
   /** Lowest point of the flyer (its bounds' corners) in a world pose. */
   const lowest = (world: Readonly<Mat4>): number =>
@@ -659,6 +945,8 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
   let stringRotation: Vec3 = [0, 0, 0];
   const elevations: number[] = [];
   let maxStretch = 0;
+  // the landing (after: 'land'): from the flight's last pose to the kite lying on the ground
+  let land: ((tf: number) => Mat4) | null = null;
 
   // the line pays out at the launch rate while the flyer pulls it taut (a slack line lets nothing
   // out, so a kite climbs on a taut line instead of drifting downwind on a loose one)
@@ -670,12 +958,20 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       ? Math.max(0, payout / CLIMB_PER_AIRSPEED - o.wind_mps) * Math.min(1, o.wind_mps / TUG_FULL_WIND_MPS)
       : 0;
   let tug = 0;
-  for (let i = 0; i < frames; i++) {
+  for (let i = 0; i < total; i++) {
     const f = o.frame_start + i;
     if (i > 0) {
       for (let st = 1; st <= STEPS; st++) {
         const tf = i - 1 + st / STEPS;
         const t = tf / fps;
+        if (land) {
+          // landing: the flyer follows its path down, the tail trails in the wind
+          if (segments) {
+            tailNodes[0] = transform(land(tf), tailLocalAnchor);
+            stepTail(tailNodes, tailPrev, tailLengths, wind(t), dt, downwind);
+          }
+          continue;
+        }
         const a = anchorAt(tf);
         if (line < L && len(sub(p, a)) >= line - 0.01) line = Math.min(L, line + payout * dt);
         tug = line < L ? tugFull : tug * Math.max(0, 1 - dt / TUG_FADE_SECONDS);
@@ -727,27 +1023,57 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
         }
       }
     }
-    const a = anchors[i];
-    if (shape.kind === 'kite')
-      lateral = 0.85 * lateral + 0.15 * dot(v, norm(cross([0, 0, 1], sub(a, p)), [1, 0, 0]));
-    let { world, x } = poseAt(p, a, i / fps);
-    // the pose keyed never reaches under the ground (lifted, unless the string cannot give)
-    const low = lowest(world);
-    if (low < 0) {
-      p = [p[0], p[1], p[2] - low];
-      const r = sub(p, a);
-      if (len(r) > line) p = add(a, mul(r, line / len(r)));
+    let world: Mat4;
+    let x: Vec3;
+    if (land) {
+      world = land(i);
+      x = norm([world[0], world[1], world[2]], [1, 0, 0]);
+    } else {
+      const a = anchors[i];
+      if (shape.kind === 'kite')
+        lateral = 0.85 * lateral + 0.15 * dot(v, norm(cross([0, 0, 1], sub(a, p)), [1, 0, 0]));
       ({ world, x } = poseAt(p, a, i / fps));
+      // the pose keyed never reaches under the ground (lifted, unless the string cannot give)
+      const low = lowest(world);
+      if (low < 0) {
+        p = [p[0], p[1], p[2] - low];
+        const r = sub(p, a);
+        if (len(r) > line) p = add(a, mul(r, line / len(r)));
+        ({ world, x } = poseAt(p, a, i / fps));
+      }
+      const toAnchor = sub(a, p);
+      maxStretch = Math.max(maxStretch, len(toAnchor) - L);
+      if (i >= launchFrames && len(toAnchor) > 1e-6)
+        elevations.push((Math.asin(-toAnchor[2] / len(toAnchor)) * 180) / Math.PI);
+      // the string: from the anchor to the bridle
+      const along = sub(p, a);
+      const [sx, sy, sz] = alongAxes(along, stringX);
+      stringX = sx;
+      const sk = channelsFor(frame(sx, sy, sz, [1, 1, 1], a), null, [1, 1, 1], stringRotation);
+      stringRotation = sk.rotation_euler;
+      stringSamples.frames.push(f);
+      stringSamples.location.push(sk.location);
+      stringSamples.rotation.push(sk.rotation_euler);
+      stringSamples.scale.push([1, 1, Math.max(1e-4, len(along))]);
+      // the flight's last frame: the landing starts from its pose, and takes as long as its height asks
+      if (i === frames - 1 && after === 'land') {
+        const path = landingPath(world, a, i, fps, {
+          downwind,
+          placed,
+          lowest: (m) => Math.min(...shape.sail.map((c) => transform(m, c)[2])),
+          bridle: p,
+          seed,
+        });
+        land = path.at;
+        landFrames = Math.min(c.landFrames, path.frames);
+        total = frames + landFrames + settleFrames;
+      }
     }
-    const toAnchor = sub(a, p);
-    maxStretch = Math.max(maxStretch, len(toAnchor) - L);
     const flyerKeys = channelsFor(world, flyerParents[i], flyer.scale, flyerRotation);
     flyerRotation = flyerKeys.rotation_euler;
     flyerSamples.frames.push(f);
     flyerSamples.location.push(flyerKeys.location);
     flyerSamples.rotation.push(flyerKeys.rotation_euler);
-    if (i >= launchFrames && len(toAnchor) > 1e-6)
-      elevations.push((Math.asin(-toAnchor[2] / len(toAnchor)) * 180) / Math.PI);
     if (segments) {
       const top = transform(world, tailLocalAnchor);
       if (i === 0) {
@@ -761,38 +1087,49 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       settleTail(tailNodes, tailLengths, downwind);
       // at rest when the flight starts (a settled first pose, not one flung by its own corrections)
       if (i === 0) for (let n = 0; n < tailNodes.length; n++) tailPrev[n] = [...tailNodes[n]];
+      // a landing kite's own parts turn with it as it comes down, to lie as they hang under it
+      const lying = landFrames ? landingEase(Math.min(1, Math.max(0, (i - frames + 1) / landFrames))) : 0;
       for (let n = 0; n < segments; n++) {
         if (ownTail) {
           // part n + 1 sits on node n + 1, turned as the chain turned from its rest direction
           const dir = norm(sub(tailNodes[n + 1], tailNodes[n]), restParts[n].dir);
-          tailWorlds[n].push(turnedWorld(restParts[n].world, restParts[n].dir, dir, tailNodes[n + 1]));
+          const hung = turnedWorld(restParts[n].world, restParts[n].dir, dir, tailNodes[n + 1]);
+          tailWorlds[n].push(
+            lying > 0
+              ? blendTurn(
+                  hung,
+                  turnedWithFlyer(restParts[n], world, flyerWorld0, dir, tailNodes[n + 1]),
+                  lying,
+                )
+              : hung,
+          );
         } else {
           const [tx, ty, tz] = hangingAxes(sub(tailNodes[n + 1], tailNodes[n]), x);
           tailWorlds[n].push(frame(tx, ty, tz, [1, 1, 1], tailNodes[n]));
         }
       }
     }
-    // the string: from the anchor to the bridle
-    const along = sub(p, a);
-    const [sx, sy, sz] = alongAxes(along, stringX);
-    stringX = sx;
-    const sk = channelsFor(frame(sx, sy, sz, [1, 1, 1], a), null, [1, 1, 1], stringRotation);
-    stringRotation = sk.rotation_euler;
-    stringSamples.frames.push(f);
-    stringSamples.location.push(sk.location);
-    stringSamples.rotation.push(sk.rotation_euler);
-    stringSamples.scale.push([1, 1, Math.max(1e-4, len(along))]);
   }
   if (maxStretch > 1e-6)
     warnings.push(`the string stretched by ${maxStretch.toFixed(4)} m (anchor moving faster than the flyer)`);
 
   // ---- write: the flyer keeps its own transform before the flight
   holdBefore(doc, flyer.id, o.frame_start, sampler.at(o.frame_start - 1));
-  for (const c of doc.getObject(flyer.id)!.constraints)
-    if (!c.mute && silenceConstraintFrom(doc, flyer.id, c.name, o.frame_start))
-      warnings.push(`'${flyer.name}': constraint '${c.name}' no longer acts from frame ${o.frame_start}`);
+  for (const con of doc.getObject(flyer.id)!.constraints)
+    if (!con.mute && silenceConstraintFrom(doc, flyer.id, con.name, o.frame_start))
+      warnings.push(`'${flyer.name}': constraint '${con.name}' no longer acts from frame ${o.frame_start}`);
   // every frame keyed (no clean-up: dropping a nearly equal key could let the string stretch)
   let keys = keyTransforms(doc, flyer.id, flyerSamples);
+  const hiddenFrom = after === 'hide' ? o.frame_end + 1 : null;
+  if (hiddenFrom !== null) {
+    // the flyer, its parts and its own tail parts with it, hidden from there; remembered so that a
+    // later flight shows it again (showFlyer)
+    const shown = sceneSampler(doc).at(o.frame_end).byId.get(flyer.id)?.scale ?? flyer.scale;
+    keys += hideFrom(doc, flyer.id, hiddenFrom, shown);
+    doc.updateObject(flyer.id, {
+      custom_props: { ...doc.getObject(flyer.id)!.custom_props, [HIDDEN_FROM]: hiddenFrom },
+    });
+  }
 
   const previous = previousParts(doc, flyer.id);
   let stringId: string | null = null;
@@ -828,6 +1165,8 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
         stringSamples.scale.map((sc) => sc[k3]),
         { replace: [o.frame_start, Infinity] },
       );
+    // hidden after the flight too, when the flyer is put away or comes down (let go)
+    if (after !== 'hold') keys += hideFrom(doc, stringId, o.frame_end + 1, stringSamples.scale[frames - 1]);
   }
 
   const tailObjects: string[] = [];
@@ -839,7 +1178,7 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
       for (const [n, part] of parts.entries()) {
         const s = transformSamples();
         let rot: Vec3 = [...part.rotation_euler];
-        for (let i = 0; i < frames; i++) {
+        for (let i = 0; i < total; i++) {
           const parent = part.parent
             ? keyedParentWorld(
                 part.parent,
@@ -881,7 +1220,7 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
         }
         const s = transformSamples();
         let rot: Vec3 = [0, 0, 0];
-        for (let i = 0; i < frames; i++) {
+        for (let i = 0; i < total; i++) {
           const t = channelsFor(tailWorlds[n][i], null, [1, 1, 1], rot);
           rot = t.rotation_euler;
           s.frames.push(o.frame_start + i);
@@ -889,20 +1228,18 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
           s.rotation.push(t.rotation_euler);
         }
         keys += keyTransforms(doc, id, s, { replace: [-Infinity, Infinity] });
-        // hidden before the flight, like the string
+        // hidden before the flight, like the string (and after it when the flyer is put away)
+        const shownFrames = [o.frame_start - 1, o.frame_start];
+        const shownScale = [TETHER_HIDDEN_SCALE, 1];
+        if (hiddenFrom !== null) {
+          shownFrames.push(hiddenFrom - 1, hiddenFrom);
+          shownScale.push(1, TETHER_HIDDEN_SCALE);
+        }
         for (let k3 = 0; k3 < 3; k3++)
-          keys += writeChannel(
-            doc,
-            id,
-            'scale',
-            k3,
-            [o.frame_start - 1, o.frame_start],
-            [TETHER_HIDDEN_SCALE, 1],
-            {
-              interpolation: 'CONSTANT',
-              replace: [-Infinity, Infinity],
-            },
-          );
+          keys += writeChannel(doc, id, 'scale', k3, shownFrames, shownScale, {
+            interpolation: 'CONSTANT',
+            replace: [-Infinity, Infinity],
+          });
         tailObjects.push(id);
       }
       // segments of an earlier, longer tail are not needed any more
@@ -919,9 +1256,117 @@ export function tetherFly(doc: SceneDoc, o: TetherOptions): TetherResult {
     kind: shape.kind,
     seed,
     mean_elevation_deg: Math.round(mean * 100) / 100,
+    after,
+    hidden_from: hiddenFrom,
+    landed_frame: landFrames ? o.frame_end + landFrames : null,
     keyframes: keys,
     warnings,
   };
+}
+
+/** How far a landing has turned and moved over the ground at its share `s` (0–1) of the time: smooth at both ends. */
+const landingEase = (s: number): number => s * s * (3 - 2 * s);
+
+/**
+ * World matrix of an own tail part (`rest`: its world and chain direction when the flight starts) as
+ * it would hang if it had turned with the flyer since then (`flyer`, `flyer0`: the flyer's world
+ * matrices now and then), turned on along its chain to `dir`, at `at`: a bow lying as it hangs flat
+ * under the kite, not on its edge.
+ */
+function turnedWithFlyer(
+  rest: { world: Mat4; dir: Vec3 },
+  flyer: Readonly<Mat4>,
+  flyer0: Readonly<Mat4>,
+  dir: Vec3,
+  at: Vec3,
+): Mat4 {
+  const [x, y, z] = axesOf(flyer);
+  const [x0, y0, z0] = axesOf(flyer0);
+  // the flyer's turn since the flight started (its rotation now times its rotation then, inverted)
+  const r = (v: Vec3): Vec3 => add(add(mul(x, dot(x0, v)), mul(y, dot(y0, v))), mul(z, dot(z0, v)));
+  const m = [...rest.world] as Mat4;
+  for (let c = 0; c < 3; c++) {
+    const v = r([rest.world[c * 4], rest.world[c * 4 + 1], rest.world[c * 4 + 2]]);
+    m[c * 4] = v[0];
+    m[c * 4 + 1] = v[1];
+    m[c * 4 + 2] = v[2];
+  }
+  return turnedWorld(m, norm(r(rest.dir), dir), dir, at);
+}
+
+/** `a`'s rotation turned toward `b`'s by `w` (0–1; quaternion slerp), with `a`'s scale and origin. */
+function blendTurn(a: Readonly<Mat4>, b: Readonly<Mat4>, w: number): Mat4 {
+  if (w <= 0 || mirrors(a) || mirrors(b)) return [...a] as Mat4;
+  const [x, y, z] = axesOfQuat(slerpQ(quatOfAxes(axesOf(a)), quatOfAxes(axesOf(b)), Math.min(1, w)));
+  return frame(x, y, z, columnScale(a), originOf(a));
+}
+
+/**
+ * The path of a kite landing after its flight (after: 'land'): from its pose at the flight's last
+ * frame (`world`, its bridle at `bridle`, the anchor at `anchor`, flight frame `i0`) it nose-dives
+ * toward the anchor, turning from its flying attitude (front to the anchor, nose up) to lie flat face
+ * down with its nose to the anchor, so its tail trails downwind; it rests LAND_REACH of its distance
+ * from the anchor away, the lowest corner of its sail (`lowest`: its bridle lines fold under it) just
+ * above the ground. It takes tetherLandSeconds of its drop (`frames` of them at `fps`), dropping slowly
+ * at first, fastest halfway and slowing again near the ground (it touches down softly, its speed at
+ * most about half a dropped stone's on landing from that height). A small seeded wobble about its nose
+ * fades as it lands. `at` is its world matrix at a (fractional) flight frame.
+ */
+function landingPath(
+  world: Readonly<Mat4>,
+  anchor: Readonly<Vec3>,
+  i0: number,
+  fps: number,
+  o: {
+    downwind: Vec3;
+    placed: (axes: [Vec3, Vec3, Vec3], at: Vec3) => Mat4;
+    lowest: (world: Readonly<Mat4>) => number;
+    bridle: Vec3;
+    seed: number;
+  },
+): { at: (tf: number) => Mat4; frames: number } {
+  const start = o.bridle;
+  // lying flat, face (−Y) down, nose (+Z) to the anchor: its bottom and tail downwind
+  const toAnchor: Vec3 = [anchor[0] - start[0], anchor[1] - start[1], 0];
+  const nose = len(toAnchor) > 1e-3 ? norm(toAnchor) : mul(o.downwind, -1);
+  const up: Vec3 = [0, 0, 1];
+  const lying: [Vec3, Vec3, Vec3] = [norm(cross(up, nose)), up, nose];
+  const ground: Vec3 = [
+    anchor[0] + (start[0] - anchor[0]) * LAND_REACH,
+    anchor[1] + (start[1] - anchor[1]) * LAND_REACH,
+    0,
+  ];
+  const rest = o.placed(lying, ground);
+  ground[2] = LANDED_CLEARANCE - o.lowest(rest);
+  const q0 = quatOfAxes(axesOf(world));
+  const q1 = quatOfAxes(lying);
+  const wobble = (o.seed & 1 ? 1 : -1) * 0.3;
+  const frames = Math.max(1, Math.round(tetherLandSeconds(start[2] - ground[2]) * fps));
+  const at = (tf: number): Mat4 => {
+    const s = Math.min(1, Math.max(0, (tf - i0) / frames));
+    const ease = landingEase(s);
+    let axes = axesOfQuat(slerpQ(q0, q1, ease));
+    // a fading wobble about the nose while it comes down
+    const roll = wobble * Math.sin(2.5 * Math.PI * s) * (1 - s);
+    if (roll) {
+      const [x, y, z] = axes;
+      const cr = Math.cos(roll);
+      const sr = Math.sin(roll);
+      axes = [add(mul(x, cr), mul(y, sr)), add(mul(y, cr), mul(x, -sr)), z];
+    }
+    // down: slow at first, fastest halfway, slowing to touch the ground softly
+    const p: Vec3 = [
+      start[0] + (ground[0] - start[0]) * ease,
+      start[1] + (ground[1] - start[1]) * ease,
+      start[2] + (ground[2] - start[2]) * ease,
+    ];
+    let m = o.placed(axes, p);
+    // never under the ground on the way down
+    const low = o.lowest(m);
+    if (low < LANDED_CLEARANCE && s < 1) m = o.placed(axes, [p[0], p[1], p[2] + LANDED_CLEARANCE - low]);
+    return m;
+  };
+  return { at, frames };
 }
 
 /** Height above z = 0 at which a tail's points lie on the ground. */

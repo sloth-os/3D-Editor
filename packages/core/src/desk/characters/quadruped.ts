@@ -1,4 +1,5 @@
 import type { Vec3 } from '../../math/types';
+import { normalize3 } from '../../math/vec3';
 import type { MeshBuilder } from '../../generate/builder';
 import {
   DEG,
@@ -93,10 +94,10 @@ interface QuadBuild {
   headR: number;
   muzzleR: number;
   /**
-   * Ears: pricked up, wide (big flat ears up and out, deer), hanging, sticking out sideways
-   * (cattle, sheep) or round (bears).
+   * Ears (ears()): pricked up (horses, donkeys, cats), a dog's folded flaps, wide (big flat ears up
+   * and out, deer), hanging, sticking out sideways (cattle, sheep) or round (bears).
    */
-  ears: 'up' | 'wide' | 'floppy' | 'side' | 'round';
+  ears: 'up' | 'fold' | 'wide' | 'floppy' | 'side' | 'round';
   earLen: number;
   earR: number;
   /** Two short horns beside the ears (cattle). */
@@ -211,9 +212,9 @@ const DOG: QuadBuild = {
   headAngle: 6,
   headR: 0.125,
   muzzleR: 0.068,
-  ears: 'up',
-  earLen: 0.13,
-  earR: 0.04,
+  ears: 'fold',
+  earLen: 0.15,
+  earR: 0.06,
   snout: 'short',
   frontRootZ: 0.82,
   hindRootZ: 0.84,
@@ -483,6 +484,118 @@ export const QUADRUPED_DEFAULT_HEIGHTS: Record<QuadrupedKind, number> = Object.f
   Object.entries(BUILDS).map(([k, b]) => [k, b.height]),
 ) as Record<QuadrupedKind, number>;
 
+/**
+ * An ear flap: a flattened, rounded capsule from `a` to `c` (half-width r0 at the base, r1 at the
+ * tip) whose flat faces look along `face`, `thin` of its width thick.
+ */
+function flap(
+  b: MeshBuilder,
+  a: Readonly<Vec3>,
+  c: Readonly<Vec3>,
+  r0: number,
+  r1: number,
+  thin: number,
+  face: Readonly<Vec3>,
+  mat: number,
+): void {
+  capsule(b, a, c, r0, r1, mat, { segs: 8, rings: 2, sx: thin, side: face as Vec3 });
+}
+
+/**
+ * One ear of a quadruped at `base` on the skull (side `sd`; head frame `f`: u forward along the
+ * head, x to the left, −z up). Ears are soft flaps in the body colour (a dark face's own colour on a
+ * black-faced sheep) with a darker inside where it shows, so a close-up reads them as ears, never as
+ * horns: pricked leaves turned forward (horses, donkeys, cats), a dog's flap standing up and out
+ * with its tip folded forward, big flaps up and out (deer), flaps out to the side (cattle, sheep),
+ * flaps hanging beside the head (small dogs, pigs) and round ears (bears).
+ */
+function ears(
+  b: MeshBuilder,
+  P: QuadBuild,
+  base: Vec3,
+  sd: number,
+  f: { u: Vec3; x: Vec3; z: Vec3 },
+  s: (x: number) => number,
+): void {
+  const up = vscale(f.z, -1);
+  const out = vscale(f.x, sd);
+  const fwd = f.u;
+  const dir = (a: number, o: number, w: number): Vec3 =>
+    normalize3(vadd(vadd(vscale(up, a), vscale(out, o)), vscale(fwd, w)));
+  const at = (p: Vec3, d: Vec3, l: number): Vec3 => vadd(p, vscale(d, l));
+  // `d` made square to the axis `a` (a flap's face across its length)
+  const across = (d: Vec3, a: Vec3): Vec3 =>
+    normalize3(vsub(d, vscale(a, d[0] * a[0] + d[1] * a[1] + d[2] * a[2])));
+  const L = s(P.earLen);
+  const R = s(P.earR);
+  const skin = P.darkPoints ? MAT_DARK : MAT_BODY;
+  // the darker inside of a flap from a to c (radii r0 → r1, `thin` thick): a thinner, narrower
+  // flap over 12–80% of its length, just proud of the face it looks along (`face`)
+  const inside = (a: Vec3, c: Vec3, r0: number, r1: number, thin: number, face: Vec3) => {
+    const n = normalize3(face);
+    const end = (t: number) => {
+      const r = r0 + t * (r1 - r0);
+      return { p: vadd(vlerp(a, c, t), vscale(n, 0.75 * thin * r)), r: 0.6 * r };
+    };
+    const e0 = end(0.12);
+    const e1 = end(0.8);
+    flap(b, e0.p, e1.p, e0.r, e1.r, 0.5 * thin, face, MAT_DARK);
+  };
+  switch (P.ears) {
+    case 'up': {
+      // a leaf standing up, leaning a little out and back, its hollow turned forward
+      const tip = at(base, dir(1, 0.2, -0.12), L);
+      const face = dir(0.1, 0.35, 1);
+      flap(b, base, tip, R, 0.3 * R, 0.4, face, skin);
+      inside(base, tip, R, 0.3 * R, 0.4, face);
+      return;
+    }
+    case 'fold': {
+      // a wide flap standing up and out from the back of the skull, its top folded forward over
+      // a hinge across it (the folded part's hollow turned down)
+      const d1 = dir(1, 0.75, -0.15);
+      const f1 = across(dir(0, 0.4, 1), d1);
+      const mid = at(base, d1, 0.62 * L);
+      const fold = 40 * DEG;
+      const d2 = normalize3(vadd(vscale(d1, Math.cos(fold)), vscale(f1, Math.sin(fold))));
+      const f2 = normalize3(vsub(vscale(f1, Math.cos(fold)), vscale(d1, Math.sin(fold))));
+      flap(b, base, mid, R, 0.85 * R, 0.3, f1, skin);
+      flap(b, mid, at(mid, d2, 0.36 * L), 0.85 * R, 0.5 * R, 0.3, f2, skin);
+      inside(base, mid, R, 0.85 * R, 0.3, f1);
+      return;
+    }
+    case 'wide': {
+      // big flat ears turned forward, standing up and out
+      const tip = at(base, dir(0.75, 0.65, 0), L);
+      const face = dir(0, 0.3, 1);
+      capsule(b, base, tip, 0.6 * R, R, skin, { segs: 8, rings: 2, sx: 0.35, cap1: 1.4, side: face });
+      inside(base, tip, 0.6 * R, R, 0.35, face);
+      return;
+    }
+    case 'side': {
+      // flaps sticking out sideways and a little down (cattle, sheep), their hollow forward
+      const tip = at(base, dir(-0.35, 1, 0), L);
+      const face = dir(-0.3, 0, 1);
+      flap(b, base, tip, R, 0.7 * R, 0.4, face, skin);
+      inside(base, tip, R, 0.7 * R, 0.4, face);
+      return;
+    }
+    case 'round': {
+      // a round ear on the crown, its hollow forward
+      const c = at(base, up, 0.4 * R);
+      ellipsoid(b, c, v(R, R, R), skin, 1);
+      ellipsoid(b, at(c, fwd, 0.55 * R), v(0.6 * R, 0.6 * R, 0.6 * R), MAT_DARK, 1);
+      return;
+    }
+    case 'floppy': {
+      // flaps hanging beside the head, a little forward
+      const tip = vadd(base, vadd(vscale(out, s(0.05)), vadd(vscale(up, -L), vscale(fwd, s(0.02)))));
+      capsule(b, base, tip, R, 0.85 * R, skin, { segs: 8, rings: 2, sz: 0.35, side: fwd });
+      return;
+    }
+  }
+}
+
 /** Whether a quadruped kind is built with a saddle bone. */
 export function quadrupedHasSaddle(kind: QuadrupedKind): boolean {
   return BUILDS[kind].saddle;
@@ -688,55 +801,11 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
         const along = (t: number, side: number, up: number) =>
           vadd(vadd(vadd(neckTop, vscale(f.u, t)), vscale(f.x, side)), vscale(f.z, -up));
         for (const sd of [1, -1]) {
-          // eyes on the sides, light so the facing reads; dark ears
+          // eyes on the sides, light so the facing reads; the ears (ears())
           const eyeT = P.snout === 'long' ? 0.2 * len : 0.3 * len;
           ball(b, along(eyeT, sd * 0.8 * hr, 0.35 * hr), 0.2 * hr, MAT_LIGHT, 1);
           ball(b, along(eyeT + 0.04 * hr, sd * 0.88 * hr, 0.38 * hr), 0.11 * hr, MAT_DARK, 1);
-          const earBase = along(-0.05 * hr, sd * 0.55 * hr, 0.75 * hr);
-          if (P.ears === 'up') {
-            const tip = vadd(earBase, vadd(vscale(f.z, -s(P.earLen)), vscale(f.x, sd * s(0.02))));
-            capsule(b, earBase, vadd(tip, vscale(f.u, -s(0.02))), s(P.earR), s(0.006), MAT_DARK, {
-              segs: 6,
-              rings: 1,
-              sx: 0.6,
-            });
-          } else if (P.ears === 'wide') {
-            // big flat ears turned forward, standing up and out
-            const tip = vadd(
-              earBase,
-              vadd(vscale(f.z, -0.75 * s(P.earLen)), vscale(f.x, sd * 0.65 * s(P.earLen))),
-            );
-            capsule(b, earBase, tip, 0.6 * s(P.earR), s(P.earR), MAT_DARK, {
-              segs: 8,
-              rings: 1,
-              sx: 0.35,
-              cap1: 1.4,
-              side: f.u,
-            });
-          } else if (P.ears === 'side') {
-            // flaps sticking out sideways and a little down (cattle, sheep)
-            const tip = vadd(earBase, vadd(vscale(f.x, sd * s(P.earLen)), vscale(f.z, 0.35 * s(P.earLen))));
-            capsule(b, earBase, tip, s(P.earR), 0.7 * s(P.earR), MAT_DARK, {
-              segs: 8,
-              rings: 1,
-              sz: 0.4,
-              side: f.u,
-            });
-          } else if (P.ears === 'round') {
-            ball(b, vadd(earBase, vscale(f.z, -0.4 * s(P.earR))), s(P.earR), MAT_DARK, 1);
-          } else {
-            // floppy ears hang beside the head
-            const tip = vadd(
-              earBase,
-              vadd(vscale(f.x, sd * s(0.05)), vadd(vscale(f.z, s(P.earLen)), vscale(f.u, s(0.02)))),
-            );
-            capsule(b, earBase, tip, s(P.earR), 0.85 * s(P.earR), MAT_DARK, {
-              segs: 8,
-              rings: 1,
-              sz: 0.35,
-              side: f.u,
-            });
-          }
+          ears(b, P, along(-0.05 * hr, sd * 0.55 * hr, 0.75 * hr), sd, f, s);
           if (P.horns) {
             // short light horns curving out and up between the ears
             const base = along(-0.15 * hr, sd * 0.35 * hr, 0.85 * hr);
@@ -792,6 +861,9 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
         }),
     });
   }
+  // a round part's radius at a joint near the floor: no larger than the joint's height, so a
+  // standing leg's pastern or fetlock never dips below the sole (the feet stand on their probes)
+  const above = (r: number, at: Vec3) => Math.min(r, 0.9 * at[2]);
   for (const leg of LEGS) {
     const j = joints(leg);
     const fr = isFront(leg);
@@ -819,8 +891,9 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
       {
         bone: `lower_leg.${leg}`,
         build: (b) => {
-          capsule(b, j.mid, j.low, loR * 1.1, loR, P.darkPoints ? MAT_DARK : MAT_BODY, { rings: 2, segs: 8 });
-          ball(b, j.low, loR * 1.25, MAT_DARK, 1);
+          const mat = P.darkPoints ? MAT_DARK : MAT_BODY;
+          capsule(b, j.mid, j.low, loR * 1.1, above(loR, j.low), mat, { rings: 2, segs: 8 });
+          ball(b, j.low, above(loR * 1.25, j.low), MAT_DARK, 1);
         },
       },
       {
@@ -828,7 +901,8 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
         build: (b) => {
           if (P.feet === 'hoof') {
             const hoofTop = vlerp(j.low, j.tip, 0.55);
-            capsule(b, j.low, hoofTop, loR, loR * 1.05, P.darkPoints ? MAT_DARK : MAT_BODY, {
+            const mat = P.darkPoints ? MAT_DARK : MAT_BODY;
+            capsule(b, j.low, hoofTop, above(loR, j.low), above(loR * 1.05, hoofTop), mat, {
               rings: 1,
               segs: 8,
             });
@@ -852,11 +926,15 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
               MAT_DARK,
             );
           } else {
-            capsule(b, j.low, vlerp(j.low, j.tip, 0.6), loR, loR * 0.95, MAT_BODY, { rings: 1, segs: 8 });
-            // a paw resting on the floor, toes forward
+            const end = vlerp(j.low, j.tip, 0.6);
+            capsule(b, j.low, end, above(loR, j.low), above(loR * 0.95, end), MAT_BODY, {
+              rings: 1,
+              segs: 8,
+            });
+            // a paw resting on the floor (its sole at the ground), toes forward
             ellipsoid(
               b,
-              v(j.tip[0], j.tip[1] - s(0.01), s(0.03)),
+              v(j.tip[0], j.tip[1] - s(0.01), s(0.032)),
               v(loR * 1.35, loR * 1.9, s(0.032)),
               MAT_BODY,
               2,
@@ -914,8 +992,8 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
     probes.push(
       { bone: `foot.${leg}`, point: j.tip, radius: 0 },
       { bone: `foot.${leg}`, point: v(j.tip[0], j.tip[1] + s(0.04), 0), radius: 0 },
-      { bone: `lower_leg.${leg}`, point: j.mid, radius: s(P.cannonR) * 1.4 },
-      { bone: `lower_leg.${leg}`, point: j.low, radius: s(P.cannonR) * 1.25 },
+      { bone: `lower_leg.${leg}`, point: j.mid, radius: above(s(P.cannonR) * 1.4, j.mid) },
+      { bone: `lower_leg.${leg}`, point: j.low, radius: above(s(P.cannonR) * 1.25, j.low) },
     );
   }
   probes.push(
@@ -935,11 +1013,13 @@ export function quadrupedBlueprint(kind: QuadrupedKind, H: number): Blueprint {
   const earTop =
     P.ears === 'up'
       ? s(P.earLen)
-      : P.ears === 'wide'
-        ? 0.75 * s(P.earLen)
-        : P.ears === 'round'
-          ? 0.6 * s(P.earR)
-          : 0;
+      : P.ears === 'fold'
+        ? 0.6 * s(P.earLen)
+        : P.ears === 'wide'
+          ? 0.75 * s(P.earLen)
+          : P.ears === 'round'
+            ? 0.6 * s(P.earR)
+            : 0;
   const short = P.snout === 'short';
   const eyeT = short ? 0.3 * len : 0.2 * len;
   return {

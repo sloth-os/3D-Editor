@@ -159,6 +159,9 @@ describe('desk actors: moves', () => {
       ['horse', 'walk', 8],
       ['horse', 'trot', 10],
       ['dog', 'gallop', 10],
+      // thick-legged builds whose fetlocks sit low (paws and hooves stand on their soles)
+      ['bear', 'walk', 8],
+      ['cow', 'trot', 10],
     ] as [ActorKind, string, number][]) {
       const doc = SceneDoc.create({ empty: true });
       const a = createActor(doc, { kind, location: [0, 0, 0], facing_deg: 90 });
@@ -276,8 +279,13 @@ describe('desk actors: holds and rides', () => {
     holdProp(doc, a.actor, cup, { frame: 10, release_frame: 70 });
     const hand = (f: number) => new FrameState(doc, f).boneMatrix(a.actor, 'hand.R')!.matrix;
     const rel = (f: number) => transformPoint3(invert4(hand(f)), position(doc, cup, f));
-    // untouched before the grab
-    expect(dist(position(doc, cup, 9), [0.4, -0.4, 0.9])).toBeLessThan(1e-9);
+    // untouched until it glides into the hand over the HOLD_BLEND (6) frames before the grab
+    expect(dist(position(doc, cup, 4), [0.4, -0.4, 0.9])).toBeLessThan(1e-9);
+    const glide = [4, 5, 6, 7, 8, 9, 10].map((f) => position(doc, cup, f));
+    const way = dist(glide[0], glide[6]);
+    expect(dist(glide[3], glide[0])).toBeGreaterThan(0.2 * way);
+    expect(dist(glide[3], glide[6])).toBeGreaterThan(0.2 * way);
+    for (let i = 1; i < glide.length; i++) expect(dist(glide[i], glide[i - 1])).toBeLessThan(0.5 * way);
     // in the hand from the grab to the release, whatever the hand does
     const inHand = rel(10);
     expect(Math.hypot(...inHand)).toBeLessThan(0.15);
@@ -416,5 +424,171 @@ describe('desk actors: holds and rides', () => {
     expect(reg.run(ctx, 'desk.actor_mount', { rider: pony, mount: ann, frame: 170 }).code).toBe(
       'INVALID_PARAMS',
     );
+  });
+});
+
+/** World positions of a bone's head at integer frames. */
+function boneTrack(doc: SceneDoc, id: string, bone: string, from: number, to: number): Vec3[] {
+  const out: Vec3[] = [];
+  for (let f = from; f <= to; f++) {
+    const m = new FrameState(doc, f).boneMatrix(id, bone)!.matrix;
+    out.push([m[12], m[13], m[14]]);
+  }
+  return out;
+}
+
+/** Constraints of type `type` on an object and on its pose bones. */
+function constraintCount(doc: SceneDoc, id: string, type: string): number {
+  const o = doc.getObject(id)!;
+  let n = (o.constraints ?? []).filter((c) => c.type === type).length;
+  for (const b of Object.values(o.pose?.bones ?? {}))
+    n += (b.constraints ?? []).filter((c) => c.type === type).length;
+  return n;
+}
+
+describe('desk actors: review regressions', () => {
+  it('a rider stays where it stands until the mount frame', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const horse = createActor(doc, { kind: 'horse', location: [0, 0, 0], facing_deg: 90 });
+    const rider = createActor(doc, { kind: 'adult', location: [0, -2, 0] });
+    const r = moveAlongPath(doc, rider.actor, [[0, -1.2, 0]], { frame_start: 1 });
+    expect(r.frame_end).toBeLessThan(55);
+    const frames = [1, 20, 40, r.frame_end, 55, 58, 59, 59.5];
+    const before = frames.map((f) => position(doc, rider.actor, f));
+    mount(doc, rider.actor, horse.actor, { frame: 60 });
+    // walking, then standing beside the horse: not on its way to the saddle before the mount
+    frames.forEach((f, i) =>
+      expect(dist(position(doc, rider.actor, f), before[i]), `frame ${f}`).toBeLessThan(1e-6),
+    );
+    expect(dist(before[before.length - 1], [0, -1.2, 0])).toBeLessThan(0.01);
+    // on the saddle from the mount frame
+    const fs = new FrameState(doc, 60);
+    const hips = fs.boneMatrix(rider.actor, 'hips')!.matrix;
+    const saddle = fs.boneMatrix(horse.actor, 'saddle')!.matrix;
+    expect(Math.hypot(hips[12] - saddle[12], hips[13] - saddle[13])).toBeLessThan(0.3);
+  });
+
+  it('walks a U-turn in a path as two moves with a stepped turn between them', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const a = createActor(doc, { kind: 'adult', location: [0, 0, 0], facing_deg: 90 });
+    const r = moveAlongPath(
+      doc,
+      a.actor,
+      [
+        [3, 0, 0],
+        [0, 0.15, 0],
+      ],
+      { frame_start: 1 },
+    );
+    expect(dist(position(doc, a.actor, r.frame_end + 2), [0, 0.15, 0])).toBeLessThan(0.05);
+    expect(angleDiff(heading(doc, a.actor, r.frame_end + 2), -90)).toBeLessThan(10);
+    // the body turns round over several frames, never snapping
+    let worstStep = 0;
+    for (let f = 2; f <= r.frame_end; f++)
+      worstStep = Math.max(worstStep, angleDiff(heading(doc, a.actor, f), heading(doc, a.actor, f - 1)));
+    expect(worstStep).toBeLessThan(25);
+    const d = stanceDrift(doc, a.actor, 'adult', 1, r.frame_end + 12);
+    expect(d.worst).toBeLessThan(0.03);
+  });
+
+  it('without face_path the feet keep their sides while walking sideways and backwards', () => {
+    for (const to of [
+      [0, 1.2, 0],
+      [-2, 0, 0],
+    ] as Vec3[]) {
+      const doc = SceneDoc.create({ empty: true });
+      const a = createActor(doc, { kind: 'adult', location: [0, 0, 0], facing_deg: 90 });
+      const r = moveAlongPath(doc, a.actor, [to], { frame_start: 1, face_path: false });
+      expect(angleDiff(heading(doc, a.actor, r.frame_end), 90), `${to}`).toBeLessThan(1);
+      const left = boneTrack(doc, a.actor, 'foot.L', 1, Math.ceil(r.frame_end));
+      const right = boneTrack(doc, a.actor, 'foot.R', 1, Math.ceil(r.frame_end));
+      // facing +X the left foot is on the +Y side of the right one at every frame
+      for (let k = 0; k < left.length; k++)
+        expect(left[k][1] - right[k][1], `${to} frame ${k + 1}`).toBeGreaterThan(0.05);
+      expect(stanceDrift(doc, a.actor, 'adult', 1, r.frame_end + 12, 1).worst, `${to}`).toBeLessThan(0.03);
+    }
+  });
+
+  it('turns on the spot past 100° by stepping round, the planted feet never dragged', () => {
+    for (const kind of ['adult', 'horse'] as ActorKind[]) {
+      const doc = SceneDoc.create({ empty: true });
+      const a = createActor(doc, { kind, location: [0, 0, 0], facing_deg: 0 });
+      faceTo(doc, a.actor, { facing_deg: 180, frame: 40, turn_frames: 24 });
+      expect(angleDiff(heading(doc, a.actor, 40), 180), kind).toBeLessThan(1);
+      expect(stanceDrift(doc, a.actor, kind, 10, 50).worst, `${kind} faceTo`).toBeLessThan(0.02);
+      const doc2 = SceneDoc.create({ empty: true });
+      const b = createActor(doc2, { kind, location: [0, 0, 0], facing_deg: 0 });
+      const r = moveAlongPath(doc2, b.actor, [[3, 3, 0]], { frame_start: 10 });
+      expect(stanceDrift(doc2, b.actor, kind, 10, r.frame_end + 12).worst, `${kind} move`).toBeLessThan(0.03);
+    }
+  });
+
+  it('small animals do not skate on their first steps', () => {
+    for (const kind of ['cat', 'small_dog'] as ActorKind[]) {
+      const doc = SceneDoc.create({ empty: true });
+      const a = createActor(doc, { kind, location: [0, 0, 0], facing_deg: 90 });
+      const r = moveAlongPath(doc, a.actor, [[1.5, 0, 0]], { frame_start: 1 });
+      const d = stanceDrift(doc, a.actor, kind, 1, r.frame_end + 12, 0.25);
+      expect(d.stances, kind).toBeGreaterThan(4);
+      expect(d.worst, kind).toBeLessThan(0.01);
+    }
+  });
+
+  it("a mount's move keys again the release of a prop its rider holds", () => {
+    const doc = SceneDoc.create({ empty: true });
+    const horse = createActor(doc, { kind: 'horse', location: [0, 0, 0], facing_deg: 90 });
+    const rider = createActor(doc, { kind: 'adult', location: [0, -2, 0] });
+    const cup = ball(doc, 'Cup', [0, -1.6, 1.2], 0.08);
+    mount(doc, rider.actor, horse.actor, { frame: 5 });
+    holdProp(doc, rider.actor, cup, { frame: 20, release_frame: 200 });
+    const r = moveAlongPath(doc, horse.actor, [[6, 0, 0]], { frame_start: 30 });
+    expect(r.frame_end).toBeLessThan(190);
+    // let go where the hand is after the walk: no jump back to where it was before it
+    const dropped = position(doc, cup, 200);
+    expect(dist(position(doc, cup, 199.99), dropped)).toBeLessThan(0.01);
+    expect(dropped[0]).toBeGreaterThan(5);
+    expect(dist(position(doc, cup, 230), dropped)).toBeLessThan(1e-9);
+  });
+
+  it('a hand-off keeps the prop in the taker’s hand after the giver is edited', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const giver = createActor(doc, { kind: 'adult', location: [0, 0, 0], facing_deg: 90 });
+    const taker = createActor(doc, { kind: 'adult', location: [1.1, 0, 0], facing_deg: -90 });
+    const cup = ball(doc, 'Cup', [0.4, -0.4, 0.9], 0.08);
+    holdProp(doc, giver.actor, cup, { frame: 10 });
+    holdProp(doc, taker.actor, cup, { frame: 40, hand: 'left' });
+    const inHand = (actor: string, bone: string, f: number) =>
+      transformPoint3(invert4(new FrameState(doc, f).boneMatrix(actor, bone)!.matrix), position(doc, cup, f));
+    const given = inHand(giver.actor, 'hand.R', 30);
+    const taken = inHand(taker.actor, 'hand.L', 41);
+    expect(Math.hypot(...taken)).toBeLessThan(0.15);
+    // the giver waves and walks away later: its keys are written again, the hand-off stays
+    applyPose(doc, giver.actor, 'wave', { frame: 60 });
+    moveAlongPath(doc, giver.actor, [[-3, 0, 0]], { frame_start: 70 });
+    expect(dist(inHand(giver.actor, 'hand.R', 30), given)).toBeLessThan(1e-3);
+    for (const f of [41, 55, 80, 120])
+      expect(dist(inHand(taker.actor, 'hand.L', f), taken), `frame ${f}`).toBeLessThan(1e-3);
+  });
+
+  it('holding or riding again with the same arguments adds nothing', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const horse = createActor(doc, { kind: 'horse', location: [3, 0, 0], facing_deg: 90 });
+    const a = createActor(doc, { kind: 'adult', location: [0, 0, 0], facing_deg: 90 });
+    const cup = ball(doc, 'Cup', [0.4, -0.4, 0.9], 0.08);
+    holdProp(doc, a.actor, cup, { frame: 10, release_frame: 30 });
+    const once = {
+      prop: constraintCount(doc, cup, 'CHILD_OF'),
+      arm: constraintCount(doc, a.actor, 'LIMIT_ROTATION'),
+    };
+    const at20 = position(doc, cup, 20);
+    holdProp(doc, a.actor, cup, { frame: 10, release_frame: 30 });
+    expect(constraintCount(doc, cup, 'CHILD_OF')).toBe(once.prop);
+    expect(constraintCount(doc, a.actor, 'LIMIT_ROTATION')).toBe(once.arm);
+    expect(dist(position(doc, cup, 20), at20)).toBeLessThan(1e-6);
+    mount(doc, a.actor, horse.actor, { frame: 50, dismount_frame: 90 });
+    const seated = position(doc, a.actor, 70);
+    mount(doc, a.actor, horse.actor, { frame: 50, dismount_frame: 90 });
+    expect(constraintCount(doc, a.actor, 'CHILD_OF')).toBe(1);
+    expect(dist(position(doc, a.actor, 70), seated)).toBeLessThan(1e-6);
   });
 });

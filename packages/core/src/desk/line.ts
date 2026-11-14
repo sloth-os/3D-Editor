@@ -197,7 +197,6 @@ export function enforceLine(
       frame_start: s.frame_start,
       frame_end: s.frame_end,
       seed: s.id,
-      subject: s.subjects[0],
       subjects: s.subjects,
       start: pose,
       scene,

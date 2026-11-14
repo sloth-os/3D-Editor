@@ -14,11 +14,14 @@ import { poseBones } from './poses';
 import {
   bezier3,
   gaitDef,
+  gaitSpeed,
+  gaitStride,
   legFrame,
   legRigs,
   moveTiming,
   smooth,
   solveLeg,
+  turnRounds,
   type GaitDef,
   type GaitName,
   type LegRig,
@@ -34,7 +37,11 @@ import type { ActorKind } from './types';
  * and the joint angles at every key come from the leg IK (gait.ts), so stride = speed / cadence
  * and a planted foot stays put. The body accelerates and stops smoothly; the gait blends in from
  * the pose the actor stands in and, once the last steps have closed beside each other after the
- * arrival, into the end pose. faceTo turns an actor on the spot.
+ * arrival, into the end pose. A path that turns back on itself (a corner sharper than
+ * SHARP_CORNER) is walked as moves that stop there and turn on the spot. A turn on the spot steps
+ * round in rounds of one step per foot, the body facing the mean of its feet, so no planted foot is
+ * dragged round; faceTo turns a standing actor that way too. Without face_path the body keeps its
+ * heading and the footsteps are laid out in its own frame (backwards, sideways).
  */
 
 /** A polyline path (world space) measured by arc length. */
@@ -222,6 +229,20 @@ interface Footprint {
   toeDir: Vec3 | null;
   fwd: Vec3;
 }
+
+/** One step of a turn on the spot: a foot swings from τ = a to b, from one heading's footprint to another's. */
+interface TurnStep {
+  a: number;
+  b: number;
+  from: number;
+  to: number;
+}
+
+/** Where in a step of a turn on the spot (fractions of its swing) the leg is keyed. */
+export const TURN_STEP_KEYS = [0, 0.15, 0.3, 0.5, 0.7, 0.85, 1] as const;
+
+/** Least swing height (fraction of the leg length) of a short swing, so that it reads as a step. */
+const MIN_LIFT = 0.08;
 
 /** Rest geometry of a foot (character space; forward = −Y, up = +Z). */
 interface FootGeom {
@@ -426,15 +447,17 @@ function footIn(pose: ArmaturePose, leg: LegRig): { end: Vec3; dir: Vec3; toeDir
 }
 
 /**
- * Keys the actor moving along `points` from where it stands at frame_start (see the module
- * comment). Throws an OperatorError for bad input.
+ * One move of moveActor (a path without corners that turn back), or, with `turnTo` (a world
+ * heading, radians), a turn on the spot from frame_start to frame_end stepped as a move's first turn
+ * is; null when the actor does not stand on its feet then (the caller turns it whole).
  */
-export function moveActor(
+function moveSegment(
   doc: SceneDoc,
   actorId: string,
   points: readonly Vec3[],
   o: MoveOptions,
-): MoveResult {
+  turnTo: number | null = null,
+): MoveResult | null {
   const meta = requireActor(doc, actorId);
   const kind = requireBuiltKind(meta.kind) as ActorKind;
   const arm = doc.getArmature(meta.armature);
@@ -444,7 +467,8 @@ export function moveActor(
   const endPose = requirePose(kind, o.end_pose ?? 'stand');
   if (!Number.isFinite(o.frame_start))
     throw new OperatorError('frame_start must be a number', 'INVALID_PARAMS');
-  if (!points.length) throw new OperatorError('points must hold at least one point', 'INVALID_PARAMS');
+  if (!points.length && turnTo === null)
+    throw new OperatorError('points must hold at least one point', 'INVALID_PARAMS');
   for (const p of points)
     if (p.length !== 3 || !p.every(Number.isFinite))
       throw new OperatorError('points must be finite [x, y, z] triples', 'INVALID_PARAMS');
@@ -473,7 +497,7 @@ export function moveActor(
   const yaw0 = yawOf([-world0[4], -world0[5], 0]);
   const raw = new PolyPath([start, ...points]);
   const startPose = obj0.pose?.bones ?? {};
-  if (raw.length < 1e-3)
+  if (raw.length < 1e-3 && turnTo === null)
     return {
       frame_end: o.frame_end ?? f0,
       length_m: 0,
@@ -489,6 +513,20 @@ export function moveActor(
   const faceP = o.face_path !== false;
   const w = 0.25 * size;
   const timingOf = (p: PolyPath) => {
+    if (turnTo !== null) {
+      // a turn on the spot: the walk's steps, the whole time to turn
+      const gw = gaitDef(family, 'walk')!;
+      const vw = gaitSpeed(gw, family, size);
+      return {
+        yawStart: nearAngle(turnTo, yaw0),
+        gait: 'walk' as GaitName,
+        g: gw,
+        v: vw,
+        S: gaitStride(gw, family, size, vw),
+        ta: 0,
+        turnT: total ?? 0,
+      };
+    }
     const yawStart = faceP ? nearAngle(p.heading(0, w), yaw0) : yaw0;
     const opts = { asked: asked as GaitName | null, speed: o.speed_mps, total };
     return { yawStart, ...moveTiming(family, size, p.length, Math.abs(yawStart - yaw0), opts) };
@@ -503,24 +541,42 @@ export function moveActor(
     path = new PolyPath(roundCorners(raw.pts, Math.min(1.2 * size, r)));
   }
   const L = path.length;
-  const { yawStart, gait: gaitName, g, v, S, ta, turnT } = timingOf(path);
+  const timed = timingOf(path);
+  const { yawStart, gait: gaitName, g, turnT } = timed;
+  let { v, S, ta } = timed;
+  // legs and their feet
+  const legs = legRigs(arm, family);
+  const narrow = family === 'humanoid' ? (g.name === 'run' ? 0.6 : 0.85) : 1;
+  // without face_path the body keeps its heading (bodyFrameStride); without a speed or an arrival
+  // frame such a walk is slower, at the same cadence
+  const latSide = SIDE_STANCE * size;
+  let sideways = 0;
+  if (!faceP && turnTo === null) {
+    const restLat = legs.length ? Math.min(...legs.map((l) => Math.abs(l.root[0]) * narrow)) : latSide;
+    const bf = bodyFrameStride(path.pts, facingOf(yaw0), S, size, restLat);
+    const k = bf.k;
+    sideways = bf.sideways;
+    if (k < 1) {
+      S *= k;
+      if (o.speed_mps === undefined && total === null) v *= k;
+      else if (total === null) ta = Math.min(ta, (0.3 * S) / v);
+    }
+  }
   const timing = new Timing(L, v, ta);
   const T = timing.T;
   const Tc = S / v;
   const grid = g.grid;
 
-  // legs and their feet
-  const legs = legRigs(arm, family);
   const legLen = legs.length ? legs.reduce((a, l) => a + l.L1 + l.L2, 0) / legs.length : size / 2;
-  const narrow = family === 'humanoid' ? (g.name === 'run' ? 0.6 : 0.85) : 1;
   const geom = new Map<string, FootGeom>();
   for (const leg of legs) {
     const df = -(leg.tip[1] - leg.end[1]);
     const du = leg.tip[2] - leg.end[2];
     const toeBone = leg.toe ? arm.bones.find((b) => b.name === leg.toe) : undefined;
+    const lat = leg.root[0] * narrow;
     geom.set(leg.id, {
       fwd: -leg.root[1],
-      lat: leg.root[0] * narrow,
+      lat: Math.sign(lat) * Math.max(Math.abs(lat), latSide * sideways),
       endZ: leg.end[2],
       dir: [df / leg.footLen, du / leg.footLen],
       len: leg.footLen,
@@ -553,6 +609,7 @@ export function moveActor(
   for (const [n, r] of restMatrices(arm.bones)) restInv.set(n, invert4(r.matrix));
   const startStands = legs.every((leg) => touching(startFK, leg));
   const endStands = legs.every((leg) => touching(endFK, leg));
+  if (turnTo !== null && (!startStands || !(turnT > 0))) return null;
 
   // the gait clock: driven by the distance travelled, then by time while the last steps close
   const phi0 = family === 'humanoid' ? Math.ceil(g.mid * grid - 1e-9) / grid : 3 / grid;
@@ -568,11 +625,12 @@ export function moveActor(
     if (Number.isFinite(last.contact)) phiEnd = Math.max(phiEnd, last.contact + g.heelEnd + 1 / grid);
   }
   phiEnd = Math.min(phiEnd, phiT + 2);
-  const tEnd = Math.max(T, tAt(phiEnd));
+  const tEnd = turnTo === null ? Math.max(T, tAt(phiEnd)) : 0;
 
   // the body (armature object)
   const bodyS = (t: number) => timing.s(Math.min(t, T));
   const bodyYaw = (t: number): number => {
+    if (turnTo !== null) return yawStart;
     if (!faceP) return yaw0;
     const y = nearAngle(path.heading(bodyS(t), w), yawStart);
     if (turnT > 0) return y;
@@ -582,27 +640,32 @@ export function moveActor(
     compose4(path.at(bodyS(t)), [obj0.rotation_euler[0], obj0.rotation_euler[1], bodyYaw(t)], obj0.scale);
   const objEnd = objWorld(tEnd);
 
-  // footprints: the nominal one of a footstep, or where the start or end pose puts the foot; they
-  // point along the path's heading rounded as the body's is (on a sharp corner the feet turn with
-  // the body over a few steps rather than all at the corner)
-  const along = (s: number): Vec3 => (faceP ? facingOf(path.heading(s, w)) : path.tangent(s));
-  const stepPoint = (s: number, f: number, l: number, u: number): Vec3 => {
-    const p = path.at(s);
-    const t = along(s);
-    return [p[0] + t[0] * f - t[1] * l, p[1] + t[1] * f + t[0] * l, p[2] + u];
-  };
-  const stepDir = (s: number, fu: [number, number]): Vec3 => {
-    const t = along(s);
+  // footprints: the nominal one of a footstep, or where the start or end pose puts the foot. Facing
+  // the path they point along its heading, rounded as the body's is (on a sharp corner the feet turn
+  // with the body over a few steps rather than all at the corner); without face_path they are laid
+  // out in the frame of the body, which keeps its heading (walking backwards, the left foot stays
+  // on the left)
+  const bodyFwd = facingOf(yaw0);
+  const along = (s: number): Vec3 => (faceP ? facingOf(path.heading(s, w)) : bodyFwd);
+  const stepDir = (t: Readonly<Vec3>, fu: [number, number]): Vec3 => {
     const n = Math.hypot(fu[0], fu[1]) || 1;
     return [(t[0] * fu[0]) / n, (t[1] * fu[0]) / n, fu[1] / n];
   };
   const nominalPrint = (leg: LegRig, s0: number): Footprint => {
     const gm = geom.get(leg.id)!;
-    const s = s0 + gm.fwd;
+    // the leg's root over the footstep: further along the path facing it, else ahead in the body
+    const s = faceP ? s0 + gm.fwd : s0;
     const fwd = along(s);
+    const base = path.at(s);
+    if (!faceP) for (let i = 0; i < 2; i++) base[i] += fwd[i] * gm.fwd;
+    const at = (f: number, l: number, u: number): Vec3 => [
+      base[0] + fwd[0] * f - fwd[1] * l,
+      base[1] + fwd[1] * f + fwd[0] * l,
+      base[2] + u,
+    ];
     if (family === 'quadruped') {
-      const tip = stepPoint(s, gm.tipF, gm.lat + gm.tipL, 0);
-      const d = stepDir(s, gm.dir);
+      const tip = at(gm.tipF, gm.lat + gm.tipL, 0);
+      const d = stepDir(fwd, gm.dir);
       return {
         end: [tip[0] - d[0] * gm.len, tip[1] - d[1] * gm.len, tip[2] - d[2] * gm.len],
         dir: d,
@@ -611,9 +674,9 @@ export function moveActor(
       };
     }
     return {
-      end: stepPoint(s, 0, gm.lat, gm.endZ),
-      dir: stepDir(s, gm.dir),
-      toeDir: gm.toeDir ? stepDir(s, gm.toeDir) : null,
+      end: at(0, gm.lat, gm.endZ),
+      dir: stepDir(fwd, gm.dir),
+      toeDir: gm.toeDir ? stepDir(fwd, gm.toeDir) : null,
       fwd,
     };
   };
@@ -678,9 +741,10 @@ export function moveActor(
       const u = (phi - st.lift) / (next.contact - st.lift);
       const t0 = prints.get(st)!.fwd;
       const t1 = prints.get(next)!.fwd;
-      // a swing shorter than the gait's (the quick first step) lifts and folds the foot less
+      // a swing shorter than the gait's (the quick first step) lifts and folds the foot less, but
+      // always clear of the ground (a paw kept within millimetres of it reads as a skate)
       const amp = Math.min(1, (next.contact - st.lift) / (1 - g.duty));
-      const lift = amp * g.lift * legLen;
+      const lift = Math.max(amp * g.lift, Math.min(g.lift, MIN_LIFT)) * legLen;
       const kick = amp * g.kick * legLen;
       const c1: Vec3 = [a.end[0] - t0[0] * kick, a.end[1] - t0[1] * kick, a.end[2] + 1.3 * lift];
       const c2: Vec3 = [
@@ -706,8 +770,9 @@ export function moveActor(
 
   // keys: every step of the gait grid (each stance event, at its exact phase), the arrival and the end
   const keyAt = new Map<number, number>();
-  for (let m = Math.ceil(phi0 * grid - 1e-9); m / grid < phiEnd + 1e-9; m++)
-    keyAt.set(round6(tAt(m / grid)), m / grid);
+  if (turnTo === null)
+    for (let m = Math.ceil(phi0 * grid - 1e-9); m / grid < phiEnd + 1e-9; m++)
+      keyAt.set(round6(tAt(m / grid)), m / grid);
   for (const t of [0, T, tEnd])
     if (![...keyAt.keys()].some((k) => Math.abs(k - t) < 1e-5)) keyAt.set(round6(t), phiAt(t));
   // the phase follows the distance, so while the speed ramps up and down the grid's steps stretch
@@ -802,56 +867,82 @@ export function moveActor(
     states.push(st);
   };
 
-  // the turn on the spot (before t = 0): the body turns about its origin while each foot in turn
-  // steps from where it stands to where the start pose puts it under the turned body
-  const turnWindows = new Map<string, [number, number]>();
+  // the turn on the spot (before t = 0): the body turns about its origin while the feet step round
+  // under it in rounds of one step of each foot (turnRounds), so that no planted foot is dragged
+  // round: each step puts a foot where the start pose puts it under a heading part of the way round
+  // (the last round's under the heading the move starts on), and the body faces the mean heading of
+  // its feet, so a planted foot is never turned far from it
+  const turnSteps = new Map<string, TurnStep[]>();
   if (turnT > 0 && startStands) {
-    const left = yawStart - yaw0 > 0;
+    const Y = yawStart - yaw0;
+    const left = Y > 0;
     const rank = (leg: LegRig) => (leg.front ? 0 : 2) + (leg.side > 0 === left ? 0 : 1);
     const order = [...legs].sort((a, b) => rank(a) - rank(b));
-    const slot = (0.95 * turnT) / order.length;
-    order.forEach((leg, i) =>
-      turnWindows.set(leg.id, [-turnT + 0.025 * turnT + i * slot, -turnT + 0.025 * turnT + (i + 1) * slot]),
-    );
-    const from = new Map<string, Footprint>();
-    const to = new Map<string, Footprint>();
-    for (const leg of legs) {
-      from.set(leg.id, posedPrint(startFK, leg, world0) ?? nominalPrint(leg, 0));
-      to.set(leg.id, posedPrint(startFK, leg, objWorld(0)) ?? nominalPrint(leg, 0));
+    const n = order.length;
+    const steps = n * turnRounds(family, Y);
+    const slot = (0.95 * turnT) / steps;
+    const heading = new Map(legs.map((l) => [l.id, yaw0]));
+    for (const leg of legs) turnSteps.set(leg.id, []);
+    for (let k = 0; k < steps; k++) {
+      const leg = order[k % n];
+      const a = -turnT + 0.025 * turnT + k * slot;
+      const to = yaw0 + Y * Math.min(1, (k + 1) / (steps - n + 1));
+      turnSteps.get(leg.id)!.push({ a, b: a + slot, from: heading.get(leg.id)!, to });
+      heading.set(leg.id, to);
     }
-    const turnYaw = (tau: number) => yaw0 + (yawStart - yaw0) * smooth((tau + turnT) / turnT);
+    const prints = new Map<string, Footprint>();
+    const printAt = (leg: LegRig, h: number): Footprint => {
+      const key = `${leg.id}:${h}`;
+      let fp = prints.get(key);
+      if (!fp) {
+        const m = compose4(start, [obj0.rotation_euler[0], obj0.rotation_euler[1], h], obj0.scale);
+        fp = posedPrint(startFK, leg, m) ?? nominalPrint(leg, 0);
+        prints.set(key, fp);
+      }
+      return fp;
+    };
+    /** A foot's heading at τ: that of its last step, between two while it swings. */
+    const headingAt = (leg: LegRig, tau: number): number => {
+      let h = yaw0;
+      for (const st of turnSteps.get(leg.id)!) {
+        if (tau <= st.a) return h;
+        if (tau < st.b) return st.from + (st.to - st.from) * smooth((tau - st.a) / (st.b - st.a));
+        h = st.to;
+      }
+      return h;
+    };
+    // keys: through each step closely enough that the leg follows the foot up and down (sparser,
+    // the joint angles interpolated between the planted and the lifted foot would drag its ball)
     const times = new Set<number>();
     for (let k = 0; k < 8; k++) times.add(round6(-turnT + (k * turnT) / 8));
-    for (const [a, b] of turnWindows.values()) times.add(round6(a)).add(round6(b));
+    for (const list of turnSteps.values())
+      for (const st of list) for (const u of TURN_STEP_KEYS) times.add(round6(st.a + (st.b - st.a) * u));
     for (const tau of [...times].filter((x) => x < -1e-6).sort((a, b) => a - b)) {
       const feet = new Map<string, FootPose>();
       for (const leg of legs) {
-        const [a, b] = turnWindows.get(leg.id)!;
         const gm = geom.get(leg.id)!;
-        const p = from.get(leg.id)!;
-        const q = to.get(leg.id)!;
-        if (tau <= a + 1e-6) feet.set(leg.id, rolled(p, gm, 0));
-        else if (tau >= b - 1e-6) feet.set(leg.id, rolled(q, gm, 0));
-        else {
-          const u = (tau - a) / (b - a);
-          const h = 0.6 * g.lift * legLen;
-          const end = bezier3(p.end, vAdd(p.end, [0, 0, 1.3 * h]), vAdd(q.end, [0, 0, 1.3 * h]), q.end, u);
-          const k = smooth(u);
-          const mix = (x: Vec3, y: Vec3): Vec3 => {
-            const m: Vec3 = [0, 1, 2].map((i) => x[i] + (y[i] - x[i]) * k) as Vec3;
-            const l = Math.hypot(m[0], m[1], m[2]) || 1;
-            return [m[0] / l, m[1] / l, m[2] / l];
-          };
-          feet.set(leg.id, {
-            end,
-            dir: mix(p.dir, q.dir),
-            toeDir: p.toeDir && q.toeDir ? mix(p.toeDir, q.toeDir) : null,
-            fwd: mix(p.fwd, q.fwd),
-            planted: false,
-          });
+        const st = turnSteps.get(leg.id)!.find((x) => tau > x.a + 1e-6 && tau < x.b - 1e-6);
+        if (!st) {
+          feet.set(leg.id, rolled(printAt(leg, headingAt(leg, tau)), gm, 0));
+          continue;
         }
+        const p = printAt(leg, st.from);
+        const q = printAt(leg, st.to);
+        // lifted and put down straight, turned to its new heading in the air (from 15% to 70% of
+        // the swing) so that it never twists on the ground
+        const u = (tau - st.a) / (st.b - st.a);
+        const h = 0.8 * g.lift * legLen;
+        const end = bezier3(p.end, vAdd(p.end, [0, 0, 1.3 * h]), vAdd(q.end, [0, 0, 1.3 * h]), q.end, u);
+        const k = smooth((u - 0.15) / 0.55);
+        feet.set(leg.id, {
+          end,
+          dir: unitMix(p.dir, q.dir, k),
+          toeDir: p.toeDir && q.toeDir ? unitMix(p.toeDir, q.toeDir, k) : null,
+          fwd: unitMix(p.fwd, q.fwd, k),
+          planted: false,
+        });
       }
-      const yaw = turnYaw(tau);
+      const yaw = legs.reduce((a, l) => a + headingAt(l, tau), 0) / Math.max(1, legs.length);
       const bodyRot: Record<string, Vec3> = {};
       for (const b of arm.bones)
         if (b.name !== 'root' && !legBones.has(b.name)) bodyRot[b.name] = rot0(b.name);
@@ -913,9 +1004,8 @@ export function moveActor(
       const b = states[i + 1];
       a.planted.clear();
       for (const leg of legs) {
-        const w = turnWindows.get(leg.id);
         const plantedNow = Number.isNaN(a.phi)
-          ? !!w && (b.t <= w[0] + 1e-6 || a.t >= w[1] - 1e-6)
+          ? !(turnSteps.get(leg.id) ?? []).some((st) => a.t < st.b - 1e-6 && b.t > st.a + 1e-6)
           : plantedThrough(leg, a.phi, b.phi);
         if (plantedNow) a.planted.add(leg.id);
       }
@@ -1051,12 +1141,14 @@ export function moveActor(
     if (leg.toe) putRot(leg.toe, st.frame, blend(leg.toe, sol.toe), interp);
   }
 
-  // the end pose, once the steps have closed
-  const fFinal = frameOf(tEnd) + Math.max(2, Math.round(0.25 * fps));
-  for (const b of arm.bones)
-    if (b.name !== 'root')
-      putRot(b.name, fFinal, (endBones[b.name]?.rotation_euler ?? zero) as Vec3, 'BEZIER');
-  for (let i = 0; i < 3; i++) put('hips', bonePath('hips', 'location'), i, fFinal, endHips[i], 'BEZIER');
+  // the end pose, once the steps have closed (a turn on the spot ends in the pose it started in)
+  const fFinal = turnTo === null ? frameOf(tEnd) + Math.max(2, Math.round(0.25 * fps)) : frameOf(0);
+  if (turnTo === null) {
+    for (const b of arm.bones)
+      if (b.name !== 'root')
+        putRot(b.name, fFinal, (endBones[b.name]?.rotation_euler ?? zero) as Vec3, 'BEZIER');
+    for (let i = 0; i < 3; i++) put('hips', bonePath('hips', 'location'), i, fFinal, endHips[i], 'BEZIER');
+  }
 
   // write: the move's range replaces whatever was keyed there
   const wr = new KeyWriter();
@@ -1087,6 +1179,181 @@ export function moveActor(
   };
 }
 
+/**
+ * Corners a move does not walk round (radians): sharper than this (walking there and back) the
+ * actor stops at the corner, turns on the spot and walks on, as a person does.
+ */
+export const SHARP_CORNER = 135 * DEG;
+
+/** Half the stance width (fraction of the height) of a walk sideways without face_path. */
+const SIDE_STANCE = 0.08;
+
+/**
+ * Without face_path the body keeps its heading (`fwd`) and the footsteps are laid out in its frame:
+ * the factor (≤ 1) by which a stride S shortens along `pts` and how far sideways the path goes (the
+ * sine of its largest angle off `fwd`). A step backwards is shorter; a step sideways never brings the
+ * feet together: the stance a little wider (SIDE_STANCE), the stride short enough that the trailing
+ * foot stays a sixteenth of the height `size` from the leading one, also on the first step from the
+ * start pose's stance (half width `restLat`).
+ */
+export function bodyFrameStride(
+  pts: readonly Readonly<Vec3>[],
+  fwd: Readonly<Vec3>,
+  S: number,
+  size: number,
+  restLat: number,
+): { k: number; sideways: number } {
+  const back = 0.65 * S;
+  const side = Math.max(0.05 * S, Math.min(S, 2 * (restLat + SIDE_STANCE * size - size / 16)));
+  let k = 1;
+  let sideways = 0;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const l = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (l < 1e-6) continue;
+    const c = ((b[0] - a[0]) * fwd[0] + (b[1] - a[1]) * fwd[1]) / l;
+    const sn = Math.sqrt(Math.max(0, 1 - c * c));
+    const ahead = c >= 0 ? S : back;
+    k = Math.min(k, 1 / Math.sqrt((c * c) / (ahead * ahead) + (sn * sn) / (side * side)) / S);
+    sideways = Math.max(sideways, sn);
+  }
+  return { k, sideways };
+}
+
+/**
+ * A path (its first point where the actor stands) cut at its sharp corners (SHARP_CORNER): the
+ * parts in order, each from its first point to its last, the next starting at that corner.
+ */
+export function splitAtSharpCorners(points: readonly Vec3[]): Vec3[][] {
+  const pts: Vec3[] = [];
+  for (const p of points) {
+    const q = pts[pts.length - 1];
+    if (!q || Math.hypot(p[0] - q[0], p[1] - q[1], p[2] - q[2]) > 1e-4) pts.push([p[0], p[1], p[2]]);
+  }
+  const parts: Vec3[][] = [];
+  let part: Vec3[] = pts.slice(0, 1);
+  for (let i = 1; i < pts.length; i++) {
+    part.push(pts[i]);
+    const a = pts[i - 1];
+    const b = pts[i];
+    const c = pts[i + 1];
+    if (!c) break;
+    const ux = b[0] - a[0];
+    const uy = b[1] - a[1];
+    const vx = c[0] - b[0];
+    const vy = c[1] - b[1];
+    const lu = Math.hypot(ux, uy);
+    const lv = Math.hypot(vx, vy);
+    if (lu < 1e-6 || lv < 1e-6) continue;
+    const turn = Math.acos(Math.max(-1, Math.min(1, (ux * vx + uy * vy) / (lu * lv))));
+    if (turn > SHARP_CORNER) {
+      parts.push(part);
+      part = [b];
+    }
+  }
+  parts.push(part);
+  return parts;
+}
+
+/**
+ * The cruise speed (m/s) at which a move cut into `parts` (splitAtSharpCorners) arrives `total`
+ * seconds after it starts: each part turns on the spot (from heading `yaw0`, then at its corner),
+ * walks, and, all but the last, stops (its last steps close and it stands, about a cycle and a
+ * quarter of a second); null when no speed makes it in time.
+ */
+function partsSpeed(
+  family: 'humanoid' | 'quadruped',
+  size: number,
+  parts: readonly Vec3[][],
+  yaw0: number,
+  faceP: boolean,
+  asked: GaitName | null,
+  total: number,
+): number | null {
+  const lengths = parts.map((p) => new PolyPath(p).length);
+  const turns: number[] = [];
+  let heading = yaw0;
+  for (const p of parts) {
+    const first = new PolyPath(p).tangent(0);
+    const h = faceP ? nearAngle(yawOf(first), heading) : heading;
+    turns.push(Math.abs(h - heading));
+    const last = new PolyPath(p).tangent(Infinity);
+    heading = faceP ? nearAngle(yawOf(last), h) : heading;
+  }
+  const time = (v: number) =>
+    parts.reduce((sum, _, k) => {
+      const t = moveTiming(family, size, lengths[k], turns[k], { asked, speed: v, total: null });
+      const stop = k < parts.length - 1 ? 1.0 * (t.S / t.v) + 0.25 : 0;
+      return sum + t.turnT + lengths[k] / t.v + t.ta + stop;
+    }, 0);
+  let lo = 0.05;
+  let hi = 30;
+  if (time(hi) > total) return null;
+  if (time(lo) <= total) return lo;
+  for (let i = 0; i < 50; i++) {
+    const mid = Math.sqrt(lo * hi);
+    if (time(mid) > total) lo = mid;
+    else hi = mid;
+  }
+  return hi;
+}
+
+/**
+ * Keys the actor moving along `points` from where it stands at frame_start (see the module
+ * comment): a path with sharp corners (splitAtSharpCorners) is walked as one move per part, each
+ * but the last ending in 'stand' at its corner, the next starting with a turn on the spot there.
+ * Throws an OperatorError for bad input.
+ */
+export function moveActor(
+  doc: SceneDoc,
+  actorId: string,
+  points: readonly Vec3[],
+  o: MoveOptions,
+): MoveResult {
+  const meta = requireActor(doc, actorId);
+  const whole = () => moveSegment(doc, actorId, points, o)!;
+  if (!Number.isFinite(o.frame_start) || points.some((p) => p.length !== 3 || !p.every(Number.isFinite)))
+    return whole();
+  const kind = requireBuiltKind(meta.kind) as ActorKind;
+  const family = isHumanoidKind(kind) ? 'humanoid' : 'quadruped';
+  const world = new FrameState(doc, o.frame_start).world(meta.id);
+  if (!world || !points.length) return whole();
+  const parts = splitAtSharpCorners([[world[12], world[13], world[14]], ...points]);
+  if (parts.length < 2) return whole();
+  const faceP = o.face_path !== false;
+  const asked =
+    o.gait && o.gait !== 'auto' && gaitDef(family, o.gait as GaitName) ? (o.gait as GaitName) : null;
+  let speed = o.speed_mps;
+  if (o.frame_end !== undefined) {
+    const fps = Math.max(1, doc.getScene().fps || 24);
+    const yaw0 = yawOf([-world[4], -world[5], 0]);
+    const v = partsSpeed(family, meta.height, parts, yaw0, faceP, asked, (o.frame_end - o.frame_start) / fps);
+    if (v === null) return whole();
+    speed = v;
+  }
+  let frame = o.frame_start;
+  let length = 0;
+  let keys = 0;
+  let last: MoveResult | null = null;
+  for (let k = 0; k < parts.length; k++) {
+    const end = k === parts.length - 1;
+    const timed = end && o.frame_end !== undefined && o.frame_end > frame + 1;
+    const r = moveSegment(doc, actorId, parts[k].slice(1), {
+      ...o,
+      frame_start: frame,
+      frame_end: timed ? o.frame_end : undefined,
+      speed_mps: timed ? undefined : speed,
+      end_pose: end ? o.end_pose : 'stand',
+    })!;
+    length += r.length_m;
+    keys += r.keys;
+    frame = r.frame_settled;
+    last = r;
+  }
+  return { ...last!, length_m: length, keys };
+}
+
 const round6 = (x: number) => Math.round(x * 1e6) / 1e6;
 const vAdd = (a: Readonly<Vec3>, b: Readonly<Vec3>): Vec3 => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
 
@@ -1104,7 +1371,9 @@ const EPS = 1e-5;
 
 /**
  * Keys the actor turning on the spot to `yawTarget` (world heading, radians) so the turn ends at
- * `frame` after `turnFrames`; returns the heading reached (degrees, world).
+ * `frame` after `turnFrames`; returns the heading reached (degrees, world). An actor standing on
+ * its feet steps round as a move's first turn does (its feet never dragged round); one that does
+ * not (seated, lying, riding), or a turn of no frames, turns whole.
  */
 export function turnActor(
   doc: SceneDoc,
@@ -1121,12 +1390,18 @@ export function turnActor(
   const old = obj.rotation_euler[2];
   const target = nearAngle(o.yaw - parentYaw, old);
   const path = 'rotation_euler';
-  const w = new KeyWriter();
-  w.clear(meta.id, path, 2, from, o.frame);
-  w.key(meta.id, path, 2, from, old, o.turnFrames > 0 ? 'BEZIER' : 'CONSTANT');
-  w.key(meta.id, path, 2, o.frame, target);
-  // a later key that held the old heading now holds the new one
   const next = nextKey(doc, meta.id, path, 2, o.frame);
+  const stepped =
+    o.turnFrames > 0 &&
+    Math.abs(target - old) > 1e-6 &&
+    moveSegment(doc, meta.id, [], { frame_start: from, frame_end: o.frame }, target + parentYaw) !== null;
+  const w = new KeyWriter();
+  if (!stepped) {
+    w.clear(meta.id, path, 2, from, o.frame);
+    w.key(meta.id, path, 2, from, old, o.turnFrames > 0 ? 'BEZIER' : 'CONSTANT');
+    w.key(meta.id, path, 2, o.frame, target);
+  }
+  // a later key that held the old heading now holds the new one
   if (next && Math.abs(next.value - old) < 1e-6)
     w.key(meta.id, path, 2, next.frame, target, next.interpolation);
   w.commit(doc);
