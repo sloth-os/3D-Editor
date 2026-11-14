@@ -219,6 +219,7 @@ describe("rideo's blockingIssues", () => {
       'missing_camera',
       'subject_out_of_frame',
       'tether_detached',
+      'walks_on_water',
     ]);
     expect(DESK_ISSUE_CODES.filter((c) => DESK_ISSUE_SEVERITY[c] === 'info').sort()).toEqual([
       'physics_unbaked',

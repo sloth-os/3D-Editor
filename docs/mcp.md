@@ -1653,7 +1653,11 @@ physics presets and shots (a camera and a range of scene frames each, solved fro
 description), with continuity checks. Its 24 `desk.*` operators and the 3 `store.*` operators run
 through `run_operator` and `batch` like any other (`list_operators {category: "Director"}`, or
 `Actors`, `Model Store`), each one undo step; `desk.check` and `desk.export_rideo_blocking` change
-nothing. The tools below do the work that runs in the background or reaches other servers.
+nothing. The errors `desk.check` reports are `line_crossed`, `subject_out_of_frame`,
+`camera_inside`, `missing_camera`, `tether_detached` and `walks_on_water`: fix them before exporting
+the shots. A kite is flown with `desk.tether_fly` after its anchor actor's moves, poses and mounts,
+since its string starts where the hand is then; `tether_detached` reports a string left behind, so
+fly it again. The tools below do the work that runs in the background or reaches other servers.
 
 #### Video export
 
@@ -1697,11 +1701,13 @@ the download fails with `NOT_DOWNLOADABLE`, a provider without its key with `NEE
 | `rideo_push`   | `project`, `export` (made with `export_video {preset: 'rideo'}`), `rideo {url, token, project, clip}`, `shots`, `mode` (`motion` / `pose` / `camera`), `pass` (per mode: `motion` beauty, `pose` pose, `camera` depth), `write_blocking` (true) | Per shot the rideo resource and mode or the error; `blocking` (written, rideo's state, lines that differ, `plan_mismatch`), `stale`, `moves`, `boards_to_redraw`, `warnings` |
 
 `rideo_import` reads a clip of the AI video studio rideo (`RIDEO_URL` and `RIDEO_TOKEN` by default;
-a call that names another server brings its own token) and builds or updates a project from it;
-`rideo_push` writes the project's blocking to the clip and sends a finished export's clips as the
-shots' reference videos: each shot its clip of the pass its mode sends, or the shot fails (export
-with `export_video {project, preset: 'rideo'}`, which has every pass the modes send). The recipes
-are in [rideo.md](rideo.md).
+a call that names another server brings its own token) and builds or updates a project from it:
+importing again rebuilds the actors, props, landmarks and shot cameras it imported from rideo's
+blocking, and its warnings name those changed in the desk since the last import (push first, or
+stage them again). `rideo_push` writes the project's blocking to the clip and sends a finished
+export's clips as the shots' reference videos: each shot its clip of the pass its mode sends, or the
+shot fails (export with `export_video {project, preset: 'rideo'}`, which has every pass the modes
+send). The recipes are in [rideo.md](rideo.md).
 
 ### Resources
 

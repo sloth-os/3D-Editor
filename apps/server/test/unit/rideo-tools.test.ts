@@ -93,6 +93,18 @@ describe('rideo tools', () => {
     );
   });
 
+  it('tell agents what importing again rebuilds, and what its warnings name', async () => {
+    await withClient(async (client) => {
+      const { tools } = await client.listTools();
+      const imp = tools.find((t) => t.name === 'rideo_import')!;
+      // what desk.rideo_import does again (rideo-import.test.ts): the staging since is replaced
+      expect(imp.description).toContain(
+        "Importing again rebuilds the imported actors, props, landmarks and shot cameras from rideo's blocking; warnings name those changed here since the last import (push first, or stage them again).",
+      );
+      expect(imp.description!.length).toBeLessThanOrEqual(600);
+    });
+  });
+
   it('refuse malformed rideo ids and unknown arguments before anything runs', async () => {
     await withClient(async (client, calls) => {
       for (const args of [

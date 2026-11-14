@@ -1,8 +1,8 @@
 import type { Mat4, Vec3 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
-import type { AnimTargetType, CameraData, FCurve, ObjectData } from '../doc/types';
-import { compose4, identity4, invert4 } from '../math/mat4';
-import { evaluateFCurve } from '../anim/fcurve';
+import type { AnimTargetType, CameraData, FCurve, Keyframe, ObjectData } from '../doc/types';
+import { compose4, identity4, invert4, multiply4 } from '../math/mat4';
+import { evaluateFCurve, sortedKeyframes } from '../anim/fcurve';
 import { writeChannel } from '../anim/properties';
 import { FrameState } from '../eval/frame-state';
 import { cameraFovY, orthoHalfExtents } from '../eval/camera';
@@ -47,6 +47,12 @@ export const DESK_NEAR = 0.05;
 
 /** The channels an object's world matrix is made of when nothing else moves it. */
 const TRANSFORM_PATHS: ReadonlySet<string> = new Set(['location', 'rotation_euler', 'scale']);
+/** Where each of them goes in DeskScene.ownTransform's location, rotation and scale. */
+const TRANSFORM_SLOTS: ReadonlyMap<string, 0 | 1 | 2> = new Map([
+  ['location', 0],
+  ['rotation_euler', 1],
+  ['scale', 2],
+]);
 
 /** rideo's default sun: azimuth 135° (front right), elevation 40°. */
 export const DEFAULT_SUN_AZIMUTH_DEG = 135;
@@ -368,6 +374,12 @@ export function projectPoint(view: CameraView, p: Readonly<Vec3>): Projected {
 export const inPicture = (p: Pick<Projected, 'x' | 'y'>, margin = 1): boolean =>
   Number.isFinite(p.x) && Math.abs(p.x) <= margin && Math.abs(p.y) <= margin;
 
+/** An F-curve and its keyframes in frame order (anim/fcurve.ts sortedKeyframes). */
+interface SortedCurve {
+  fc: FCurve;
+  keys: Keyframe[];
+}
+
 /** A solid volume a camera must not stand in: the oriented box of a mesh's stored geometry. */
 interface Solid {
   /** The object carrying the desk role (a model's root) and its label. */
@@ -397,10 +409,14 @@ export class DeskScene {
   private readonly meshBoxes = new Map<string, Box | null>();
   private readonly solidLists = new Map<number, Solid[]>();
   /** Datablocks' own F-curves (`type:id`; null: a driver writes the datablock too). */
-  private readonly curveLists = new Map<string, FCurve[] | null>();
+  private readonly curveLists = new Map<string, SortedCurve[] | null>();
+  /** Objects' own F-curves by `path:index` (null: a driver writes the object), see {@link channel}. */
+  private readonly channelMaps = new Map<string, Map<string, SortedCurve> | null>();
   /** The datablocks drivers write (`type:id`). */
   private driven: Set<string> | null = null;
   private childList: Map<string, string[]> | null = null;
+  /** The last ownWorld of each object (its frame and matrix): readers ask for one object's at a frame several times in a row. */
+  private readonly lastOwn = new Map<string, { frame: number; world: Mat4 | null }>();
   private readonly physics: boolean;
   private readonly sim = new RigidBodySimulator();
   /** The reading subjects, set pieces and other objects than cameras come from (this one, or `subjects`). */
@@ -497,8 +513,11 @@ export class DeskScene {
     return this.ownWorld(id, frame) ?? this.frameState(frame).world(id) ?? identity4();
   }
 
-  /** A datablock's unmuted, keyed F-curves, or null when a driver writes it too. */
-  private curvesOf(type: AnimTargetType, id: string): FCurve[] | null {
+  /**
+   * A datablock's unmuted, keyed F-curves with their keys in frame order (found once: a curve is then
+   * evaluated by binary search), or null when a driver writes it too.
+   */
+  private curvesOf(type: AnimTargetType, id: string): SortedCurve[] | null {
     const key = `${type}:${id}`;
     let out = this.curveLists.get(key);
     if (out === undefined) {
@@ -512,10 +531,38 @@ export class DeskScene {
         ? null
         : this.doc
             .listFCurves(id)
-            .filter((fc) => fc.target_type === type && !fc.mute && fc.keyframes.length > 0);
+            .filter((fc) => fc.target_type === type && !fc.mute && fc.keyframes.length > 0)
+            .map((fc) => ({ fc, keys: sortedKeyframes(fc) }));
       this.curveLists.set(key, out);
     }
     return out;
+  }
+
+  /**
+   * Object `id`'s own unmuted, keyed F-curves with their keys in frame order (read once per scene),
+   * or null when a driver writes the object. Read only.
+   */
+  objectCurves(id: string): readonly { fc: FCurve; keys: readonly Keyframe[] }[] | null {
+    if (this.shared(id)) return this.reading.objectCurves(id);
+    return this.curvesOf('object', id);
+  }
+
+  /**
+   * The value object `id`'s own F-curve gives its channel `path[index]` at `frame` (a location
+   * component, a constraint's influence): undefined when the channel is not keyed, null when a driver
+   * writes the object (read it from a frame state). The curves are read once per scene.
+   */
+  channel(id: string, path: string, index: number, frame: number): number | undefined | null {
+    if (this.shared(id)) return this.reading.channel(id, path, index, frame);
+    let map = this.channelMaps.get(id);
+    if (map === undefined) {
+      const curves = this.curvesOf('object', id);
+      map = curves && new Map(curves.map((c) => [`${c.fc.path}:${c.fc.index}`, c]));
+      this.channelMaps.set(id, map);
+    }
+    if (!map) return null;
+    const c = map.get(`${path}:${index}`);
+    return c ? evaluateFCurve(c.fc, Number.isFinite(frame) ? frame : 0, c.keys) : undefined;
   }
 
   /** Datablock `id` with its F-curves applied at `frame` (a frame state's animated value), or null when driven. */
@@ -530,24 +577,98 @@ export class DeskScene {
     if (!curves) return null;
     const at = Number.isFinite(frame) ? frame : 0;
     const out = { ...raw } as Record<string, unknown>;
-    for (const fc of curves) {
+    for (const { fc, keys } of curves) {
       if (paths && !paths.has(fc.path)) continue;
-      const v = evaluateFCurve(fc, at);
+      const v = evaluateFCurve(fc, at, keys);
       if (v !== undefined) writeChannel(out, fc.path, fc.index, v);
     }
     return out as T;
   }
 
   /**
-   * The world matrix of an object that is just its own channels (no parent, constraints, rigid body
-   * or drivers) at `frame`: its location, rotation and scale as its F-curves give them, what a frame
-   * state evaluates for it. Null for other objects.
+   * The world matrix of an object that is just its own channels and its parents' at `frame`: no
+   * constraints, rigid body or drivers on it or on any parent, and no bone parent; its location,
+   * rotation and scale as its F-curves give them, times its parent's world: what a frame state
+   * evaluates for it, without evaluating the scene (a baked prop under its model's root, a lake's
+   * water part). Null for other objects.
    */
-  private ownWorld(id: string, frame: number): Mat4 | null {
+  private ownWorld(id: string, frame: number, depth = 0): Mat4 | null {
+    const last = this.lastOwn.get(id);
+    if (last && last.frame === frame) return last.world;
+    const world = this.ownWorldAt(id, frame, depth);
+    this.lastOwn.set(id, { frame, world });
+    return world;
+  }
+
+  /** ownWorld, worked out. */
+  private ownWorldAt(id: string, frame: number, depth: number): Mat4 | null {
     const o = this.objects.get(id);
-    if (!o || o.parent || o.constraints?.length || o.rigid_body?.enabled) return null;
-    const own = this.ownValues('object', id, o, frame, TRANSFORM_PATHS);
-    return own && compose4(own.location, own.rotation_euler, own.scale);
+    if (!o || o.constraints?.length || o.rigid_body?.enabled || depth > 64) return null;
+    if (
+      o.parent &&
+      (o.parent === id || !this.objects.has(o.parent) || (o.parent_type === 'BONE' && o.parent_bone))
+    )
+      return null;
+    const own = this.ownTransform(id, o, frame);
+    if (!own) return null;
+    const local = compose4(own[0], own[1], own[2]);
+    if (!o.parent) return local;
+    const parent = this.ownWorld(o.parent, frame, depth + 1);
+    return parent && multiply4(parent, local);
+  }
+
+  /**
+   * Object `o`'s location, rotation and scale with its own F-curves applied at `frame` (what
+   * ownValues gives for those channels, without copying the object: the desk's checks read it for
+   * every frame of a keyed body), or null when a driver writes the object.
+   */
+  private ownTransform(id: string, o: ObjectData, frame: number): [Vec3, Vec3, Vec3] | null {
+    const curves = this.curvesOf('object', id);
+    if (!curves) return null;
+    const at = Number.isFinite(frame) ? frame : 0;
+    const t: [Vec3, Vec3, Vec3] = [
+      [o.location[0], o.location[1], o.location[2]],
+      [o.rotation_euler[0], o.rotation_euler[1], o.rotation_euler[2]],
+      [o.scale[0], o.scale[1], o.scale[2]],
+    ];
+    for (const { fc, keys } of curves) {
+      const slot = TRANSFORM_SLOTS.get(fc.path);
+      if (slot === undefined || !Number.isInteger(fc.index) || fc.index < 0 || fc.index > 2) continue;
+      const v = evaluateFCurve(fc, at, keys);
+      if (v !== undefined) t[slot][fc.index] = v;
+    }
+    return t;
+  }
+
+  /**
+   * The frames between which object `id`'s own channels and its parents' move it: the first and last
+   * keys of their location, rotation and scale curves ([Infinity, -Infinity] when none is keyed: it
+   * stands still), held before and after (CONSTANT extrapolation). Null when more may move it: a
+   * constraint, a rigid body, a driver, a bone parent (see ownWorld), or a curve that cycles,
+   * extrapolates or has modifiers.
+   */
+  motionSpan(id: string): [number, number] | null {
+    if (this.shared(id)) return this.reading.motionSpan(id);
+    let lo = Infinity;
+    let hi = -Infinity;
+    const seen = new Set<string>();
+    for (let cur: string | null = id; cur;) {
+      const o = this.objects.get(cur);
+      if (!o || seen.has(cur) || o.constraints?.length || o.rigid_body?.enabled) return null;
+      if (o.parent && (!this.objects.has(o.parent) || (o.parent_type === 'BONE' && o.parent_bone)))
+        return null;
+      seen.add(cur);
+      const curves = this.curvesOf('object', cur);
+      if (!curves) return null;
+      for (const { fc, keys } of curves) {
+        if (!TRANSFORM_PATHS.has(fc.path)) continue;
+        if (fc.extrapolation !== 'CONSTANT' || fc.modifiers?.length) return null;
+        lo = Math.min(lo, keys[0].frame);
+        hi = Math.max(hi, keys[keys.length - 1].frame);
+      }
+      cur = o.parent;
+    }
+    return [lo, hi];
   }
 
   /** The world position of object `id`'s origin at `frame`. */
@@ -561,12 +682,14 @@ export class DeskScene {
    * matrix may be collapsed (hide.ts maybeCollapsed) and its geometry, as {@link bounds} gathers it,
    * is less than a micrometre across (collapsedBox), which tells a store model in very large units
    * shown a few centimetres across, at a tiny world scale, from one put away. Without geometry, its
-   * world matrix alone decides (hiddenByScale).
+   * world matrix alone decides (hiddenByScale), and so it does for a kite's string (desk_role
+   * 'string', as tether.ts tells them): a string of 300 m put away is still a few micrometres long.
    */
   hidden(id: string, frame: number): boolean {
     if (this.shared(id)) return this.reading.hidden(id, frame);
     const world = this.world(id, frame);
     if (!maybeCollapsed(world)) return false;
+    if (deskProp(this.objects.get(id), DESK_PROPS.role) === 'string') return hiddenByScale(world);
     const box = emptyBox();
     this.eachMesh(id, frame, (local, m) => growByCorners(box, local, m));
     return boxEmpty(box) ? hiddenByScale(world) : collapsedBox(box);
@@ -730,7 +853,8 @@ export class DeskScene {
    * actors below it left out): the local box of its stored geometry and its world matrix at `frame`.
    */
   private eachMesh(id: string, frame: number, fn: (local: Box, world: Readonly<Mat4>) => void): void {
-    const fs = this.frameState(frame);
+    // the frame state only when a mesh is placed by more than its own and its parents' channels
+    let fs: FrameState | null = null;
     const visit = (oid: string, root: boolean) => {
       const o = this.objects.get(oid);
       if (!o) return;
@@ -740,7 +864,8 @@ export class DeskScene {
         if (role === 'actor' || role === 'string' || role === 'camera') return;
       }
       const local = this.localBox(oid);
-      if (local) fn(local, fs.world(oid) ?? identity4());
+      if (local)
+        fn(local, this.ownWorld(oid, frame) ?? (fs ??= this.frameState(frame)).world(oid) ?? identity4());
       for (const c of this.children(oid)) visit(c, false);
     };
     visit(id, true);

@@ -1,6 +1,7 @@
 import {
   FrameState,
   actorKeypoints,
+  collapsedBox,
   defaultAoRadius,
   depthToBytes,
   drawLines,
@@ -8,12 +9,14 @@ import {
   encodePNG,
   evaluatedBounds,
   hiddenByScale,
+  maybeCollapsed,
   normalToRGB,
   renderItems,
   renderSceneSoftware,
   resolveView,
   type EvaluatedScene,
   type Mat4,
+  type MeshData,
   type RenderItem,
   type SceneDoc,
   type SceneEvaluator,
@@ -52,11 +55,15 @@ import type {
  * skeletons, the camera and the subjects' screen boxes are computed here from the same evaluation,
  * so the server's event loop only writes bytes to ffmpeg.
  *
- * Objects hidden by their scale (core `hiddenByScale`: the scale-1e-8 keys of desk.tether_fly's
- * after: 'hide' and of the rideo import, which also collapse their children) are not in the frame:
- * no skeleton, no string line, no subject box (the subject reads `hidden`), and they count in none of
- * a shot's measurements. Their collapsed triangles cover no pixel (the rasterizer drops them), so
- * the per-pixel passes have none of them either.
+ * Objects a hide key put away (core hide.ts: desk.tether_fly's after: 'hide' and the rideo import
+ * key an object's scale down to HIDE_SCALE times the scale it is shown at, which collapses its
+ * children too) are not in the frame: no skeleton, no string line, no subject box (the subject reads
+ * `hidden`), and they count in none of a shot's measurements. Their geometry tells them (hiddenItem:
+ * a collapsed world matrix and less than a micrometre across), so a store model shown at a tiny world
+ * scale (one authored in micrometres and shown 1 m tall is at 1e-6) is drawn and measured as any
+ * other; a string, by its world matrix (hiddenItem and stringPoints: a hidden string keeps its length
+ * times HIDE_SCALE, up to 5 µm). Their collapsed triangles cover no pixel (the rasterizer drops
+ * them), so the per-pixel passes have none of them either.
  */
 
 /** Objects larger than this (m, horizontally) are grounds or sky domes: left out of shadow boxes. */
@@ -108,8 +115,38 @@ class Ancestry {
 }
 
 /**
+ * Whether a piece of evaluated geometry is put away by a hide key at this frame (core hide.ts): its
+ * world matrix may be collapsed (maybeCollapsed) and it is less than a micrometre across in the world
+ * (collapsedBox of `box`, its world bounds: measured when not given, null for none). A store model
+ * shown at a tiny world scale (one in micrometres shown 1 m tall is at 1e-6; one in very large units
+ * shown a few centimetres across is below the 1e-7 of hiddenByScale) is still centimetres or metres
+ * across, so it is seen; what a hide key shrank (HIDE_SCALE times the scale it is shown at) is not.
+ * A string (desk_role 'string', `item.data`) is told by its world matrix (hiddenByScale), as
+ * stringPoints tells it: a hide key shrinks its two thickness axes to HIDE_SCALE but leaves its
+ * length times HIDE_SCALE, and desk.tether_fly's strings are up to 500 m long (5 µm hidden), longer
+ * than geometry counts as collapsed under. Without vertices, its world matrix alone decides
+ * (hiddenByScale).
+ */
+export function hiddenItem(
+  item: {
+    mesh?: MeshData;
+    worldMatrix: Mat4;
+    data?: { custom_props?: Readonly<Record<string, unknown>> };
+  },
+  box?: { min: Vec3; max: Vec3 } | null,
+): boolean {
+  if (!maybeCollapsed(item.worldMatrix)) return false;
+  if (item.data?.custom_props?.desk_role === 'string') return hiddenByScale(item.worldMatrix);
+  const b = box === undefined ? evaluatedBounds([item]) : box;
+  return b ? collapsedBox(b) : hiddenByScale(item.worldMatrix);
+}
+
+/**
  * World-space points of the polyline a string object runs along at this frame (none: empty, also
- * when the string is hidden by its scale: a long one would still leave a dot of its line width).
+ * when a hide key put the string away: a long one would still leave a dot of its line width). A
+ * string's world matrix tells it (hiddenByScale): it is shown at scale 1 across its two thickness
+ * axes and a hide key shrinks them to HIDE_SCALE, while its length (desk.tether_fly's strings are up
+ * to 500 m long, so up to 5 µm hidden) can stay longer than geometry counts as collapsed under.
  */
 export function stringPoints(scene: EvaluatedScene, objectId: string): Vec3[] {
   const o = scene.byId.get(objectId);
@@ -196,10 +233,26 @@ export function deskAovs(passes: ReadonlySet<PassName>, strings: boolean): Softw
 
 const toByte = (c: number): number => Math.max(0, Math.min(255, Math.round(c * 255)));
 
-/** Whether object `id` is hidden by its scale at the evaluated frame (unknown objects are not). */
-function hiddenObject(scene: EvaluatedScene, id: string): boolean {
+/**
+ * Whether object `id` is put away by a hide key at the evaluated frame (unknown objects are not): its
+ * world matrix may be collapsed and every piece of geometry it draws (its own and its parts', of
+ * `drawn`) is put away (hiddenItem); without geometry, its world matrix alone decides (hiddenByScale).
+ */
+function hiddenObject(
+  scene: EvaluatedScene,
+  id: string,
+  drawn: readonly RenderItem[],
+  ancestry: Ancestry,
+): boolean {
   const o = scene.byId.get(id);
-  return !!o && hiddenByScale(o.worldMatrix);
+  if (!o || !maybeCollapsed(o.worldMatrix)) return false;
+  let any = false;
+  for (const item of drawn) {
+    if (!ancestry.ofItem(item).includes(id)) continue;
+    if (!hiddenItem(item)) return false;
+    any = true;
+  }
+  return any || hiddenByScale(o.worldMatrix);
 }
 
 /**
@@ -223,6 +276,8 @@ export function renderDeskFrame(
   const items = renderItems(scene, { forRender: true });
   const drawn = items.filter((o) => o.mesh.faces.length > 0);
   const resolved = resolveView(doc, scene, base, width / height, evaluatedBounds(drawn));
+  let ancestry: Ancestry | null = null;
+  const ancestryOf = () => (ancestry ??= new Ancestry(scene));
 
   const strings = (desk.lines ?? [])
     .map((line) => ({ line, points: stringPoints(scene, line.object) }))
@@ -310,9 +365,8 @@ export function renderDeskFrame(
   if (passes.has('mask')) {
     const palette = Object.keys(desk.objectPalette ?? {});
     const index = new Map(palette.slice(0, 255).map((id, i) => [id, i + 1]));
-    const ancestry = new Ancestry(scene);
     const groupOf = (id: string): number => {
-      for (const a of ancestry.of(id)) {
+      for (const a of ancestryOf().of(id)) {
         const k = index.get(a);
         if (k) return k;
       }
@@ -341,7 +395,7 @@ export function renderDeskFrame(
     const rgb = new Uint8Array(n * 3);
     // an actor shrunk to a point by a hide key (and its parts with it) has no skeleton to draw: its
     // keypoints would all fall on one point, a blot of joint colours where nobody stands
-    const actors = (desk.poseActors ?? []).filter((id) => !hiddenObject(scene, id));
+    const actors = (desk.poseActors ?? []).filter((id) => !hiddenObject(scene, id, drawn, ancestryOf()));
     if (actors.length) {
       let fs: FrameState | null = null;
       for (const actor of actors) {
@@ -371,15 +425,16 @@ export function renderDeskFrame(
   const meta: FrameMeta = { camera: cameraOfView(view), subjects: {} };
   const subjects = desk.subjects ?? [];
   if (subjects.length) {
-    const ancestry = new Ancestry(scene);
     const builders = new Map(subjects.map((s) => [s, new ScreenBoxBuilder(proj)]));
     const shown = new Set<string>();
     const hidden = new Set<string>();
     for (const item of drawn) {
-      const mine = ancestry.ofItem(item).filter((a) => builders.has(a));
+      const mine = ancestryOf()
+        .ofItem(item)
+        .filter((a) => builders.has(a));
       if (!mine.length) continue;
-      // a part hidden by its scale is not seen: its collapsed vertices would make a 1 px box
-      if (hiddenByScale(item.worldMatrix)) {
+      // a part a hide key put away is not seen: its collapsed vertices would make a 1 px box
+      if (hiddenItem(item)) {
         for (const s of mine) hidden.add(s);
         continue;
       }
@@ -392,7 +447,7 @@ export function renderDeskFrame(
     for (const s of subjects)
       meta.subjects[s] = shown.has(s)
         ? builders.get(s)!.box()
-        : hidden.has(s) || hiddenObject(scene, s)
+        : hidden.has(s) || hiddenObject(scene, s, drawn, ancestryOf())
           ? { x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true }
           : null;
   }
@@ -418,9 +473,9 @@ export function sampleShotFrames(frames: readonly number[], max = MAX_SHOT_SAMPL
  * frames (the nearest and farthest surface the camera sees, with margins), else from the rendered
  * bounds; the shadow box from the bounds of everything but huge objects, widened by the shadows'
  * reach; the ambient occlusion reach of the whole shot from what its first frame draws (core
- * `defaultAoRadius`, as the renderer would choose for that frame). Objects hidden by their scale
- * count in none of these. The rigid body simulation is not run for these samples (bodies at their
- * animated places; the occlusion reach depends on sizes only).
+ * `defaultAoRadius`, as the renderer would choose for that frame). What a hide key put away
+ * (hiddenItem) counts in none of these. The rigid body simulation is not run for these samples
+ * (bodies at their animated places; the occlusion reach depends on sizes only).
  */
 export function deskShotInfo(
   d: Pick<DeskDocument, 'doc' | 'evaluator'>,
@@ -448,14 +503,20 @@ export function deskShotInfo(
     const eye: Vec3 = [cam.worldMatrix[12], cam.worldMatrix[13], cam.worldMatrix[14]];
     // what the renderer draws (renderSceneSoftware's items: render-visible meshes with faces), but
     // for what hide keys shrank to a point: it is not seen, and a kite put away high above the set
-    // would stretch the shadow box, or its tiny size shorten the occlusion reach
-    const drawn = renderItems(scene, { forRender: true }).filter(
-      (item) => item.mesh.faces.length > 0 && !hiddenByScale(item.worldMatrix),
-    );
+    // (or its string, at the hand it was last flown from) would stretch the shadow box, or its tiny
+    // size shorten the occlusion reach
+    const drawn: RenderItem[] = [];
+    const boxes: ({ min: Vec3; max: Vec3 } | null)[] = [];
+    for (const item of renderItems(scene, { forRender: true })) {
+      if (!item.mesh.faces.length) continue;
+      const b = evaluatedBounds([item]);
+      if (hiddenItem(item, b)) continue;
+      drawn.push(item);
+      boxes.push(b);
+    }
     // the first sampled frame is the shot's first: one reach for every frame of the shot
     aoRadius ??= defaultAoRadius(drawn);
-    for (const item of drawn) {
-      const b = evaluatedBounds([item]);
+    for (const b of boxes) {
       if (!b) continue;
       const [dn, df] = boxDistances(eye, b.min, b.max);
       near = Math.min(near, dn);

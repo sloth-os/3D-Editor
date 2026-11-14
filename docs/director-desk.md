@@ -49,9 +49,10 @@ or a label whose head noun is lake, sea, river …).
 
 ### Actors
 
-`desk.actor_add {kind, name?, color?, height_m?, location?, facing_deg?, pose?}` adds a rigged
-mannequin: an ARMATURE with fixed bone names and one low-poly mesh part per bone in the actor's
-colour, with darker joints and a nose so the facing reads in every frame.
+`desk.actor_add {kind, name?, color?, height_m?, location?, facing_deg?, pose?, in_water?}` adds a
+rigged mannequin: an ARMATURE with fixed bone names and one low-poly mesh part per bone in the
+actor's colour, with darker joints and a nose so the facing reads in every frame. `in_water: true`
+makes it a swimmer or a wader: it belongs in the water at every frame (see the checks).
 
 | Kind                             | Default height                      | Notes                                                                                                                                                                       |
 | -------------------------------- | ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -75,12 +76,13 @@ Colours default to rideo's cast palette in order (#ff8a3d, #3d8bff, #3dbe6b, #a3
   until the next one: `hold_frames` only adds a key where the hold ends, so key `stand` or `idle`
   after a gesture to end it.
 - **Walking**
-  (`desk.actor_move {actor, points, frame_start, speed_mps? | frame_end?, gait='auto', face_path=true, end_pose?}`):
+  (`desk.actor_move {actor, points, frame_start, speed_mps? | frame_end?, gait='auto', face_path=true, end_pose?, in_water?}`):
   the armature object's location and heading are keyed along the path, and a gait is keyed for every
   cycle with the stride matching the speed, so the feet do not slide (planted feet drift 1–2 cm).
   Walk 1.3 m/s and run 3.5 m/s by default; animals walk, trot and gallop. Turns sharper than 135°
   split the path, with a stepped turn on the spot. The result gives the arrival frame and the length
-  walked (corners rounded).
+  walked (corners rounded). `in_water: true` marks the frames of the move as a swim or a wade (the
+  actor belongs in the water from `frame_start` to its end), `false` marks them as on land again.
 - **Facing and looking**: `desk.actor_face {actor, facing_deg | target, frame, turn_frames=8}` turns
   the body (stepping round on the spot);
   `desk.actor_look_at {actor, target | null, frame, blend_frames=6}` turns the head toward an
@@ -212,11 +214,11 @@ shot also uses keeps that shot's first and last view.
 
 `desk.check {shots?}` changes nothing and returns `{issues, lines, layouts, summary}`:
 
-| Severity | Codes                                                                                                                                                                                                                                       |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| error    | `line_crossed`, `subject_out_of_frame` (at the shot's first, middle and last frame; a pan's or tilt's first and last), `camera_inside` (water exempt), `missing_camera`, `tether_detached` (a kite's string left over 5 cm from its anchor) |
-| warning  | `plan_mismatch`, `screen_direction`, `jump_cut`, `absent_in_frame`, `subject_hidden`, `subject_revealed` (brought in by a pan or tilt), `occluded_subject`, `actors_overlap` (< 0.35 m), `outside_set`, `empty_shot`, `duration_clamped`    |
-| info     | `physics_unbaked`, `shot_gap`                                                                                                                                                                                                               |
+| Severity | Codes                                                                                                                                                                                                                                                                                                     |
+| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| error    | `line_crossed`, `subject_out_of_frame` (at the shot's first, middle and last frame; a pan's or tilt's first and last), `camera_inside` (water exempt), `missing_camera`, `tether_detached` (a kite's string left over 5 cm from its anchor), `walks_on_water` (an actor standing on water in the picture) |
+| warning  | `plan_mismatch`, `screen_direction`, `jump_cut`, `absent_in_frame`, `subject_hidden`, `subject_revealed` (brought in by a pan or tilt), `occluded_subject`, `body_in_water` (a physics body in water it does not float on), `actors_overlap` (< 0.35 m), `outside_set`, `empty_shot`, `duration_clamped`  |
+| info     | `physics_unbaked`, `shot_gap`                                                                                                                                                                                                                                                                             |
 
 Objects put away by a hide key (scaled to nothing: `after: 'hide'` of `desk.tether_fly`, the actors
 and props a rideo import hides) are nowhere at the frames they are hidden: a subject hidden at a
@@ -228,6 +230,26 @@ brings into the frame by its last frame instead is `subject_revealed`, and one i
 neither is `subject_out_of_frame`. A rider and the mount she sits on move as one: they are never
 the pair of the 180° line where she rides, and cross the frame once, as the mount
 (`screen_direction`).
+
+Water is the water part of a store model (the lake's, the sea's, a fountain's, a trough's, a
+well's), a mesh whose `desk_shape` is `water` (the water landmarks of a rideo import), and a
+landmark, prop or set piece whose label names water ("the pond"), rideo's boxes and cylinders too
+(its blue "river" box); a mesh renders do not draw (its own `hide_render`) is none. Its footprint is
+its own polygons that face up (a box of water's top), never a box around them, so the lake's sandy
+shore is dry ground. `walks_on_water` looks at every actor in the picture every 6 frames (and finds
+the first and last frame of each stretch to the frame), and at every frame between two of them near
+water, so a dash across a ditch is seen: the actor's mark (its origin, where its feet are) over
+water whose surface is within 15 cm of it. A rider is left to her mount and a rower to the boat that
+carries her (an actor parented to anything but a plain empty, or held to it by a constraint); an
+actor renders do not draw, one put away by a hide key, one whose lowest point clears the water by 10
+cm (a jump) and one on a bridge or a pier deck over the water are not on it. A swimmer or a wader
+belongs in the water: `desk.actor_add {in_water: true}` marks every frame of an actor,
+`desk.actor_move {in_water: true}` the frames of a move (`false` takes them out again), and the
+rideo import marks the shots in which an actor stands in rideo's water; the check leaves an actor
+alone at the frames its `desk_in_water` names (`true`, or spans such as `'..12, 30..40'`).
+`body_in_water` looks at the bodies physics moves (baked keys on every frame, a rigid body the bake
+will simulate every 6 frames): the middle of the body over water, its bottom at or under the
+surface, until the frame `desk.physics_bake` let it float from (its `desk_floats`).
 
 `lines` gives each shot's blocking line in rideo's own sentence format, which is what rideo puts
 into its prompts, e.g. "Blocking: Ada is left of frame, facing right. Light: the sun is ahead of
@@ -247,14 +269,36 @@ frames the bodies need:
   `desk.physics_throw {object, target, frame, flight_s=1, spin?}` (the launch velocity that lands it
   on a point or an object after `flight_s`),
   `desk.physics_push {object, direction, speed_mps, frame}`.
-- `desk.physics_bake {frame_start?, frame_end?, objects?}`: keys the simulation and removes the
-  rigid bodies and the hold constraints of held props, so renders and exports need no simulation
-  (at most 2,000,000 body frames per bake). A store model's body moves the model's root, so the
-  model stays one object.
+- `desk.physics_bake {frame_start?, frame_end?, objects?, water='float'}`: keys the simulation and
+  removes the rigid bodies and the hold constraints of held props, so renders and exports need no
+  simulation (at most 2,000,000 body frames per bake). A store model's body moves the model's root,
+  so the model stays one object. Bodies that reach water float there (below); `water: 'ignore'` keys
+  the simulation as it is.
 
 A body with a start frame follows its keys, its parent or the hand that holds it until then
 (kinematic), and is simulated from there with the velocity it had (plus any launch velocity): a
 ball thrown from a hand leaves at the hand's speed.
+
+Water is no collider of the simulation: a ball rolls over a lake as over the ground. The bake
+follows each body instead, and from the frame its middle comes over water with its bottom at the
+surface (or reaching it by the next frame) it keys the body floating: the impact leaves it at most 2
+m/s, which dies away with a time constant of 0.7 s, so it drifts at most 1.4 m on from where it
+touches the water and stops at the water's edge; its centre settles a quarter of its radius under
+the surface, but never deeper than half the height its top stands above it, so the top of a frisbee
+or a book stays out of the water, and bobs up to 1.5 cm (less for a flat body) at half a hertz; its
+spin dies down, and a flat body (its thinnest side at most half its largest) turns to lie flat on
+the water. A body denser than water (the rigid body's mass over the volume of its collision shape)
+sinks to two radii under the surface in about a second instead. The frame it reached the water is
+kept in its custom property `desk_floats`, the result lists it in `floats` (the frame, the water,
+whether it sinks), and a bake to the simulation's end keys a floating body until 3 s after that
+frame. The same keys come out of the same scene every time.
+
+`desk.physics_throw`, `desk.physics_drop` and `desk.physics_push` warn when the body reaches water
+in the simulation (it lands in it, or rolls or bounces into it after coming down on dry ground),
+`desk.actor_move` where a path crosses water (the metres along the path and about when; not for a
+move made in the water), and `desk.actor_add` and `store.add` (people and animals) where an actor is
+put down on water; their advice names a bridge's deck for a path and `in_water` for a swimmer or a
+wader.
 
 ### Kites and balloons
 
@@ -354,9 +398,9 @@ servers: `export_video`, `export_status`, `cancel_export`, `list_exports`, `stor
 | Operator                     | Parameters (defaults)                                                                                                                                                                                                      |
 | ---------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `desk.set_build`             | `width` (12), `depth` (10), `ground` ('grass'), `interior` (false), `sun_azimuth_deg` (135), `sun_elevation_deg` (40), `sky` (true)                                                                                        |
-| `desk.actor_add`             | `kind`, `name`, `color`, `height_m`, `location` (3D cursor), `facing_deg` (0), `pose` (stand)                                                                                                                              |
+| `desk.actor_add`             | `kind`, `name`, `color`, `height_m`, `location` (3D cursor), `facing_deg` (0), `pose` (stand), `in_water` (false)                                                                                                          |
 | `desk.actor_pose`            | `actor`, `pose`, `frame` (current), `blend_frames` (6), `hold_frames`, `layer` ('auto')                                                                                                                                    |
-| `desk.actor_move`            | `actor`, `points`, `frame_start`, `speed_mps` or `frame_end`, `gait` ('auto'), `face_path` (true), `end_pose`                                                                                                              |
+| `desk.actor_move`            | `actor`, `points`, `frame_start`, `speed_mps` or `frame_end`, `gait` ('auto'), `face_path` (true), `end_pose`, `in_water` (as it was)                                                                                      |
 | `desk.actor_face`            | `actor`, `facing_deg` or `target`, `frame`, `turn_frames` (8)                                                                                                                                                              |
 | `desk.actor_look_at`         | `actor`, `target` (or null), `frame`, `blend_frames` (6)                                                                                                                                                                   |
 | `desk.actor_hold`            | `actor`, `prop`, `hand` ('right'), `frame`, `release_frame`                                                                                                                                                                |
@@ -372,7 +416,7 @@ servers: `export_video`, `export_status`, `cancel_export`, `list_exports`, `stor
 | `desk.physics_drop`          | `objects`, `frame`, `height` (0)                                                                                                                                                                                           |
 | `desk.physics_throw`         | `object`, `target`, `frame`, `flight_s` (1), `spin`                                                                                                                                                                        |
 | `desk.physics_push`          | `object`, `direction`, `speed_mps`, `frame`                                                                                                                                                                                |
-| `desk.physics_bake`          | `frame_start`, `frame_end`, `objects` (every simulated body)                                                                                                                                                               |
+| `desk.physics_bake`          | `frame_start`, `frame_end`, `objects` (every simulated body), `water` ('float')                                                                                                                                            |
 | `desk.tether_fly`            | `flyer`, `anchor`, `anchor_bone`, `length_m`, `wind_dir_deg`, `wind_mps`, `frame_start`, `frame_end`, `launch_frames`, `tail` (true), `string` (true), `seed`, `after` ('hold')                                            |
 | `desk.vehicle_drive`         | `vehicle`, `points`, `frame_start`, `speed_mps` or `frame_end`                                                                                                                                                             |
 | `desk.import_rideo_blocking` | `blocking`, `shots`, `characters`, `elements`, `settings`, `model_limits`, `state`, `cast_overrides`, `project`, `clip`, `pre_roll_frames` (12), `update` (true)                                                           |
@@ -505,8 +549,18 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   as it was flown: it starts where the kite was then, so fly the later flights again.
 - **Physics**: balls are recognized by name or store tag (other round objects need
   `shape: 'SPHERE'`); there is no rolling resistance (the presets give balls an angular damping of
-  0.9, a ball with Blender's default 0.1 rolls on); water is not a collider. A body carried by a
-  rotating, non-uniformly scaled parent is sheared before its release and cannot be baked exactly.
+  0.9, a ball with Blender's default 0.1 rolls on). A body carried by a rotating, non-uniformly
+  scaled parent is sheared before its release and cannot be baked exactly.
+- **Water**: it is no collider: until the bake makes a body float, the simulation (and a
+  `water: 'ignore'` bake) rolls it over a lake as over the ground. A floating body drifts on its
+  own: it passes through what stands in the water (a pier's posts, a boat) and stops at the edge of
+  the water it came into. `body_in_water` reads a body the simulation moves (not baked yet) every 6
+  frames, so a bounce off the water between two of them goes unreported; a baked body is read on
+  every frame. `walks_on_water` reads an actor's mark, not its feet: an animal whose middle is on
+  the shore while its front legs are in the water is not on it. An actor is not checked at the
+  frames it belongs in the water, wherever it stands then (one added with `in_water: true` never),
+  and a boat is neither an actor nor a body: what it carries stands on it, and it floats only as it
+  is keyed.
 - **Vehicles** follow the path's height only: no terrain, suspension or slip, and the wheels slide
   sideways a little on tight curves.
 - **Cameras**: the solids cameras are pushed out of are the stored meshes (modifiers ignored); moves

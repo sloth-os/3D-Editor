@@ -4,6 +4,7 @@
  * workstream adds exports to its own modules; this barrel only lists the modules.
  */
 export * from './hide';
+export * from './water';
 export * from './props';
 export * from './shots';
 export * from './solver';

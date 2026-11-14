@@ -3,6 +3,7 @@ import type { Mat4, Vec3 } from '../src/math/types';
 import { TETHER_LAND_SECONDS, TETHER_TAIL_SETTLE_SECONDS, tetherLandSeconds } from '../src/desk/physics';
 import { TETHER_HIDDEN_SCALE, tetherFly } from '../src/desk/physics/tether';
 import { sceneSampler } from '../src/desk/physics/common';
+import { DeskScene } from '../src/desk/layout';
 import { deskScene, dist, kiteMesh, originOf, transformPoint } from './desk-physics-helpers';
 
 /*
@@ -117,6 +118,25 @@ describe('desk.tether_fly after the flight', () => {
       expect(dist(originOf(worldAt(t, t.kite, f)), last)).toBeLessThan(1e-9);
     }
   });
+
+  it.each([300, 500])(
+    "'hide' puts away a string of %d m for the desk's checks too, though it stays micrometres long",
+    (length) => {
+      const t = kiteScene();
+      const r = t.run('desk.tether_fly', {
+        ...FLY,
+        length_m: length,
+        frame_start: 1,
+        frame_end: 120,
+        after: 'hide',
+      });
+      const scene = new DeskScene(t.doc);
+      expect([scene.hidden(r.string.object, 120), scene.hidden(r.string.object, 121)]).toEqual([false, true]);
+      // still longer than the micrometre a geometry test would call put away
+      expect(meshBounds(t, r.string.object, 121).diagonal).toBeGreaterThan(1e-6);
+      expect(scene.hidden(t.kite, 121)).toBe(true);
+    },
+  );
 
   it("'hide' puts away a store kite with every part and its own tail through its root", () => {
     const t = storeKiteScene();

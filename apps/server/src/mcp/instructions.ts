@@ -1,3 +1,4 @@
+import { DESK_ISSUE_CODES, DESK_ISSUE_SEVERITY } from '@3d-editor/core';
 import { MAX_EDITOR_TIMEOUT_MS } from './editor-commands';
 import { AUTO_KEYFRAMES } from './scene-summary';
 import {
@@ -7,6 +8,11 @@ import {
   measured,
   measuredOnServer,
 } from './editor-costs';
+
+/** desk.check's error codes (core DESK_ISSUE_SEVERITY), the issues to fix before exporting the shots. */
+export const DESK_CHECK_ERRORS: readonly string[] = DESK_ISSUE_CODES.filter(
+  (code) => DESK_ISSUE_SEVERITY[code] === 'error',
+);
 
 /** Server instructions sent to MCP clients on initialization. */
 export const MCP_INSTRUCTIONS = `You control a Blender-inspired, real-time collaborative 3D editor.
@@ -41,7 +47,7 @@ Recommended workflows
 - Physics: rigidbody.object_add {type: ACTIVE | PASSIVE, collision_shape, mass} on falling objects and the ground → set_scene_settings {rigidbody_frame_end, gravity} → check with render_animation or rigidbody.describe → rigidbody.bake_to_keyframes to freeze the motion.
 - Look development: material.preset_list → material.preset_apply {preset} or material.procedural_set {channel, procedural: {type: NOISE | VORONOI | BRICK | WOOD …}}; world.sky_set {preset: CLEAR_DAY | SUNSET …} (or set_scene_settings sky fields) and world.mist_set for atmosphere; light.properties_set for soft area lights, camera.properties_set for depth of field.
 - Rendering: preview with render_image engine RASTER (or a browser editor); final images with render_image {engine: PATHTRACER, samples: 64–256, time_limit} — the image reports the samples reached; check animations with render_animation format CONTACT_SHEET and frame_step so the sheet has 12–24 frames, then GIF/APNG for the result.
-- Director's desk: desk.set_build → desk.actor_add, store_add → desk.actor_move / actor_pose / actor_hold / actor_mount, desk.tether_fly, desk.physics_throw then desk.physics_bake → desk.shot_add {framing, angle, subjects, layout, move} per shot → desk.shot_solve → desk.check (fix errors) → render_animation {camera: 'shots'} → export_video {quality: 'draft'} → export_status {wait_s: 50} until done. For rideo: rideo_import builds the scene, the same steps stage it, then export_video {preset: 'rideo'} → export_status until done → rideo_push {project, export, rideo}.
+- Director's desk: desk.set_build → desk.actor_add, store_add → desk.actor_move / actor_pose / actor_hold / actor_mount, desk.tether_fly, desk.physics_throw then desk.physics_bake → desk.shot_add {framing, angle, subjects, layout, move} per shot → desk.shot_solve → desk.check (fix its errors: ${DESK_CHECK_ERRORS.join(', ')}) → render_animation {camera: 'shots'} → export_video {quality: 'draft'} → export_status {wait_s: 50} until done. Fly kites with desk.tether_fly after the anchor actor's moves, poses and mounts (the string is tied where the hand is then): desk.check's tether_detached reports a string left behind, fly it again. For rideo: rideo_import builds the scene, the same steps stage it, then export_video {preset: 'rideo'} → export_status until done → rideo_push {project, export, rideo}.
 
 Typical session
 1. list_projects or create_project (projects open in the editor at /?project=<id>).

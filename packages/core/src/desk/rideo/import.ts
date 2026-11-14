@@ -11,7 +11,8 @@ import { OperatorError, type OperatorContext } from '../../operators/context';
 import type { CatalogEntry } from '../../store/types';
 import { DESK_PROPS } from '../props';
 import { MAX_SHOT_SUBJECTS, getShots, newShotId, setDeskSettings, setShots } from '../shots';
-import { DESK_SHAPE_PROP, DeskScene, toEditor } from '../layout';
+import { DESK_SHAPE_PROP, DeskScene, isWaterLabel, toEditor } from '../layout';
+import { setInWaterSpans, type FrameSpan } from '../water';
 import { buildSet } from '../set';
 import { addDeskCamera, applyCameraMove, lookEuler, prepareDeskCamera } from '../moves';
 import { cameraMoveOf, FRAMING_TABLE } from '../solver';
@@ -84,7 +85,11 @@ import {
  * the holder's hand over those shots (one flight, from the first to the last), hidden with its string
  * and tail in the shots without the holder and after the last. Landmarks are primitives (box,
  * cylinder, wall; water a flat plane cameras may stand in) or a built-in model scaled to width ×
- * depth × height when the label names one, its footprint centred on the mark.
+ * depth × height when the label names one, its footprint centred on the mark. A box or a cylinder
+ * whose label names water (rideo's blue 'river', 'pond') is the primitive, its top the water over all
+ * of rideo's footprint (no model whose shore would take its edge). rideo lets its cast stand in its
+ * water (a swim, a wade): an actor whose mark or walk's end in a shot lies inside such a landmark
+ * belongs in the water over that shot (desk_in_water: desk.check's walks_on_water leaves it alone).
  *
  * Re-import updates in place: actors by character id, props and landmarks by rideo id, shots by rideo
  * shot id (their ids and cameras kept); objects the import did not make are left alone, imported ones
@@ -1028,6 +1033,15 @@ export function importRideoBlocking(
     });
   }
 
+  // ------------------------------------------------------------ the cast rideo puts in its water
+  markCastInWater(
+    doc,
+    blocking.set.landmarks,
+    (l) => elements.get(l.elementId ?? '')?.name ?? null,
+    plans,
+    actors,
+  );
+
   // ------------------------------------------------------------ held props, kites and balloons (phases C, D, E)
   const holdsOut: RideoImportResult['holds'] = [];
   const tethersOut: RideoImportResult['tethers'] = [];
@@ -1761,14 +1775,18 @@ function buildLandmark(
   const label = l.label || elementName || l.id;
   const water = l.shape === 'water';
   const shape = water ? 'water' : l.shape;
+  // a box or a cylinder of water (rideo's 'river'): the primitive, whose top is water over all of
+  // its footprint, as rideo draws it (a lake model's shore would take its edge)
+  const wet = !water && rideoWater(l, elementName);
   const color =
     l.color.toLowerCase() === '#8a8f98' && l.label ? rideoLandmarkColor(l.label, l.shape) : l.color;
-  const found = water
-    ? null
-    : modelFor([l.label, elementName ?? ''].filter(Boolean), {
-        exclude: castNames,
-        categories: ['nature', 'architecture', 'street', 'props', 'furniture', 'vehicles', 'sports'],
-      });
+  const found =
+    water || wet
+      ? null
+      : modelFor([l.label, elementName ?? ''].filter(Boolean), {
+          exclude: castNames,
+          categories: ['nature', 'architecture', 'street', 'props', 'furniture', 'vehicles', 'sports'],
+        });
   const model = found?.entry.id ?? null;
   const build = JSON.stringify([
     'landmark',
@@ -1811,7 +1829,7 @@ function buildLandmark(
     const mat = doc.addMaterial({
       name: label,
       base_color: hexLinear(water && l.color.toLowerCase() === '#8a8f98' ? '#3f7fc0' : color),
-      roughness: water ? 0.1 : 0.8,
+      roughness: water || wet ? 0.1 : 0.8,
     });
     const mesh = water
       ? (() => {
@@ -1840,6 +1858,59 @@ function buildLandmark(
   }
   doc.updateObject(id, { location, custom_props: { ...o.custom_props, ...props } });
   return { id, name: o.name, shape, model, created };
+}
+
+/**
+ * Whether rideo landmark `l` is water its cast may stand in: its shape 'water', or a box or a
+ * cylinder its label (else its element's name) names water (rideo draws it blue: 'the river').
+ */
+function rideoWater(l: RideoBlockingLandmark, elementName: string | null): boolean {
+  if (l.shape === 'water') return true;
+  return (l.shape === 'box' || l.shape === 'cylinder') && isWaterLabel(l.label || elementName || '');
+}
+
+/**
+ * Whether rideo floor point (x, z) lies in landmark `l`'s footprint as rideo measures it (its
+ * insideLandmark, whatever the height): an ellipse for a cylinder, else a rectangle, turned by
+ * rotationDeg.
+ */
+function inFootprint(l: RideoBlockingLandmark, x: number, z: number): boolean {
+  const a = -rad(l.rotationDeg);
+  const dx = x - l.x;
+  const dz = z - l.z;
+  const lx = dx * Math.cos(a) + dz * Math.sin(a);
+  const lz = -dx * Math.sin(a) + dz * Math.cos(a);
+  if (l.shape === 'cylinder') return Math.hypot(lx / (l.width / 2), lz / (l.depth / 2)) <= 1;
+  return Math.abs(lx) <= l.width / 2 && Math.abs(lz) <= l.depth / 2;
+}
+
+/**
+ * The frames at which each actor belongs in rideo's water: the shots (from their key frame) where
+ * its mark, or the end of its walk, lies inside a water landmark (rideoWater). Every imported actor
+ * gets its own (none: the property removed), so a re-import follows rideo.
+ */
+function markCastInWater(
+  doc: SceneDoc,
+  landmarks: readonly RideoBlockingLandmark[],
+  elementName: (l: RideoBlockingLandmark) => string | null,
+  plans: readonly ShotPlan[],
+  actors: ReadonlyMap<string, ActorPlan>,
+): void {
+  const waters = landmarks.filter((l) => rideoWater(l, elementName(l)));
+  for (const [characterId, a] of actors) {
+    const spans: FrameSpan[] = [];
+    for (const p of plans) {
+      const m = p.marks.get(characterId);
+      if (!m) continue;
+      const ends: [number, number][] = [
+        [m.x, m.z],
+        [m.toX ?? m.x, m.toZ ?? m.z],
+      ];
+      if (ends.some(([x, z]) => waters.some((l) => inFootprint(l, x, z))))
+        spans.push([p.keyFrame, p.frameEnd]);
+    }
+    setInWaterSpans(doc, a.id, spans);
+  }
 }
 
 /**

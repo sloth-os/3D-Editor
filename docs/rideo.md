@@ -56,10 +56,15 @@ editor and back without any change to rideo:
    view off, storyboard frames to redraw). One undo step. An agent that already has the blocking
    and the clip documents can run `desk.import_rideo_blocking` itself instead.
 3. **editor**: refine the staging with the desk operators (`desk.actor_move`, `desk.tether_fly`
-   after the anchor's moves, `desk.physics_throw` …), then `desk.shot_solve {only_missing: true}`
-   and `desk.check`. A later `rideo_import` rebuilds the imported actors, props and cameras from
-   rideo's blocking (its warnings name those changed here since): push first. Fix
-   `line_crossed`, `subject_out_of_frame` and `plan_mismatch`;
+   after the anchor's moves, poses and mounts, `desk.physics_throw` …), then
+   `desk.shot_solve {only_missing: true}` and `desk.check`. A later `rideo_import` rebuilds the
+   imported actors, props, landmarks and shot cameras from rideo's blocking, and its warnings name
+   those changed here since the last import: push first, or stage them again. Fix the check's errors
+   (`line_crossed`, `subject_out_of_frame`, `camera_inside`, `missing_camera`, `tether_detached`,
+   `walks_on_water`) and `plan_mismatch`: `tether_detached` is a kite's string left behind when its
+   anchor moved after the flight (fly it again), `walks_on_water` an actor standing on water (route
+   the walk around it; the cast rideo puts in its water is imported in the water and left alone, and
+   a swimmer or wader staged here takes `in_water` on `desk.actor_add` or `desk.actor_move`);
    `render_animation {camera: 'shots', format: 'CONTACT_SHEET'}` shows the cut.
 4. **editor** `export_video {project, preset: 'rideo'}`: draft clips in the clay look with the
    beauty, depth and pose passes (one for each reference mode), without the sequence, posters or

@@ -593,14 +593,22 @@ have tools of their own. A session goes like this:
    `desk.actor_hold {actor, prop, frame, release_frame}`, `desk.actor_mount {rider, mount, frame}`;
    `desk.tether_fly {flyer, anchor, anchor_bone: "hand.R", length_m, wind_dir_deg, wind_mps, frame_start, frame_end}`
    for kites and balloons; `desk.physics_throw`, `desk.physics_drop` or `desk.physics_push`, then
-   `desk.physics_bake`.
+   `desk.physics_bake`. Keep actors off water: `desk.actor_move` warns where a path crosses a lake,
+   pond or stream (the metres along the path), `desk.actor_add` and `store.add` where an actor is
+   put down on one; route the move around it with more points (or raise them onto a bridge's deck).
+   A swimmer or a wader belongs in the water: give it `in_water: true` (`desk.actor_add` for every
+   frame, `desk.actor_move` for the frames of the swim), and neither the warnings nor `desk.check`
+   take it for walking on water; a rower parented to her boat stands on the boat. A body that
+   reaches water floats there once baked (the presets warn where it does; `desk.physics_bake` lists
+   it in `floats`, `water: 'ignore'` keys it as simulated); re-aim the throw to keep it on land.
 5. **Shots**: one `desk.shot_add {name, framing, angle, height, subjects, layout, move, duration_s}`
    per shot, in cut order. Each gets a camera named after it, solved from the description, kept in
    frame over the shot and on one side of the 180° line; `desk.shot_solve {}` solves them all again
    after the action changed.
 6. **Check**: `desk.check {}` returns the issues (errors `line_crossed`, `subject_out_of_frame`,
-   `camera_inside`, `missing_camera`; warnings such as `plan_mismatch` and `jump_cut`) and each
-   shot's blocking line. Fix the errors, then look at the cut with
+   `camera_inside`, `missing_camera`, `tether_detached`, `walks_on_water`; warnings such as
+   `plan_mismatch`, `jump_cut`, `subject_revealed` and `body_in_water`) and each shot's blocking
+   line. Fix the errors, then look at the cut with
    `render_animation {camera: "shots", format: "CONTACT_SHEET", frame_step: 24}`.
 7. **Export**: `export_video {project, quality: "draft"}` returns at once with an export id; call
    `export_status {export, wait_s: 50}` until `status` is `done`, then fetch the files by their

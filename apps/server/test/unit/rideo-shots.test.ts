@@ -1,15 +1,20 @@
 import { describe, expect, it } from 'vitest';
 import {
+  FrameState,
   SceneDoc,
   createConstraint,
   createCube,
+  createEditorState,
   createFCurve,
+  createOperatorRegistry,
   defaultRigidBody,
   defaultRigidBodyWorld,
   getShots,
+  hiddenScale,
   insertKeyframe,
   newShotId,
   setShots,
+  type OperatorContext,
   type ShotData,
 } from '@3d-editor/core';
 import {
@@ -24,7 +29,8 @@ import {
 /*
  * Which shots of an export get a reference video by default, and in which mode (SPEC §0(d), §11):
  * shots with physics, tethers, held props or a camera move, read from the project at five frames of
- * the shot (an object counts when it projects into the shot camera's frame).
+ * the shot (an object counts when it projects into the shot camera's frame and a hide key has not put
+ * it away there; a store model shown at a tiny world scale counts as any other).
  */
 
 const ASPECT = 16 / 9;
@@ -263,6 +269,129 @@ describe('shot features', () => {
       { id: newShotId(), name: 'S', enabled: true, camera: null, frame_start: 1, frame_end: 10 },
     ]);
     expect(shotFeatures(doc, s, ASPECT).characters).toBe(true);
+  });
+});
+
+/** An OBJ cube `units` native units across, standing on its base. */
+function cubeObj(units: number): string {
+  const h = units / 2;
+  const v = [
+    [-h, -h, 0],
+    [h, -h, 0],
+    [h, h, 0],
+    [-h, h, 0],
+    [-h, -h, units],
+    [h, -h, units],
+    [h, h, units],
+    [-h, h, units],
+  ];
+  return (
+    v.map((p) => `v ${p.join(' ')}`).join('\n') +
+    '\nf 1 2 3 4\nf 5 8 7 6\nf 1 5 6 2\nf 2 6 7 3\nf 3 7 8 4\nf 4 8 5 1\n'
+  );
+}
+
+/** Runs core operators on `doc` (as agents run them); throws with the error of one that fails. */
+function operators(doc: SceneDoc) {
+  const reg = createOperatorRegistry();
+  const ctx: OperatorContext = {
+    doc,
+    state: createEditorState(),
+    origin: doc.origin,
+    source: 'test',
+    report: () => {},
+  };
+  return <T = Record<string, unknown>>(id: string, params: Record<string, unknown>): T => {
+    const r = reg.run(ctx, id, params);
+    if (!r.ok) throw new Error(`${id}: ${r.error}`);
+    return r.result as T;
+  };
+}
+
+describe('objects put away by a hide key', () => {
+  it.each([
+    ['in micrometres shown 30 cm wide (1e-6)', 1e-6],
+    ["in very large units shown 30 cm wide (5e-8, below hiddenByScale's 1e-7)", 5e-8],
+  ])(
+    'a body shown at a tiny world scale counts in view until a hide key puts it away: %s',
+    (_label, scale) => {
+      const { doc, cam } = scene();
+      doc.updateScene({
+        rigidbody_world: { ...defaultRigidBodyWorld(), enabled: true, frame_start: 1, frame_end: 48 },
+      });
+      const ball = doc.addObject({
+        type: 'MESH',
+        name: 'Ball',
+        data: doc.addMesh('Ball', createCube({ size: 0.3 / scale })),
+        location: [0.5, 0, 2],
+        scale: [scale, scale, scale],
+        rigid_body: defaultRigidBody(),
+      });
+      expect(shotFeatures(doc, shot(doc, cam, 1, 24), ASPECT)).toMatchObject({
+        physics: true,
+        found: ['Ball (physics)'],
+      });
+      // put away from frame 25 on (HIDE_SCALE times the scale it is shown at, as desk.tether_fly and
+      // the rideo import key it): not in view in a shot after that
+      for (let i = 0; i < 3; i++)
+        key(
+          doc,
+          ball,
+          'scale',
+          i,
+          [
+            [24, scale],
+            [25, hiddenScale(scale)],
+          ],
+          'CONSTANT',
+        );
+      expect(shotFeatures(doc, shot(doc, cam, 25, 48), ASPECT).physics).toBe(false);
+      expect(shotFeatures(doc, shot(doc, cam, 1, 24), ASPECT).physics).toBe(true);
+    },
+  );
+
+  it('a kite of a store model in micrometres on a 200 m string counts while it flies, not after after: hide', () => {
+    const { doc, cam } = scene();
+    const run = operators(doc);
+    const kite = run<{ root: string }>('store.insert_files', {
+      entry: {
+        id: 'kite',
+        name: 'Kite',
+        provider: 'test',
+        license: { spdx: 'CC0-1.0', url: null, attribution: null },
+        author: 'test',
+        source_url: 'https://example.invalid/kite',
+        category: 'props',
+      },
+      format: 'obj',
+      files: { 'kite.obj': Buffer.from(cubeObj(6e5)).toString('base64') },
+      main: 'kite.obj',
+      height_m: 0.6,
+      location: [0.5, 0, 1.5],
+    }).root;
+    expect(doc.getObject(kite)!.scale[0]).toBeCloseTo(1e-6, 15);
+    const hand = doc.addObject({ type: 'EMPTY', name: 'Hand', location: [0, 0, 1.2] });
+    const fly = run<{ hidden_from: number; string: { object: string } }>('desk.tether_fly', {
+      flyer: kite,
+      anchor: hand,
+      length_m: 200,
+      wind_dir_deg: 90,
+      wind_mps: 6,
+      frame_start: 1,
+      frame_end: 24,
+      after: 'hide',
+    });
+    expect(fly.hidden_from).toBe(25);
+    const name = doc.getObject(kite)!.name;
+    expect(shotFeatures(doc, shot(doc, cam, 1, 24), ASPECT)).toMatchObject({
+      tether: true,
+      found: [`${name} (tether)`],
+    });
+    // put away, the string is still 2 µm long (200 m times HIDE_SCALE): its two thickness axes
+    // tell that a hide key shrank it
+    const m = new FrameState(doc, 40).world(fly.string.object)!;
+    expect(Math.hypot(m[8], m[9], m[10])).toBeGreaterThan(1e-6);
+    expect(shotFeatures(doc, shot(doc, cam, 30, 48), ASPECT)).toMatchObject({ tether: false, found: [] });
   });
 });
 

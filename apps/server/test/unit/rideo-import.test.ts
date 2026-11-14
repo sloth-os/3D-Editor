@@ -338,6 +338,34 @@ describe('the import into a project (real desk.import_rideo_blocking)', () => {
     expect(importedShots(doc, fx.ids.clip)).toEqual(r.shots);
   });
 
+  it('importing again rebuilds what was staged in the desk since, and its warnings name it (rideo_import)', async () => {
+    const { fx, read } = setup();
+    const docs = await read();
+    const { runner, doc } = project();
+    const first = imp(runner, docs);
+    const changed = (r: { warnings: string[] }) =>
+      r.warnings.filter((w) => /changed in the desk since the last import/.test(w));
+    expect(changed(first)).toEqual([]);
+    expect(changed(imp(runner, docs, { created: false }))).toEqual([]);
+    // an agent walks Rosie off in the desk, then imports the clip again without pushing first
+    const rosie = doc
+      .listObjects()
+      .find((o) => o.custom_props?.desk_role === 'actor' && o.name.startsWith('Rosie'))!;
+    const moved = runner.run('desk.actor_move', {
+      actor: rosie.id,
+      points: [[3, -2, 0]],
+      frame_start: 2,
+    });
+    expect(moved.ok, moved.error).toBe(true);
+    const again = imp(runner, docs, { created: false });
+    expect(again.shots).toEqual(first.shots);
+    const [warning] = changed(again);
+    expect(warning).toContain(`'${doc.getObject(rosie.id)!.name}'`);
+    expect(warning).not.toMatch(/Clover/);
+    expect(warning).toMatch(/Stage them again, or before importing again write the desk's blocking to rideo/);
+    void fx;
+  });
+
   it('imports a clip rideo has no blocking for, with the warning', async () => {
     const { read } = setup({ blocked: false });
     const docs = await read();

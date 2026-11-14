@@ -18,8 +18,10 @@ import { blockingProblem, kiteFixture, RideoMock } from '../helpers/rideo-mock';
  * rideo_push writes the blocking (a SceneBlocking v1 rideo accepts) and sends the clips of the shots
  * that need a reference as multipart uploads (H.264 MP4 with its ffprobe account and a JPEG
  * poster) and shot PATCHes; pushing again sends nothing; an approved clip refuses the blocking
- * (409) unless write_blocking is false; POST /api/rideo/previs does it all as one job; RIDEO_TOKEN
- * only goes to RIDEO_URL. Skipped without ffmpeg unless FFMPEG_REQUIRED=1.
+ * (409) unless write_blocking is false; POST /api/rideo/previs does it all as one job: it imports
+ * the blocking the push wrote, so its draft renders the same clips byte for byte and rideo, which has
+ * them (by sha256), gets no upload, while a staging changed in rideo uploads the clips that changed;
+ * RIDEO_TOKEN only goes to RIDEO_URL. Skipped without ffmpeg unless FFMPEG_REQUIRED=1.
  */
 
 process.env.RENDER_WORKERS = '2';
@@ -35,6 +37,8 @@ let projectId = '';
 let exportId = '';
 /** The previs job of POST /api/rideo/previs as it ended. */
 let previsJob: any = null;
+/** What the first rideo_push sent of each shot it pushed: its clip's sha256 and rideo's resource. */
+let firstPush: { rideo_shot: string; sha256: string; resource: string }[] = [];
 
 type ToolResult = { content: { type: string; text?: string }[]; isError?: boolean };
 
@@ -53,6 +57,31 @@ const target = () => ({ project: fx.ids.project, clip: fx.ids.clip });
 const clipDoc = () => fx.data.clips.get(fx.ids.clip)!;
 const rideoShot = (id: string) => (clipDoc().shots as Record<string, any>[]).find((s) => s.id === id)!;
 const exportDir = (id: string) => path.join(server.dataDir, 'exports', projectId, id);
+
+/** POST /api/rideo/previs for the fixture's clip, followed to its end: the answer and the job. */
+async function previs(): Promise<{ started: any; job: any }> {
+  const started = await api(server.url, '/api/rideo/previs', { method: 'POST', json: { rideo: target() } });
+  expect(started.status).toBe(202);
+  let job = started.body;
+  for (let i = 0; i < 40 && !['done', 'failed', 'cancelled'].includes(job.status); i++)
+    job = (await api(server.url, `/api/rideo/previs/${job.id}?wait=20`)).body;
+  return { started: started.body, job };
+}
+
+/** Moves a character's opening mark and its marks of every shot `dx` metres along rideo's x. */
+function moveCharacter(blocking: any, characterId: string, dx: number): void {
+  for (const a of blocking.actors) if (a.characterId === characterId) a.x += dx;
+  for (const shot of Object.values(blocking.shots) as any[]) {
+    const mark = shot.marks?.[characterId];
+    if (!mark) continue;
+    mark.x += dx;
+    if (typeof mark.toX === 'number') mark.toX += dx;
+  }
+}
+
+/** Pushed shots by rideo shot id, for comparisons that do not depend on their order. */
+const byShot = <T extends { rideo_shot: string }>(shots: T[]): T[] =>
+  [...shots].sort((a, b) => a.rideo_shot.localeCompare(b.rideo_shot));
 
 async function exported(id: string): Promise<any> {
   for (let i = 0; i < 40; i++) {
@@ -164,6 +193,11 @@ describe.skipIf(!run)('rideo bridge end to end', { timeout: 300_000 }, () => {
     const pushed = r.shots.filter((s: any) => s.status === 'pushed');
     // shot 2 pushes in: a camera move always needs a reference
     expect(pushed.map((s: any) => s.rideo_shot)).toContain(fx.ids.s2);
+    firstPush = pushed.map((s: any) => ({
+      rideo_shot: s.rideo_shot,
+      sha256: s.sha256,
+      resource: s.resource,
+    }));
     for (const s of r.shots.filter((x: any) => x.status === 'skipped')) expect(s.why).toBeTruthy();
     expect(mock.uploads).toHaveLength(pushed.length);
     expect(mock.patches).toHaveLength(pushed.length);
@@ -255,24 +289,41 @@ describe.skipIf(!run)('rideo bridge end to end', { timeout: 300_000 }, () => {
 
   it('POST /api/rideo/previs imports, exports a draft and pushes as one job', async () => {
     const uploads = mock.uploads.length;
-    const started = await api(server.url, '/api/rideo/previs', { method: 'POST', json: { rideo: target() } });
-    expect(started.status).toBe(202);
-    expect(started.body).toMatchObject({ status: 'importing', rideo: { url: mock.url, ...target() } });
-    let job = started.body;
-    for (let i = 0; i < 40 && !['done', 'failed', 'cancelled'].includes(job.status); i++)
-      job = (await api(server.url, `/api/rideo/previs/${job.id}?wait=20`)).body;
+    const patches = mock.patches.length;
+    const { started, job } = await previs();
+    expect(started).toMatchObject({ status: 'importing', rideo: { url: mock.url, ...target() } });
     expect(job.error).toBeNull();
     expect(job.status).toBe('done');
     expect(job.project).toBe(projectId);
     expect(job.project_name).toBe('Kite in the meadow');
     expect(Object.keys(job.import.shots)).toEqual([fx.ids.s1, fx.ids.s2, fx.ids.s3]);
     expect(job.export).toBeTruthy();
+    expect(job.export).not.toBe(exportId);
     expect(job.export_status).toMatchObject({ status: 'done' });
     expect(job.push).toMatchObject({ status: 'done', export: job.export });
-    // a new export: its clips go up (its record is its own)
+    // the round trip is exact: the import rebuilds the staging the first push wrote, so the new
+    // export renders the same clips byte for byte; rideo has them (by sha256), so every shot is set
+    // to the resource the first push uploaded, and nothing is uploaded again
     const pushed = job.push.shots.filter((s: any) => s.status === 'pushed');
     expect(pushed.length).toBeGreaterThan(0);
-    expect(mock.uploads.length).toBe(uploads + pushed.length);
+    expect(
+      byShot(pushed).map((s: any) => ({
+        rideo_shot: s.rideo_shot,
+        sha256: s.sha256,
+        resource: s.resource,
+        reused: s.reused,
+      })),
+    ).toEqual(byShot(firstPush).map((s) => ({ ...s, reused: true })));
+    expect(mock.uploads).toHaveLength(uploads);
+    // a new export keeps a record of its own: each shot is set to its reference again, once
+    expect(
+      mock.patches
+        .slice(patches)
+        .filter((p) => p.body.motionReference)
+        .map((p) => p.shot),
+    ).toEqual(pushed.map((s: any) => s.rideo_shot));
+    for (const s of pushed)
+      expect(rideoShot(s.rideo_shot).motionReference).toEqual({ resourceId: s.resource, mode: s.mode });
     // the previs export: draft clay clips only, at rideo's fps and size
     const ex = await ok('export_status', { export: job.export });
     expect(ex.params).toMatchObject({
@@ -286,6 +337,33 @@ describe.skipIf(!run)('rideo bridge end to end', { timeout: 300_000 }, () => {
     expect(ex.params.passes).toContain('beauty');
     expect((await api(server.url, '/api/rideo/previs/nope')).status).toBe(404);
     previsJob = job;
+  });
+
+  it('a previs of a staging changed in rideo uploads the clips that changed', async () => {
+    // rideo's blocking as the last push wrote it, with Clover 1.5 m further right in every mark
+    moveCharacter(clipDoc().blocking, fx.ids.clover, 1.5);
+    const uploads = mock.uploads.length;
+    const known = new Set(mock.uploads.map((u) => u.resource?.id));
+    const { job } = await previs();
+    expect(job.error).toBeNull();
+    expect(job.status).toBe('done');
+    expect(job.push).toMatchObject({ status: 'done', export: job.export });
+    const pushed = job.push.shots.filter((s: any) => s.status === 'pushed');
+    const fresh = pushed.filter((s: any) => !s.reused);
+    expect(fresh.length).toBeGreaterThan(0);
+    expect(mock.uploads).toHaveLength(uploads + fresh.length);
+    const before = new Map(firstPush.map((s) => [s.rideo_shot, s.sha256]));
+    for (const s of fresh) {
+      // a clip rideo did not have, uploaded as a new resource with its bytes
+      expect(s.sha256, s.rideo_shot).not.toBe(before.get(s.rideo_shot));
+      expect(known.has(s.resource), s.rideo_shot).toBe(false);
+      const upload = mock.uploads.slice(uploads).find((u) => u.resource?.id === s.resource);
+      expect(upload, s.rideo_shot).toBeDefined();
+      expect(createHash('sha256').update(upload!.file!.bytes).digest('hex')).toBe(s.sha256);
+      expect(rideoShot(s.rideo_shot).motionReference).toEqual({ resourceId: s.resource, mode: s.mode });
+    }
+    // a clip the change left as it was keeps the resource rideo has
+    for (const s of pushed.filter((x: any) => x.reused)) expect(known.has(s.resource)).toBe(true);
   });
 
   it('RIDEO_TOKEN goes to RIDEO_URL only: another rideo server gets the token passed or none', async () => {

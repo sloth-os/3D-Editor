@@ -2,6 +2,7 @@ import type { Vec3 } from '../../math/types';
 import type { SceneDoc } from '../../doc/scene-doc';
 import type { CollisionShape } from '../../doc/types';
 import { deskBake, deskBakePlan, type DeskBakeResult } from './bake';
+import type { DeskBakeWater } from './float';
 import { deskDrop, deskPhysicsSetupBodies, deskPush, deskThrow, type DeskWorldRange } from './presets';
 import { tetherFly, type TetherAfter, type TetherResult } from './tether';
 import { vehicleDrive, type VehicleResult } from './vehicle';
@@ -19,7 +20,7 @@ import { vehicleDrive, type VehicleResult } from './vehicle';
  *   deskPhysicsDrop    desk.physics_drop    lift and release objects at a frame
  *   deskPhysicsThrow   desk.physics_throw   launch velocity to land on a point or object
  *   deskPhysicsPush    desk.physics_push    a push (velocity along a direction) at a frame
- *   deskPhysicsBake    desk.physics_bake    simulated motion to world-space keyframes
+ *   deskPhysicsBake    desk.physics_bake    simulated motion to world-space keyframes (floating on water)
  *   deskTetherFly      desk.tether_fly      a kite / balloon on a string from an anchor (phase 2)
  *   deskVehicleDrive   desk.vehicle_drive   a vehicle along a path, wheels spinning, steering (phase 2)
  *
@@ -42,9 +43,26 @@ export {
   DESK_BAKE_MAX_BODY_FRAMES,
   deskBakePlan,
   type DeskBakeBody,
+  type DeskBakeFloat,
   type DeskBakePlan,
   type DeskBakeResult,
 } from './bake';
+export {
+  DESK_BAKE_WATER,
+  FLAT_RATIO,
+  FLOAT_BOB_HZ,
+  FLOAT_BOB_M,
+  FLOAT_DEPTH_RADII,
+  FLOAT_DRIFT_S,
+  FLOAT_ENTRY_MPS,
+  FLOAT_SETTLE_S,
+  FLOAT_SPIN_S,
+  FLOAT_TILT_S,
+  FLOAT_TOP_SHARE,
+  SINK_DEPTH_RADII,
+  WATER_DENSITY,
+  type DeskBakeWater,
+} from './float';
 export { modelRootOf as deskModelRoot } from './common';
 export {
   TETHER_AFTER,
@@ -168,11 +186,12 @@ export function deskPhysicsPush(
 /**
  * Bakes the simulation of `objects` (bodies, or objects above them such as a store model's root;
  * default: every simulated body) to keyframes: a body that carries a store model's geometry is keyed
- * through the model's root, any other body on itself (desk/physics/bake.ts).
+ * through the model's root, any other body on itself (desk/physics/bake.ts); bodies that reach water
+ * float there unless `water` is 'ignore' (desk/physics/float.ts).
  */
 export function deskPhysicsBake(
   doc: SceneDoc,
-  o: { frame_start?: number; frame_end?: number; objects?: readonly string[] },
+  o: { frame_start?: number; frame_end?: number; objects?: readonly string[]; water?: DeskBakeWater },
 ): DeskBakeResult {
   return deskBake(doc, deskBakePlan(doc, o));
 }

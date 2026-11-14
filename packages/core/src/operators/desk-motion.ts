@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Vec3 } from '../math/types';
 import type { CollisionShape } from '../doc/types';
 import {
+  DESK_BAKE_WATER,
   DESK_PHYSICS_KINDS,
   TETHER_AFTER,
   deskModelRoot,
@@ -292,8 +293,12 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
         "need), so renders and exports need no simulation. A store model's body is keyed through the model's " +
         'root (the root moves as the simulated part did, its parts stay in it); any other body is keyed itself, ' +
         'in world space when it had a parent (it is unparented). The rigid bodies and the hold constraints of ' +
-        'held props are removed. Returns {objects (the keyed objects, with `part` the simulated mesh of a ' +
-        'model), keyframes, frame_start, frame_end, removed_constraints}.',
+        'held props are removed. A body that comes down on water (a lake, a pond, a stream) floats from there: ' +
+        'it drifts to a stop, bobs and settles (a body denser than water sinks), and keeps the frame it ' +
+        "reached the water in its custom property desk_floats; water: 'ignore' keys the simulation as it is " +
+        '(the body rolls over the water as over the ground). Returns {objects (the keyed objects, with `part` ' +
+        'the simulated mesh of a model), keyframes, frame_start, frame_end, removed_constraints, floats ' +
+        '(bodies that reached water: the frame, the water and whether it sinks)}.',
       category: 'Desk',
       poll: pollObjectMode,
       redoable: true,
@@ -307,10 +312,22 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
             "Bodies to bake, or objects above them such as a store model's root (its bodies): default every " +
               'simulated body',
           ),
+        water: z
+          .enum(DESK_BAKE_WATER)
+          .default('float')
+          .describe(
+            "Bodies that reach water: 'float' there (drift to a stop and bob; denser than water: sink) or " +
+              "'ignore' it (keyed as simulated: they roll over it as over the ground)",
+          ),
       }),
       execute(ctx, p) {
         const objects = p.objects?.length ? [...new Set(resolveObjectIds(ctx, p.objects))] : undefined;
-        const r = deskPhysicsBake(ctx.doc, { frame_start: p.frame_start, frame_end: p.frame_end, objects });
+        const r = deskPhysicsBake(ctx.doc, {
+          frame_start: p.frame_start,
+          frame_end: p.frame_end,
+          objects,
+          water: p.water,
+        });
         for (const w of r.warnings) ctx.report('WARNING', w);
         return {
           objects: r.objects.map((id, i) =>
@@ -322,6 +339,12 @@ export function registerDeskMotionOperators(reg: OperatorRegistry): void {
           removed_constraints: Object.entries(r.removed_constraints).map(([id, names]) => ({
             ...named(ctx, id),
             constraints: names,
+          })),
+          floats: r.floats.map((f) => ({
+            ...bodyNamed(ctx, f.body),
+            frame: f.frame,
+            water: { ...named(ctx, f.water.object), label: f.water.label },
+            sinks: f.sinks,
           })),
         };
       },

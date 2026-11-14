@@ -168,9 +168,10 @@ export interface FrameMeta {
   /** The camera's world matrix (column-major) and vertical field of view in radians. */
   camera: { matrix: number[]; fovY: number };
   /**
-   * Screen boxes of `DeskFrameOptions.subjects` in pixels (null: not in the frame). A subject hidden
-   * by its scale at the frame (core `hiddenByScale`, as hide keys shrink it) has an empty box with
-   * `hidden: true` (never a collapsed point).
+   * Screen boxes of `DeskFrameOptions.subjects` in pixels (null: not in the frame). A subject a hide
+   * key put away at the frame (render/desk.ts hiddenItem: the geometry it draws collapsed to under a
+   * micrometre, a string by its world matrix) has an empty box with `hidden: true` (never a
+   * collapsed point).
    */
   subjects: Record<
     string,

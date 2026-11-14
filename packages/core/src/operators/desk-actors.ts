@@ -16,6 +16,7 @@ import { keyPose } from '../desk/characters/actor';
 import { holdObject, lookAtObject, mountActor } from '../desk/characters/attach';
 import { actorPosition } from '../desk/characters/locomotion';
 import { tetherDetachments } from '../desk/physics/tether';
+import { inWaterSpans, markInWater, pathWaterWarnings, standsOnWaterWarning } from '../desk/water';
 import { FrameState } from '../eval/frame-state';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
@@ -89,6 +90,24 @@ function warnLeftStrings(ctx: OperatorContext, actor: string, from: number): voi
   }
 }
 
+/**
+ * Warns where the path a desk.actor_move walks (`path`: from where the actor stood, through the
+ * points; frame_start to frame_end) crosses water: the actor would walk on it (water.ts).
+ */
+function warnWaterPath(ctx: OperatorContext, actor: string, path: Vec3[], from: number, to: number): void {
+  let length = 0;
+  for (let i = 1; i < path.length; i++)
+    length += Math.hypot(
+      path[i][0] - path[i - 1][0],
+      path[i][1] - path[i - 1][1],
+      path[i][2] - path[i - 1][2],
+    );
+  // about when it is where along the path (the move eases in and out and rounds the corners)
+  const frameAt = (m: number) => from + (to - from) * (length > 0 ? Math.min(1, m / length) : 0);
+  const name = ctx.doc.getObject(actor)?.name ?? actor;
+  for (const w of pathWaterWarnings(ctx.doc, name, path, from, frameAt)) ctx.report('WARNING', w);
+}
+
 const actorRef = z.string().describe('Actor (its armature object) id or exact name');
 const poseEnum = z
   .enum(ACTOR_POSES)
@@ -147,17 +166,28 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           .optional()
           .describe('Heading in degrees about +Z, 0 facing the front (−Y) (default 0)'),
         pose: poseEnum.optional().describe('Pose to start in (default stand)'),
+        in_water: z
+          .boolean()
+          .optional()
+          .describe(
+            "A swimmer or a wader: the actor belongs in the water at every frame (its desk_in_water), so desk.check's " +
+              'walks_on_water and the water warnings leave it alone (desk.actor_move in_water marks single moves)',
+          ),
       }),
       execute(ctx, p) {
+        const location = (p.location ?? ctx.state.cursorLocation) as Vec3;
         const r = createActor(ctx.doc, {
           kind: p.kind,
           name: p.name,
           color: p.color,
           height_m: p.height_m,
-          location: (p.location ?? ctx.state.cursorLocation) as Vec3,
+          location,
           facing_deg: p.facing_deg,
           pose: p.pose,
         });
+        if (p.in_water) markInWater(ctx.doc, r.actor, -Infinity, Infinity, true);
+        const wet = !p.in_water && standsOnWaterWarning(ctx.doc, r.name, location, ctx.state.frame);
+        if (wet) ctx.report('WARNING', wet);
         setSelection(ctx, [r.actor]);
         return { actor: r.actor, parts: r.parts, name: r.name };
       },
@@ -258,9 +288,19 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           .describe('Gait: walk, run, trot, gallop, or auto (chosen from the speed and the kind)'),
         face_path: z.boolean().default(true).describe('Turn to face along the path'),
         end_pose: poseEnum.optional().describe('Pose to blend into at the end (default stand)'),
+        in_water: z
+          .boolean()
+          .optional()
+          .describe(
+            "true: a swim or a wade, the actor belongs in the water from frame_start to the move's end (its " +
+              "desk_in_water), so desk.check's walks_on_water and the path's water warning leave it alone; false: " +
+              'those frames are on land again; omitted: as they were',
+          ),
       }),
       execute(ctx, p) {
         const id = actorId(ctx, p.actor);
+        // the path walked: from where the actor stands at frame_start through the points
+        const path = [actorPosition(ctx.doc, id, p.frame_start), ...(p.points as Vec3[])];
         const r = moveAlongPath(ctx.doc, id, p.points as Vec3[], {
           frame_start: p.frame_start,
           speed_mps: p.speed_mps,
@@ -269,6 +309,12 @@ export function registerDeskActorOperators(reg: OperatorRegistry): void {
           face_path: p.face_path,
           end_pose: p.end_pose,
         });
+        if (p.in_water !== undefined) markInWater(ctx.doc, id, p.frame_start, r.frame_end, p.in_water);
+        // a move made in the water from end to end (a swim) is no walk on it
+        const swim = inWaterSpans(ctx.doc.getObject(id)).some(
+          ([a, b]) => a <= Math.floor(p.frame_start) && b >= Math.ceil(r.frame_end),
+        );
+        if (!swim) warnWaterPath(ctx, id, path, p.frame_start, r.frame_end);
         warnLeftStrings(ctx, id, p.frame_start);
         return { ...named(ctx, id), frame_end: r.frame_end, length_m: r.length_m };
       },

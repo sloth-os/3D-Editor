@@ -82,7 +82,7 @@ export function registerRideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
     {
       title: 'Import rideo clip',
       description:
-        "Build or update a project from a rideo clip (scene) as one undo step: fps and size from rideo's settings, its shots in order with their cameras, layout and moves, the cast at their marks, props and landmarks. Without project, the project is named after the clip (made when missing; importing again updates it in place). Returns our project id, our shot id for each rideo shot, issues and warnings (no blocking yet, rideo's desk off, storyboard frames to redraw).",
+        "Build or update a project from a rideo clip (scene) as one undo step: rideo's fps and size, its shots in order with their cameras, layout and moves, the cast at their marks, props and landmarks. Without project, the project is named after the clip (made when missing). Importing again rebuilds the imported actors, props, landmarks and shot cameras from rideo's blocking; warnings name those changed here since the last import (push first, or stage them again). Returns our project id, our shot id per rideo shot, issues and warnings (no blocking yet, rideo's desk off, boards to redraw).",
       annotations: { ...EDIT, openWorldHint: true },
     },
     {

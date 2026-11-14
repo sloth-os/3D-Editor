@@ -8,7 +8,10 @@
  * - props, landmarks, set pieces and strings: desk_role 'prop' | 'landmark' | 'set' | 'string',
  *   desk_label, desk_element_id (rideo element id), and for store models store_id, store_source,
  *   license, author, source_url;
- * - shot cameras: desk_role 'camera', desk_shot (the shot's id).
+ * - shot cameras: desk_role 'camera', desk_shot (the shot's id);
+ * - rigid bodies desk.physics_bake let float on water: desk_floats (the frame they reached it);
+ * - actors that belong in the water (swimmers, waders): desk_in_water, true or the frames they do
+ *   (water.ts inWaterSpans), which desk.check's walks_on_water leaves alone.
  */
 
 export const DESK_PROPS = {
@@ -26,6 +29,8 @@ export const DESK_PROPS = {
   license: 'license',
   author: 'author',
   sourceUrl: 'source_url',
+  floats: 'desk_floats',
+  inWater: 'desk_in_water',
 } as const;
 
 /** Values of the desk_role custom property. */

@@ -1,30 +1,38 @@
 import { describe, expect, it } from 'vitest';
 import {
+  HIDDEN_SCALE_EPS,
   SceneDoc,
   SceneEvaluator,
+  collapsedBox,
   createCube,
   createEditorState,
   createFCurve,
   createMesh,
   createOperatorRegistry,
   defaultAoRadius,
+  evaluatedBounds,
   hiddenByScale,
+  hiddenScale,
   insertKeyframe,
   renderItems,
   type FCurve,
+  type Mat4,
   type OperatorContext,
   type Vec3,
 } from '@3d-editor/core';
-import { deskShotInfo, renderDeskFrame } from '../../src/render/desk';
+import { deskShotInfo, hiddenItem, renderDeskFrame } from '../../src/render/desk';
 import type { DeskFrameOptions, FrameMeta } from '../../src/render/protocol';
 import { ShotTracks } from '../../src/video/manifest';
 
 /*
  * Objects hidden by their scale in video export frames (render/desk.ts): desk.tether_fly's
- * after: 'hide' and the rideo import shrink what should not be seen to a point (scale 1e-8 keys,
- * core hiddenByScale). Such an object draws nothing in any pass (no skeleton for a shrunk actor, no
- * string line, nothing in the mask or edges), its subject box says hidden instead of a 1 px box at
- * the point it shrank to, and it counts in none of a shot's measurements.
+ * after: 'hide' and the rideo import shrink what should not be seen to a point (scale keys of
+ * HIDE_SCALE times the scale it is shown at; earlier versions keyed an absolute 1e-8). Such an object
+ * draws nothing in any pass (no skeleton for a shrunk actor, no string line, nothing in the mask or
+ * edges), its subject box says hidden instead of a 1 px box at the point it shrank to, and it counts
+ * in none of a shot's measurements. Its geometry tells it (hiddenItem), so a store model shown at a
+ * tiny world scale (a model in micrometres shown 1 m tall is at 1e-6) is drawn and measured as any
+ * other.
  */
 
 const W = 160;
@@ -254,6 +262,31 @@ describe('objects hidden by their scale in export frames', () => {
     expect(pixels(hidden.pose!, 3, (i) => hidden.pose![i] > 0 && hidden.pose![i + 1] === 0)).toEqual([]);
   });
 
+  it('say a subject that draws nothing is hidden once a hide key puts it away', () => {
+    // a marker (an EMPTY: no geometry of its own, so no box) hidden from frame 2: its world matrix
+    // alone tells it is put away
+    const doc = SceneDoc.create({ empty: true });
+    const cam = doc.addObject({
+      type: 'CAMERA',
+      name: 'Cam',
+      data: doc.addCamera({ lens: 35 }),
+      location: [0, -8, 1],
+      rotation_euler: [Math.PI / 2, 0, 0],
+    });
+    doc.addObject({ type: 'MESH', name: 'Box', data: doc.addMesh('Box', createCube({ size: 1 })) });
+    const marker = doc.addObject({ type: 'EMPTY', name: 'Marker', location: [1, 0, 1] });
+    hideFrom(doc, marker, 2);
+    const evaluator = new SceneEvaluator(doc);
+    const box = (frame: number) =>
+      renderDeskFrame(
+        { doc, evaluator, simulated: () => null },
+        { width: W, height: H, frame, cameraId: cam, samples: 1 },
+        { look: 'material', shadows: false, ao: false, msaa: true, passes: ['beauty'], subjects: [marker] },
+      ).meta!.subjects[marker];
+    expect(box(1)).toBeNull();
+    expect(box(2)).toEqual({ x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true });
+  });
+
   it('keep the visible parts of a subject in its box when some of its parts are hidden', () => {
     const doc = SceneDoc.create({ empty: true });
     const cam = doc.addObject({
@@ -336,6 +369,79 @@ describe('objects hidden by their scale in export frames', () => {
     expect(info.aoRadius).toBeCloseTo(defaultAoRadius(seen), 9);
     expect(info.aoRadius).toBeGreaterThan(0.3);
   });
+
+  it.each([200, 500])(
+    'count a kite string %i m long put away after its flight in none of a shot’s measurements',
+    (length_m) => {
+      // a box and a crate, and a kite flown on a long string from a hand right of them over frames
+      // 1–12, put away after it (after: 'hide'): hidden, its string keeps its length times
+      // HIDE_SCALE (2–5 µm, longer than geometry counts as collapsed under), at the hand
+      const { doc, run } = deskScene();
+      doc.updateScene({ fps: 24, frame_start: 1, frame_end: 40 });
+      const cam = doc.addObject({
+        type: 'CAMERA',
+        name: 'Cam',
+        data: doc.addCamera({ lens: 35 }),
+        location: [0.5, -8, 1],
+        rotation_euler: [Math.PI / 2, 0, 0],
+      });
+      const boxes = [
+        doc.addObject({
+          type: 'MESH',
+          name: 'Box',
+          data: doc.addMesh('Box', createCube({ size: 1 })),
+          location: [-1, 0, 0.5],
+        }),
+        doc.addObject({
+          type: 'MESH',
+          name: 'Crate',
+          data: doc.addMesh('Crate', createCube({ size: 0.5 })),
+          location: [0.5, 0, 0.25],
+        }),
+      ];
+      const hand = doc.addObject({ type: 'EMPTY', name: 'Hand', location: [4, 0, 1.2] });
+      const kite = run<{ root: string }>('store.add', { model: 'diamond_kite', name: 'Kite' }).root;
+      const fly = run<{ string: { object: string } | null; hidden_from: number | null }>('desk.tether_fly', {
+        flyer: kite,
+        anchor: hand,
+        length_m,
+        wind_dir_deg: 90,
+        wind_mps: 6,
+        frame_start: 1,
+        frame_end: 12,
+        launch_frames: 0,
+        after: 'hide',
+      });
+      expect(fly.hidden_from).toBe(13);
+      const string = fly.string!.object;
+      let evaluator = new SceneEvaluator(doc);
+      const items = (frame: number) =>
+        renderItems(evaluator.evaluate(frame, { forRender: true }), { forRender: true });
+      const stringAt = (frame: number) => items(frame).find((i) => i.object.id === string)!;
+      // flying, the string is seen; put away, it is not, although its geometry is more than a
+      // micrometre long (the geometry alone would read it as shown)
+      expect(hiddenItem(stringAt(6))).toBe(false);
+      const away = stringAt(20);
+      expect(hiddenByScale(away.worldMatrix)).toBe(true);
+      expect(collapsedBox(evaluatedBounds([away])!)).toBe(false);
+      expect(hiddenItem(away)).toBe(true);
+
+      const shot = () =>
+        deskShotInfo({ doc, evaluator }, { frames: [20, 30, 40], cameraId: cam, aspect: 16 / 9 }, () => {});
+      const info = shot();
+      // the box's and the crate's shadows only (the crate's right side at 0.75, then the reach of
+      // 2.5 heights of the 1 m box), not the hand's at x = 4, where the string was put away
+      expect(info.shadowFit!.max[0]).toBeCloseTo(0.75 + 2.5, 6);
+      // the occlusion reach of the two (the median of their sizes), not of a third tiny item
+      const seen = items(20).filter((i) => boxes.includes(i.object.id));
+      expect(seen).toHaveLength(2);
+      expect(info.aoRadius).toBeCloseTo(defaultAoRadius(seen), 9);
+      // the same as the scene without the string measures
+      doc.removeObject(string);
+      evaluator = new SceneEvaluator(doc);
+      expect({ ...info, ms: 0 }).toEqual({ ...shot(), ms: 0 });
+    },
+  );
 });
 
 describe('subject tracks of hidden subjects', () => {
@@ -351,5 +457,189 @@ describe('subject tracks of hidden subjects', () => {
       { frame: 2, x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true },
       { frame: 3, x: 0, y: 0, w: 0, h: 0, visible: false },
     ]);
+  });
+});
+
+/** An OBJ cube `units` native units across, standing on its base. */
+function cubeObj(units: number): string {
+  const s = units / 2;
+  const v = [
+    [-s, -s, 0],
+    [s, -s, 0],
+    [s, s, 0],
+    [-s, s, 0],
+    [-s, -s, units],
+    [s, -s, units],
+    [s, s, units],
+    [-s, s, units],
+  ];
+  return (
+    v.map((p) => `v ${p.join(' ')}`).join('\n') +
+    '\nf 1 2 3 4\nf 5 8 7 6\nf 1 5 6 2\nf 2 6 7 3\nf 3 7 8 4\nf 4 8 5 1\n'
+  );
+}
+
+/**
+ * Inserts a cube model `units` native units across with store.insert_files, fitted to `height_m`
+ * metres as a store model is: its root is scaled to height_m / units. Returns the root's id.
+ */
+function insertModel(
+  run: ReturnType<typeof deskScene>['run'],
+  name: string,
+  units: number,
+  height_m: number,
+  location: Vec3,
+): string {
+  return run<{ root: string }>('store.insert_files', {
+    entry: {
+      id: `cube-${units}`,
+      name,
+      provider: 'test',
+      license: { spdx: 'CC0-1.0', url: null, attribution: null },
+      author: 'test',
+      source_url: 'https://example.invalid/cube',
+      category: 'props',
+    },
+    format: 'obj',
+    files: { 'cube.obj': Buffer.from(cubeObj(units)).toString('base64') },
+    main: 'cube.obj',
+    height_m,
+    location,
+  }).root;
+}
+
+describe('store models shown at a tiny world scale in export frames', () => {
+  /**
+   * A crate in micrometres shown 1 m tall (world scale 1e-6) and a toy kite 10,000,000 units across
+   * shown 50 cm tall (5e-8: below hiddenByScale's 1e-7), flown from frame 10 to 20 and put away after
+   * it (desk.tether_fly after: 'hide'); before frame 10 it stands at x = 2.
+   */
+  function toyScene() {
+    const { doc, run } = deskScene();
+    doc.updateScene({ fps: 24, frame_start: 1, frame_end: 40 });
+    const cam = doc.addObject({
+      type: 'CAMERA',
+      name: 'Cam',
+      data: doc.addCamera({ lens: 35 }),
+      location: [0.5, -5, 0.5],
+      rotation_euler: [Math.PI / 2, 0, 0],
+    });
+    doc.updateScene({ camera: cam });
+    const crate = insertModel(run, 'Crate', 1e6, 1, [-1, 0, 0]);
+    const toy = insertModel(run, 'Toy kite', 1e7, 0.5, [2, 0, 0]);
+    const hand = doc.addObject({ type: 'EMPTY', name: 'Hand', location: [2, 0, 1.2] });
+    const fly = run<{ hidden_from: number | null }>('desk.tether_fly', {
+      flyer: toy,
+      anchor: hand,
+      length_m: 20,
+      wind_dir_deg: 90,
+      wind_mps: 6,
+      frame_start: 10,
+      frame_end: 20,
+      after: 'hide',
+    });
+    expect(fly.hidden_from).toBe(21);
+    return { doc, cam, crate, toy, evaluator: new SceneEvaluator(doc) };
+  }
+
+  it('are drawn, boxed and measured as any other model, and put away by a hide key as any other', () => {
+    const s = toyScene();
+    expect(s.doc.getObject(s.crate)!.scale[0]).toBeCloseTo(1e-6, 15);
+    expect(s.doc.getObject(s.toy)!.scale[0]).toBeCloseTo(5e-8, 18);
+    // a world matrix alone reads the toy as collapsed while it is shown: its geometry tells it is not
+    const toyPart = (frame: number) =>
+      renderItems(s.evaluator.evaluate(frame, { forRender: true }), { forRender: true }).find(
+        (i) => i.object.data.parent === s.toy,
+      )!;
+    expect(hiddenByScale(toyPart(5).worldMatrix)).toBe(true);
+    expect([hiddenItem(toyPart(5)), hiddenItem(toyPart(30))]).toEqual([false, true]);
+
+    const frame = (f: number) =>
+      renderDeskFrame(
+        { doc: s.doc, evaluator: s.evaluator, simulated: () => null },
+        { width: W, height: H, frame: f, cameraId: s.cam, samples: 1 },
+        {
+          look: 'material',
+          shadows: false,
+          ao: false,
+          msaa: true,
+          passes: ['beauty', 'mask'],
+          // mask indices: the crate 1, the toy 2
+          objectPalette: { [s.crate]: [255, 0, 0], [s.toy]: [0, 255, 0] },
+          subjects: [s.crate, s.toy],
+        },
+      );
+    const shown = frame(5);
+    const hidden = frame(30);
+    // frame 5: both are seen, with boxes and mask pixels
+    for (const id of [s.crate, s.toy]) {
+      expect(shown.meta!.subjects[id]).toMatchObject({ visible: true });
+      expect(shown.meta!.subjects[id]!.hidden).toBeUndefined();
+    }
+    const toyBox = shown.meta!.subjects[s.toy]!;
+    expect(toyBox.w).toBeGreaterThan(10);
+    expect(toyBox.x).toBeGreaterThan(W / 2);
+    const mask5 = shown.passes!.mask!;
+    expect(pixels(mask5, 1, (i) => mask5[i] === 1).length).toBeGreaterThan(100);
+    expect(pixels(mask5, 1, (i) => mask5[i] === 2).length).toBeGreaterThan(100);
+    // frame 30: the toy is put away (after its flight), the crate is not
+    expect(hidden.meta!.subjects[s.crate]).toEqual(shown.meta!.subjects[s.crate]);
+    expect(hidden.meta!.subjects[s.toy]).toEqual({ x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true });
+    const mask30 = hidden.passes!.mask!;
+    expect(pixels(mask30, 1, (i) => mask30[i] === 2)).toEqual([]);
+    expect(pixels(mask30, 1, (i) => mask30[i] === 1).length).toBe(
+      pixels(mask5, 1, (i) => mask5[i] === 1).length,
+    );
+
+    // the subject tracks of the manifest: the toy is boxed while shown, hidden after its flight
+    const tracks = new ShotTracks();
+    tracks.add(5, shown.meta);
+    tracks.add(30, hidden.meta);
+    expect(tracks.subjects.get(s.toy)).toEqual([
+      { frame: 5, ...toyBox },
+      { frame: 30, x: 0, y: 0, w: 0, h: 0, visible: false, hidden: true },
+    ]);
+
+    // the shot's shadow box reaches the toy while it stands at x = 2 (its right side at 2.25, then
+    // the shadows' reach of 2.5 heights of the 1 m crate), and the crate alone once it is put away
+    const shot = (frames: number[]) =>
+      deskShotInfo(
+        { doc: s.doc, evaluator: s.evaluator },
+        { frames, cameraId: s.cam, aspect: W / H },
+        () => {},
+      );
+    expect(shot([1, 3, 5]).shadowFit!.max[0]).toBeCloseTo(2.25 + 2.5, 6);
+    expect(shot([25, 30, 35]).shadowFit!.max[0]).toBeCloseTo(-0.5 + 2.5, 6);
+  });
+
+  it('hiddenItem: geometry collapsed to under a micrometre, whatever scale it is shown at', () => {
+    const at = (scale: Vec3): Mat4 => [scale[0], 0, 0, 0, 0, scale[1], 0, 0, 0, 0, scale[2], 0, 1, 2, 3, 1];
+    const cube = (size: number) => ({ mesh: createCube({ size }) });
+    const s3 = (k: number): Vec3 => [k, k, k];
+    // shown: at scale 1, a 2 m model in micrometres at 1e-6, a 50 cm one in very large units at 5e-8
+    expect(hiddenItem({ ...cube(2), worldMatrix: at(s3(1)) })).toBe(false);
+    expect(hiddenItem({ ...cube(2e6), worldMatrix: at(s3(1e-6)) })).toBe(false);
+    expect(hiddenByScale(at(s3(5e-8)))).toBe(true);
+    expect(5e-8).toBeLessThan(HIDDEN_SCALE_EPS);
+    expect(hiddenItem({ ...cube(1e7), worldMatrix: at(s3(5e-8)) })).toBe(false);
+    // put away: HIDE_SCALE times the scale it is shown at, and the absolute 1e-8 of earlier versions
+    expect(hiddenItem({ ...cube(1e7), worldMatrix: at(s3(hiddenScale(5e-8))) })).toBe(true);
+    expect(hiddenItem({ ...cube(2e6), worldMatrix: at(s3(hiddenScale(1e-6))) })).toBe(true);
+    expect(hiddenItem({ ...cube(2), worldMatrix: at(s3(1e-8)) })).toBe(true);
+    // flattened along one axis is still drawn
+    expect(hiddenItem({ ...cube(2), worldMatrix: at([1, 1, 0]) })).toBe(false);
+    // a string (desk_role 'string': a 1 m mesh scaled along its length) by its world matrix: put
+    // away, one 500 m long is still 5 µm long, more than geometry counts as collapsed under
+    const string = { ...cube(1), data: { custom_props: { desk_role: 'string' } } };
+    expect(hiddenItem({ ...string, worldMatrix: at([1e-8, 1e-8, 5e-6]) })).toBe(true);
+    expect(hiddenItem({ ...cube(1), worldMatrix: at([1e-8, 1e-8, 5e-6]) })).toBe(false);
+    expect(hiddenItem({ ...string, worldMatrix: at([1, 1, 500]) })).toBe(false);
+    expect(hiddenItem({ ...string, worldMatrix: at(s3(1e-8)) })).toBe(true);
+    // the world box given decides; without vertices, the world matrix alone
+    expect(hiddenItem({ worldMatrix: at(s3(1e-6)) }, { min: [0, 0, 0], max: [1, 0, 0] })).toBe(false);
+    expect(hiddenItem({ worldMatrix: at(s3(1e-6)) }, { min: [0, 0, 0], max: [1e-7, 0, 0] })).toBe(true);
+    expect(hiddenItem({ mesh: createMesh({ positions: [] }), worldMatrix: at(s3(1e-8)) })).toBe(true);
+    expect(hiddenItem({ worldMatrix: at(s3(1e-6)) }, null)).toBe(false);
+    expect(hiddenItem({ worldMatrix: at(s3(1e-8)) }, null)).toBe(true);
   });
 });

@@ -15,6 +15,8 @@ import {
   simulatedFrameEnd,
   worldParams,
 } from '../../physics/settings';
+import { DESK_PROPS } from '../props';
+import { hasWater } from '../water';
 import {
   RIGID_BODY_BAKED_PROP,
   constraintActiveFrom,
@@ -31,6 +33,7 @@ import {
   type KeyWriteStats,
   type TransformSamples,
 } from './common';
+import { BodyFloat, FLOAT_SETTLE_S, type DeskBakeWater, type WaterEntry } from './float';
 
 /** `m` with the columns of the negative axes of `signs` negated (a mirrored object's orientation kept). */
 function flipColumns(m: Readonly<Mat4>, signs: Readonly<Vec3>): Mat4 {
@@ -62,6 +65,12 @@ function flipColumns(m: Readonly<Mat4>, signs: Readonly<Vec3>): Mat4 {
  * hold the shear of a rotating body under a non-uniformly scaled parent, nor keep the body where the
  * simulation leaves it while the parent moves on after the bake; its keys then start where anything
  * that moved it under its parent was keyed, so it moves as before there too, and include its scale.
+ *
+ * Bodies that reach water float from there (float.ts; water: 'ignore' keys the simulation as it is):
+ * the body's own motion is replaced before it goes to its carrier, the frame it reached the water is
+ * kept on the body (desk_floats, which desk.check's body_in_water reads), and a bake to the end of the
+ * simulation keys a floating body until it has settled (FLOAT_SETTLE_S after its entry) when the
+ * simulation ends sooner.
  */
 
 /** Most body frames (bodies × baked frames) one bake writes: 2,000,000 is 12 million keys at most. */
@@ -93,8 +102,15 @@ export interface DeskBakePlan {
   frame_end: number;
   /** Whether frame_end is the simulation's end (later keys of the bodies are replaced: the simulation held them). */
   to_end: boolean;
-  /** Σ baked frames over the bodies (the budget: {@link DESK_BAKE_MAX_BODY_FRAMES}). */
+  /** Σ baked frames over the bodies, with their float_frames (the budget: {@link DESK_BAKE_MAX_BODY_FRAMES}). */
   body_frames: number;
+  /** What bodies that reach water do: float there (float.ts) or move on as simulated. */
+  water: DeskBakeWater;
+  /**
+   * Frames past frame_end a body floating from near the end is keyed at most (a bake to the end of
+   * the simulation where the scene has water and bodies float; else 0).
+   */
+  float_frames: number;
   warnings: string[];
 }
 
@@ -158,7 +174,7 @@ function motionStart(
  */
 export function deskBakePlan(
   doc: SceneDoc,
-  o: { frame_start?: number; frame_end?: number; objects?: readonly string[] },
+  o: { frame_start?: number; frame_end?: number; objects?: readonly string[]; water?: DeskBakeWater },
 ): DeskBakePlan {
   const scene = doc.getScene();
   const world = sanitizeRigidBodyWorld(scene.rigidbody_world);
@@ -218,7 +234,13 @@ export function deskBakePlan(
     };
   });
   const frameStart = Math.min(...bodies.map((b) => b.from));
-  const bodyFrames = bodies.reduce((n, b) => n + (end - b.from + 1), 0);
+  const water = o.water ?? 'float';
+  // a body reaching water near the end of the simulation floats on until it has settled
+  const floatFrames =
+    water === 'float' && o.frame_end === undefined && params.timeScale > 0 && hasWater(doc)
+      ? Math.min(MAX_SIMULATED_FRAMES, Math.ceil((FLOAT_SETTLE_S * params.fps) / params.timeScale))
+      : 0;
+  const bodyFrames = bodies.reduce((n, b) => n + (end - b.from + 1 + floatFrames), 0);
   if (end - frameStart + 1 > MAX_SIMULATED_FRAMES)
     throw new OperatorError(
       `Too many frames to bake (${end - frameStart + 1}, at most ${MAX_SIMULATED_FRAMES}): bake a shorter range ` +
@@ -238,6 +260,8 @@ export function deskBakePlan(
     frame_end: end,
     to_end: o.frame_end === undefined,
     body_frames: bodyFrames,
+    water,
+    float_frames: floatFrames,
     warnings,
   };
 }
@@ -264,6 +288,39 @@ export function deskSimulationEnd(doc: SceneDoc, params: ReturnType<typeof world
   );
 }
 
+/**
+ * Where simulated body `id` reaches water in the scene's simulation (the document's cached one, from
+ * its release to the simulation's end), as desk.physics_bake (water: 'float') lets it float from there:
+ * null when it stays dry, is not a simulated body, or the scene has no water. The release presets
+ * warn with it.
+ */
+export function deskWaterEntry(doc: SceneDoc, id: string): WaterEntry | null {
+  const o = doc.getObject(id);
+  const scene = doc.getScene();
+  if (!o || !isSimulatedBody(o) || !sanitizeRigidBodyWorld(scene.rigidbody_world).enabled || !hasWater(doc))
+    return null;
+  const params = worldParams(scene);
+  const release = delayedStartFrame(sanitizeRigidBody(o.rigid_body)!, params.frameStart) ?? params.frameStart;
+  const end = deskSimulationEnd(doc, params);
+  const sim = new RigidBodySimulator();
+  const host = sceneSampler(doc);
+  let float: BodyFloat | null = null;
+  for (let f = Math.max(release, params.frameStart + 1); f <= end; f++) {
+    // the body's simulated world (absent until its release)
+    const world = sim.evaluate(doc, f, host)?.get(id);
+    if (!world) continue;
+    float ??= new BodyFloat(doc, o, world, {
+      release,
+      dt: params.timeScale / params.fps,
+      gravity: Math.max(0, -params.gravity[2]),
+      end: (entry) => entry,
+    });
+    float.step(f, world);
+    if (float.entry) return float.entry;
+  }
+  return null;
+}
+
 export interface DeskBakeResult {
   /** The objects keyed (the carriers: a store model's root, or the body itself), one per body. */
   objects: string[];
@@ -276,7 +333,21 @@ export interface DeskBakeResult {
   removed_constraints: Record<string, string[]>;
   removed_drivers: number;
   removed_modifiers: number;
+  /** Bodies that reached water and float (or sink) from `frame` on (float.ts), in the order of `bodies`. */
+  floats: DeskBakeFloat[];
   warnings: string[];
+}
+
+/** A body that reached water in a bake. */
+export interface DeskBakeFloat {
+  /** The simulated body (the custom prop desk_floats on it holds `frame`). */
+  body: string;
+  /** The first frame of its floating motion. */
+  frame: number;
+  /** The water piece's owner (a landmark, or a store model's root) and label. */
+  water: { object: string; label: string };
+  /** Denser than water: it sinks instead. */
+  sinks: boolean;
 }
 
 /** The sign of each axis an object's world matrix keeps in its scale channel (mirrored objects). */
@@ -343,15 +414,50 @@ export function deskBake(doc: SceneDoc, plan: DeskBakePlan): DeskBakeResult {
   // a model root carrier: the inverse of its body's rigid frame and the root's world at the body's
   // first baked frame, and the body's channels there (held from there on)
   const refs = new Map<string, { inverse: Mat4; root: Mat4; channels: ObjectData }>();
-  for (let f = plan.frame_start; f <= plan.frame_end; f++) {
-    const simulated = sim.evaluate(doc, f, sampler);
+  // bodies that may reach water (float.ts), and the last frame each is keyed on
+  const params = worldParams(doc.getScene());
+  const floating = plan.water === 'float' && hasWater(doc);
+  const floats = new Map<string, BodyFloat>();
+  const ends = new Map(plan.bodies.map((b) => [b.id, plan.frame_end]));
+  const endOf = (entry: number) =>
+    Math.max(plan.frame_end, plan.float_frames ? entry + plan.float_frames : 0);
+  let last = plan.frame_end;
+  for (let f = plan.frame_start; f <= last; f++) {
+    // past the simulation's end only floating bodies are keyed, on the scene as animated
+    const past = f > plan.frame_end;
+    const simulated = past ? null : sim.evaluate(doc, f, sampler);
     const fs = sampler.at(f, simulated);
     for (const b of plan.bodies) {
-      if (f < b.from) continue;
+      if (f < b.from || f > ends.get(b.id)!) continue;
       const c = carriers.get(b.id)!;
       const animated = fs.byId.get(c.id) ?? c;
+      // the body's own world matrix: as simulated, or floating from where it reached water
+      let own: Mat4 | null = past ? null : (fs.world(b.id) ?? fs.local(b.id));
+      if (floating) {
+        let float = floats.get(b.id);
+        if (!float && own) {
+          const rb = sanitizeRigidBody(bodies.get(b.id)!.rigid_body);
+          const release = (rb && delayedStartFrame(rb, params.frameStart)) ?? params.frameStart;
+          float = new BodyFloat(doc, bodies.get(b.id)!, own, {
+            release,
+            dt: params.timeScale / params.fps,
+            gravity: Math.max(0, -params.gravity[2]),
+            end: endOf,
+          });
+          floats.set(b.id, float);
+        }
+        if (float) {
+          const entered = !float.entry;
+          own = float.step(f, own);
+          if (entered && float.entry) {
+            ends.set(b.id, endOf(float.entry.frame));
+            last = Math.max(last, endOf(float.entry.frame));
+          }
+        }
+      }
+      if (!own) continue;
       let world: Mat4;
-      if (b.carrier === b.id) world = fs.world(b.id) ?? fs.local(b.id);
+      if (b.carrier === b.id) world = own;
       else {
         let ref = refs.get(b.id);
         if (!ref) {
@@ -367,7 +473,7 @@ export function deskBake(doc: SceneDoc, plan: DeskBakePlan): DeskBakeResult {
           };
           refs.set(b.id, ref);
         }
-        world = multiply4(multiply4(rigidFrame(fs.world(b.id) ?? fs.local(b.id)), ref.inverse), ref.root);
+        world = multiply4(multiply4(rigidFrame(own), ref.inverse), ref.root);
       }
       let sign = signs.get(b.id);
       if (!sign) signs.set(b.id, (sign = b.unparent ? scaleSigns(animated, world) : [...animated.scale]));
@@ -442,13 +548,15 @@ export function deskBake(doc: SceneDoc, plan: DeskBakePlan): DeskBakeResult {
         `'${c.name}' was unparented from '${parentName}' and keyed in world space from frame ${b.from}`,
       );
     const o = doc.getObject(b.id)!;
-    doc.updateObject(b.id, {
-      rigid_body: null,
-      custom_props: {
-        ...o.custom_props,
-        [RIGID_BODY_BAKED_PROP]: `frames ${b.from}-${plan.frame_end} step 1`,
-      },
-    });
+    const props: Record<string, string | number | boolean> = {
+      ...o.custom_props,
+      [RIGID_BODY_BAKED_PROP]: `frames ${b.from}-${s.frames.length ? s.frames[s.frames.length - 1] : plan.frame_end} step 1`,
+    };
+    // where it reached water (desk.check's body_in_water reads it): this bake's, not an earlier one's
+    const entry = floats.get(b.id)?.entry;
+    if (entry) props[DESK_PROPS.floats] = entry.frame;
+    else delete props[DESK_PROPS.floats];
+    doc.updateObject(b.id, { rigid_body: null, custom_props: props });
   }
   const left = doc.listObjects().filter(isSimulatedBody);
   if (left.length)
@@ -466,10 +574,23 @@ export function deskBake(doc: SceneDoc, plan: DeskBakePlan): DeskBakeResult {
     bodies: plan.bodies.map((b) => b.id),
     keyframes: stats.keys,
     frame_start: plan.frame_start,
-    frame_end: plan.frame_end,
+    frame_end: last,
     removed_constraints: removed,
     removed_drivers: stats.drivers,
     removed_modifiers: stats.modifiers,
+    floats: plan.bodies.flatMap((b) => {
+      const e: WaterEntry | null | undefined = floats.get(b.id)?.entry;
+      return e
+        ? [
+            {
+              body: b.id,
+              frame: e.frame,
+              water: { object: e.water.owner, label: e.water.label },
+              sinks: e.sinks,
+            },
+          ]
+        : [];
+    }),
     warnings,
   };
 }

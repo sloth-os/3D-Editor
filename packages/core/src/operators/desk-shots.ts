@@ -1171,10 +1171,14 @@ export function registerDeskShotOperators(reg: OperatorRegistry): void {
       label: 'Check Shots',
       description:
         'Continuity checks of the shots (read-only): line_crossed, subject_out_of_frame, camera_inside, ' +
-        'missing_camera (errors); plan_mismatch, screen_direction, jump_cut, absent_in_frame, subject_hidden (a ' +
-        'subject scaled to nothing by a hide key), occluded_subject (a subject behind an actor the shot does not ' +
-        'frame), actors_overlap, outside_set, empty_shot, duration_clamped (warnings); physics_unbaked, shot_gap ' +
-        "(info). Returns {issues, lines: [{shot, line}] (rideo's blocking sentence), layouts: [{shot, layout}], summary}.",
+        "missing_camera, tether_detached (a kite's string left where the flight tied it), walks_on_water (an " +
+        'actor standing or walking on a lake, pond or stream in the picture) (errors); plan_mismatch, ' +
+        'screen_direction, jump_cut, absent_in_frame, subject_hidden (a subject scaled to nothing by a hide key), ' +
+        'subject_revealed (a subject a pan or a tilt brings into the frame by its last frame), occluded_subject (a ' +
+        'subject behind an actor the shot does not frame), body_in_water (a physics body in water it does not ' +
+        "float on: bake with desk.physics_bake water: 'float'), actors_overlap, outside_set, empty_shot, " +
+        'duration_clamped (warnings); physics_unbaked, shot_gap (info). Returns {issues, lines: [{shot, line}] ' +
+        "(rideo's blocking sentence), layouts: [{shot, layout}], summary}.",
       category: 'Desk',
       undo: false,
       schema: z.object({ shots: shotRefs.optional() }),

@@ -46,7 +46,8 @@ import { VEHICLE_DEFAULT_MPS, VEHICLE_EASE_SECONDS, VEHICLE_MAX_FRAMES, vehicleP
  *    lifted location keys;
  *  - a bake keys the location and rotation (and the scale of a carrier that loses its parent or is a
  *    store model's root) of each body's carrier on every frame from its release (or the start of its
- *    hold) to the end (bake.ts deskBakePlan), stepping the world where its cache has no frames;
+ *    hold) to the end (bake.ts deskBakePlan), and a body floating from near the end until it has
+ *    settled (float_frames more), stepping the world where its cache has no frames;
  *  - a flight keys the flyer, its string (location, rotation and scale) and its tail on every frame,
  *    and of a landing after it; hiding them after it keys their scale twice more;
  *  - a drive keys the vehicle, the spin of each wheel and the turn of each steering pivot on every
@@ -252,7 +253,8 @@ export function deskReleaseEstimate(
  * root carries in it; the keys those objects hold rewritten, and the world stepped over the range (as
  * if nothing were cached: a cache made stale by an edit is simulated again). Null when the bake fails
  * by itself (bake.ts deskBakePlan refuses it: no world, a bad range, over the
- * DESK_BAKE_MAX_BODY_FRAMES budget).
+ * DESK_BAKE_MAX_BODY_FRAMES budget). A bake to the simulation's end where bodies float on water counts
+ * each body float_frames frames longer (it may reach the water on the last frame).
  */
 export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown>): OperatorEstimate | null {
   const doc = ctx.doc;
@@ -264,6 +266,7 @@ export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown
       frame_start: typeof p.frame_start === 'number' ? p.frame_start : undefined,
       frame_end: typeof p.frame_end === 'number' ? p.frame_end : undefined,
       objects: named,
+      water: p.water === 'ignore' ? 'ignore' : 'float',
     });
   } catch {
     return null;
@@ -275,7 +278,10 @@ export function deskBakeEstimate(ctx: OperatorContext, p: Record<string, unknown
   // the body a model's root carries: at most a key per channel where it holds from the bake's start
   const held = (b: (typeof plan.bodies)[number]) => (b.carrier !== b.id ? 9 : 0);
   const keys = newKeyframesWrites(
-    plan.bodies.reduce((n, b) => n + channels(b) * (plan.frame_end - b.from + 1) + held(b), 0),
+    plan.bodies.reduce(
+      (n, b) => n + channels(b) * (plan.frame_end - b.from + 1 + plan.float_frames) + held(b),
+      0,
+    ),
     plan.bodies.reduce((n, b) => n + channels(b) + held(b), 0),
     BAKE_LOWER,
     objectKeys(doc, ids).keys,

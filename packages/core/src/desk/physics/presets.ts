@@ -16,6 +16,7 @@ import {
   worldParams,
 } from '../../physics/settings';
 import { getCatalogEntry } from '../../store/catalog';
+import { DESK_PROPS } from '../props';
 import { getDeskSettings } from '../shots';
 import {
   RIGID_BODY_BAKED_PROP,
@@ -29,6 +30,7 @@ import {
   sceneSampler,
   worldBounds,
 } from './common';
+import { deskWaterEntry } from './bake';
 
 /*
  * The physics presets of the director's desk (spec §4, review finding 3): rigid bodies on props with
@@ -251,12 +253,13 @@ function bodySettings(doc: SceneDoc, o: ObjectData, s: DeskBodySettings): RigidB
   return rb;
 }
 
-/** Stores rigid body settings on an object, which is no longer a baked body then. */
+/** Stores rigid body settings on an object, which is no longer a baked (or floating) body then. */
 function setBody(doc: SceneDoc, id: string, rb: RigidBodyData): void {
   const o = doc.getObject(id)!;
-  if (o.custom_props && RIGID_BODY_BAKED_PROP in o.custom_props) {
+  if (o.custom_props && (RIGID_BODY_BAKED_PROP in o.custom_props || DESK_PROPS.floats in o.custom_props)) {
     const props = { ...o.custom_props };
     delete props[RIGID_BODY_BAKED_PROP];
+    delete props[DESK_PROPS.floats];
     doc.updateObject(id, { rigid_body: rb, custom_props: props });
   } else doc.updateObject(id, { rigid_body: rb });
 }
@@ -617,6 +620,36 @@ export function updateDeskWorldRange(doc: SceneDoc, warnings: string[]): DeskWor
 
 // ---------------------------------------------------------------- the presets
 
+/**
+ * Warns about released `bodies` that reach water in the simulation (bake.ts deskWaterEntry):
+ * desk.physics_bake lets them float there (or sink). `landing`: the frame a throw comes down, so a
+ * body that only rolls or bounces into the water afterwards is told apart.
+ */
+function warnWater(doc: SceneDoc, bodies: readonly string[], warnings: string[], landing?: number): void {
+  for (const b of bodies) {
+    let entry: ReturnType<typeof deskWaterEntry>;
+    try {
+      entry = deskWaterEntry(doc, b);
+    } catch (e) {
+      // the settling could not be simulated either (updateDeskWorldRange warned)
+      if (!isMeshMemoryError(e)) throw e;
+      return;
+    }
+    if (!entry) continue;
+    const name = doc.getObject(modelRootOf(doc, b)?.id ?? b)?.name ?? b;
+    const water = `the water of ${entry.water.label}`;
+    const fate = entry.sinks ? 'sink there (it is denser than water)' : 'float there';
+    warnings.push(
+      landing === undefined
+        ? `'${name}' reaches ${water} at frame ${entry.frame}; desk.physics_bake makes it ${fate}`
+        : entry.frame <= Math.ceil(landing) + 1
+          ? `'${name}' lands in ${water} (frame ${entry.frame}); desk.physics_bake makes it ${fate}`
+          : `'${name}' comes down on dry ground but rolls or bounces into ${water} at frame ${entry.frame}; ` +
+            `desk.physics_bake makes it ${fate} (aim it farther from the water to keep it on land)`,
+    );
+  }
+}
+
 /** Rigid bodies on `objectIds` (EMPTY model roots: their mesh part), and the ground under them. */
 export function setupBodies(
   doc: SceneDoc,
@@ -721,6 +754,7 @@ export function deskDrop(
   }
   ensureGround(doc, bodies, landing, o.frame, warnings);
   const world = updateDeskWorldRange(doc, warnings);
+  warnWater(doc, bodies, warnings);
   return { bodies, world, warnings };
 }
 
@@ -857,6 +891,7 @@ export function deskThrow(
     warnings,
   );
   const world = updateDeskWorldRange(doc, warnings);
+  warnWater(doc, [body], warnings, landing);
   return { body, velocity, landing_frame: landing, world, warnings };
 }
 
@@ -884,5 +919,6 @@ export function deskPush(
   const landing = landingPoint(doc, body, o.frame, velocity, true);
   ensureGround(doc, [body], landing ? [landing] : [], o.frame, warnings);
   const world = updateDeskWorldRange(doc, warnings);
+  warnWater(doc, [body], warnings);
   return { body, velocity, world, warnings };
 }

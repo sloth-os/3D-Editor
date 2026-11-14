@@ -1,10 +1,12 @@
 import {
   DESK_PROPS,
-  FrameState,
+  DeskScene,
   cameraFovY,
   evaluateFCurve,
   fcurveKey,
+  hiddenByScale,
   orthoHalfExtents,
+  type FrameState,
   type Mat4,
   type ObjectData,
   type SceneDoc,
@@ -19,7 +21,11 @@ import type { PassName } from '../render/protocol';
  * only the shots whose motion a video model gets wrong are pushed: physics (drops, throws, pushes,
  * baked or simulated), tethered flyers (kites, balloons), props an actor holds, and camera moves.
  * What a shot shows is read from the project at a few frames of the shot: an object counts when its
- * origin (an actor's middle) projects into the shot camera's frame, give or take 15 %.
+ * origin (an actor's middle) projects into the shot camera's frame, give or take 15 %, and a hide key
+ * has not put it away at that frame (core hide.ts: a kite after desk.tether_fly's after: 'hide', an
+ * actor or prop the rideo import hides in the shots it is not in). Core's DeskScene tells that from
+ * the object's geometry, so a store model shown at a tiny world scale (a model in micrometres made
+ * 1 m tall is at 1e-6) counts as any other; a string, from its world matrix (hiddenByScale).
  *
  * Modes: 'camera' when rideo's first frame cannot have been drawn from our staging (the desk is off
  * in rideo, the board was approved before, the shot starts from an image, or rideo's blocking line
@@ -61,11 +67,6 @@ const VIEW_MARGIN = 1.15;
 /** Below this, the camera did not move (metres) or turn (cosine of the angle between aims). */
 const MOVE_EPS_M = 0.01;
 const TURN_COS = Math.cos((0.5 * Math.PI) / 180);
-/**
- * An object scaled below this is shrunk away: a string before and after its flight (tether.ts
- * TETHER_HIDDEN_SCALE), an actor or prop the rideo import hides in the shots without it.
- */
-const HIDDEN_SCALE = 1e-4;
 /** Custom properties of other modules this module reads. */
 const STRING_TO = 'desk_string_to';
 const BAKED = 'rigid_body_baked';
@@ -96,8 +97,6 @@ function unit(v: Vec3): Vec3 {
   return [v[0] / l, v[1] / l, v[2] / l];
 }
 const translation = (m: Mat4): Vec3 => [m[12], m[13], m[14]];
-/** Length of a column of a column-major matrix (the object's scale along that local axis). */
-const columnLength = (m: Mat4, c: number) => Math.hypot(m[c * 4], m[c * 4 + 1], m[c * 4 + 2]);
 
 function cameraView(doc: SceneDoc, fs: FrameState, cameraId: string, aspect: number): View | null {
   const o = doc.getObject(cameraId);
@@ -171,8 +170,11 @@ export function shotFeatures(doc: SceneDoc, shot: ShotData, aspect: number): Sho
   const scene = doc.getScene();
   const cameraId = shot.camera ?? scene.camera ?? null;
   const frames = sampleFrames(shot.frame_start, shot.frame_end);
-  const objects = doc.listObjects();
-  const byId = new Map(objects.map((o) => [o.id, o]));
+  // one reading of the project at the sampled frames, without the simulation (bodies at their stored
+  // or keyed place), that also tells what a hide key put away (DeskScene.hidden)
+  const desk = new DeskScene(doc, { aspect, physics: false });
+  const byId = desk.objects;
+  const objects = [...byId.values()];
   const actors = objects.filter((o) => role(o) === 'actor');
   const subjects = new Set(shot.subjects);
   if (shot.subjects.some((id) => role(byId.get(id)) === 'actor')) out.characters = true;
@@ -201,15 +203,11 @@ export function shotFeatures(doc: SceneDoc, shot: ShotData, aspect: number): Sho
   const note = (what: string) => {
     if (!out.found.includes(what)) out.found.push(what);
   };
-  let base: FrameState | null = null;
   let firstPos: Vec3 | null = null;
   let firstFwd: Vec3 | null = null;
   const bakedFirst = new Map<string, Vec3>();
   for (const frame of frames) {
-    const fs: FrameState = base
-      ? new FrameState(doc, frame, null, { base })
-      : new FrameState(doc, frame, null);
-    base ??= fs;
+    const fs = desk.frameState(frame);
     const view = cameraId ? cameraView(doc, fs, cameraId, aspect) : null;
     if (view) {
       if (!firstPos || !firstFwd) {
@@ -218,11 +216,9 @@ export function shotFeatures(doc: SceneDoc, shot: ShotData, aspect: number): Sho
       } else if (Math.hypot(...sub(view.pos, firstPos)) > MOVE_EPS_M || dot(view.fwd, firstFwd) < TURN_COS)
         out.camera_move = true;
     }
-    const shrunk = (m: Mat4) =>
-      Math.max(columnLength(m, 0), columnLength(m, 1), columnLength(m, 2)) < HIDDEN_SCALE;
     const seen = (id: string, lift = 0): boolean => {
       const m = fs.world(id);
-      if (!m || !view || shrunk(m)) return false;
+      if (!m || !view || desk.hidden(id, frame)) return false;
       const p = translation(m);
       return inView(view, p) || (lift > 0 && inView(view, [p[0], p[1], p[2] + lift]));
     };
@@ -258,7 +254,9 @@ export function shotFeatures(doc: SceneDoc, shot: ShotData, aspect: number): Sho
     }
     for (const s of strings) {
       const m = fs.world(s.id);
-      if (!m || shrunk(m)) continue;
+      // a hide key shrinks a string's two thickness axes from 1 (render/desk.ts stringPoints): its
+      // length, up to 500 m, can leave it longer than DeskScene.hidden counts as put away
+      if (!m || hiddenByScale(m)) continue;
       const flyer = s.custom_props?.[STRING_TO];
       const flyerId = typeof flyer === 'string' ? flyer : null;
       if (seen(s.id) || (flyerId && seen(flyerId))) {

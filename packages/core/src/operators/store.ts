@@ -5,6 +5,7 @@ import { builtinResult, getCatalogEntry } from '../store/catalog';
 import { rankCatalog, searchCatalogPage } from '../store/search';
 import { insertStoreFiles, normalizeFilePath } from '../store/insert';
 import { meshWorldBounds, parseModelParams, takesColor } from '../store/builtin/kit';
+import { standsOnWaterWarning } from '../desk/water';
 import type { OperatorContext } from './context';
 import { OperatorError } from './context';
 import { defineOperator, safeJsonSchema, type OperatorRegistry } from './registry';
@@ -155,8 +156,9 @@ export function registerStoreOperators(reg: OperatorRegistry): void {
         const entry = entryOrThrow(p.model);
         // checked before anything is added (the build checks again)
         parseModelParams({ id: entry.id, params: entry.params }, p.params);
+        const location = placeAt(ctx, p.location);
         const res = entry.build(ctx.doc, {
-          location: placeAt(ctx, p.location),
+          location,
           rotation_deg: p.rotation_deg,
           height_m: p.height_m,
           width_m: p.width_m,
@@ -167,6 +169,17 @@ export function registerStoreOperators(reg: OperatorRegistry): void {
           params: p.params,
         });
         const warnings = buildWarnings(res);
+        // a person or an animal (an actor) put down on water stands on it as on the ground
+        const wet =
+          entry.rig === 'actor'
+            ? standsOnWaterWarning(
+                ctx.doc,
+                ctx.doc.getObject(res.root)?.name ?? res.root,
+                location,
+                ctx.state.frame,
+              )
+            : null;
+        if (wet) warnings.push(wet);
         for (const w of warnings) ctx.report('WARNING', w);
         setSelection(ctx, [res.root], res.root);
         return {

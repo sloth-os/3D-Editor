@@ -129,10 +129,13 @@ keyframes, so they are frame-exact (the tests check every clip's frame count and
 - `pose`: OpenPose-18 skeletons of the people and AP-10K skeletons of the animals on black, in the
   OpenPose colours.
 
-Strings (a kite's, anything with `desk_role: 'string'`) are drawn as screen-space lines at least
-2 px wide in the beauty, mask, edge and pose passes, hidden behind opaque objects. Objects hidden
-by their scale (a kite after `after: 'hide'`, the actors and props a rideo import hides in shots
-they are not in) draw nothing in any pass: no skeleton, no string line, no mask colour.
+Strings (a kite's, anything with `desk_role: 'string'`) are drawn as screen-space lines at least 2
+px wide in the beauty, mask, edge and pose passes, hidden behind opaque objects. Objects hidden by
+their scale (a kite after `after: 'hide'`, the actors and props a rideo import hides in shots they
+are not in) draw nothing in any pass: no skeleton, no string line, no mask colour. What tells them
+is their geometry, which a hide key shrinks to under a micrometre across (a string to under a
+micrometre thick), so a store model shown at a tiny scale (one in micrometres made 1 m tall is shown
+at 1e-6) is drawn, boxed and measured as any other.
 
 ## The manifest
 
@@ -251,7 +254,9 @@ export. In the editor, Render › Export Video… (Ctrl+Shift+F12) runs the same
 | failed "server shut down while the export ran"                                          | the server was stopped (SIGTERM, Ctrl+C) during the export: start the export again                                                                                                                      |
 | failed "server restarted while the export ran"                                          | the server ended without a shutdown (a crash, `kill -9`) during the export: start the export again                                                                                                      |
 | failed "the export grew larger than EXPORT_MAX_MB"                                      | export fewer frames, a smaller size or fewer passes, or raise `EXPORT_MAX_MB`                                                                                                                           |
-| a subject out of frame in a clip                                                        | run `desk.check`: `subject_out_of_frame` names the shot and frame; solve the shot again or widen its framing                                                                                            |
+| a subject out of frame in a clip                                                        | run `desk.check`: `subject_out_of_frame` names the shot and frame; solve the shot again or widen its framing (a subject a pan or tilt brings in by its last frame is `subject_revealed`, a warning)     |
+| a kite's string runs from where the hand was                                            | the anchor actor moved, posed or mounted after `desk.tether_fly`: `desk.check` reports `tether_detached` with the frames; fly the kite again after the anchor's last move                               |
+| an actor walks on water, or a body rolls on it                                          | `desk.check` reports `walks_on_water` (route the walk around it, or give a swimmer `in_water: true`) and `body_in_water` (re-aim the throw, or release it again and bake with `{water: 'float'}`)       |
 | a kite's string missing                                                                 | strings come from `desk.tether_fly` (or objects with `desk_role: 'string'`); a string is hidden before its flight starts                                                                                |
 | the clip has a different length than rideo expects                                      | rideo asks its model for `clamp(duration)`: set the desk's take limits and export with `match_model_duration: true`                                                                                     |
 | exports disappear                                                                       | finished exports are deleted after `EXPORT_TTL_HOURS` and beyond `EXPORT_MAX_MB`                                                                                                                        |
