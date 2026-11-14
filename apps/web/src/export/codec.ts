@@ -2,12 +2,12 @@ import { fpsRational, fpsValue, type ExportQuality } from '@3d-editor/core';
 
 /*
  * How the browser export encodes its videos with WebCodecs: the codec string (H.264 High, else Main,
- * else Constrained Baseline, at the lowest level that holds the frame size and rate; VP9 profile 0),
- * the bit rate of each quality (WebCodecs has no constant-quality mode for H.264: a bit rate per
- * pixel and frame instead of the server's CRF), VP9's quantizer (the server's CRF values), and where
- * the key frames go: at every shot start, so that each shot's clip starts on one and is cut from the
- * stream without encoding again, and at most round(2 × fps) frames after the one before (the
- * server's `-g`).
+ * else Constrained Baseline, at the lowest level that holds the frame size and rate; VP9 profile 0 at
+ * the lowest level that holds its size, rate, longest side and bit rate), the bit rate of each
+ * quality (WebCodecs has no constant-quality mode for H.264: a bit rate per pixel and frame instead
+ * of the server's CRF), VP9's quantizer (the server's CRF values), and where the key frames go: at
+ * every shot start, so that each shot's clip starts on one and is cut from the stream without
+ * encoding again, and at most round(2 × fps) frames after the one before (the server's `-g`).
  */
 
 /** H.264 levels from 3.0 up: macroblocks per second and per frame, High profile bit rate (bit/s). */
@@ -52,29 +52,45 @@ export function avcCodecs(width: number, height: number, fps: number, bitrate = 
   return [`avc1.6400${level}`, `avc1.4d00${level}`, `avc1.42e0${level}`];
 }
 
-/** VP9 levels: luma samples per frame and per second. */
-const VP9_LEVELS: readonly { level: number; size: number; rate: number }[] = [
-  { level: 10, size: 36_864, rate: 829_440 },
-  { level: 11, size: 73_728, rate: 2_764_800 },
-  { level: 20, size: 122_880, rate: 4_608_000 },
-  { level: 21, size: 245_760, rate: 9_216_000 },
-  { level: 30, size: 552_960, rate: 20_736_000 },
-  { level: 31, size: 983_040, rate: 36_864_000 },
-  { level: 40, size: 2_228_224, rate: 83_558_400 },
-  { level: 41, size: 2_228_224, rate: 160_432_128 },
-  { level: 50, size: 8_912_896, rate: 311_951_360 },
-  { level: 51, size: 8_912_896, rate: 588_251_136 },
-  { level: 52, size: 8_912_896, rate: 1_176_502_272 },
-  { level: 60, size: 35_651_584, rate: 1_176_502_272 },
-  { level: 61, size: 35_651_584, rate: 2_353_004_544 },
-  { level: 62, size: 35_651_584, rate: 4_706_009_088 },
+/** A VP9 level's limits: luma samples per frame and per second, the longest side, the bit rate (bit/s). */
+interface Vp9Level {
+  level: number;
+  size: number;
+  rate: number;
+  breadth: number;
+  bitrate: number;
+}
+
+/** The VP9 levels (webmproject.org/vp9/levels; libvpx's vp9_level_defs). */
+const VP9_LEVELS: readonly Vp9Level[] = [
+  { level: 10, size: 36_864, rate: 829_440, breadth: 512, bitrate: 200_000 },
+  { level: 11, size: 73_728, rate: 2_764_800, breadth: 768, bitrate: 800_000 },
+  { level: 20, size: 122_880, rate: 4_608_000, breadth: 960, bitrate: 1_800_000 },
+  { level: 21, size: 245_760, rate: 9_216_000, breadth: 1_344, bitrate: 3_600_000 },
+  { level: 30, size: 552_960, rate: 20_736_000, breadth: 2_048, bitrate: 7_200_000 },
+  { level: 31, size: 983_040, rate: 36_864_000, breadth: 2_752, bitrate: 12_000_000 },
+  { level: 40, size: 2_228_224, rate: 83_558_400, breadth: 4_160, bitrate: 18_000_000 },
+  { level: 41, size: 2_228_224, rate: 160_432_128, breadth: 4_160, bitrate: 30_000_000 },
+  { level: 50, size: 8_912_896, rate: 311_951_360, breadth: 8_384, bitrate: 60_000_000 },
+  { level: 51, size: 8_912_896, rate: 588_251_136, breadth: 8_384, bitrate: 120_000_000 },
+  { level: 52, size: 8_912_896, rate: 1_176_502_272, breadth: 8_384, bitrate: 180_000_000 },
+  { level: 60, size: 35_651_584, rate: 1_176_502_272, breadth: 16_832, bitrate: 180_000_000 },
+  { level: 61, size: 35_651_584, rate: 2_353_004_544, breadth: 16_832, bitrate: 240_000_000 },
+  { level: 62, size: 35_651_584, rate: 4_706_009_088, breadth: 16_832, bitrate: 480_000_000 },
 ];
 
-/** The VP9 codec string (profile 0, 8 bits) of a video of this size and rate, at the lowest level that holds it. */
-export function vp9Codec(width: number, height: number, fps: number): string {
+/**
+ * The VP9 codec string (profile 0, 8 bits) of a video of this size, rate and bit rate (bit/s; 0 for
+ * quantizer mode, which has none), at the lowest level that holds it: its picture size, its samples
+ * per second, its longest side (a wide strip needs the level of its width) and its bit rate.
+ */
+export function vp9Codec(width: number, height: number, fps: number, bitrate = 0): string {
   const size = width * height;
+  const side = Math.max(width, height);
   const l =
-    VP9_LEVELS.find((v) => size <= v.size && size * fps <= v.rate) ?? VP9_LEVELS[VP9_LEVELS.length - 1];
+    VP9_LEVELS.find(
+      (v) => size <= v.size && size * fps <= v.rate && side <= v.breadth && bitrate <= v.bitrate,
+    ) ?? VP9_LEVELS[VP9_LEVELS.length - 1];
   return `vp09.00.${String(l.level).padStart(2, '0')}.08`;
 }
 
@@ -177,8 +193,12 @@ export async function chooseEncoding(
   const bitrate = videoBitrate(quality, width, height, fps);
   const base = { width, height, framerate: fps, latencyMode: 'quality' as const };
   if (codec === 'vp9') {
-    const vp9 = vp9Codec(width, height, fps);
-    const quantized: VideoEncoderConfig = { ...base, codec: vp9, bitrateMode: 'quantizer' };
+    // quantizer mode has no bit rate: its level holds the size and rate; the rated one's its bit rate too
+    const quantized: VideoEncoderConfig = {
+      ...base,
+      codec: vp9Codec(width, height, fps),
+      bitrateMode: 'quantizer',
+    };
     if (await probe(quantized))
       return {
         codec,
@@ -188,7 +208,12 @@ export async function chooseEncoding(
         container: 'webm',
         mime: 'video/webm',
       };
-    const rated: VideoEncoderConfig = { ...base, codec: vp9, bitrate, bitrateMode: 'variable' };
+    const rated: VideoEncoderConfig = {
+      ...base,
+      codec: vp9Codec(width, height, fps, bitrate),
+      bitrate,
+      bitrateMode: 'variable',
+    };
     if (await probe(rated))
       return {
         codec,

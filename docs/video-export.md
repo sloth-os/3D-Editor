@@ -43,12 +43,14 @@ update; later edits never reach the export) and hands it to the export engine
    (an RGB PNG and a JPEG), the stills and the contact sheet tiles.
 4. The page encodes every video stream with one WebCodecs `VideoEncoder`: H.264 High, else Main,
    else Constrained Baseline, at the lowest level from 3.0 that holds the size, rate and bit rate
-   (`latencyMode: 'quality'`), the frames tagged BT.709 limited range (the encoder writes it in the
-   stream's VUI), a key frame at every shot start and at least every round(2 × fps) frames, and at
-   most 4 frames queued in the encoder. Its chunks are muxed (mediabunny) into the sequence and
-   into the clip of their shot without encoding again, each clip starting on the key frame of its
-   shot start; every MP4 has its index (`moov`) before the media and an `nclx` colour box saying
-   BT.709 limited range.
+   (VP9: profile 0 at the lowest level that holds the picture size, the samples per second, the
+   longest side and, in bit rate mode, the bit rate), `latencyMode: 'quality'`, the frames tagged
+   BT.709 limited range (the encoder writes it in the stream's VUI), a key frame at every shot start
+   and at least every round(2 × fps) frames, and at most 4 frames queued in the encoder. Its chunks
+   are muxed (mediabunny) into the sequence and into the clip of their shot without encoding again,
+   each clip starting on the key frame of its shot start (a shot the encoder gave no frame of fails
+   the export); every MP4 has its index (`moov`) before the media, an `nclx` colour box saying
+   BT.709 limited range and the frame rate as its time scale (WebM files count in milliseconds).
 5. The first worker makes the contact sheet and the manifest (core's `contactSheet`,
    `buildManifest`), the others having stopped once the frames were rendered.
 
@@ -93,8 +95,11 @@ else the videos are H.264 MP4 with a warning, as on a server without libvpx.
   beauty pass whatever passes the export has.
 - **The manifest** has the server's fields, with these additions: files of kind `frames` (the PNG
   archives, with their `pass`) and `still`, and an `exporter` object: `kind` (`browser`),
-  `video_codec` (the codec string, such as `avc1.64001f`), `bitrate` (bit/s; null in VP9 quantizer
-  mode), `vp9_quantizer` and `render_workers`. The project's id is the one the page gives (the
+  `video_codec` (the codec string of the videos as written: for H.264 the profile, constraint flags
+  and level of the stream's decoder configuration, which the encoder chooses itself; Chrome's
+  writes `avc1.640c1f` at 1280 × 720 when asked for `avc1.64001f`, and a lower level for small
+  frames; for VP9 the string asked for, which the WebM file's header repeats), `bitrate` (bit/s;
+  null in VP9 quantizer mode), `vp9_quantizer` and `render_workers`. The project's id is the one the page gives (the
   editor's project id).
 
 **Speed**, measured in headless Chromium 153 on a 4-core machine shared with other work (load 2–5),
@@ -192,7 +197,8 @@ Preset `reference` makes reference clips for a video model: quality `draft`, loo
 clips only (no sequence, posters or contact sheet), with the passes `beauty`, `depth` and `pose`,
 one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 % and
 the scene's fps. The parameters given win over the preset, `outputs` key by key. Its former name
-`rideo` is still accepted (and stored as `reference`).
+`rideo` is still accepted (and stored as `reference`; a job an older server queued with it is sized
+as the preset says too).
 
 ## Quality presets and speed
 

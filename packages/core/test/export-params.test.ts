@@ -259,6 +259,10 @@ describe('export plan', () => {
     expect(planExport(doc, params({ preset: 'reference' }))).toMatchObject({ width: 1920, height: 1080 });
     // the former name sizes the same
     expect(planExport(doc, params({ preset: 'rideo' }))).toMatchObject({ width: 1920, height: 1080 });
+    // and so does a job queued with it before the rename: job.json holds the parameters as the old
+    // schema parsed them (the preset's other settings written in, its name kept), read back unparsed
+    const queued = { ...params({ preset: 'reference' }), preset: 'rideo' } as unknown as VideoExportParams;
+    expect(planExport(doc, queued)).toMatchObject({ width: 1920, height: 1080 });
     // a size given wins
     expect(planExport(doc, params({ preset: 'reference', width: 640 }))).toMatchObject({
       width: 640,

@@ -349,7 +349,8 @@ describe('browser export (in process)', () => {
       look: 'clay',
       quality: 'draft',
       passes: ['beauty', 'mask'],
-      exporter: { kind: 'browser', video_codec: 'avc1.64001e', render_workers: 2 },
+      // the codec of the videos as written (their avcC), not the string the encoder was asked for
+      exporter: { kind: 'browser', video_codec: 'avc1.640c0c', render_workers: 2 },
     });
     expect(manifest.shots).toHaveLength(2);
     expect(manifest.files.map((f: { name: string }) => f.name)).toEqual(

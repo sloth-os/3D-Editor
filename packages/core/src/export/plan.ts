@@ -2,7 +2,7 @@ import type { SceneDoc } from '../doc/scene-doc';
 import type { ShotData } from '../doc/types';
 import { findShotIndex, getDeskSettings, getShots, shotOutputFrames } from '../desk/shots';
 import { ExportError } from './errors';
-import { exportSize, type VideoExportParams } from './params';
+import { exportPresetOf, exportSize, type VideoExportParams } from './params';
 
 /*
  * What a video export renders (SPEC §5, §9): the shots in cut order (or one frame range), each
@@ -97,10 +97,11 @@ export function planExport(doc: SceneDoc, params: VideoExportParams): ExportPlan
   const scene = doc.getScene();
   const sceneFps = scene.fps > 0 && Number.isFinite(scene.fps) ? scene.fps : 24;
   const fps = params.fps ?? sceneFps;
-  // preset 'reference': the clip size a video model takes, the render resolution at 100 %
+  // preset 'reference': the clip size a video model takes, the render resolution at 100 % (a job
+  // queued before the preset was renamed, and never parsed again, holds its former name 'rideo')
   const render = doc.getRender();
   const { width, height } = exportSize(
-    params.preset === 'reference' ? { ...render, resolution_percentage: 100 } : render,
+    exportPresetOf(params.preset) === 'reference' ? { ...render, resolution_percentage: 100 } : render,
     params.width,
     params.height,
   );

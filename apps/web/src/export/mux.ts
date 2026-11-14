@@ -26,8 +26,9 @@ import { BT709_LIMITED } from './yuv';
  * ("reserve", from the number of frames). WebM (VP9) needs neither. The decoder configuration of
  * every file is the encoder's, its colour space set to BT.709 limited range (what the frames were
  * tagged with, and what the H.264 stream's VUI says): mediabunny writes it as the MP4 `colr` box.
- * Timestamps are exact multiples of the frame duration (den / num seconds): each file's time scale
- * is the frame rate's.
+ * An MP4 file's time scale is the frame rate's, so its timestamps are exact multiples of the frame
+ * duration (den / num seconds); WebM files count in milliseconds (Matroska's 1 ms timestamp scale,
+ * which mediabunny always writes), each timestamp the frame's time rounded to the millisecond.
  */
 
 /** A shot of the export as the muxer sees it: its first output frame and its frame count. */
@@ -111,6 +112,23 @@ export class StreamMuxer {
     return { output, source, target, packets: 0, started };
   }
 
+  /**
+   * The codec string of the stream as written (null before its first chunk): an H.264 stream's
+   * from its decoder configuration record (the avcC's profile, constraint flags and level, as the
+   * encoder wrote them: Chrome's encoder picks its own level and sets constraint flags, while its
+   * decoder configuration repeats the codec string it was asked for), else the encoder's (a VP9
+   * WebM file's CodecPrivate is written from that string).
+   */
+  get codec(): string | null {
+    const c = this.config;
+    if (!c) return null;
+    if (this.o.muxCodec === 'avc') {
+      const d = bytesOf(c.description);
+      if (d && d.length >= 4 && d[0] === 1) return `avc1.${hex2(d[1])}${hex2(d[2])}${hex2(d[3])}`;
+    }
+    return c.codec;
+  }
+
   /** The decoder configuration every file gets: the encoder's, tagged BT.709 limited range. */
   private meta(): EncodedVideoChunkMetadata {
     if (!this.config) throw new Error('the video encoder gave no decoder configuration with its first chunk');
@@ -168,6 +186,9 @@ export class StreamMuxer {
         `the video encoder gave a chunk of shot ${shot + 1} after shot ${this.lastShot + 1} had started`,
       );
     if (shot !== this.clip?.shot) {
+      // every shot has frames: one whose chunks never came would be left without a clip
+      if (shot !== this.lastShot + 1)
+        throw new Error(`the video encoder gave no chunk of shot ${this.lastShot + 2}`);
       await this.closeClip();
       if (!chunk.key)
         throw new Error(
@@ -223,6 +244,8 @@ function sameConfig(a: VideoDecoderConfig, b: VideoDecoderConfig): boolean {
   for (let i = 0; i < da.length; i++) if (da[i] !== db[i]) return false;
   return true;
 }
+
+const hex2 = (n: number) => n.toString(16).padStart(2, '0');
 
 function bytesOf(d: AllowSharedBufferSource | undefined): Uint8Array | null {
   if (!d) return null;

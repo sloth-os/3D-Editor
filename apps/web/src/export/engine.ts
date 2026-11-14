@@ -772,7 +772,8 @@ export async function runBrowserExport(
     });
     manifest.exporter = {
       kind: 'browser',
-      video_codec: videoSpecs.length ? encoding!.config.codec : null,
+      // the codec string of the videos as written (the first stream's: they share their settings)
+      video_codec: videoSpecs.length ? (muxers[0]?.codec ?? encoding!.config.codec) : null,
       bitrate: videoSpecs.length && encoding!.quantizer === null ? (encoding!.config.bitrate ?? null) : null,
       vp9_quantizer: videoSpecs.length ? encoding!.quantizer : null,
       render_workers: threads.length,

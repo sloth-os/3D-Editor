@@ -176,6 +176,53 @@ describe('stream muxer', () => {
     expect(mp4Info((await n.finish())!).samples).toBe(2);
   });
 
+  it('fails when the encoder gave no chunk of a shot, the sequence written or not', async () => {
+    for (const sequence of [null, 'memory'] as const) {
+      const make = () =>
+        new StreamMuxer({
+          muxCodec: 'avc',
+          container: 'mp4',
+          fps: { num: 24, den: 1 },
+          frames: 9,
+          shots: SHOTS,
+          sequence,
+          clips: true,
+          onClip: async () => {},
+        });
+      // shot 2 (frames 3 and 4) gets none: the chunk of shot 3 says so
+      const m = make();
+      for (let f = 0; f < 3; f++) await m.add(chunk(f, f === 0), f === 0 ? CONFIG : null);
+      await expect(m.add(chunk(5, true), null)).rejects.toThrow(/gave no chunk of shot 2/);
+      await m.cancel();
+      // nor does the first shot
+      const n = make();
+      await expect(n.add(chunk(3, true), CONFIG)).rejects.toThrow(/gave no chunk of shot 1/);
+      await n.cancel();
+    }
+  });
+
+  it("names the codec of the stream as written: H.264's from its avcC, not the string asked for", async () => {
+    const make = (muxCodec: 'avc' | 'vp9', container: 'mp4' | 'webm') =>
+      new StreamMuxer({
+        muxCodec,
+        container,
+        fps: { num: 24, den: 1 },
+        frames: 1,
+        shots: [{ start: 0, frames: 1 }],
+        sequence: 'memory',
+        clips: false,
+        onClip: async () => {},
+      });
+    const avc = make('avc', 'mp4');
+    expect(avc.codec).toBeNull();
+    // Chrome's encoder, asked for High 3.0 (avc1.64001e), wrote High with constraint flags 0x0c at level 1.2
+    await avc.add(chunk(0, true), { ...CONFIG, codec: 'avc1.64001e' });
+    expect(avc.codec).toBe('avc1.640c0c');
+    const vp9 = make('vp9', 'webm');
+    await vp9.add(chunk(0, true), { codec: 'vp09.00.10.08', codedWidth: 160, codedHeight: 90 });
+    expect(vp9.codec).toBe('vp09.00.10.08');
+  });
+
   it('fails a file that did not get all its frames', async () => {
     const m = new StreamMuxer({
       muxCodec: 'avc',

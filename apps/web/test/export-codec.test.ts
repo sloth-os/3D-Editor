@@ -133,6 +133,19 @@ describe('H.264 levels and bit rates', () => {
     expect(vp9Codec(1920, 1080, 60)).toBe('vp09.00.41.08');
   });
 
+  it("picks the VP9 level that holds the frame's longest side and the bit rate too", () => {
+    // wide or tall strips: few samples, but a side beyond the smaller levels' (2752 at level 3.1)
+    expect(vp9Codec(3840, 256, 24)).toBe('vp09.00.40.08');
+    expect(vp9Codec(2560, 200, 30)).toBe('vp09.00.31.08');
+    expect(vp9Codec(2304, 128, 24)).toBe('vp09.00.31.08');
+    expect(vp9Codec(16, 2160, 24)).toBe('vp09.00.31.08');
+    expect(vp9Codec(512, 64, 24)).toBe('vp09.00.10.08');
+    expect(vp9Codec(514, 64, 24)).toBe('vp09.00.11.08');
+    // a bit rate beyond level 1's 200 kbit/s
+    expect(vp9Codec(16, 352, 120)).toBe('vp09.00.10.08');
+    expect(vp9Codec(16, 352, 120, 203_000)).toBe('vp09.00.11.08');
+  });
+
   it('spends bits per pixel by quality, more per pixel for small frames, at least MIN_BITRATE', () => {
     expect(BITS_PER_PIXEL).toEqual({ draft: 0.05, standard: 0.09, high: 0.15 });
     const table: [number, number, number, [number, number, number]][] = [
@@ -204,5 +217,10 @@ describe('encoder configuration', () => {
     );
     expect(rated?.config).toMatchObject({ bitrateMode: 'variable', bitrate: 3_318_000 });
     expect(rated?.quantizer).toBeNull();
+    // the rated encoding's level holds its bit rate (quantizer mode has none)
+    const tiny = { width: 16, height: 352, fps: 120, quality: 'high' as const };
+    expect((await chooseEncoding('vp9', tiny, async () => true))?.config.codec).toBe('vp09.00.10.08');
+    const tinyRated = await chooseEncoding('vp9', tiny, async (c) => c.bitrateMode !== 'quantizer');
+    expect(tinyRated?.config).toMatchObject({ codec: 'vp09.00.11.08', bitrate: 203_000 });
   });
 });
