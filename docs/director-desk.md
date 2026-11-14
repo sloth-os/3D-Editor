@@ -346,10 +346,13 @@ continuity, and no positions. `stageBrief(doc, brief)` (in `@3d-editor/core`; th
 undo step, and runs in a web worker as well as on the server:
 
 - **Frames**: the scene takes the brief's fps and size. Each brief shot becomes a shot of
-  `max(1, round(durationSec × fps))` frames, in brief order and back to back from the scene's first
-  frame, named `Shot N` (its index + 1), with the brief's description and action as its notes, and
-  with the host's ids (`external: {source: 'host', clip: <scene id>, shot: <shot id>, index}`), so
-  the results name the host's shots.
+  `max(1, round(durationSec × fps))` frames, in brief order from the scene's first frame, back to
+  back except before a cut where a rider gets on or off a mount between two shots: that cut gets a
+  pre-roll gap before it (`pre_roll_frames` of `desk.stage_brief`, default 12, at most 1000), where
+  the change is animated. Each is named `Shot N` (its index + 1), with the brief's description and
+  action as its notes, and with the host's ids
+  (`external: {source: 'host', clip: <scene id>, shot: <shot id>, index}`), so the results name the
+  host's shots.
 - **The cast**: an actor for every cast member a shot casts (its `castIds`, and those its planned
   layout names besides); a member in no shot is left out, with a warning. Its kind is the hint when
   the hint names a kind the desk builds ("child", "dog", "golden retriever"), a person read from the
@@ -411,9 +414,14 @@ morning light come from its right and the evening light from its left.
 
 `briefRecord(doc)` says what a project was staged from (the host's scene id and the brief's hash).
 The record lives in the document (the scene settings' `brief`), so it travels with the desk state a
-host stores. `briefChanges(doc, brief)` lists how a later brief differs from it, as the contract's
-`BriefChanges` (shots added, removed, retimed and recast; cast added and removed), or null when
-nothing that matters changed.
+host stores. `briefChanges(doc, brief)` lists how a later brief differs from the one staged, as the
+contract's `BriefChanges` (shots added, removed, retimed and recast; cast added and removed), and in
+`other` (the desk's own, left out when empty) what else an update acts on: the frame rate and size,
+the set, the props, shots with a new camera plan or new words, cast members renamed or of another
+kind or height. It is null exactly when an update would change nothing of the staging and warn of
+nothing, so a desk that offers the update on a non-null value offers it whenever it does something.
+A lens and move the host gives back as the desk staged them (copied from the shot results) are no
+change, and a new frame rate lists as retimed only the shots whose frame count changes.
 
 `shotResults(doc, {shots?})` (`desk.shot_results`, and `desk_shot_results` over MCP) is what the
 desk tells a host about each staged shot besides its files, in brief order: its frames and duration,
@@ -425,35 +433,45 @@ reference clips and stills.
 ### Updating from a later brief
 
 `updateFromBrief(doc, brief)` (`desk.update_from_brief`; `desk_stage_brief` on a project staged from
-the same scene) brings a staging up to a later brief of the same scene, as one undo step, and keeps
-what did not change, hand edits included: a shot whose duration, cast and camera plan stay the same
-keeps its camera and its actors' marks, poses and keys, whatever was done to them in the desk. Time
-is edited as an editor's ripple edit does, so the shots after an edit keep their staging, only
-earlier or later:
+the same scene) brings a staging up to a later brief of the same scene, as one undo step. It acts on
+how the brief differs from the one staged before (the record), not on how the desk differs from the
+brief, so what was done by hand stays: a shot the brief did not change keeps its camera and its
+actors' marks, poses and keys, whatever was done to them in the desk, and its length when it was
+made shorter or longer there (with a warning); one removed in the desk stays removed until the
+brief changes its length, cast or camera plan. Time is edited as an editor's ripple edit does, in
+frames no other shot covers, so the shots after an edit keep their staging, only earlier or later,
+and no other shot's keys are cut:
 
-- a shot the brief no longer has goes, with its frames and its camera (unless another shot uses it);
-- a shot whose frame count changed (its duration, or the frame rate) grows or shrinks at its end,
-  its camera's move fitted to its new length;
-- a new shot comes after the brief's shot before it (first when it leads), its camera solved and
-  fitted to its plan, the cast not in it hidden;
+- a shot the brief no longer has goes, with its camera (unless another shot uses it) and those of
+  its frames no other shot covers;
+- a shot whose frame count the brief changed (its duration, or the frame rate) grows at its end over
+  free frames and the shots that overlap its end, or shrinks by its own frames only, its camera's
+  move fitted to its new length;
+- a new shot comes after the brief's shot before it (first when it leads: the scene's and the rigid
+  body world's frame ranges then start with it), its camera solved and fitted to its plan, the cast
+  not in it hidden; a rider that a shot it stages, or whose words or cast change, puts on a mount is
+  not seated by an update: it stands beside the mount, with a warning (`desk.actor_mount` seats it,
+  and staging the brief in a new project mounts it as staging does);
 - a recast shot shows its new cast and hides the rest, and is solved again, as is a shot whose
   camera plan changed (framing, movement, lens, move, layout, continuity) and every shot when the
   size changed;
 - a camera set by hand in the desk is never solved again: the update keeps it and warns;
 - cast members the brief drops go; new ones stand on a free spot of the front row, shown in their
-  shots;
+  shots; one the brief renames is renamed (unless the desk renamed it), and one whose kind or height
+  the brief changes stays the actor staged, with a warning;
 - props whose element went go and new ones are placed; a held prop whose holder or holder's shots
   changed is held (or flown) again; the set is built again when its plan changed;
 - notes the desk did not edit follow the brief's words, and the desk's own shot names (`Shot 3`)
   follow the brief's order.
 
-A ripple moves everything keyed after the edit: F-curve keys (where frames are cut, a curve keeps
-the value it had right after them), F-curve modifier ranges, the shots, the scene's and the rigid
-body world's frame ranges, rigid body start frames, tether flights, the frames actors spend in water
-and those bodies float from; a driver that reads `frame` is left as it is, with a warning. An update
-does not reorder the shots the desk keeps (it warns when the brief does): stage the brief in a new
-project to follow a new order. It refuses a project not staged from a brief, or staged from another
-scene.
+A ripple moves everything keyed after the edit: F-curve keys (where frames are cut or inserted, a
+curve keeps the values it had on both sides of the edit, so an actor a later shot hides stays shown
+in the shot before it), F-curve modifier ranges (one wholly inside cut frames goes, as does a shot),
+the shots, the scene's and the rigid body world's frame ranges, rigid body start frames, tether
+flights, the frames actors spend in water and those bodies float from; a driver that reads `frame`
+is left as it is, with a warning. An update does not reorder the shots the desk keeps (it warns when
+the brief does): stage the brief in a new project to follow a new order. It refuses a project not
+staged from a brief, or staged from another scene.
 
 ### SceneBlocking v1
 

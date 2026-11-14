@@ -477,7 +477,9 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
 
 // ---------------------------------------------------------------- briefs (desk/brief)
 
-const BRIEF_LOWER = 'the number of shots and cast members of the brief, and its kites and balloons';
+/** What a brief can lower when the server refuses it for memory (its frames drive cameras and kites). */
+const BRIEF_LOWER =
+  "the number and length of the brief's shots (or its frame rate), and the number of its cast members, kites and balloons";
 
 /**
  * Keys an actor writes per shot a brief stages, at most: where it stands (location and rotation, two

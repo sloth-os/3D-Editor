@@ -17,7 +17,9 @@ import { EDIT, READ_ONLY, projectArg, type ToolContext, type ToolRegistrar } fro
  * desk_stage_brief stages a brief in a project, or brings a project staged from the same scene up to
  * it (one undo step of the agent each), and desk_shot_results reports each staged shot's frames,
  * camera, blocking line, moves, plan and checks. The renders a host wants are export_video's
- * (preset 'reference'). Handlers read ctx when they run (registration reads nothing of it).
+ * (preset 'reference'). Handlers read ctx when they run (registration reads nothing of it). A project
+ * desk_stage_brief made for a brief that then fails to stage (refused for memory, or any other
+ * failure) is deleted again, so that its name stays free for the next try.
  */
 
 /** Most characters of a project name made from a brief's name. */
@@ -53,13 +55,36 @@ async function createProject(ctx: ToolContext, brief: SceneBrief): Promise<Agent
   return ctx.agent.project(room.id);
 }
 
+/**
+ * Deletes project `p`, made by this call for a brief that then failed to stage with `err`, and
+ * returns the error to throw: `err` itself, or (when storage did not delete the project) `err` naming
+ * the project left behind.
+ */
+async function dropMadeProject(ctx: ToolContext, p: AgentProject, err: unknown): Promise<unknown> {
+  const name = p.scene.name;
+  try {
+    const deleted = await withProjectNames(ctx.rooms, () => ctx.rooms.deleteProject(p.id));
+    if (deleted) {
+      ctx.agent.forget(p.id);
+      return err;
+    }
+  } catch {
+    // storage refused the deletion: the project stays, and the error names it
+  }
+  if (!(err instanceof ToolError)) return err;
+  return new ToolError(
+    `${err.message} (the project '${name}' (${p.id}) made for the brief stays: pass it as project to stage the brief in it, or delete it)`,
+    err.code,
+  );
+}
+
 export function registerBriefTools(tool: ToolRegistrar, ctx: ToolContext): void {
   tool(
     'desk_stage_brief',
     {
       title: 'Stage brief',
       description:
-        "Stage a host's scene brief (desk embed protocol v1 SceneBrief: fps, size, set, cast, elements, shots) as one undo step: the set and its sun, the cast as actors, the props, a shot per brief shot (round(durationSec × fps) frames, the host's ids kept) with its camera solved from its framing and fitted to its planned layout. Without project, a new project named after the brief. A project staged from the same scene is updated instead, keeping what is unchanged (cameras and actors moved by hand too); one staged from another scene, or holding shots of its own, is refused. Returns the project, the shots (host id → desk shot, frames), changes, warnings and issues; render with export_video {preset: 'reference'}.",
+        "Stage a host's scene brief (desk embed protocol v1 SceneBrief: fps, size, set, cast, elements, shots) as one undo step: the set and its sun, the cast as actors, the props, a shot per brief shot (round(durationSec × fps) frames, the host's ids kept) with its camera solved from its framing and fitted to its planned layout. Without project, a new project named after the brief (deleted again when the staging fails). A project staged from the same scene is updated instead, keeping what is unchanged (cameras and actors moved by hand too); one staged from another scene, or holding shots of its own, is refused. Returns the project, the shots (host id → desk shot, frames), changes, warnings and issues; render with export_video {preset: 'reference'}.",
       annotations: EDIT,
     },
     {
@@ -80,9 +105,13 @@ export function registerBriefTools(tool: ToolRegistrar, ctx: ToolContext): void 
           'INVALID_PARAMS',
         );
       const action = staged ? 'updated' : 'staged';
-      const r = runStep<StageBriefReport>(p, staged ? 'desk.update_from_brief' : 'desk.stage_brief', {
-        brief,
-      });
+      let r: StageBriefReport;
+      try {
+        r = runStep<StageBriefReport>(p, staged ? 'desk.update_from_brief' : 'desk.stage_brief', { brief });
+      } catch (err) {
+        // a project made for this brief goes with the failure: its name stays free for a retry
+        throw project ? err : await dropMadeProject(ctx, p, err);
+      }
       return {
         project: { id: p.id, name: p.scene.name },
         action,

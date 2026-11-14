@@ -217,6 +217,40 @@ describe('job store', () => {
   );
 });
 
+describe('jobs of the retired rideo bridge', () => {
+  /*
+   * Jobs exported before the rideo bridge was retired may hold a `push` block (rideo_push's
+   * results: status and shots). Nothing reads it any more: a loaded job leaves it out, so
+   * export_status and list_exports return only the documented fields, and a save keeps it in
+   * job.json (the server deletes no data of the old bridge; docs/architecture.md says what can go).
+   */
+  it('reads a job with a push block without it, and keeps the block in job.json when saving the job', async () => {
+    const dir = await tmp('legacy');
+    const store = new JobStore(dir, silentLogLike());
+    const push = { status: 'running', shots: [{ shot: 'S01', clip: 'clip_1', status: 'pushed' }] };
+    const job = {
+      id: 'job1',
+      project: 'p1',
+      status: 'running',
+      created_at: '2026-11-01T10:00:00.000Z',
+      warnings: [],
+      files: [],
+    };
+    const file = path.join(dir, 'p1', 'job1', 'job.json');
+    await mkdir(path.dirname(file), { recursive: true });
+    await writeFile(file, JSON.stringify({ ...job, push }));
+    const [loaded] = await store.loadAll();
+    expect(loaded).toEqual(job);
+    expect('push' in loaded).toBe(false);
+    // what a restart does with a job that was running: failed, and saved again
+    loaded.status = 'failed';
+    await store.save(loaded);
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ ...job, status: 'failed', push });
+    // read again: still left out
+    expect(await store.loadAll()).toEqual([{ ...job, status: 'failed' }]);
+  });
+});
+
 function silentLogLike() {
   return { debug() {}, info() {}, warn() {}, error() {} };
 }

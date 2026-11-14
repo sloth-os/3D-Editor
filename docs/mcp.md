@@ -527,7 +527,7 @@ particle systems or an instanced collection is an error. The JSON is compact.
 
 Arguments: `category`, `search`, `include_parameters`.
 
-The operator catalogue: 263 operators are registered, of which the 2 `render.*` operators are not
+The operator catalogue: 293 operators are registered, of which the 2 `render.*` operators are not
 listed (renders go through the [rendering tools](#rendering)). `category` accepts,
 case-insensitively:
 
@@ -1706,12 +1706,17 @@ the download fails with `NOT_DOWNLOADABLE`, a provider without its key with `NEE
 [embedding.md](embedding.md)) in a new project, or in the one `project` names when it has no shots,
 as described in [director-desk.md](director-desk.md#staging-from-a-brief): the set and its sun, the
 cast as actors, the props, a shot per brief shot with its camera solved. Called again with a later
-brief of the same scene on that project, it updates the staging instead and keeps what did not
-change, cameras and actors moved by hand included. A brief that does not validate, a project staged
-from another scene, one holding shots of its own, or a new project's name that another project has
-are refused (`INVALID_PARAMS`). `desk_shot_results` reports each staged shot as the contract's
-`ShotResult` without its files; render the references with
-`export_video {project, preset: 'reference'}`.
+brief of the same scene on that project, it updates the staging instead: what the brief changed is
+staged again, and what was done by hand to the rest stays (shots retimed, removed or staged again,
+cameras and actors moved). A brief that does not validate, a project staged from another scene, one
+holding shots of its own, or a new project's name that another project has are refused
+(`INVALID_PARAMS`). A brief the server has no memory to stage is refused with
+`{"code": "OUT_OF_MEMORY"}` after the message, which says what to lower (the number and length of
+the brief's shots or its frame rate, and the number of its cast members, kites and balloons). A
+project the call made for a brief that then fails to stage is deleted again, so that the brief can
+be sent again; when storage does not delete it, the error names it (pass it as `project`, or delete
+it). `desk_shot_results` reports each staged shot as the contract's `ShotResult` without its files;
+render the references with `export_video {project, preset: 'reference'}`.
 
 ### Resources
 
@@ -1729,12 +1734,14 @@ the `selection`, the object, an element index, the project or the operator id is
 out-of-memory errors of `render_image`, `render_animation`, `export_scene`, `import_model` and
 `apply_modifier`, and the error of a tool that reads a stored mesh the server's process has no
 memory to decode (`get_mesh_data` …), carry `{"code": "OUT_OF_MEMORY"}` as JSON after the message
-(see [Engines and routing](#engines-and-routing) and [`import_model`](#import_model)). Errors of the
-tool arguments (`Input validation error: …`, checked before any tool runs) and the other errors of
-the other tools are plain messages. A call that found its project by a name compared with fewer
-projects than all adds `project_note` (see [Projects](#projects)) to the JSON after its message, or
-as JSON of its own after a plain message. A message never spans lines: line breaks in the names it
-quotes are written as `\n`, `\r` or `\u2028`, as in JSON.
+(see [Engines and routing](#engines-and-routing) and [`import_model`](#import_model)), and so do
+those of `desk_stage_brief` and `desk_shot_results`, whose operators the server's memory check
+refuses with that code (see [Briefs](#briefs)). Errors of the tool arguments
+(`Input validation error: …`, checked before any tool runs) and the other errors of the other tools
+are plain messages. A call that found its project by a name compared with fewer projects than all
+adds `project_note` (see [Projects](#projects)) to the JSON after its message, or as JSON of its own
+after a plain message. A message never spans lines: line breaks in the names it quotes are written
+as `\n`, `\r` or `\u2028`, as in JSON.
 
 The video export and model store tools fail with codes of their own, written as JSON `{"code": …}`
 on the line after the message: `UNAVAILABLE` (not set up on this server: no render processes),

@@ -991,6 +991,10 @@ the editor's `index.html`. The PWA's service worker precaches `desk.html` and se
   project, each change one undo step. The server talks to no host: a brief comes in as a tool
   argument, and the references go out through `export_video`
   ([director-desk.md](director-desk.md#staging-from-a-brief), [embedding.md](embedding.md)).
+  Upgrading from a server with the retired rideo bridge: nothing reads `DATA_DIR/rideo-previs` (its
+  previs jobs) or `DATA_DIR/rideo-push` (what it pushed to each clip) any more, and both can be
+  deleted by hand; the server deletes neither. Exports of that time may keep a `push` block in their
+  `job.json`, which `export_status` and `list_exports` leave out (`video/jobs.ts`).
 
 ## Persistence & sync
 

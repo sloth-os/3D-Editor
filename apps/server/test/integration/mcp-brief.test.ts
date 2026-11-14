@@ -7,8 +7,8 @@ import { startServer, type TestServer } from '../helpers/app';
 /*
  * desk_stage_brief and desk_shot_results over MCP (the desk embed protocol v1's SceneBrief, the
  * open.json fixture): a brief staged in a new project named after it, the same scene updated in that
- * project (one undo step each), a brief of another scene and an invalid one refused, and the shots'
- * results in brief order.
+ * project (one undo step each), a brief of another scene and an invalid one refused, the shots'
+ * results in brief order, and no project left behind by a brief that fails to stage.
  */
 
 const fixture = (name: string) =>
@@ -19,6 +19,23 @@ const fixture = (name: string) =>
     ),
   );
 const openScene = () => structuredClone(fixture('open.json').scene);
+
+/** A brief no server holds: 200 shots of ten minutes at 120 fps, each a tracking camera. */
+function tooLong(id: string, name: string, shot: string) {
+  const brief = openScene();
+  brief.id = id;
+  brief.name = name;
+  brief.fps = 120;
+  brief.shots = Array.from({ length: 200 }, (_, i) => ({
+    ...brief.shots[0],
+    id: `sht_${shot}${String(i).padStart(4, '0')}`,
+    index: i,
+    durationSec: 600,
+    move: 'tracking_follow',
+    layout: [],
+  }));
+  return brief;
+}
 
 let server: TestServer;
 let client: Client;
@@ -131,5 +148,60 @@ describe('desk_stage_brief and desk_shot_results', () => {
     const odd = await call('desk_stage_brief', { brief: fixture('invalid/open-odd-width.json').scene });
     expect(odd.isError).toBe(true);
     expect(odd.text).toMatch(/^invalid brief: /);
+  });
+
+  it('leave no project behind when staging a brief fails, so that the same brief can be staged again', async () => {
+    const projects = async () =>
+      ((await ok('list_projects', {})).projects as { name: string }[]).map((p) => p.name);
+    const r = await call('desk_stage_brief', {
+      brief: tooLong('clp_toolongtostage', 'Too long to stage', 'toolong'),
+    });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/^not run on the server: /);
+    // what to lower: its frames (shots × length × frame rate) are what take the memory here
+    expect(r.text).toContain(
+      "Lower the number and length of the brief's shots (or its frame rate), and the number of its cast members, kites and balloons",
+    );
+    expect(r.text).toMatch(/"code":\s*"OUT_OF_MEMORY"/);
+    expect(r.text).not.toMatch(/made for the brief stays/);
+    // the project made for the brief went with the failure: its name is free for the next try
+    expect(await projects()).not.toContain('Too long to stage');
+    const fits = openScene();
+    fits.id = 'clp_toolongtostage';
+    fits.name = 'Too long to stage';
+    const again = await ok('desk_stage_brief', { brief: fits });
+    expect(again).toMatchObject({ action: 'staged', project: { name: 'Too long to stage' } });
+    expect((await projects()).filter((n) => n === 'Too long to stage')).toHaveLength(1);
+  });
+
+  it('name the project made for a brief that failed to stage when storage does not delete it', async () => {
+    const huge = tooLong('clp_keptafterrefusal', 'Kept after a refused deletion', 'kept');
+    const rooms = server.handle.rooms;
+    const deleteProject = rooms.deleteProject;
+    rooms.deleteProject = async () => {
+      throw new Error('storage refused');
+    };
+    let r: Awaited<ReturnType<typeof call>>;
+    try {
+      r = await call('desk_stage_brief', { brief: huge });
+    } finally {
+      rooms.deleteProject = deleteProject;
+    }
+    expect(r.isError).toBe(true);
+    const listed = (await ok('list_projects', {})).projects as { id: string; name: string }[];
+    const kept = listed.find((p) => p.name === 'Kept after a refused deletion')!;
+    expect(kept).toBeDefined();
+    expect(r.text).toContain(
+      `(the project 'Kept after a refused deletion' (${kept.id}) made for the brief stays: pass it as project to stage the brief in it, or delete it)`,
+    );
+    expect(r.text).toMatch(/"code":\s*"OUT_OF_MEMORY"/);
+    // as the error says: the brief stages in that project
+    const fits = openScene();
+    fits.id = 'clp_keptafterrefusal';
+    fits.name = 'Kept after a refused deletion';
+    expect(await ok('desk_stage_brief', { project: kept.id, brief: fits })).toMatchObject({
+      action: 'staged',
+      project: { id: kept.id },
+    });
   });
 });
