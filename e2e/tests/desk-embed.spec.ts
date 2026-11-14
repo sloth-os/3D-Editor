@@ -593,7 +593,8 @@ test.describe('the embeddable desk', () => {
 
     // the viewport's keys act over the viewport only: not over the shot list or the header
     const objects = () => frame.evaluate(() => (window as any).__desk.objects() as number);
-    await frame.getByTestId('viewport').hover();
+    // a click gives the frame the keyboard (keys go to the focused frame), then select everything
+    await frame.getByTestId('viewport').click();
     await page.keyboard.press('a');
     const n = await objects();
     expect(n).toBeGreaterThan(0);
