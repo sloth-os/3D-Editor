@@ -347,7 +347,7 @@ describe.skipIf(!run)('video export with ffmpeg', { timeout: 180_000 }, () => {
     // the manifest
     const manifest = JSON.parse(await readFile(path.join(dir, 'manifest.json'), 'utf8'));
     expect(manifest).toMatchObject({
-      version: 1,
+      version: 2,
       project: { id: projectId, name: 'Video export' },
       fps: 24,
       width: 160,
