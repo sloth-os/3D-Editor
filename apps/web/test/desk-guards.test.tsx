@@ -315,6 +315,14 @@ describe('the keys the desk ignores', () => {
     expect(messages()).toEqual([]);
   });
 
+  it('takes a keydown without a key (browsers’ autofill sends some) without failing', () => {
+    desk(false);
+    off = installKeymap({ ignore: DESK_IGNORED_KEYS });
+    const autofill = new Event('keydown', { bubbles: true, cancelable: true });
+    expect(() => input.dispatchEvent(autofill)).not.toThrow();
+    expect(autofill.defaultPrevented).toBe(false);
+  });
+
   it('stops keeping them once the keymap is removed', () => {
     off = installKeymap({ ignore: DESK_IGNORED_KEYS });
     off();

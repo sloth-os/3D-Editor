@@ -214,6 +214,8 @@ export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () =
   // listener below leaves keys typed into a field alone, so it would not keep a Ctrl+S typed into one
   const kept = [...KEPT_FROM_BROWSER].filter((k) => opts.ignore?.has(k));
   const onKept = (e: KeyboardEvent) => {
+    // a keydown without a key (browsers' autofill sends some to the field it fills) is none of them
+    if (typeof e.key !== 'string' || typeof e.code !== 'string') return;
     if (kept.includes(combo(e))) e.preventDefault();
   };
   // The field keys are being typed into, while the typing goes on. When it is taken away under the
