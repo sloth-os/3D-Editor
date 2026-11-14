@@ -113,6 +113,8 @@ export interface BriefPlan {
   marks: Map<string, RideoBlockingMark>;
   /** The set as planned (the blocking's set in the import's input). */
   set: BriefPlannedSet;
+  /** The props as planned (the blocking's props in the import's input), each with its element id. */
+  blockingProps: z.input<typeof RideoBlockingPropSchema>[];
   warnings: string[];
 }
 
@@ -482,5 +484,17 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
     update: false,
     source: 'host',
   };
-  return { input, cast: kinds, order, unstaged, holders, props, skipped, marks, set, warnings };
+  return {
+    input,
+    cast: kinds,
+    order,
+    unstaged,
+    holders,
+    props,
+    skipped,
+    marks,
+    set,
+    blockingProps,
+    warnings,
+  };
 }

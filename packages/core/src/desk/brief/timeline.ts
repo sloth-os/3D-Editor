@@ -1,5 +1,5 @@
 import type { SceneDoc } from '../../doc/scene-doc';
-import type { FCurve, FModifierData, Keyframe, ObjectData } from '../../doc/types';
+import type { FCurve, FModifierData, Keyframe, ObjectData, ShotData } from '../../doc/types';
 import { fcurveKey } from '../../doc/scene-doc';
 import { evaluateFCurve } from '../../anim/fcurve';
 import { sanitizeRigidBodyWorld } from '../../physics/settings';
@@ -20,7 +20,14 @@ import { replaceKeys } from '../rideo/keys';
  * What moves: the keys of every F-curve and the frames of their modifiers, the shots, the scene's and
  * the rigid body world's ranges, bodies' start frames, recorded tether flights, in-water spans, the
  * frame a body floats from and the range a bake records. Drivers that read the frame number cannot be
- * moved: the edit warns of them.
+ * moved: the edit warns of them. A curve keeps its values on both sides of an edit: where a segment
+ * of it spans the edit, keys pin the values it had at the frames next to it (CONSTANT across the
+ * inserted or cut frames), so nothing before the edit changes and everything after it only moves
+ * (the desk's curves hold their first and last values outside their keys; one a person made to
+ * extrapolate LINEAR or CYCLIC before its first key moves that extrapolation with its keys).
+ *
+ * The callers choose frames no other shot covers (uncoveredRanges): a ripple never cuts or stretches
+ * a shot the edit is not about.
  */
 
 const EPS = 1e-6;
@@ -35,6 +42,13 @@ const MODIFIER_FRAMES = ['frame_start', 'frame_end', 'frame_offset'] as const;
 interface Remap {
   start: (f: number) => number;
   end: (f: number) => number;
+  /**
+   * Where the first frame of the scene's or the rigid body world's range goes: frames inserted right
+   * at its start join it (the range grows instead of moving), as a new first shot does.
+   */
+  rangeStart: (f: number) => number;
+  /** The frames it inserts after (`after`, `delta` of them) or deletes (`from`–`to`). */
+  insert: { after: number; delta: number } | null;
   cut: { from: number; to: number } | null;
   /** Whether frame `f` is moved at all (curves and objects without such frames are left alone). */
   touches: (f: number) => boolean;
@@ -42,8 +56,10 @@ interface Remap {
 }
 
 /**
- * Inserts `delta` frames after frame `after`: everything later moves `delta` later; a shot spanning
- * `after` grows. Returns warnings (drivers that read the frame number).
+ * Inserts `delta` frames after frame `after`: everything later moves `delta` later (a shot spanning
+ * `after` grows; the scene's and the rigid body world's ranges grow when they start right after it),
+ * curves holding over the new frames the value they had at `after`. Returns warnings (drivers that
+ * read the frame number).
  */
 export function insertSceneTime(doc: SceneDoc, after: number, delta: number): string[] {
   if (!(delta > 0)) return [];
@@ -51,6 +67,8 @@ export function insertSceneTime(doc: SceneDoc, after: number, delta: number): st
   return remapSceneTime(doc, {
     start: move,
     end: move,
+    rangeStart: (f) => (f > after + 1 + EPS ? f + delta : f),
+    insert: { after, delta },
     cut: null,
     touches: (f) => f > after + EPS,
     what: `the ${delta} frame${delta > 1 ? 's' : ''} inserted after frame ${after}`,
@@ -58,44 +76,140 @@ export function insertSceneTime(doc: SceneDoc, after: number, delta: number): st
 }
 
 /**
- * Deletes frames `from`–`to` (inclusive): the keys inside go (each curve keeps, at `from`, the value it
- * had at `to + 1`), everything later moves earlier by their count; a range ending inside them ends at
- * `from - 1`, one starting inside them starts at `from`, one inside them goes. Returns warnings.
+ * Deletes frames `from`–`to` (inclusive): the keys inside go (each curve keeps the values it had at
+ * `from - 1` and at `to + 1`, now next to each other), everything later moves earlier by their count;
+ * a range ending inside them ends at `from - 1`, one starting inside them starts at `from`, and one
+ * inside them goes (a shot leaves the cut, an F-curve modifier limited to them is removed). Returns
+ * warnings.
  */
 export function deleteSceneTime(doc: SceneDoc, from: number, to: number): string[] {
   if (!(to >= from)) return [];
   const n = to - from + 1;
   const inside = (f: number) => f >= from - EPS && f <= to + EPS;
+  const start = (f: number) => (f > to + EPS ? f - n : inside(f) ? from : f);
   return remapSceneTime(doc, {
-    start: (f) => (f > to + EPS ? f - n : inside(f) ? from : f),
+    start,
     end: (f) => (f > to + EPS ? f - n : inside(f) ? from - 1 : f),
+    rangeStart: start,
+    insert: null,
     cut: { from, to },
     touches: (f) => f >= from - EPS,
     what: `the ${n} frame${n > 1 ? 's' : ''} deleted from frame ${from}`,
   });
 }
 
-/** A curve's keys after the edit (null: unchanged). */
+/** The frames a shot animates: its pre-roll's and its own. */
+export const shotSpan = (s: Pick<ShotData, 'frame_start' | 'frame_end' | 'pre_roll'>): FrameRange => ({
+  from: s.frame_start - s.pre_roll,
+  to: s.frame_end,
+});
+
+/** A range of whole frames, both ends included. */
+export interface FrameRange {
+  from: number;
+  to: number;
+}
+
+/** The frames of `from`–`to` that none of `spans` covers, as ranges in frame order. */
+export function uncoveredRanges(spans: readonly FrameRange[], from: number, to: number): FrameRange[] {
+  let parts: FrameRange[] = to >= from ? [{ from, to }] : [];
+  for (const s of spans) {
+    const next: FrameRange[] = [];
+    for (const p of parts) {
+      if (s.to < p.from || s.from > p.to) {
+        next.push(p);
+        continue;
+      }
+      if (s.from > p.from) next.push({ from: p.from, to: s.from - 1 });
+      if (s.to < p.to) next.push({ from: s.to + 1, to: p.to });
+    }
+    parts = next;
+  }
+  return parts.sort((a, b) => a.from - b.from);
+}
+
+/**
+ * Deletes frame ranges (overlapping or touching ones merged), the latest first so that the earlier
+ * ones keep their frames. Returns the warnings, each once.
+ */
+export function deleteSceneRanges(doc: SceneDoc, ranges: readonly FrameRange[]): string[] {
+  const merged: FrameRange[] = [];
+  for (const r of [...ranges].filter((x) => x.to >= x.from).sort((a, b) => a.from - b.from)) {
+    const last = merged.at(-1);
+    if (last && r.from <= last.to + 1) last.to = Math.max(last.to, r.to);
+    else merged.push({ ...r });
+  }
+  const warnings = new Set<string>();
+  for (const r of merged.reverse()) for (const w of deleteSceneTime(doc, r.from, r.to)) warnings.add(w);
+  return [...warnings];
+}
+
+/** The key whose segment holds frame `f` (the last at or before it), or null before the first. */
+function keyAt(keys: readonly Keyframe[], f: number): Keyframe | null {
+  let out: Keyframe | null = null;
+  for (const k of keys) if (k.frame <= f + EPS) out = k;
+  return out;
+}
+
+/**
+ * A curve's keys after the edit (null: unchanged): the keys inside cut frames go and the later ones
+ * move; where a segment of the curve spans the edit, keys pin the values it had next to it so the
+ * frames on both sides keep their values (a CONSTANT key at the last frame before it: the inserted
+ * frames hold that value, and cut frames leave no blend behind). A segment that already holds its
+ * value (a CONSTANT key before the edit) needs no pin.
+ */
 function remapKeys(fc: FCurve, r: Remap): Keyframe[] | null {
   if (!fc.keyframes.some((k) => r.touches(k.frame))) return null;
-  let keys = fc.keyframes;
+  const keys = [...fc.keyframes].sort((a, b) => a.frame - b.frame);
+  const value = (f: number) => evaluateFCurve({ ...fc, keyframes: keys, modifiers: [] }, f, keys);
+  const at = (f: number) => keys.some((k) => Math.abs(k.frame - f) < EPS);
+  let out: Keyframe[] = keys;
   if (r.cut) {
     const { from, to } = r.cut;
-    const inside = (k: Keyframe) => k.frame >= from - EPS && k.frame <= to + EPS;
-    const gone = keys.filter(inside);
-    if (gone.length) {
-      // the value the curve had right after the deleted frames is kept where they were
-      const after = to + 1;
-      const kept = keys.filter((k) => !inside(k));
-      if (!kept.some((k) => Math.abs(k.frame - after) < EPS)) {
-        const value = evaluateFCurve({ ...fc, modifiers: [] }, after);
-        const last = [...keys].reverse().find((k) => k.frame < after - EPS)!;
-        if (value !== undefined) kept.push({ ...last, frame: after, value });
+    const before = keys.filter((k) => k.frame < from - EPS);
+    const inside = keys.filter((k) => k.frame >= from - EPS && k.frame <= to + EPS);
+    const after = keys.filter((k) => k.frame > to + EPS);
+    const lastBefore = before.at(-1);
+    out = [...before, ...after];
+    // the frames before the cut: the last of them keeps its value (a segment that holds it, or the
+    // first key's value held before it, needs no pin)
+    const pinBefore = lastBefore
+      ? lastBefore.interpolation !== 'CONSTANT' && inside.length + after.length > 0
+      : inside.length > 0;
+    if (!at(from - 1) && pinBefore) {
+      const v = value(from - 1);
+      if (v !== undefined)
+        out.push({ ...(lastBefore ?? keys[0]), frame: from - 1, value: v, interpolation: 'CONSTANT' });
+    }
+    // the frames after the cut: the first of them keeps its value (and the segment it was in)
+    const held = keyAt(keys, to + 1);
+    if (
+      !at(to + 1) &&
+      after.length + inside.length > 0 &&
+      (inside.length || (lastBefore && after.length && held?.interpolation !== 'CONSTANT'))
+    ) {
+      const v = value(to + 1);
+      if (v !== undefined) out.push({ ...(held ?? keys[0]), frame: to + 1, value: v });
+    }
+  } else if (r.insert) {
+    const { after } = r.insert;
+    const lastBefore = keyAt(keys, after);
+    const later = keys.some((k) => k.frame > after + EPS);
+    // a segment spanning the insertion holds its value over the new frames, then goes on as it did
+    if (lastBefore && later && lastBefore.interpolation !== 'CONSTANT') {
+      out = [...keys];
+      if (!at(after)) {
+        const v = value(after);
+        if (v !== undefined) out.push({ ...lastBefore, frame: after, value: v, interpolation: 'CONSTANT' });
+      } else
+        out = out.map((k) => (Math.abs(k.frame - after) < EPS ? { ...k, interpolation: 'CONSTANT' } : k));
+      if (!at(after + 1)) {
+        const v = value(after + 1);
+        if (v !== undefined) out.push({ ...lastBefore, frame: after + 1, value: v });
       }
-      keys = kept;
     }
   }
-  return keys.map((k) => ({ ...k, frame: r.start(k.frame) })).sort((a, b) => a.frame - b.frame);
+  return out.map((k) => ({ ...k, frame: r.start(k.frame) })).sort((a, b) => a.frame - b.frame);
 }
 
 /** A "lo:hi…" flight entry moved by the edit (null: it was inside deleted frames). */
@@ -107,7 +221,13 @@ function remapFlight(entry: string, r: Remap): string | null {
   return hi < lo ? null : `${lo}:${hi}${m[3]}`;
 }
 
+/** Whether an F-curve modifier's frame range limits where it acts (a restricted range, or a stepping bounded at both ends). */
+const rangeInUse = (m: FModifierData): boolean =>
+  m.params.use_restricted_range === true ||
+  (m.type === 'STEPPED' && m.params.use_frame_start === true && m.params.use_frame_end === true);
+
 function remapSceneTime(doc: SceneDoc, r: Remap): string[] {
+  const warnings: string[] = [];
   // every animation curve, whatever it animates
   for (const fc of doc.listFCurves()) {
     const keys = remapKeys(fc, r);
@@ -116,34 +236,49 @@ function remapSceneTime(doc: SceneDoc, r: Remap): string[] {
     );
     if (!keys && !mods) continue;
     const next: FCurve = { ...fc, keyframes: keys ?? fc.keyframes };
-    if (fc.modifiers)
-      next.modifiers = fc.modifiers.map((m): FModifierData => {
+    if (fc.modifiers) {
+      const kept: FModifierData[] = [];
+      for (const m of fc.modifiers) {
         const params = { ...m.params };
         for (const p of MODIFIER_FRAMES)
           if (typeof params[p] === 'number')
             params[p] = p === 'frame_end' ? r.end(params[p] as number) : r.start(params[p] as number);
-        return { ...m, params };
-      });
+        const { frame_start: a, frame_end: b } = params;
+        if (typeof a === 'number' && typeof b === 'number' && b < a) {
+          // a range the cut swallowed: a modifier limited to it acts nowhere any more
+          if (rangeInUse(m)) continue;
+          params.frame_end = a;
+        }
+        kept.push({ ...m, params });
+      }
+      next.modifiers = kept.length ? kept : undefined;
+    }
     doc.setFCurve(next);
   }
-  // the shots: later ones move, one spanning an insertion grows, one spanning a deletion shrinks
+  // the shots: later ones move, one spanning an insertion grows, one spanning a deletion shrinks and
+  // one inside deleted frames leaves the cut
   const shots = getShots(doc);
   if (shots.some((s) => r.touches(s.frame_end))) {
-    const moved = shots.map((s) => {
+    const moved: ShotData[] = [];
+    for (const s of shots) {
+      if (r.cut && s.frame_start >= r.cut.from - EPS && s.frame_end <= r.cut.to + EPS) {
+        warnings.push(`'${s.name}' lay inside ${r.what}: it left the cut`);
+        continue;
+      }
       const start = r.start(s.frame_start);
-      return { ...s, frame_start: start, frame_end: Math.max(start, r.end(s.frame_end)) };
-    });
+      moved.push({ ...s, frame_start: start, frame_end: Math.max(start, r.end(s.frame_end)) });
+    }
     setShots(doc, moved);
   }
   // the scene's range and the rigid body world's
   const scene = doc.getScene();
   if (r.touches(scene.frame_end)) {
-    const start = r.start(scene.frame_start);
+    const start = r.rangeStart(scene.frame_start);
     doc.updateScene({ frame_start: start, frame_end: Math.max(start, r.end(scene.frame_end)) });
   }
   const world = sanitizeRigidBodyWorld(scene.rigidbody_world);
   if (r.touches(world.frame_end)) {
-    const start = r.start(world.frame_start);
+    const start = r.rangeStart(world.frame_start);
     doc.updateScene({
       rigidbody_world: { ...world, frame_start: start, frame_end: Math.max(start, r.end(world.frame_end)) },
     });
@@ -203,11 +338,11 @@ function remapSceneTime(doc: SceneDoc, r: Remap): string[] {
       );
   }
   const readsFrame = doc.listDrivers().filter((d) => !d.mute && /\bframe\b/.test(d.expression));
-  return readsFrame.length
-    ? [
-        `${readsFrame.length} driver${readsFrame.length > 1 ? 's read' : ' reads'} the frame number: ${readsFrame.length > 1 ? 'they do' : 'it does'} not follow ${r.what}`,
-      ]
-    : [];
+  if (readsFrame.length)
+    warnings.push(
+      `${readsFrame.length} driver${readsFrame.length > 1 ? 's read' : ' reads'} the frame number: ${readsFrame.length > 1 ? 'they do' : 'it does'} not follow ${r.what}`,
+    );
+  return warnings;
 }
 
 /** The scale an object channel has at `frame` (its F-curve, else its stored value). */

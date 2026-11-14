@@ -1,13 +1,16 @@
 import type { SceneDoc } from '../../doc/scene-doc';
-import type { ShotData } from '../../doc/types';
+import type { ObjectData, ShotData } from '../../doc/types';
 import { createEditorState, OperatorError, type OperatorContext } from '../../operators/context';
 import { solveShotCameras } from '../../operators/desk-shots';
 import type { ActorKind } from '../characters/types';
 import type { DeskIssue, DeskIssueSeverity } from '../checks';
 import { getShots } from '../shots';
-import { importRideoBlocking } from '../rideo/import';
+import { isActor } from '../characters';
+import { DESK_PROPS } from '../props';
+import { RIDEO_PROPS, importRideoBlocking } from '../rideo/import';
 import { planBrief, shotCast } from './plan';
 import {
+  briefFrames,
   briefHash,
   castDigest,
   digest,
@@ -18,6 +21,7 @@ import {
   shotTextDigest,
   writeBriefRecord,
   type BriefRecord,
+  type BriefRecordShot,
 } from './record';
 import { SceneBriefSchema, briefProblems, type BriefChanges, type SceneBrief } from './schema';
 
@@ -105,6 +109,31 @@ export function hostShots(doc: SceneDoc, sceneId: string): Map<string, ShotData>
   return out;
 }
 
+/** A role's objects staged from scene `sceneId` (`desk_role`, `rideo_clip`), by key (the first of each key). */
+export function stagedBy(
+  doc: SceneDoc,
+  role: string,
+  sceneId: string,
+  key: (o: ObjectData) => unknown,
+): Map<string, ObjectData> {
+  const out = new Map<string, ObjectData>();
+  for (const o of doc.listObjects()) {
+    if (o.custom_props?.[DESK_PROPS.role] !== role || o.custom_props?.[RIDEO_PROPS.clip] !== sceneId)
+      continue;
+    const k = key(o);
+    if (typeof k === 'string' && k && !out.has(k)) out.set(k, o);
+  }
+  return out;
+}
+
+/** The actors staged from `sceneId`, by cast id. */
+export const stagedActors = (doc: SceneDoc, sceneId: string): Map<string, ObjectData> =>
+  new Map(
+    [...stagedBy(doc, 'actor', sceneId, (o) => o.custom_props?.[DESK_PROPS.characterId])].filter(([, o]) =>
+      isActor(doc, o.id),
+    ),
+  );
+
 /** The issues of `issues` with the host's shot ids. */
 export function briefIssues(issues: readonly DeskIssue[], hostOf: ReadonlyMap<string, string>): BriefIssue[] {
   return issues.map((i) => ({
@@ -119,6 +148,10 @@ export function briefIssues(issues: readonly DeskIssue[], hostOf: ReadonlyMap<st
  * The record of brief `b` staged with the desk shots `desk` (by host shot id), the cast's kinds, the
  * held elements' holders and the set as planned. `notes`: the digest to keep for shots whose notes
  * were edited in the desk (the staged notes' digest, so that a later update still keeps them).
+ * `removed`: the recorded shots that were removed in the desk and stay removed (an update keeps them
+ * in the record, with the brief's values, so that only a later change of the brief stages them
+ * again). A shot's frames are the brief's (its duration at the brief's frame rate), whatever length
+ * the desk gave it.
  */
 export function recordOf(
   b: SceneBrief,
@@ -127,6 +160,7 @@ export function recordOf(
   holders: ReadonlyMap<string, string>,
   plannedSet: unknown,
   notes: ReadonlyMap<string, string> = new Map(),
+  removed: ReadonlyMap<string, BriefRecordShot> = new Map(),
 ): BriefRecord {
   return {
     version: 1,
@@ -137,26 +171,30 @@ export function recordOf(
     height: b.height,
     set: setDigest(plannedSet),
     shots: b.shots
-      .filter((s) => desk.has(s.id))
+      .filter((s) => desk.has(s.id) || removed.has(s.id))
       .map((s) => {
-        const d = desk.get(s.id)!;
+        const d = desk.get(s.id);
+        const was = removed.get(s.id);
         return {
           id: s.id,
-          desk: d.id,
+          desk: d?.id ?? was!.desk,
           index: s.index,
           durationSec: s.durationSec,
-          frames: d.frame_end - d.frame_start + 1,
+          frames: briefFrames(s.durationSec, b.fps),
           castIds: shotCast(s),
           elementIds: [...s.elementIds],
           text: shotTextDigest(s),
-          notes: notes.get(s.id) ?? digest(d.notes),
+          notes: notes.get(s.id) ?? (d ? digest(d.notes) : was!.notes),
           camera: shotCameraDigest(s),
+          lensMm: s.lensMm,
+          move: s.move,
         };
       }),
     cast: b.cast.map((c) => ({
       id: c.id,
       name: c.name,
       kind: kinds.get(c.id)?.kind ?? null,
+      heightM: c.heightM,
       digest: castDigest(c),
     })),
     elements: b.elements.map((e) => ({

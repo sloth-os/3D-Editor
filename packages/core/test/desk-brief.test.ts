@@ -352,6 +352,8 @@ describe('briefChanges', () => {
       retimed: [],
       recast: [SHOT_A],
       cast: { added: ['chr_lena'], removed: [PIP] },
+      // what else an update acts on: the set fitted to the new marks, the layout cleared
+      other: ['the set', '1 shot with a new camera plan'],
     });
   });
 

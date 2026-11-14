@@ -128,17 +128,27 @@ export type BriefCast = SceneBrief['cast'][number];
 export type BriefElement = SceneBrief['elements'][number];
 export type BriefShot = SceneBrief['shots'][number];
 
-/** How a brief differs from the one a scene was staged from (the contract's BriefChanges). */
+/**
+ * How a brief differs from the one a scene was staged from: the contract's BriefChanges, and `other`,
+ * the desk's own (not the contract's).
+ */
 export interface BriefChanges {
   /** Shots in the brief, not staged. */
   added: string[];
   /** Shots staged, no longer in the brief. */
   removed: string[];
-  /** Shots whose duration changed (or whose frame count, when the frame rate did). */
+  /** Shots whose duration changed, or whose frame count did when the frame rate changed. */
   retimed: string[];
   /** Shots whose cast changed. */
   recast: string[];
   cast: { added: string[]; removed: string[] };
+  /**
+   * Not in the contract (a desk's host never needs it): what else differs that an update acts on, in
+   * words ("the frame size (1280×720 to 1920×1080)", "the set", "the props", "2 shots with a new camera
+   * plan", "1 shot with new words", "3 shots renumbered", "1 cast member with new words", "the frame
+   * rate (24 to 30 fps)"). Absent when nothing else differs.
+   */
+  other?: string[];
 }
 
 /** The ids in `ids` that occur more than once. */

@@ -10,10 +10,13 @@ import { BRIEF_ELEMENT_KINDS, type SceneBrief } from './schema';
  * key, read and written only here) so that a later brief can be compared with it (changes.ts) and
  * the staging updated (update.ts) wherever the document goes (the desk state a host stores is the
  * document). It holds the host's scene id, a hash of the whole brief, the frame rate and size, each
- * shot staged (host id, desk shot id, duration, frames, cast, elements, and digests of its words, of
- * the notes it was given and of its camera's plan), the cast (with the kind staged) and the elements
- * (with who holds them), and a digest of the set as planned. Reads are validated and cached until the
- * document changes.
+ * shot staged (host id, desk shot id, duration, the frames the brief gives it, cast, elements, the
+ * lens and move it gave, and digests of its words, of the notes it was given and of its camera's
+ * plan; a shot removed in the desk that an update kept removed stays in it), the cast (with the kind
+ * staged and the height given) and the elements (with who holds them), and a digest of the set as
+ * planned. It records the brief, not the desk: a shot made longer or shorter in the desk keeps the
+ * brief's frames here, so that a later brief is compared with the brief before it. Reads are
+ * validated and cached until the document changes.
  */
 
 /** The scene settings key the record is kept under. */
@@ -33,12 +36,20 @@ const RecordShotSchema = z.object({
   notes: z.string(),
   /** Digest of what the shot's camera is solved from: framing, movement, lens, move, layout, continuity. */
   camera: z.string(),
+  /**
+   * The lens and move the brief gave the shot (records written before them have only `camera`): a
+   * later brief whose lens or move gives back what the desk staged agrees with these.
+   */
+  lensMm: z.number().nullable().optional(),
+  move: z.string().nullable().optional(),
 });
 
 const RecordCastSchema = z.object({
   id: z.string(),
   name: z.string(),
   kind: z.enum(ACTOR_KINDS).nullable(),
+  /** The height the brief gave (records written before it have only `digest`). */
+  heightM: z.number().nullable().optional(),
   /** Digest of the member's name, description, kind hint and height. */
   digest: z.string(),
 });
@@ -94,6 +105,10 @@ export function digest(text: string): string {
   const hex = (n: number) => (n >>> 0).toString(16).padStart(8, '0');
   return `${hex(h1)}${hex(h2)}`;
 }
+
+/** The frames a shot of `durationSec` takes at `fps` (at least one). */
+export const briefFrames = (durationSec: number, fps: number): number =>
+  Math.max(1, Math.round(durationSec * fps));
 
 /** The hash of a validated brief: the digest of its canonical JSON (equal briefs, equal hashes). */
 export const briefHash = (brief: SceneBrief): string => digest(canonicalJson(brief));
