@@ -1,12 +1,30 @@
 import { describe, expect, it, vi } from 'vitest';
 import { DeskBridge, isHostOrigin, type BridgeHandler, type PortLike } from '../src/embed/bridge';
+import type { DeskMessage } from '../src/embed/protocol';
 
 /*
  * The desk's side of the connection (embed/bridge.ts) with a fake window, parent and ports: hello
  * to the parent only inside a frame, one connect only from the parent with a version the desk
- * speaks (another version answered on its port and refused), nothing on window afterwards, and the
- * port's messages validated (unknown types ignored, bad ones answered when they carry an id).
+ * speaks (another version answered on its port and refused), nothing on window afterwards, the
+ * port's messages validated (unknown types ignored, bad ones answered when they carry an id), and
+ * what the host sends before the desk's ready handled after it, in order.
  */
+
+const READY: DeskMessage = {
+  type: 'ready',
+  deskVersion: '1.0.0',
+  protocol: 1,
+  capabilities: {
+    export: {
+      available: true,
+      reason: null,
+      container: 'mp4',
+      videoCodec: 'avc1',
+      modes: ['motion', 'pose', 'camera'],
+    },
+    offline: true,
+  },
+};
 
 class FakePort implements PortLike {
   posted: { message: any; transfer?: Transferable[] }[] = [];
@@ -135,6 +153,8 @@ describe('the desk bridge', () => {
     const t = setup();
     t.bridge.start();
     const port = t.connect()!;
+    t.bridge.send(READY);
+    port.posted.length = 0;
     port.emit({ type: 'save', id: 's-1' });
     expect(t.handler.message).toHaveBeenCalledWith({ type: 'save', id: 's-1' });
     port.emit({ type: 'frobnicate', id: 'x' });
@@ -147,6 +167,28 @@ describe('the desk bridge', () => {
     ]);
     expect(t.handler.message).toHaveBeenCalledTimes(1);
     expect(t.log.info).toHaveBeenCalledWith(expect.stringContaining('frobnicate'));
+  });
+
+  it('handles what the host sends before ready once ready is out, in order (ready goes first)', () => {
+    const t = setup();
+    t.bridge.start();
+    const port = t.connect()!;
+    // the host does not wait for ready: an open, a bad export and a save arrive before it
+    port.emit({ type: 'save', id: 's-1' });
+    port.emit({ type: 'export', id: 'e-1', modes: ['smell'] });
+    port.emit({ type: 'save', id: 's-2' });
+    expect(t.handler.message).not.toHaveBeenCalled();
+    expect(port.posted).toEqual([]);
+    t.bridge.send(READY);
+    expect(port.posted.map((p) => p.message.type)).toEqual(['ready', 'error']);
+    expect(port.posted[1].message).toMatchObject({ id: 'e-1', code: 'bad_message' });
+    expect(t.handler.message.mock.calls.map((c) => c[0])).toEqual([
+      { type: 'save', id: 's-1' },
+      { type: 'save', id: 's-2' },
+    ]);
+    // after ready, messages go to the handler as they come
+    port.emit({ type: 'save', id: 's-3' });
+    expect(t.handler.message).toHaveBeenCalledTimes(3);
   });
 
   it('sends on the port with its transfer list, and checks what it sends', () => {

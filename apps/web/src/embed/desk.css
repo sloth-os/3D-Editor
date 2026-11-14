@@ -142,6 +142,19 @@
 .desk-side {
   background: var(--bg-area);
 }
+/* the viewport's wrapper (it takes the viewport's keys back on focus) fills the column as the viewport does */
+.desk-viewport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.desk-modal > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
 .desk-empty {
   flex: 1;
   display: flex;

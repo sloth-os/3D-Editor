@@ -1,14 +1,25 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { OperatorRegistry, defineOperator } from '@3d-editor/core';
+import { h } from 'preact';
+import { cleanup, fireEvent, render } from '@testing-library/preact';
+import { OperatorRegistry, defineOperator, type SceneBrief } from '@3d-editor/core';
 import { z } from 'zod';
 import { DESK_HIDDEN_OPERATORS, DESK_IGNORED_KEYS, deskRefusal, guardRegistry } from '../src/embed/guards';
 import { readStorage, writeStorage } from '../src/app/safe-storage';
+import { DeskController, type SceneWorkspace } from '../src/embed/controller';
+import type { LengthCheck } from '../src/embed/export';
+
+// (the service worker's registration is a module of the production build)
+vi.mock('../src/pwa/register', () => ({ pwaUpdate: { value: false }, applyPwaUpdate: () => undefined }));
 
 /*
  * What the embedded desk turns off (embed/guards.ts and the desk runtime): the editor chrome's
  * operators always, every operator that changes the scene in a read-only open (refused in the
  * registry's poll, so every way of running them fails), the keys of the chrome it hides, the
- * editor's preferences (never read or written by the desk), and storage that may be blocked.
+ * editor's preferences (never read or written by the desk), and storage that may be blocked; and
+ * the desk's header: where the state went, the Follow menu in the host's order, Send off for a
+ * brief over the export's size, the Send check (the brief's retimed shots apart from the desk's,
+ * with Update shots). (The chrome taking the viewport's keys away is checked in a real browser:
+ * e2e/tests/desk-embed.spec.ts.)
  */
 
 const ctx = {} as never;
@@ -152,5 +163,128 @@ describe('the desk runtime', () => {
     expect(readStorage('k')).toBe('v');
     writeStorage('k', null);
     expect(readStorage('k')).toBeNull();
+  });
+});
+
+describe("the desk's header", () => {
+  afterEach(() => cleanup());
+
+  const brief = {
+    id: 'clp_1',
+    name: 'Scene',
+    fps: 24,
+    width: 320,
+    height: 180,
+    shots: [
+      { id: 'sht_a', durationSec: 3 },
+      { id: 'sht_b', durationSec: 2 },
+    ],
+  } as unknown as SceneBrief;
+
+  async function openDesk(options: object, scene: SceneBrief = brief) {
+    const ws: SceneWorkspace = {
+      open: async () => ({
+        source: 'brief',
+        changes: null,
+        unreadable: null,
+        plan: 'stage',
+        stageMs: 1,
+        persistent: true,
+      }),
+      encodeState: async () => ({
+        state: { format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(4) },
+        shots: 2,
+      }),
+      onEdit: () => () => {},
+      snapshot: () => new Uint8Array([1]),
+      stagedShots: () => ['sht_a', 'sht_b'],
+      lengthMismatches: () => [],
+      changes: () => null,
+      updateFromBrief: async () => null,
+      results: async () => [],
+      projectId: 'desk-1',
+    };
+    const c = new DeskController({
+      send: () => true,
+      workspace: ws,
+      exportSupport: async () => ({ available: true, reason: null }),
+      deskVersion: '1.0.0',
+      log: () => {},
+    });
+    await c.connected('https://host.example');
+    c.message({ type: 'open', scene, state: null, options } as never);
+    await vi.waitFor(() => expect(c.lastStateAt.value).not.toBeNull());
+    return c;
+  }
+
+  async function header(c: DeskController, checks: LengthCheck[] = []) {
+    const { DeskApp } = await import('../src/embed/DeskApp');
+    return render(h(DeskApp, { c, work: null, lengthChecks: () => checks }));
+  }
+
+  it("says the state was sent to the host, and lists the host's modes in its order in Follow", async () => {
+    const c = await openDesk({ hostName: 'rideo', modes: ['camera', 'pose'] });
+    const v = await header(c);
+    expect(v.getByTestId('desk-state-sent').textContent).toMatch(/^Sent to rideo just now/);
+    const follow = v.getByTestId('desk-mode') as HTMLSelectElement;
+    expect([...follow.options].map((o) => o.value)).toEqual(['camera', 'pose']);
+    expect(follow.value).toBe('camera');
+    fireEvent.change(follow, { target: { value: 'pose' } });
+    expect(c.mode.value).toBe('pose');
+    expect(v.getByTestId('desk-send').getAttribute('title')).toContain('the Pose reference clip');
+  });
+
+  it("lists the brief's changes in words, what else an update acts on too", async () => {
+    const { changesText } = await import('../src/embed/DeskApp');
+    const changes = {
+      added: ['sht_c'],
+      removed: [],
+      retimed: ['sht_a', 'sht_b'],
+      recast: [],
+      cast: { added: [], removed: ['chr_x'] },
+    };
+    expect(changesText(changes)).toBe('1 shot added, 2 shots retimed, 1 cast member removed');
+    expect(changesText({ ...changes, other: ['the frame rate (24 to 30 fps)', 'the set'] })).toBe(
+      '1 shot added, 2 shots retimed, 1 cast member removed, the frame rate (24 to 30 fps), the set',
+    );
+  });
+
+  it("turns Send off for a brief over the export's size and says why", async () => {
+    const c = await openDesk({ hostName: 'rideo' }, { ...brief, width: 2160, height: 3840 } as SceneBrief);
+    const v = await header(c);
+    const send = v.getByTestId('desk-send') as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+    expect(send.getAttribute('title')).toContain('2160 × 3840, too high');
+  });
+
+  it("asks before a Send whose clips the host refuses: the brief's retimed shots apart from the desk's", async () => {
+    const c = await openDesk({ hostName: 'rideo' });
+    const update = vi.spyOn(c, 'updateShots').mockResolvedValue();
+    const send = vi.spyOn(c, 'sendToHost').mockResolvedValue(null);
+    const checks: LengthCheck[] = [
+      { shotId: 'sht_a', name: 'Opening', frames: 72, briefFrames: 84, byBrief: true },
+      { shotId: 'sht_b', name: 'Reply', frames: 60, briefFrames: 48, byBrief: false },
+    ];
+    const v = await header(c, checks);
+    fireEvent.click(v.getByTestId('desk-send'));
+    expect(send).not.toHaveBeenCalled();
+    expect(v.getByTestId('desk-send-check-brief').textContent).toContain(
+      'The brief changed the length of this shot',
+    );
+    expect(v.getByTestId('desk-send-check-brief').textContent).toContain('Opening');
+    expect(v.getByTestId('desk-send-check-desk').textContent).toContain('made longer or shorter here');
+    expect(v.getByTestId('desk-send-check-desk').textContent).toContain('Reply');
+    fireEvent.click(v.getByTestId('desk-send-check-update'));
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(v.queryByTestId('desk-send-check')).toBeNull();
+    // read-only: no Update shots, and it says why the clips are refused
+    cleanup();
+    const ro = await openDesk({ hostName: 'rideo', readOnly: true });
+    const r = await header(ro, checks);
+    fireEvent.click(r.getByTestId('desk-send'));
+    expect(r.queryByTestId('desk-send-check-update')).toBeNull();
+    expect(r.getByTestId('desk-send-check-brief').textContent).toContain('read-only here');
+    fireEvent.click(r.getByTestId('desk-send-check-send'));
+    expect(r.queryByTestId('desk-send-check')).toBeNull();
   });
 });

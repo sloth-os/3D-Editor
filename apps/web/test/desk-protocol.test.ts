@@ -11,6 +11,7 @@ import {
   deskMessageProblems,
   parseHostMessage,
   stateBytes,
+  uniqueModes,
 } from '../src/embed/protocol';
 
 /*
@@ -142,7 +143,7 @@ describe('reading a host message', () => {
     const open = load(DIR, 'open.json');
     for (const m of [
       { ...open, state: 'a state' },
-      { ...open, options: { modes: [] } },
+      { ...open, options: { modes: ['smell'] } },
       { ...open, options: { hostName: 'h'.repeat(41) } },
       { type: 'open', state: null },
     ]) {
@@ -153,6 +154,25 @@ describe('reading a host message', () => {
         reply: { type: 'error', code: 'bad_message' },
       });
     }
+  });
+
+  it('bounds no list the contract leaves open: empty lists and repeated modes are valid', () => {
+    const open = load(DIR, 'open.json');
+    for (const options of [
+      { modes: [] },
+      { modes: ['pose', 'pose', 'camera', 'pose'], defaultMode: 'camera' },
+      { modes: ['camera', 'camera', 'camera', 'camera', 'motion'] },
+    ])
+      expect(parseHostMessage({ ...open, options }).kind, JSON.stringify(options)).toBe('ok');
+    for (const m of [
+      { type: 'export', id: 'e-1', shots: [] },
+      { type: 'export', id: 'e-2', modes: [] },
+      { type: 'export', id: 'e-3', modes: ['pose', 'pose', 'pose', 'pose'] },
+      { type: 'export', id: 'e-4', shots: Array.from({ length: 300 }, (_, i) => `sht_${i}`) },
+    ])
+      expect(parseHostMessage(m).kind, m.id).toBe('ok');
+    // repeats count once, in the order first named
+    expect(uniqueModes(['pose', 'camera', 'pose', 'motion', 'camera'])).toEqual(['pose', 'camera', 'motion']);
   });
 
   it('takes a given state of any format (the desk decides whether it reads it), as a buffer or a view', () => {

@@ -126,14 +126,13 @@ async function waitFor(page: Page, type: string, count = 1, timeout = 60_000): P
 
 const send = (page: Page, message: unknown) => page.evaluate((m) => (window as any).host.send(m), message);
 
-/** A message as the desk sent it: {"$bytes"} as ArrayBuffers, result files' data as buffers of their size. */
+/** A message as the desk sent it: {"$bytes"} (states, result files) as ArrayBuffers. */
 function revive(m: any): any {
   return JSON.parse(JSON.stringify(m), (_k, v) => {
     if (v && typeof v === 'object' && typeof v.$bytes === 'string') {
       const b = Buffer.from(v.$bytes, 'base64');
       return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
     }
-    if (v && typeof v === 'object' && typeof v.$size === 'number') return new ArrayBuffer(v.$size);
     return v;
   });
 }
@@ -268,9 +267,16 @@ test.describe('the embeddable desk', () => {
     expect(render.at(-1).total).toBe(72 + 60);
     for (let i = 1; i < render.length; i++) expect(render[i].done).toBeGreaterThanOrEqual(render[i - 1].done);
     expect(new Set(render.map((m) => m.shotId))).toEqual(new Set([SHOT_A, SHOT_B]));
-    // about ten a second at most (the desk sends one per 100 ms at most; the host's clock sees them
-    // with the jitter of its event loop, so: any six in a row span 400 ms or more)
-    const recs = (await allMessages(page)).filter((r) => r.message.type === 'progress');
+    // the last message of each phase goes: every frame rendered, every file read, then finish
+    expect(render.at(-1).done).toBe(72 + 60);
+    expect(progress.filter((m) => m.phase === 'encode').at(-1)).toMatchObject({ done: 6, total: 6 });
+    expect(progress.at(-1).phase).toBe('finish');
+    // about ten a second at most (one per 100 ms; a phase's last message goes at once; the host's
+    // clock sees them with the jitter of its event loop, so: any six render messages in a row but
+    // the phase's last span 400 ms or more)
+    const recs = (await allMessages(page))
+      .filter((r) => r.message.type === 'progress' && r.message.phase === 'render')
+      .slice(0, -1);
     for (let i = 5; i < recs.length; i++) expect(recs[i].at - recs[i - 5].at).toBeGreaterThan(400);
 
     expect(result).toMatchObject({ id: 'exp-1', sceneId: EXAMPLE.id, fps: 24, width: 1280, height: 720 });
@@ -289,7 +295,8 @@ test.describe('the embeddable desk', () => {
     );
     for (const f of result.files) {
       const bytes = await fileBytes(page, f.name);
-      expect(bytes.byteLength).toBe(f.data.$size);
+      // the host recorded the file as the desk sent it, in the fixtures' $bytes notation
+      expect(Buffer.from(f.data.$bytes, 'base64').equals(Buffer.from(bytes)), f.name).toBe(true);
       if (f.name.endsWith('.mp4')) {
         expect(f.mime).toBe('video/mp4');
         const info = mp4Info(bytes);
@@ -536,7 +543,10 @@ test.describe('the embeddable desk', () => {
     await expect(frame.getByTestId('desk-source')).toHaveAttribute('data-source', 'brief');
 
     await frame.getByTestId('desk-send').click();
-    await expect(frame.getByTestId('desk-send-check')).toContainText(SHOT_B);
+    // made longer here, not by the brief: no Update shots, and the host refuses its clip
+    await expect(frame.getByTestId('desk-send-check-desk')).toContainText(SHOT_B);
+    await expect(frame.getByTestId('desk-send-check-brief')).toHaveCount(0);
+    await expect(frame.getByTestId('desk-send-check-update')).toHaveCount(0);
     await frame.getByTestId('desk-send-check-send').click();
     const [result] = await waitFor(page, 'result', 1, 180_000);
     expect(result.id).toBe('desk-1');
@@ -547,11 +557,88 @@ test.describe('the embeddable desk', () => {
     expect(result.shots[0].issues.filter((i: any) => i.code === 'brief_length')).toEqual([]);
     expect(result.shots[1].issues.find((i: any) => i.code === 'brief_length')).toMatchObject({
       severity: 'error',
+      message: expect.stringContaining('Set its length back'),
     });
     expect(result.files.map((f: any) => f.name).sort()).toEqual(
       [`${SHOT_A}.camera.mp4`, `${SHOT_A}.still.png`, `${SHOT_B}.camera.mp4`, `${SHOT_B}.still.png`].sort(),
     );
     expect(mp4Info(await fileBytes(page, `${SHOT_B}.camera.mp4`)).samples).toBe(24);
+    await expectValidMessages(page);
+  });
+
+  test("Follow and Send; the viewport's keys only over the viewport; a brief over the export's size; the wake lock", async ({
+    page,
+  }) => {
+    test.setTimeout(300_000);
+    await openHost(page);
+    await waitFor(page, 'ready');
+    const frame = await deskFrame(page);
+    // the host's frame allows screen-wake-lock (as docs/embedding.md shows): an export may keep the
+    // screen on
+    expect(await frame.evaluate(() => typeof (navigator as any).wakeLock)).toBe('object');
+    await send(page, {
+      type: 'open',
+      scene: smallBrief(),
+      state: null,
+      options: { hostName: 'rideo', modes: ['pose', 'camera'], defaultMode: 'camera' },
+    });
+    await waitFor(page, 'opened', 1, 120_000);
+    await waitFor(page, 'state');
+    // Follow lists the host's modes in its order, its defaultMode chosen; the header says where
+    // the state went
+    const follow = frame.getByTestId('desk-mode');
+    await expect(follow.locator('option')).toHaveText(['Pose', 'Camera']);
+    await expect(follow).toHaveValue('camera');
+    await expect(frame.getByTestId('desk-state-sent')).toContainText('Sent to rideo');
+
+    // the viewport's keys act over the viewport only: not over the shot list or the header
+    const objects = () => frame.evaluate(() => (window as any).__desk.objects() as number);
+    await frame.getByTestId('viewport').hover();
+    await page.keyboard.press('a');
+    const n = await objects();
+    expect(n).toBeGreaterThan(0);
+    await frame.getByTestId('desk-side').hover();
+    await page.keyboard.press('Delete');
+    await page.keyboard.press('x');
+    await frame.getByTestId('desk-header').hover();
+    await page.keyboard.press('Delete');
+    expect(await objects()).toBe(n);
+    await frame.getByTestId('viewport').hover();
+    await page.keyboard.press('Delete');
+    await expect.poll(objects).toBeLessThan(n);
+    await page.keyboard.press('Control+z');
+    await expect.poll(objects).toBe(n);
+
+    // Send renders the mode Follow shows, with stills
+    await follow.selectOption('pose');
+    await frame.getByTestId('desk-send').click();
+    const [result] = await waitFor(page, 'result', 1, 180_000);
+    expect(result.id).toBe('desk-1');
+    expect(result.shots.map((x: any) => Object.keys(x.references))).toEqual([['pose'], ['pose']]);
+    expect(result.files.map((f: any) => f.name).sort()).toEqual(
+      [`${SHOT_A}.pose.mp4`, `${SHOT_A}.still.png`, `${SHOT_B}.pose.mp4`, `${SHOT_B}.still.png`].sort(),
+    );
+    await expectValidMessages(page);
+
+    // a frame without screen-wake-lock: the desk never asks for one
+    await page.evaluate(() => (window as any).host.mount({ allow: 'fullscreen; clipboard-write' }));
+    await waitFor(page, 'ready', 2, 30_000);
+    const second = await deskFrame(page);
+    expect(await second.evaluate(() => typeof (navigator as any).wakeLock)).toBe('undefined');
+    // a portrait brief over 2160 pixels high: said when it opens, Send off, an export refused at once
+    const tall = smallBrief('clp_tall0000000001');
+    tall.width = 2160;
+    tall.height = 3840;
+    await send(page, { type: 'open', scene: tall, state: null, options: { hostName: 'rideo' } });
+    await waitFor(page, 'opened', 2, 120_000);
+    await expect(second.getByTestId('desk-notice')).toContainText('too high');
+    await expect(second.getByTestId('desk-send')).toBeDisabled();
+    await send(page, { type: 'export', id: 'tall-1' });
+    await expect
+      .poll(async () => (await ofType(page, 'error')).find((e) => e.id === 'tall-1')?.code, {
+        timeout: 10_000,
+      })
+      .toBe('export_unavailable');
     await expectValidMessages(page);
   });
 

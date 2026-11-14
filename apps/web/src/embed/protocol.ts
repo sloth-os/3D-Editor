@@ -35,6 +35,9 @@ export const MODES = ['motion', 'pose', 'camera'] as const;
 export type Mode = (typeof MODES)[number];
 export const ModeSchema = z.enum(MODES);
 
+/** The modes of a list, each once, in the order the list first names them. */
+export const uniqueModes = (modes: readonly Mode[]): Mode[] => [...new Set(modes)];
+
 export const ERROR_CODES = [
   'bad_message',
   'unsupported_version',
@@ -93,9 +96,13 @@ export const GivenStateSchema = z.object({
 });
 export type GivenState = z.infer<typeof GivenStateSchema>;
 
+/**
+ * An open's options. The contract bounds no list: `modes` may repeat a mode (each counts once) and
+ * may be empty (the default, ["camera"]); see controller.ts resolveOptions.
+ */
 export const OpenOptionsSchema = z.object({
   hostName: z.string().max(40).optional(),
-  modes: z.array(ModeSchema).min(1).max(MODES.length).optional(),
+  modes: z.array(ModeSchema).optional(),
   defaultMode: ModeSchema.optional(),
   readOnly: z.boolean().optional(),
 });
@@ -150,11 +157,15 @@ const OpenEnvelopeSchema = z.object({
 export const OpenSchema = OpenEnvelopeSchema.extend({ scene: SceneBriefSchema });
 export type OpenMessage = Omit<z.infer<typeof OpenSchema>, 'scene'> & { scene: SceneBrief };
 
+/**
+ * An export. The contract bounds no list: an empty or missing `shots` names none (every shot of the
+ * brief), an empty or missing `modes` asks for the open's; repeats count once.
+ */
 export const ExportSchema = z.object({
   type: z.literal('export'),
   id: MessageIdSchema,
-  shots: z.array(IdSchema).min(1).max(200).optional(),
-  modes: z.array(ModeSchema).min(1).max(MODES.length).optional(),
+  shots: z.array(IdSchema).optional(),
+  modes: z.array(ModeSchema).optional(),
   still: z.boolean().optional(),
 });
 export type ExportMessage = z.infer<typeof ExportSchema>;

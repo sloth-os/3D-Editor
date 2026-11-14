@@ -10,6 +10,7 @@ import {
 } from './export';
 import {
   MODES,
+  uniqueModes,
   type DeskMessage,
   type DeskState,
   type ErrorCode,
@@ -20,6 +21,7 @@ import {
   type OpenMessage,
   type OpenSource,
   type Phase,
+  type ProgressMessage,
   type ResultAckMessage,
 } from './protocol';
 import { StateTooLarge } from './state';
@@ -30,17 +32,22 @@ import type { LengthMismatch, OpenOutcome } from './workspace';
  *
  * - `ready` right after the connect (within 2 s): its version and whether this browser can export
  *   (checked for 1280 × 720 at 24 fps, since ready comes before the brief; each export checks again
- *   at the brief's real size).
+ *   at the brief's real size). The bridge holds what the host sends before it until ready is out.
  * - `open` once: the scene from the host's state, the local copy or the brief, then `opened` and a
- *   first `state`. A second open is answered with busy. An open that fails (a brief the desk cannot
- *   stage) is answered with invalid_scene and does not count: the host may send another.
+ *   first `state` (none after a state it could not read: the host's copy stays until an edit, Done
+ *   or save). A second open is answered with busy. An open that fails (a brief the desk cannot
+ *   stage) is answered with invalid_scene and does not count: the host may send another. Close while
+ *   the scene opens cancels the open: nothing more is sent, and the host may send another.
  * - `state` after `opened`, after edits (2 s after the last change, at most one every 5 s), when
- *   the person presses Done, and in answer to `save` (with its id).
- * - `export` (and the person's Send, id `desk-<n>`): the brief's shots (those named, else all) in
- *   brief order; progress at most about ten times a second, then `result` (its files
- *   transferred), and an `error` per shot left out (one that failed, or one the brief has that is
- *   not staged yet); bad_message for ids that are no shots of the brief; busy while another export
- *   or an update runs, not_open before the scene is open.
+ *   the person presses Done, and in answer to `save` (with its id; not_open when no scene is open).
+ *   Never after close on its own: edits made then wait until the person goes back to the desk.
+ * - `export` (and the person's Send, id `desk-<n>`, of the mode the desk's Follow menu shows): the
+ *   brief's shots (those named, else all) in brief order; progress at most about ten times a
+ *   second (the last of each phase always), then `result` (its files transferred), and an
+ *   `export_failed` error per shot left out (one that failed, or one the brief has that is not
+ *   staged); bad_message for ids that are no shots of the brief; export_unavailable at once for a
+ *   brief over the export's size; busy while another export or an update runs, not_open before the
+ *   scene is open.
  * - `cancel` of the running export ends it with error cancelled; a cancel of another id is ignored.
  * - `result-ack` is shown to the person.
  * - Done: a final state, then close {reason: 'done'}; Close: close {reason: 'cancel'} (with a state
@@ -59,6 +66,8 @@ export interface SceneWorkspace {
   updateFromBrief(): Promise<BriefChanges | null>;
   results(update: Uint8Array, shots?: string[]): Promise<ShotResultMeta[]>;
   readonly projectId: string | null;
+  /** Lets go of the scene (an open cancelled by Close); a later open opens it again. */
+  close?(): void;
 }
 
 export interface ControllerDeps {
@@ -90,8 +99,12 @@ export interface DeskOptions {
   readOnly: boolean;
 }
 
+/**
+ * The options of an open with the contract's defaults: `modes` in the host's order, each once (none:
+ * ["camera"]); `defaultMode` the host's when it is one of them, else the first of them.
+ */
 export function resolveOptions(o: OpenMessage['options'] | undefined): DeskOptions {
-  const modes = o?.modes?.length ? MODES.filter((m) => o.modes!.includes(m)) : (['camera'] as Mode[]);
+  const modes = o?.modes?.length ? uniqueModes(o.modes) : (['camera'] as Mode[]);
   const defaultMode = o?.defaultMode && modes.includes(o.defaultMode) ? o.defaultMode : modes[0];
   return { hostName: o?.hostName?.trim() || 'the host', modes, defaultMode, readOnly: o?.readOnly === true };
 }
@@ -106,8 +119,22 @@ export const STATE_QUIET_MS = 2000;
 export const STATE_MIN_INTERVAL_MS = 5000;
 /** Progress messages: at most one per this many milliseconds (about ten a second). */
 export const PROGRESS_INTERVAL_MS = 100;
+/** The brief's changes are compared again this long after the last edit (an undone Update shots). */
+export const CHANGES_QUIET_MS = 300;
+/** Done and Close wait this long at most for a cancelled export to end (its cancelled goes first). */
+export const EXPORT_STOP_WAIT_MS = 2000;
 
 export type DeskStatus = 'waiting' | 'connected' | 'opening' | 'open' | 'closed';
+
+/** One export the controller runs (the host's, or the person's Send). */
+interface ExportJob {
+  id: string;
+  by: 'desk' | 'host';
+  /** The brief's shots asked for (none: every shot of the brief). */
+  asked?: readonly string[];
+  modes: Mode[];
+  still: boolean;
+}
 
 export interface ExportRun {
   id: string;
@@ -153,7 +180,7 @@ export class DeskController {
   /** When the last state went to the host (ms), and whether edits since are not sent yet. */
   readonly lastStateAt = signal<number | null>(null);
   readonly dirty = signal(false);
-  /** The person's mode (Follow), preselected from the options. */
+  /** The reference the person's Send renders (Follow): one of the host's modes, preselected from the options. */
   readonly mode = signal<Mode>('camera');
   readonly opened = signal<OpenOutcome | null>(null);
 
@@ -162,10 +189,23 @@ export class DeskController {
   private abort: AbortController | null = null;
   private stopEdits: (() => void) | null = null;
   private stateTimer: unknown = null;
+  private changesTimer: unknown = null;
   private lastChangeAt = 0;
   private lastSentAt = 0;
+  /** The state being written (a Done or Close waits for it, so it goes before close). */
+  private stateInFlight: Promise<boolean> | null = null;
+  /** Close was pressed while the scene opened: the open is cancelled. */
+  private openCancelled = false;
+  /** The open in progress (settles, never rejects). */
+  private opening: Promise<void> | null = null;
+  /** An open cancelled by Close that has not let go of its scene yet: a later open waits for it. */
+  private cancelledOpen: Promise<void> | null = null;
+  /** The running export (settles, never rejects). */
+  private exporting: Promise<void> | null = null;
+  /** Done or Close is sending its last state. */
+  private closing = false;
   private progressTimer: unknown = null;
-  private pendingProgress: DeskMessage | null = null;
+  private pendingProgress: ProgressMessage | null = null;
   private lastProgressAt = 0;
   private readonly timers: NonNullable<ControllerDeps['timers']>;
   private readonly log: NonNullable<ControllerDeps['log']>;
@@ -182,6 +222,18 @@ export class DeskController {
 
   private tell(level: Notice['level'], message: string): void {
     this.notice.value = { level, message, at: this.timers.now() };
+  }
+
+  /** Why a request that needs the open scene is refused (not_open). */
+  private notOpen(id?: string): void {
+    const closed = this.status.peek() === 'closed' && !!this.brief.peek();
+    this.error(
+      'not_open',
+      closed
+        ? 'The desk was closed (Done or Close): it takes requests again once the person goes back to the desk.'
+        : 'No scene is open yet: send open first.',
+      id,
+    );
   }
 
   // ---------------------------------------------------------------- connection
@@ -235,11 +287,14 @@ export class DeskController {
         if (this.exportRun.peek()?.id === m.id) this.cancelExport();
         else this.log('info', `ignored a cancel of '${m.id}': no such export runs`);
         return;
-      case 'save':
-        if (this.status.peek() !== 'open' && this.status.peek() !== 'closed')
-          return this.error('not_open', 'No scene is open yet: send open first.', m.id);
+      case 'save': {
+        // after Done or Close the scene is still here (and answered); before open, or after a Close
+        // that cancelled the open, there is none
+        const st = this.status.peek();
+        if (!this.brief.peek() || (st !== 'open' && st !== 'closed')) return this.notOpen(m.id);
         void this.sendState(m.id);
         return;
+      }
       case 'result-ack':
         this.showAck(m);
         return;
@@ -249,11 +304,37 @@ export class DeskController {
   // ---------------------------------------------------------------- open
 
   private async open(m: OpenMessage): Promise<void> {
+    // an open that Close cancelled lets go of its scene first; this one follows
+    while (this.cancelledOpen) {
+      const pending = this.cancelledOpen;
+      await pending;
+      if (this.cancelledOpen === pending) this.cancelledOpen = null;
+    }
     const st = this.status.peek();
-    if (st !== 'connected' && st !== 'waiting') {
-      this.error('busy', 'The desk has a scene open already: one open per connection.');
+    // a Close before any scene opened (or one that cancelled an open) leaves room for one
+    const free = st === 'connected' || st === 'waiting' || (st === 'closed' && !this.brief.peek());
+    if (!free) {
+      this.error(
+        'busy',
+        st === 'opening'
+          ? 'The desk is opening a scene already: one open per connection.'
+          : 'The desk has a scene open already: one open per connection.',
+      );
       return;
     }
+    const task = this.openScene(m);
+    // what a later open waits for when Close cancels this one (settles once the scene is let go)
+    const settled = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.opening = settled;
+    await task;
+    if (this.opening === settled) this.opening = null;
+  }
+
+  private async openScene(m: OpenMessage): Promise<void> {
+    this.openCancelled = false;
     this.status.value = 'opening';
     const options = resolveOptions(m.options);
     this.options.value = options;
@@ -267,27 +348,49 @@ export class DeskController {
         state: m.state,
       });
     } catch (err) {
-      this.status.value = 'connected';
       this.brief.value = null;
+      // closed while it opened: the host was told already, nothing more goes to it
+      if (this.openCancelled) {
+        this.openCancelled = false;
+        return;
+      }
+      this.status.value = 'connected';
       const message = err instanceof Error ? err.message : String(err);
       this.tell('error', `The scene could not be staged: ${message}`);
       this.error('invalid_scene', `The scene could not be staged: ${message}`);
+      return;
+    }
+    if (this.openCancelled) {
+      // Close while the scene opened cancels the open: no opened, no state; the scene is let go and
+      // a later open is taken
+      this.openCancelled = false;
+      this.brief.value = null;
+      this.deps.workspace.close?.();
       return;
     }
     this.opened.value = r;
     this.source.value = r.source;
     this.changes.value = r.changes;
     this.status.value = 'open';
+    const notices: string[] = [];
     if (r.unreadable) {
       const text =
         r.source === 'local'
           ? `The stored desk state was not applied (${r.unreadable}); the desk opened its own copy of the scene.`
           : `The stored desk state was not applied (${r.unreadable}); the scene was staged from the brief.`;
-      this.tell('warning', text);
+      notices.push(text);
       this.error('state_unreadable', text);
     }
+    // a brief larger than the export renders: said now, not at the first Send
+    const size = exportSizeProblem(m.scene.width, m.scene.height);
+    if (size) notices.push(size);
+    // storage that failed: the scene is kept in memory only (workspace.ts)
+    if (r.notice) notices.push(r.notice);
+    if (notices.length) this.tell('warning', notices.join(' '));
     this.deps.send({ type: 'opened', sceneId: m.scene.id, source: r.source, changes: r.changes });
-    await this.sendState();
+    // after a state it could not read, opening sends none on its own: the host keeps its copy
+    // until an edit, Done or save (docs/embedding.md, Readings)
+    if (!r.unreadable) await this.sendState();
     this.stopEdits = this.deps.workspace.onEdit(() => this.edited());
   }
 
@@ -296,7 +399,31 @@ export class DeskController {
   private edited(): void {
     this.dirty.value = true;
     this.lastChangeAt = this.timers.now();
+    this.scheduleChanges();
+    // after Done or Close nothing goes to the host on its own: the edit waits for Back to the desk
+    if (this.status.peek() === 'closed') return;
     this.scheduleState();
+  }
+
+  /** Compares the brief with the scene again once the edits pause (an undone Update shots). */
+  private scheduleChanges(): void {
+    if (this.changesTimer !== null) this.timers.clearTimeout(this.changesTimer);
+    this.changesTimer = this.timers.setTimeout(() => {
+      this.changesTimer = null;
+      this.refreshChanges();
+    }, CHANGES_QUIET_MS);
+  }
+
+  /** The brief's changes as the scene has them now (kept as they are when nothing differs). */
+  private refreshChanges(): void {
+    if (!this.brief.peek()) return;
+    let now: BriefChanges | null;
+    try {
+      now = this.deps.workspace.changes();
+    } catch {
+      return;
+    }
+    if (JSON.stringify(now) !== JSON.stringify(this.changes.peek())) this.changes.value = now;
   }
 
   private scheduleState(): void {
@@ -318,9 +445,22 @@ export class DeskController {
   }
 
   /** Sends the scene's state (in answer to save `id` when given). */
-  async sendState(id?: string): Promise<boolean> {
+  sendState(id?: string): Promise<boolean> {
+    const p = this.writeState(id);
+    this.stateInFlight = p;
+    const settled = () => {
+      if (this.stateInFlight === p) this.stateInFlight = null;
+    };
+    p.then(settled, settled);
+    return p;
+  }
+
+  private async writeState(id?: string): Promise<boolean> {
     const brief = this.brief.peek();
-    if (!brief) return false;
+    if (!brief) {
+      if (id) this.notOpen(id);
+      return false;
+    }
     this.dirty.value = false;
     let encoded: { state: DeskState; shots: number };
     try {
@@ -332,8 +472,14 @@ export class DeskController {
           ? `${err.message}: the host cannot store this scene; the desk keeps it in this browser.`
           : `The desk state could not be written: ${err instanceof Error ? err.message : String(err)}`;
       this.tell('error', message);
-      // out_of_memory: the closest code the contract has for a state too large to hand over
+      // out_of_memory: the closest code the contract has for a state too large to hand over;
+      // export_failed for any other failure to write it (docs/embedding.md, Readings)
       this.error(err instanceof StateTooLarge ? 'out_of_memory' : 'export_failed', message, id);
+      return false;
+    }
+    // a state of edits written while Done or Close sent the last one waits for Back to the desk
+    if (!id && this.status.peek() === 'closed') {
+      this.dirty.value = true;
       return false;
     }
     this.lastSentAt = this.timers.now();
@@ -368,8 +514,7 @@ export class DeskController {
   // ---------------------------------------------------------------- export
 
   private async hostExport(m: ExportMessage): Promise<void> {
-    if (this.status.peek() !== 'open')
-      return this.error('not_open', 'No scene is open yet: send open first.', m.id);
+    if (this.status.peek() !== 'open') return this.notOpen(m.id);
     if (this.exportRun.peek() || this.updating.peek())
       return this.error(
         'busy',
@@ -378,15 +523,17 @@ export class DeskController {
           : 'The desk is updating its shots.',
         m.id,
       );
-    const plan = this.exportShots(m.shots);
-    if (plan.unknown.length)
-      return this.error('bad_message', `Not shots of this scene's brief: ${plan.unknown.join(', ')}.`, m.id);
-    const options = this.options.peek();
+    // an empty list names no shot: every shot of the brief, as when it names none
+    const asked = m.shots?.length ? m.shots : undefined;
+    const unknown = this.exportShots(asked).unknown;
+    if (unknown.length)
+      return this.error('bad_message', `Not shots of this scene's brief: ${unknown.join(', ')}.`, m.id);
     await this.runExport({
       id: m.id,
       by: 'host',
-      ...plan,
-      modes: m.modes?.length ? MODES.filter((x) => m.modes!.includes(x)) : options.modes,
+      asked,
+      // the host's own modes (each once), else the open's
+      modes: m.modes?.length ? uniqueModes(m.modes) : this.options.peek().modes,
       still: m.still ?? true,
     });
   }
@@ -414,12 +561,16 @@ export class DeskController {
     };
   }
 
-  /** The person's Send: every mode the host takes, every shot of the brief, with stills. */
+  /**
+   * The person's Send: every shot of the brief, in the mode of the desk's Follow menu (one of the
+   * host's modes; preselected from options.defaultMode), with stills.
+   */
   async sendToHost(): Promise<string | null> {
     if (this.status.peek() !== 'open' || this.exportRun.peek() || this.updating.peek()) return null;
+    const options = this.options.peek();
+    const mode = options.modes.includes(this.mode.peek()) ? this.mode.peek() : options.defaultMode;
     const id = `desk-${++this.deskSeq}`;
-    const { shots, notStaged } = this.exportShots();
-    await this.runExport({ id, by: 'desk', shots, notStaged, modes: this.options.peek().modes, still: true });
+    await this.runExport({ id, by: 'desk', modes: [mode], still: true });
     return id;
   }
 
@@ -431,9 +582,13 @@ export class DeskController {
   private progress(p: { id: string; phase: Phase; done: number; total: number; shotId?: string }): void {
     const run = this.exportRun.peek();
     if (run && run.id === p.id) this.exportRun.value = { ...run, ...p };
-    const msg: DeskMessage = { type: 'progress', ...p };
+    const msg: ProgressMessage = { type: 'progress', ...p };
+    // the last message of a phase always goes: the one waiting goes first when another phase starts
+    if (this.pendingProgress && this.pendingProgress.phase !== msg.phase)
+      this.flushProgress(this.pendingProgress);
     const now = this.timers.now();
-    // at most one message per PROGRESS_INTERVAL_MS; the latest one waiting goes when it ends
+    // at most one message per PROGRESS_INTERVAL_MS otherwise; the latest one waiting goes when the
+    // interval ends, or before the result
     if (this.lastProgressAt === 0 || now - this.lastProgressAt >= PROGRESS_INTERVAL_MS) {
       this.flushProgress(msg);
       return;
@@ -449,9 +604,11 @@ export class DeskController {
       );
   }
 
-  private flushProgress(msg: DeskMessage): void {
+  private flushProgress(msg: ProgressMessage): void {
     this.pendingProgress = null;
     this.lastProgressAt = this.timers.now();
+    // after close the export only ends (cancelled): no more progress goes to the host
+    if (this.status.peek() === 'closed') return;
     this.deps.send(msg);
   }
 
@@ -462,18 +619,26 @@ export class DeskController {
     this.lastProgressAt = 0;
   }
 
-  private async runExport(o: {
-    id: string;
-    by: 'desk' | 'host';
-    /** The staged shots to render, in brief order. */
-    shots: string[];
-    /** The brief's shots asked for that are not staged: left out, each named in an error. */
-    notStaged: string[];
-    modes: Mode[];
-    still: boolean;
-  }): Promise<void> {
+  private runExport(o: ExportJob): Promise<void> {
+    const task = this.exportJob(o);
+    this.exporting = task;
+    const settled = () => {
+      if (this.exporting === task) this.exporting = null;
+    };
+    task.then(settled, settled);
+    return task;
+  }
+
+  private async exportJob(o: ExportJob): Promise<void> {
     const brief = this.brief.peek()!;
     const options = this.options.peek();
+    // a brief larger than the export renders is answered at once
+    const size = exportSizeProblem(brief.width, brief.height);
+    if (size) {
+      if (o.by === 'desk') this.tell('warning', size);
+      this.error('export_unavailable', size, o.id);
+      return;
+    }
     const abort = new AbortController();
     this.abort = abort;
     this.ack.value = null;
@@ -489,14 +654,9 @@ export class DeskController {
       this.tell(code === 'cancelled' ? 'info' : 'error', message);
       this.error(code, message, o.id);
     };
-    // the brief's shots the staging does not have: left out, each named like a shot that failed
-    const notStaged = o.notStaged.map(
-      (id) => `${id}: the shot is in the brief but not staged in the desk yet (Update shots stages it).`,
-    );
+    let notStaged: string[] = [];
     let outcome: DeskExportOutcome | null = null;
     try {
-      const size = exportSizeProblem(brief.width, brief.height);
-      if (size) return fail('export_unavailable', size);
       const support = await this.deps.exportSupport({
         width: brief.width,
         height: brief.height,
@@ -505,10 +665,21 @@ export class DeskController {
       if (!support.available)
         return fail('export_unavailable', support.reason ?? 'This browser cannot encode the clips.');
       this.progress({ id: o.id, phase: 'prepare', done: 0, total: 1 });
+      // the snapshot, the shots it stages and the brief's changes, read together (nothing changes
+      // between them): a shot deleted meanwhile is left out like one not staged yet
       const update = this.deps.workspace.snapshot();
-      if (!o.shots.length)
+      const { shots, notStaged: missing } = this.exportShots(o.asked);
+      const retimed = this.deps.workspace.changes()?.retimed ?? [];
+      // the brief's shots the staging does not have: left out, each named like a shot that failed
+      notStaged = missing.map(
+        (id) =>
+          `${id}: the shot is in the brief but not staged in the desk (${
+            options.readOnly ? 'the scene is read-only here' : 'Update shots stages it'
+          }).`,
+      );
+      if (!shots.length)
         return fail('export_failed', notStaged.join(' ') || 'The scene has no staged shots to export.');
-      const results = await this.deps.workspace.results(update, o.shots);
+      const results = await this.deps.workspace.results(update, shots);
       if (abort.signal.aborted) return fail('cancelled', 'The export was cancelled.');
       if (!results.length) return fail('export_failed', 'The scene has no staged shots to export.');
       const req: DeskExportRequest = {
@@ -519,11 +690,16 @@ export class DeskController {
         still: o.still,
         hostName: options.hostName,
         project: { id: this.deps.workspace.projectId ?? brief.id, name: brief.name },
+        retimed,
+        readOnly: options.readOnly,
       };
       outcome = await (this.deps.runExport ?? runDeskExport)(req, {
         signal: abort.signal,
         onProgress: (p: DeskExportProgress) => this.progress({ id: o.id, ...p }),
       });
+      if (abort.signal.aborted) return fail('cancelled', 'The export was cancelled.');
+      // the last progress waiting (encode N/N, finish) goes before the result
+      if (this.pendingProgress) this.flushProgress(this.pendingProgress);
       this.stopProgress();
       const message: DeskMessage = {
         type: 'result',
@@ -540,8 +716,9 @@ export class DeskController {
         message,
         outcome.files.map((f) => f.data),
       );
-      // the shots left out, each named in an error after the result (the result never waits for them)
-      for (const f of outcome.failures) this.error(f.code, f.message, o.id);
+      // the shots left out, each named in an export_failed error after the result (the cause in its
+      // message; the result never waits for them)
+      for (const f of outcome.failures) this.error('export_failed', f.message, o.id);
       for (const m of notStaged) this.error('export_failed', m, o.id);
       const left = [...outcome.failures.map((f) => f.message), ...notStaged];
       if (left.length)
@@ -586,31 +763,71 @@ export class DeskController {
 
   /** Done: a final state, then close {reason: 'done'}. */
   async done(): Promise<void> {
-    if (this.status.peek() !== 'open') return;
-    if (this.exportRun.peek()) this.cancelExport();
+    if (this.status.peek() !== 'open' || this.closing) return;
+    this.closing = true;
+    await this.stopExport();
+    // a state being written goes first, then the last one
+    if (this.stateInFlight) await this.stateInFlight.catch(() => false);
     await this.sendState();
     this.finish('done');
   }
 
-  /** Close: close {reason: 'cancel'} (a state first when edits are not sent yet). */
+  /**
+   * Close: close {reason: 'cancel'} (a state first when edits are not sent yet). Pressed while the
+   * scene opens, it cancels the open: close goes now, and nothing after it.
+   */
   async close(): Promise<void> {
     const st = this.status.peek();
-    if (st === 'closed') return;
-    if (this.exportRun.peek()) this.cancelExport();
-    if (st === 'open' && this.dirty.peek()) await this.sendState();
+    if (st === 'closed' || this.closing) return;
+    if (st === 'opening') {
+      this.openCancelled = true;
+      this.cancelledOpen = this.opening;
+      this.finish('cancel');
+      return;
+    }
+    this.closing = true;
+    await this.stopExport();
+    if (st === 'open') {
+      if (this.stateInFlight) await this.stateInFlight.catch(() => false);
+      if (this.dirty.peek()) await this.sendState();
+    }
     this.finish('cancel');
   }
 
+  /** Cancels the running export and waits (at most EXPORT_STOP_WAIT_MS) for its cancelled to go. */
+  private async stopExport(): Promise<void> {
+    const running = this.exporting;
+    if (!running || !this.exportRun.peek()) return;
+    this.cancelExport();
+    let timer: unknown = null;
+    await Promise.race([
+      running,
+      new Promise<void>((r) => (timer = this.timers.setTimeout(r, EXPORT_STOP_WAIT_MS))),
+    ]);
+    this.timers.clearTimeout(timer);
+  }
+
   private finish(reason: 'done' | 'cancel'): void {
+    this.closing = false;
     if (this.stateTimer !== null) this.timers.clearTimeout(this.stateTimer);
     this.stateTimer = null;
     this.deps.send({ type: 'close', reason });
     this.status.value = 'closed';
   }
 
-  /** Back to the desk after Done or Close (the host keeps the frame open): nothing is sent. */
+  /**
+   * Back to the desk after Done or Close (the host keeps the frame open): nothing is sent now;
+   * edits made while it was closed go as a state as usual. With no scene opened, the desk waits for
+   * one again.
+   */
   reopen(): void {
-    if (this.status.peek() === 'closed') this.status.value = this.brief.peek() ? 'open' : 'connected';
+    if (this.status.peek() !== 'closed') return;
+    if (!this.brief.peek()) {
+      this.status.value = 'connected';
+      return;
+    }
+    this.status.value = 'open';
+    if (this.dirty.peek()) this.scheduleState();
   }
 
   dispose(): void {
@@ -618,6 +835,8 @@ export class DeskController {
     this.stopEdits = null;
     if (this.stateTimer !== null) this.timers.clearTimeout(this.stateTimer);
     this.stateTimer = null;
+    if (this.changesTimer !== null) this.timers.clearTimeout(this.changesTimer);
+    this.changesTimer = null;
     this.stopProgress();
     this.abort?.abort();
   }

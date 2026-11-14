@@ -26,8 +26,9 @@ Contents: [the contract](#the-contract) · [hosting the desk](#hosting-the-desk)
   [headers](#headers) below. Never from a path of the host's origin: the host's service worker,
   storage and routes would collide with the desk's.
 - The host embeds it as shown under [the iframe](#the-iframe): no `sandbox`, or a sandbox that
-  includes `allow-scripts allow-same-origin allow-downloads` (without `allow-same-origin` the desk
-  has no storage), and never the `credentialless` attribute (its storage is thrown away).
+  includes `allow-scripts allow-same-origin allow-downloads` (without `allow-same-origin` the
+  desk's origin is `null`, so it cannot connect at all), and never the `credentialless` attribute
+  (its storage is thrown away).
 - The desk page is served with `Cross-Origin-Embedder-Policy: require-corp` and
   `Cross-Origin-Resource-Policy: cross-origin`, so that hosts that are cross-origin isolated (COEP
   `require-corp` or `credentialless`) can embed it, and with
@@ -66,7 +67,8 @@ messages of other protocols, a `connect` from another window, from an origin tha
 answered on that port with `error` `unsupported_version` and the port is closed; the desk keeps
 waiting for a `connect` it can take. Once connected it reads no more window messages (they are
 logged and ignored), and it checks every message it sends against the protocol's schemas (a
-problem is logged; the host's own validation decides).
+problem is logged; the host's own validation decides). `ready` is always the first message on the
+port: what the host sends before it waits, and is handled in order once `ready` is out.
 
 ### Messages from the host
 
@@ -157,8 +159,8 @@ type DeskState = {
 
 type OpenOptions = {
   hostName?: string;         // ≤ 40, shown on the desk's Send button ("Send to rideo")
-  modes?: Mode[];            // the reference modes the host can use (default ["camera"])
-  defaultMode?: Mode;        // preselected in the desk (default modes[0])
+  modes?: Mode[];            // the reference modes the host takes, its order (default ["camera"])
+  defaultMode?: Mode;        // preselected in the desk's Follow menu (default modes[0])
   readOnly?: boolean;        // default false: view and export, no edits
 };
 
@@ -327,12 +329,16 @@ server {
 <iframe
   src="https://desk.example.com/desk.html"
   title="3D director's desk"
-  allow="fullscreen; clipboard-write"
+  allow="fullscreen; clipboard-write; screen-wake-lock"
 ></iframe>
 ```
 
 - No `sandbox`, or one with at least `allow-scripts allow-same-origin allow-downloads`: without
-  `allow-same-origin` the desk's origin is `null` and it has no storage.
+  `allow-same-origin` the desk's origin is `null`, so its `hello` comes from no origin the host can
+  accept and the desk never connects (it would have no storage either).
+- `screen-wake-lock` in `allow` lets the desk keep the screen on while it exports (on a phone the
+  screen would otherwise turn off and the export stop). A frame's permissions policy refuses the
+  wake lock unless the host allows it, and the desk asks for one only where it may.
 - Never the `credentialless` attribute: such a frame gets storage of its own that is thrown away
   with the page, and the local copy with it.
 - Give the frame the panel it opens in, from a phone's 390 × 844 up: up to 760 pixels wide the desk
@@ -431,10 +437,14 @@ local copy, else the brief), tells the person why, and sends `error` `state_unre
 
 The desk sends `state` after `opened`, 2 s after the last edit (at most one every 5 s while edits
 go on), on **Done**, before **Close** when edits have not been sent, and at once in answer to
-`save` (with its `id`). The desk's header bar says whether the host has the latest one ("Saved to
-rideo 12 s ago", "Changes not sent to rideo yet"). A state that would be over 64 MiB is not sent:
+`save` (with its `id`). After Done or Close nothing goes on its own: edits made then (an undo
+behind the closed panel) wait until the person goes back to the desk. The desk's header bar says
+whether the host has the latest one ("Sent to rideo 12 s ago", "Changes not sent to rideo yet");
+when the host stores it is the host's matter. A state that would be over 64 MiB is not sent:
 the desk answers with `error` `out_of_memory` (with the `save`'s `id` when it answers one), tells
-the person, and keeps the scene in the browser; the next edit tries again.
+the person, and keeps the scene in the browser; the next edit tries again. A state that cannot be
+written for another reason is answered the same way with `export_failed`
+([Readings](#readings-of-the-contract)).
 
 ### Opening a scene
 
@@ -452,7 +462,9 @@ copy of the document and applies the result as one change that undo does not tra
 is where the scene starts); the page stays responsive and shows the work. Then come `opened` and a
 first `state`, so the host's copy is current from the start. A brief that validates but cannot be
 staged is answered with `error` `invalid_scene` without an `id`; it does not count as the
-connection's `open`, and the host may send another.
+connection's `open`, and the host may send another. **Close** while the scene opens cancels the
+open: `close` goes at once and nothing after it (no `opened`, no `state`); the desk lets go of the
+scene and takes a later `open`, as it does after a Close before any `open`.
 
 ### A later brief: changes and Update shots
 
@@ -461,8 +473,9 @@ scene was staged from (core's `briefChanges`) and sends the differences in `open
 added, removed, retimed and recast, cast members added and removed. It never changes the person's
 staging by itself: a banner lists the changes with **Update shots**, which brings the staging up to
 the brief (core's `updateFromBrief`, in the worker: new shots staged, dropped ones removed, changed
-ones changed, hand edits of the others kept) as **one undo step** (Ctrl+Z takes it back), and
-**Not now**, which hides the banner. A read-only open shows the changes without the button. How a
+ones changed, hand edits of the others kept) as **one undo step** (Ctrl+Z takes it back, and the
+banner with it: the desk compares the brief with the scene again once edits pause), and **Not
+now**, which hides the banner. A read-only open shows the changes without the button. How a
 brief becomes a scene, and what an update keeps, is in
 [director-desk.md](director-desk.md#staging-from-a-brief).
 
@@ -473,50 +486,72 @@ the [browser export engine](video-export.md#browser-export) on a snapshot of the
 `reference` (draft quality, the clay look) at the brief's width, height and frame rate, one engine
 export per shot in brief order.
 
-- **Shots**: the brief's shots, those the `export` names or else all, in brief order whatever order
-  the host named them in. A shot of the brief that is not staged yet (the brief added it, and the
-  person has not pressed Update shots) is left out and named in an `error` `export_failed`. An id
-  that is no shot of the brief is answered with `bad_message`, and nothing is exported. A shot the
-  brief dropped is never exported.
+- **Shots**: the brief's shots, those the `export` names or else all (an empty list names none:
+  all), in brief order whatever order the host named them in. A shot of the brief that is not
+  staged yet (the brief added it, and the person has not pressed Update shots) is left out and
+  named in an `error` `export_failed`. An id that is no shot of the brief is answered with
+  `bad_message`, and nothing is exported. A shot the brief dropped is never exported.
 - **Modes**: `motion` renders the beauty pass in the clay look, `pose` the pose pass, `camera` the
-  depth pass; the `export`'s `modes`, else the open's `options.modes`, else `["camera"]`. Send
-  takes every mode of `options.modes`.
+  depth pass; the `export`'s `modes` (each once; an empty list asks for the open's), else the
+  open's `options.modes`, else `["camera"]`. **Send** renders the one mode the header's **Follow**
+  menu shows: the host's `options.modes` in its order (the menu shows when there are two or more),
+  preselected with `options.defaultMode`, else the first.
 - **Stills** (`still`, default true; Send always): the beauty image of each shot's first frame.
 - **Files**: `<shotId>.<mode>.mp4` and `<shotId>.still.png`, named with the host's shot ids and
-  transferred with the `result`; the desk keeps no copy, and the engine's files in the Origin
-  Private File System are deleted once the result is posted. Every clip of a shot must have
-  exactly the shot's frames, else the shot is left out (`export_failed`, naming the clip).
+  transferred with the `result`; the desk keeps no copy, and each shot's engine files in the
+  Origin Private File System are deleted as soon as their bytes are in the result. Every clip of a
+  shot must have exactly the frames the engine planned for it at the brief's rate (the shot's
+  frames resampled from the scene's rate, counted before anything renders), else the shot is left
+  out (`export_failed`, naming the clip).
 - **Progress**: `prepare`, then `render` (frames rendered and encoded of all the export's frames,
   with the shot being rendered), `encode` (files read out for the result) and `finish`, at most
-  one message every 100 ms.
+  one message every 100 ms; the last message of each phase always goes (the last frames rendered,
+  `encode` N of N, `finish`), and all of them before the `result`.
 - **Failures**: a shot that fails (out of memory, an encoder that stops) is left out and named in
-  an `error` after the `result`, with the export's `id` and the code `out_of_memory`,
-  `export_unavailable` or `export_failed`; the other shots come back. When no shot comes back the
-  export ends with one `error` instead of a `result`.
+  an `error` `export_failed` after the `result`, with the export's `id` and the cause in its
+  message (`sht_a: out of memory: …`); the other shots come back. When no shot comes back the
+  export ends with one `error` instead of a `result`: `out_of_memory` when every shot ran out of
+  memory, `export_unavailable` when the browser could encode none, else `export_failed`.
+- **Memory**: the result is handed over at once, its files' bytes in this tab, so before rendering
+  the desk estimates its size from the encoder's bit rate, the frames, the modes and the stills.
+  One over what the tab can hold for it (half of what a render may use: a quarter of the device's
+  memory, at most 2 GB) is refused at once with `out_of_memory`, the estimate and the limit in the
+  message: export fewer shots or modes at a time, or ask for a smaller size.
 - **Result**: `fps`, `width` and `height` are the brief's. Each `ShotResult` has the shot's frames
-  as staged, the files of the modes asked for, the staged camera (its lens rounded to whole
-  millimetres in 8–800, its named move), the blocking line, who moves where, whether the camera
-  shows the planned layout, and the desk's checks of the shot.
-- **Size**: a brief over 3840 × 2160 is answered with `export_unavailable` (the engine renders at
-  most that; staging and editing work at any size), and so is a browser that cannot encode H.264
-  at the brief's size and rate.
+  at the brief's rate (as the clips have them), the files of the modes asked for, the staged
+  camera (its lens rounded to whole millimetres in 8–800, its named move), the blocking line, who
+  moves where, whether the camera shows the planned layout, and the desk's checks of the shot.
+- **Size**: a brief over 3840 × 2160 (wider than 3840 or higher than 2160 pixels, a portrait scene
+  too) is answered with `export_unavailable` at once (the engine renders at most that; staging and
+  editing work at any size); the desk says so when it opens such a scene, and **Send** is off with
+  the reason. A browser that cannot encode H.264 at the brief's size and rate is answered with
+  `export_unavailable` too.
+- **Screen**: while it exports, the desk keeps the screen on where its frame may
+  ([the iframe](#the-iframe): `screen-wake-lock`).
 - **One at a time**: an `export` or Send while one runs, or while Update shots runs, is answered
   with `busy`. `cancel` with the export's `id`, or **Cancel** in the desk, ends it with `error`
   `cancelled`.
 
-A shot whose length the person changed in the desk no longer has the brief's
-`max(1, round(durationSec × fps))` frames, and a host refuses a clip of another length. Its
-`ShotResult` carries the issue `brief_length` (severity `error`) saying so, and **Send** first
-lists such shots and asks before sending. The host's `result-ack` is shown to the person: its
-message, and each shot it refused with the reason.
+A host refuses a clip of another length than the brief's `max(1, round(durationSec × fps))`
+frames. A shot has another length when the person made it longer or shorter in the desk, or when
+the brief retimed it (or changed its frame rate) since it was staged and Update shots has not
+brought it up to the brief. Its `ShotResult` carries the issue `brief_length` (severity `error`)
+saying which: for a shot the brief retimed it points to Update shots (in a read-only open, to
+opening the scene for editing), for one changed in the desk to setting its length back. **Send**
+first lists such shots in those two groups, offers **Update shots** for the brief's, and asks
+before sending. The host's `result-ack` is shown to the person: its message, and each shot it
+refused with the reason.
 
 ### Done and Close
 
 **Done** sends a last `state`, then `close` with `reason` `"done"`. **Close** sends `close` with
 `reason` `"cancel"`, after a `state` when edits have not been sent, so the host's newest state is
-always the scene as the person left it. Either cancels a running export. The desk then says that
-it is closed and waits for the host to remove the frame; **Back to the desk** returns to the scene
-(nothing is sent, and later edits send states as before).
+always the scene as the person left it. Either cancels a running export: its `error` `cancelled`
+goes first (the desk waits up to 2 s for the export to end), then the `state` and `close`. The
+desk then says that it is closed and waits for the host to remove the frame. After `close` nothing
+goes on its own (no `state`, no `progress`); an `export` is answered with `not_open`, and `save`
+still with the scene's state. **Back to the desk** returns to the scene (nothing is sent, and
+edits, those made while it was closed too, send states as before).
 
 ### Read-only
 
@@ -549,8 +584,8 @@ server, so it is a quick check of a deployment, offline too.
 ## Limits and timings
 
 From the contract: a brief has at most 200 shots, 16 cast members and 64 elements, each shot at
-most 600 s; a state at most 64 MiB. From the desk: an export at most 3840 × 2160, and one at a
-time.
+most 600 s; a state at most 64 MiB. From the desk: an export at most 3840 × 2160 (3840 pixels
+wide, 2160 high), with a result the tab can hold at once, and one at a time.
 
 Measured in headless Chromium on a 4-core machine with 15 GB of memory and software WebGL, the
 desk served by the production server and embedded by a cross-origin isolated host on another site
@@ -592,11 +627,16 @@ writes the state uncompressed and cannot read a gzipped one (`state_unreadable`)
 Where the contract leaves room, the desk takes the most robust reading:
 
 - **A brief larger than the export engine renders.** Briefs may be up to 4096 pixels a side; the
-  engine renders at most 3840 × 2160. The desk stages and edits any size and answers an export of
-  a larger brief with `export_unavailable`, its message giving the limit, rather than scaling the
-  clips.
+  engine renders at most 3840 × 2160, per axis (3840 wide, 2160 high, a portrait scene too). The
+  desk stages and edits any size, says so when it opens such a brief, and answers an export of it
+  at once with `export_unavailable`, its message giving the limit, rather than scaling the clips.
 - **A state too large to send.** No code names it: the desk sends `out_of_memory` (with the
-  `save`'s `id` when it answers one) and keeps the scene in the browser.
+  `save`'s `id` when it answers one) and keeps the scene in the browser. **A state that cannot be
+  written** for another reason (the browser refuses to compress or encode it) is answered with
+  `export_failed` the same way: no code names a failed write either.
+- **A result too large to hand over.** The contract bounds no result, but the desk hands one over
+  at once: an export whose result is estimated over what the tab can hold is refused before it
+  renders, with `out_of_memory`.
 - **An `open` that does not validate.** `open` has no `id`, so "`bad_message` when it had an `id`"
   would leave the host without an answer: the desk answers an `open` whose brief does not validate
   with `invalid_scene`, and one whose envelope (`state`, `options`) does not with `bad_message`,
@@ -606,11 +646,15 @@ Where the contract leaves room, the desk takes the most robust reading:
   that is not staged yet is one the desk could not render: left out and named in `export_failed`.
   An id that is no shot of the brief is a bad request (`bad_message`, nothing exported). Results
   come in brief order whatever order `export.shots` names them in.
-- **`frames` of a shot made longer or shorter in the desk.** The desk reports the frames its clips
-  have, adds the issue `brief_length` (an error) to that shot and asks before Send; it does not
-  stretch or cut the clip to the brief's length.
-- **Errors of shots left out** follow the `result`, each with the export's `id`; an export of which
-  no shot comes back ends with one `error` and no `result`.
+- **`frames` of a shot.** The desk reports the frames its clips have: the shot's frames resampled
+  from the scene's rate to the brief's (`round(frames × fps ÷ scene fps)`, as the engine renders
+  them), so a brief whose frame rate changed since staging still exports. Where they differ from
+  the brief's frames it adds the issue `brief_length` (an error) saying whose change it is, and
+  asks before Send; it does not stretch or cut the clip to the brief's length.
+- **Errors of shots left out** follow the `result`, each with the export's `id` and the code
+  `export_failed` whatever made the shot fail (the cause is in the message); an export of which no
+  shot comes back ends with one `error` and no `result`, its code naming the cause
+  (`out_of_memory`, `export_unavailable`, else `export_failed`).
 - **The progress phases.** The engine encodes while it renders, so `render` counts frames rendered
   and encoded, and `encode` counts the files read out for the result.
 - **`ready` before the brief.** `capabilities.export` is checked for 1280 × 720 at 24 fps (when the
@@ -622,11 +666,19 @@ Where the contract leaves room, the desk takes the most robust reading:
 - **`unsupported_version`** answers, on its port, a `connect` of a version the desk does not speak;
   the desk then closes that port and keeps waiting for a `connect` it can take.
 - **A `cancel` of an id that is not the running export** is ignored (and logged).
-- **`save` before `open`** is answered with `not_open`; after Done or Close the desk still answers
-  `save`.
-- **Options**: an empty or missing `hostName` is "the host"; `modes` keeps the contract's order
-  (motion, pose, camera) without repeats; a `defaultMode` not among `modes` becomes the first of
-  them.
+- **`save` before `open`**, and after a Close that came before any scene opened, is answered with
+  `not_open`; after Done or Close of an open scene the desk still answers `save`.
+- **Close while the scene opens** cancels the open: nothing follows `close`, and a later `open` is
+  taken (one sent before the cancelled open let go of its scene waits for it).
+- **Requests before `ready`** wait until `ready` is out, then are handled in order.
+- **Lists.** The contract bounds no list: `export.shots: []` names no shot (every shot of the brief,
+  as when it is missing), `export.modes: []` asks for the open's, and a repeated mode counts once,
+  in `export.modes` and `options.modes` alike.
+- **Options**: an empty or missing `hostName` is "the host"; `modes` keeps the host's order without
+  repeats (an empty list is the default, `["camera"]`); a `defaultMode` not among `modes` becomes
+  the first of them. The Follow menu lists `modes` in that order, and Send renders its mode.
+- **Wake lock.** The desk asks for one while it exports only where the frame's permissions policy
+  allows `screen-wake-lock`, so a host that does not allow it sees no policy violation.
 
 ## Testing a host
 
@@ -639,19 +691,21 @@ Where the contract leaves room, the desk takes the most robust reading:
   [sample](#opened-on-its-own-the-sample) with no host at all.
 - **The fake host.** `e2e/fixtures/desk-host/index.html` is a complete host of the protocol in one
   page with no dependencies: it embeds `?desk=<url>`, answers `hello` with a `connect` and a
-  `MessageChannel`, records every message (binary data in the fixtures' `$bytes` notation) and
-  keeps the last state and the last result's files; `window.host` drives it (`open`, `send`,
-  `connectFromSibling`, `postToDesk`, `messages`, `state`, `file`). A host's own end-to-end test
-  can start from it.
+  `MessageChannel`, records every message (binary data, a result's files too, in the fixtures'
+  `$bytes` notation) and keeps the last state and the last result's files; `window.host` drives
+  it (`open`, `send`, `mount`, `connectFromSibling`, `postToDesk`, `messages`, `state`, `file`). A
+  host's own end-to-end test can start from it.
 - **The end-to-end test.** `e2e/tests/desk-embed.spec.ts` serves the fake host with COOP
   `same-origin` and COEP `require-corp` from another site than the desk and goes through the
   protocol: the handshake, `ready`, `open` of the example brief, states, an export of camera and
   pose with stills (each clip checked: the index first, one `avc1` track, BT.709 limited range,
   exactly the shot's frames, a key frame first; each still an RGB PNG), `result-ack`, `save` and
-  Done, with nothing going to the network after the page has loaded; reopening from the host's
-  state and from the local copy, and with a changed brief and Update shots; what the desk ignores
-  or refuses; Send of a shot made longer; read-only; offline; a phone's 390 × 844; and the page on
-  its own. Every message the desk sends is checked against the schemas. Run it with
+  Done, with nothing going to the network after the page has loaded; reopening from the host's state
+  and from the local copy, and with a changed brief and Update shots; what the desk ignores or
+  refuses; Send of a shot made longer; Follow and Send of one mode, the viewport's keys only over
+  the viewport, a portrait brief over the export's size, and the wake lock with and without
+  `screen-wake-lock`; read-only; offline; a phone's 390 × 844; and the page on its own. Every
+  message the desk sends is checked against the schemas. Run it with
   `cd e2e && npx playwright test tests/desk-embed.spec.ts --trace off` after `npm run build`.
 
 A host should check, besides its own logic, that it:

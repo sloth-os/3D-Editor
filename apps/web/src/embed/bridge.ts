@@ -22,8 +22,10 @@ import {
  * On the port: messages of a type the desk does not know are ignored and logged; a known type that
  * does not validate is answered with error bad_message when it carried an id (an invalid `open`,
  * which carries none, with invalid_scene or bad_message without an id) and is otherwise ignored.
- * Valid messages go to the handler. Every message the desk sends is validated first (a problem is
- * logged; the message goes all the same, the host's validation decides).
+ * Valid messages go to the handler. What the host sends before the desk's `ready` waits until
+ * `ready` is out (ready is always the first message on the port), then is handled in order. Every
+ * message the desk sends is validated first (a problem is logged; the message goes all the same,
+ * the host's validation decides).
  */
 
 /** What the bridge needs of a port (a MessagePort, or a fake in tests). */
@@ -73,6 +75,9 @@ export class DeskBridge {
   private port: PortLike | null = null;
   private hostOrigin: string | null = null;
   private started = false;
+  /** Whether `ready` went out; until then the host's messages wait in `early`. */
+  private readySent = false;
+  private early: unknown[] = [];
 
   constructor(
     private readonly win: WindowLike,
@@ -171,7 +176,16 @@ export class DeskBridge {
   };
 
   private readonly onPortMessage = (e: MessageEvent): void => {
-    const parsed = parseHostMessage(e.data);
+    // the host's requests are answered after ready (which goes within 2 s of the connect)
+    if (!this.readySent) {
+      this.early.push(e.data);
+      return;
+    }
+    this.handle(e.data);
+  };
+
+  private handle(data: unknown): void {
+    const parsed = parseHostMessage(data);
     if (parsed.kind === 'unknown') {
       this.log.info(`ignored a message of unknown type '${parsed.type ?? '(none)'}'`);
       return;
@@ -182,7 +196,7 @@ export class DeskBridge {
       return;
     }
     this.handler.message(parsed.message);
-  };
+  }
 
   /** Sends a message to the host (its ArrayBuffers in `transfer`); false when not connected. */
   send(message: DeskMessage, transfer: Transferable[] = []): boolean {
@@ -190,6 +204,11 @@ export class DeskBridge {
     const problem = deskMessageProblems(message);
     if (problem) this.log.warn(`the desk sends a ${message.type} message that is not valid: ${problem}`);
     this.port.postMessage(message, transfer);
+    if (message.type === 'ready' && !this.readySent) {
+      this.readySent = true;
+      // what the host sent before ready, in its order
+      for (const data of this.early.splice(0)) this.handle(data);
+    }
     return true;
   }
 }

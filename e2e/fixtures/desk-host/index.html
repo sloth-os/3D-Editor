@@ -48,17 +48,9 @@
           out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
         return btoa(out);
       };
-      /** A message as JSON with its ArrayBuffers as {"$bytes": base64} (files: their size only). */
+      /** A message as JSON with its ArrayBuffers (a result's files too) as {"$bytes": base64}. */
       const plain = (m) =>
-        JSON.parse(
-          JSON.stringify(m, (key, v) =>
-            v instanceof ArrayBuffer
-              ? key === 'data' && m.type === 'result'
-                ? { $size: v.byteLength }
-                : { $bytes: b64(v) }
-              : v,
-          ),
-        );
+        JSON.parse(JSON.stringify(m, (key, v) => (v instanceof ArrayBuffer ? { $bytes: b64(v) } : v)));
 
       function record(m) {
         if (m && m.type === 'result') s.files = new Map(m.files.map((f) => [f.name, f.data]));
@@ -95,7 +87,10 @@
 
       window.host = {
         deskOrigin,
-        /** (Re)mounts the desk's iframe: a new page, a new connection. */
+        /**
+         * (Re)mounts the desk's iframe: a new page, a new connection. `opts.allow`: the frame's
+         * permissions (default: as docs/embedding.md shows, with screen-wake-lock).
+         */
         mount(opts = {}) {
           s.port?.close();
           s.port = null;
@@ -103,7 +98,7 @@
           s.version = opts.firstVersion ?? 1;
           const f = document.createElement('iframe');
           f.title = "3D director's desk";
-          f.allow = 'fullscreen; clipboard-write';
+          f.allow = opts.allow ?? 'fullscreen; clipboard-write; screen-wake-lock';
           f.dataset.desk = '';
           f.src = deskUrl;
           document.body.append(f);

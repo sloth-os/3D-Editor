@@ -4,7 +4,7 @@ import { getShots } from '@3d-editor/core';
 import '../ui/styles.css';
 import { session, workspace as workspaceSignal } from '../app/store';
 import { registerUiOperators } from '../editor/ui-operators';
-import { registry, runResult } from '../editor/editor';
+import { hoveredArea, registry, runResult } from '../editor/editor';
 import { installKeymap } from '../editor/keymap';
 import { browserExportSupport } from '../export';
 import { selectedShot } from '../ui/director/state';
@@ -12,6 +12,7 @@ import { showShot } from '../ui/director/playback';
 import { DeskBridge } from './bridge';
 import { DeskController } from './controller';
 import { DeskApp, SampleBar, StandalonePage } from './DeskApp';
+import { lengthChecks, wakeLockAllowed } from './export';
 import { DESK_IGNORED_KEYS, guardRegistry } from './guards';
 import type { DeskMessage } from './protocol';
 import { registerDeskServiceWorker } from './pwa';
@@ -34,7 +35,18 @@ workspaceSignal.value = 'Director';
 let readOnly = false;
 guardRegistry(registry, () => readOnly);
 installKeymap({ ignore: DESK_IGNORED_KEYS });
+// the viewport's keys act once the pointer or the focus is in the viewport (DeskApp.tsx), not before
+hoveredArea.value = 'other';
 void registerDeskServiceWorker();
+// an export keeps the screen on only where the permissions policy lets this frame do so (the host's
+// iframe `allow` names screen-wake-lock): elsewhere it never asks, so the host sees no policy violation
+if (!wakeLockAllowed()) {
+  try {
+    Object.defineProperty(navigator, 'wakeLock', { value: undefined, configurable: true });
+  } catch {
+    // a navigator that keeps its wakeLock: the export's request is refused, as before
+  }
+}
 
 const work = signal<WorkProgress | null>(null);
 const staging = new StagingClient();
@@ -69,6 +81,12 @@ function makeController(send: (m: DeskMessage, transfer?: Transferable[]) => boo
 const root = document.getElementById('app')!;
 const timings = { bootMs: 0, helloAt: 0, readyAt: 0 };
 
+/** The scene's objects, as the tests read them (a key that deletes objects changes the count). */
+function objectsNow(): number {
+  const s = session.peek();
+  return s ? s.doc.objectIds().length : 0;
+}
+
 /** The scene's shots as the tests and measurements read them: desk id, host shot id, name, frames. */
 function shotsNow() {
   const s = session.peek();
@@ -84,12 +102,26 @@ function shotsNow() {
 /** A small scripting hook for the end-to-end tests and measurements (window.__desk). */
 function exposeHook(c: DeskController): void {
   Object.assign(window, {
-    __desk: { controller: c, workspace: scene, run: runResult, timings, shots: shotsNow },
+    __desk: {
+      controller: c,
+      workspace: scene,
+      run: runResult,
+      timings,
+      shots: shotsNow,
+      objects: objectsNow,
+    },
   });
 }
 
+/** The brief's shots whose clips would have another length than the brief's (the Send check). */
+function briefLengthChecks(c: DeskController) {
+  const s = session.peek();
+  const brief = c.brief.peek();
+  return s && brief ? lengthChecks(s.doc, brief) : [];
+}
+
 function Embedded({ c }: { c: DeskController }) {
-  return <DeskApp c={c} work={work.value} lengthMismatches={() => scene.lengthMismatches()} />;
+  return <DeskApp c={c} work={work.value} lengthChecks={() => briefLengthChecks(c)} />;
 }
 
 const sampleFiles = signal<{ name: string; url: string; size: number }[]>([]);
@@ -99,7 +131,7 @@ function Sample({ c }: { c: DeskController }) {
     <DeskApp
       c={c}
       work={work.value}
-      lengthMismatches={() => scene.lengthMismatches()}
+      lengthChecks={() => briefLengthChecks(c)}
       sampleBar={<SampleBar files={sampleFiles.value} onLeave={() => location.reload()} />}
     />
   );
