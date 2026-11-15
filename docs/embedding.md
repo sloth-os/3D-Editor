@@ -483,7 +483,8 @@ then sends no `state` on its own: the host keeps the state it has until the pers
 scene, presses **Done**, or the host sends `save` ([Readings](#readings-of-the-contract)).
 
 The desk sends `state` after `opened`, 2 s after the last edit (at most one every 5 s while edits
-go on), on **Done**, before **Close** when edits have not been sent, and at once in answer to
+go on; edits count from `opened` on, so one made while the first `state` is written goes in the
+next), on **Done**, before **Close** when edits have not been sent, and at once in answer to
 `save` (with its `id`). After Done or Close nothing goes on its own: edits made then (an undo
 behind the closed panel) wait until the person goes back to the desk. The desk's header bar says
 whether the host has the latest one ("Sent to rideo 12 s ago", "Changes not sent to rideo yet");
@@ -523,7 +524,10 @@ when the check was asked for: an edit made while it runs shows it as out of date
 
 When the scene opens from a state or the local copy, the desk compares the brief with the one the
 scene was staged from (core's `briefChanges`) and sends the differences in `opened.changes`: shots
-added, removed, retimed and recast, cast members added and removed. It never changes the person's
+added, removed, retimed and recast, cast members added and removed. These are the contract's lists
+and nothing more, and `opened.changes` is `null` when none of them has an entry; what else differs
+(the desk's own notes, such as the frame rate, the set or shots renumbered) only the desk's banner
+lists, with Update shots as for the others. It never changes the person's
 staging by itself: a banner lists the changes with **Update shots**, which brings the staging up to
 the brief (core's `updateFromBrief`, in the worker: new shots staged, dropped ones removed, changed
 ones changed, hand edits of the others kept) as **one undo step** (Ctrl+Z takes it back, and the
@@ -540,10 +544,12 @@ the [browser export engine](video-export.md#browser-export) on a snapshot of the
 export per shot in brief order.
 
 - **Shots**: the brief's shots, those the `export` names or else all (an empty list names none:
-  all), in brief order whatever order the host named them in. A shot of the brief that is not
-  staged yet (the brief added it, and the person has not pressed Update shots) is left out and
-  named in an `error` `export_failed`. An id that is no shot of the brief is answered with
-  `bad_message`, and nothing is exported. A shot the brief dropped is never exported.
+  all), in the order of the `open`'s brief, whatever order the host named them in and whatever
+  order they were staged in (a brief that reorders its shots needs no Update shots for that). A
+  shot of the brief that is not staged yet (the brief added it, and the person has not pressed
+  Update shots) is left out and named in an `error` `export_failed`. An id that is no shot of the
+  brief is answered with `bad_message`, and nothing is exported. A shot the brief dropped is never
+  exported.
 - **Modes**: `motion` renders the beauty pass in the clay look, `pose` the pose pass, `camera` the
   depth pass; the `export`'s `modes` (each once; an empty list asks for the open's), else the
   open's `options.modes`, else `["camera"]`. **Send** renders the one mode the header's **Follow**
@@ -558,8 +564,9 @@ export per shot in brief order.
   out (`export_failed`, naming the clip).
 - **Progress**: `prepare`, then `render` (frames rendered and encoded of all the export's frames,
   with the shot being rendered), `encode` (files read out for the result) and `finish`, at most
-  one message every 100 ms; the last message of each phase always goes (the last frames rendered,
-  `encode` N of N, `finish`), and all of them before the `result`.
+  one message every 100 ms, also when a busy page runs its timers late; the last message of each
+  phase always goes, at once when the next phase starts (the last frames rendered, `encode` N of
+  N, `finish`), and all of them before the `result`.
 - **Failures**: a shot that fails (out of memory, an encoder that stops) is left out and named in
   an `error` `export_failed` after the `result`, with the export's `id` and the cause in its
   message (`sht_a: out of memory: …`); the other shots come back. When no shot comes back the
@@ -722,7 +729,12 @@ Where the contract leaves room, the desk takes the most robust reading:
 - **The shots of an export.** "The brief" is the brief of this connection's `open`. A shot of it
   that is not staged yet is one the desk could not render: left out and named in `export_failed`.
   An id that is no shot of the brief is a bad request (`bad_message`, nothing exported). Results
-  come in brief order whatever order `export.shots` names them in.
+  come in the order of that brief whatever order `export.shots` names them in, also when the host
+  reordered its shots since the scene was staged (before Update shots and after it).
+- **`opened.changes`** holds the contract's five lists and nothing more, and is `null` when none of
+  them has an entry: a brief that differs only in what they do not cover (the set, the props,
+  shots renumbered or reworded) gives `null`, and the desk's own banner lists it and offers Update
+  shots.
 - **`frames` of a shot.** The desk reports the frames its clips have: the shot's frames resampled
   from the scene's rate to the brief's (`round(frames × fps ÷ scene fps)`, as the engine renders
   them), so a brief whose frame rate changed since staging still exports. Where they differ from

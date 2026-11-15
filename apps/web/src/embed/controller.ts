@@ -22,6 +22,7 @@ import {
   type OpenSource,
   type Phase,
   type ProgressMessage,
+  type ProtocolBriefChanges,
   type ResultAckMessage,
 } from './protocol';
 import { StateTooLarge } from './state';
@@ -33,17 +34,21 @@ import type { LengthMismatch, OpenOutcome } from './workspace';
  * - `ready` right after the connect (within 2 s): its version and whether this browser can export
  *   (checked for 1280 × 720 at 24 fps, since ready comes before the brief; each export checks again
  *   at the brief's real size). The bridge holds what the host sends before it until ready is out.
- * - `open` once: the scene from the host's state, the local copy or the brief, then `opened` and a
- *   first `state` (none after a state it could not read: the host's copy stays until an edit, Done
- *   or save). A second open is answered with busy. An open that fails (a brief the desk cannot
- *   stage) is answered with invalid_scene and does not count: the host may send another. Close while
- *   the scene opens cancels the open: nothing more is sent, and the host may send another.
- * - `state` after `opened`, after edits (2 s after the last change, at most one every 5 s), when
- *   the person presses Done, and in answer to `save` (with its id; not_open when no scene is open).
+ * - `open` once: the scene from the host's state, the local copy or the brief, then `opened` (its
+ *   `changes` the contract's lists only, null when they are all empty; the banner also shows the
+ *   desk's own notes) and a first `state` (none after a state it could not read: the host's copy
+ *   stays until an edit, Done or save). A second open is answered with busy. An open that fails (a
+ *   brief the desk cannot stage) is answered with invalid_scene and does not count: the host may
+ *   send another. Close at any moment of an open cancels it: nothing more is sent, and the host may
+ *   send another.
+ * - `state` after `opened`, after edits (2 s after the last change, at most one every 5 s; edits
+ *   are followed from `opened` on, those made while the first state is written too), when the
+ *   person presses Done, and in answer to `save` (with its id; not_open when no scene is open).
  *   Never after close on its own: edits made then wait until the person goes back to the desk.
  * - `export` (and the person's Send, id `desk-<n>`, of the mode the desk's Follow menu shows): the
- *   brief's shots (those named, else all) in brief order; progress at most about ten times a
- *   second (the last of each phase always), then `result` (its files transferred), and an
+ *   brief's shots (those named, else all) in the open's brief order, also after the host reordered
+ *   them since staging; progress at most one message per 100 ms (the last of each phase always,
+ *   early), however late the page runs its timers, then `result` (its files transferred), and an
  *   `export_failed` error per shot left out (one that failed, or one the brief has that is not
  *   staged); bad_message for ids that are no shots of the brief; export_unavailable at once for a
  *   brief over the export's size; busy while another export or an update runs, not_open before the
@@ -109,6 +114,30 @@ export function resolveOptions(o: OpenMessage['options'] | undefined): DeskOptio
   const modes = o?.modes?.length ? uniqueModes(o.modes) : (['camera'] as Mode[]);
   const defaultMode = o?.defaultMode && modes.includes(o.defaultMode) ? o.defaultMode : modes[0];
   return { hostName: o?.hostName?.trim() || 'the host', modes, defaultMode, readOnly: o?.readOnly === true };
+}
+
+/**
+ * The brief's changes as `opened` sends them: the contract's lists only (core's briefChanges adds
+ * the desk's own `other` notes, which only its banner shows), and null when none of them has an
+ * entry.
+ */
+export function contractChanges(c: BriefChanges | null): ProtocolBriefChanges | null {
+  if (!c) return null;
+  const out: ProtocolBriefChanges = {
+    added: [...c.added],
+    removed: [...c.removed],
+    retimed: [...c.retimed],
+    recast: [...c.recast],
+    cast: { added: [...c.cast.added], removed: [...c.cast.removed] },
+  };
+  const empty =
+    !out.added.length &&
+    !out.removed.length &&
+    !out.retimed.length &&
+    !out.recast.length &&
+    !out.cast.added.length &&
+    !out.cast.removed.length;
+  return empty ? null : out;
 }
 
 /** The size the ready message's export check is made for (ready comes before the brief). */
@@ -389,11 +418,18 @@ export class DeskController {
     // storage that failed: the scene is kept in memory only (workspace.ts)
     if (r.notice) notices.push(r.notice);
     if (notices.length) this.tell('warning', notices.join(' '));
-    this.deps.send({ type: 'opened', sceneId: m.scene.id, source: r.source, changes: r.changes });
+    // the contract's lists only (the banner shows the desk's own notes too)
+    this.deps.send({
+      type: 'opened',
+      sceneId: m.scene.id,
+      source: r.source,
+      changes: contractChanges(r.changes),
+    });
+    // edits from now on, those made while the first state is written too (the scene is open)
+    this.stopEdits = this.deps.workspace.onEdit(() => this.edited());
     // after a state it could not read, opening sends none on its own: the host keeps its copy
     // until an edit, Done or save (docs/embedding.md, Readings)
     if (!r.unreadable) await this.sendState();
-    this.stopEdits = this.deps.workspace.onEdit(() => this.edited());
   }
 
   // ---------------------------------------------------------------- state
@@ -592,18 +628,37 @@ export class DeskController {
     // at most one message per PROGRESS_INTERVAL_MS otherwise; the latest one waiting goes when the
     // interval ends, or before the result
     if (this.lastProgressAt === 0 || now - this.lastProgressAt >= PROGRESS_INTERVAL_MS) {
+      // it replaces the one waiting, and the timer of that one goes with it
+      this.clearProgressTimer();
       this.flushProgress(msg);
       return;
     }
     this.pendingProgress = msg;
-    if (this.progressTimer === null)
-      this.progressTimer = this.timers.setTimeout(
-        () => {
-          this.progressTimer = null;
-          if (this.pendingProgress) this.flushProgress(this.pendingProgress);
-        },
-        PROGRESS_INTERVAL_MS - (now - this.lastProgressAt),
-      );
+    this.scheduleProgress();
+  }
+
+  /**
+   * Sends the message waiting once PROGRESS_INTERVAL_MS have passed since the last one. The timer
+   * checks again when it runs: it may run late (a busy page runs due timers after the events
+   * queued before them), or after a phase's last message went early.
+   */
+  private scheduleProgress(): void {
+    if (this.progressTimer !== null) return;
+    const wait = PROGRESS_INTERVAL_MS - (this.timers.now() - this.lastProgressAt);
+    this.progressTimer = this.timers.setTimeout(
+      () => {
+        this.progressTimer = null;
+        if (!this.pendingProgress) return;
+        if (this.timers.now() - this.lastProgressAt < PROGRESS_INTERVAL_MS) return this.scheduleProgress();
+        this.flushProgress(this.pendingProgress);
+      },
+      Math.max(0, wait),
+    );
+  }
+
+  private clearProgressTimer(): void {
+    if (this.progressTimer !== null) this.timers.clearTimeout(this.progressTimer);
+    this.progressTimer = null;
   }
 
   private flushProgress(msg: ProgressMessage): void {
@@ -615,8 +670,7 @@ export class DeskController {
   }
 
   private stopProgress(): void {
-    if (this.progressTimer !== null) this.timers.clearTimeout(this.progressTimer);
-    this.progressTimer = null;
+    this.clearProgressTimer();
     this.pendingProgress = null;
     this.lastProgressAt = 0;
   }
@@ -681,7 +735,12 @@ export class DeskController {
       );
       if (!shots.length)
         return fail('export_failed', notStaged.join(' ') || 'The scene has no staged shots to export.');
-      const results = await this.deps.workspace.results(update, shots);
+      // in the open's brief order (the contract's): the worker reports the order the scene was
+      // staged in, another one once the host reordered its shots, before and after Update shots
+      const rank = new Map(shots.map((id, i) => [id, i]));
+      const results = (await this.deps.workspace.results(update, shots)).sort(
+        (a, b) => (rank.get(a.shotId) ?? shots.length) - (rank.get(b.shotId) ?? shots.length),
+      );
       if (abort.signal.aborted) return fail('cancelled', 'The export was cancelled.');
       if (!results.length) return fail('export_failed', 'The scene has no staged shots to export.');
       const req: DeskExportRequest = {

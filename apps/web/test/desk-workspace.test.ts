@@ -4,7 +4,8 @@ import * as Y from 'yjs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getShots, type SceneBrief } from '@3d-editor/core';
 import { session } from '../src/app/store';
-import { DeskController } from '../src/embed/controller';
+import { DeskController, type ControllerDeps } from '../src/embed/controller';
+import type { DeskExportOutcome, DeskExportRequest } from '../src/embed/export';
 import type { DeskMessage } from '../src/embed/protocol';
 import { StagingClient } from '../src/embed/staging';
 import { decodeDeskState, encodeDeskState, readLineage } from '../src/embed/state';
@@ -532,8 +533,11 @@ function handTimers() {
   };
 }
 
-/** The real controller over a real workspace: what it sends. */
-async function controllerWith(ws: DeskWorkspace) {
+/** The real controller over a real workspace: what it sends (`runExport`: a fake export, available). */
+async function controllerWith(
+  ws: DeskWorkspace,
+  o: { hostOrigin?: string; runExport?: ControllerDeps['runExport'] } = {},
+) {
   const sent: DeskMessage[] = [];
   const timers = handTimers();
   const c = new DeskController({
@@ -542,14 +546,38 @@ async function controllerWith(ws: DeskWorkspace) {
       return true;
     },
     workspace: ws,
-    exportSupport: () => Promise.resolve({ available: false, reason: 'not in this test' }),
+    exportSupport: () =>
+      Promise.resolve(
+        o.runExport ? { available: true, reason: null } : { available: false, reason: 'not in this test' },
+      ),
+    runExport: o.runExport,
     deskVersion: 'test',
     timers,
     log: () => {},
   });
-  await c.connected('https://host.example');
+  await c.connected(o.hostOrigin ?? 'https://host.example');
   return { c, sent, timers, ofType: (t: DeskMessage['type']) => sent.filter((m) => m.type === t) };
 }
+
+/** An export that hands back every shot asked, in the order asked, with no files. */
+const echoExport = () =>
+  vi.fn(async (req: DeskExportRequest): Promise<DeskExportOutcome> => ({
+    shots: req.shots.map((m) => ({
+      shotId: m.shotId,
+      frames: m.frames,
+      durationSec: m.durationSec,
+      references: {},
+      still: null,
+      camera: m.camera,
+      line: m.line,
+      moves: m.moves,
+      planAgrees: m.planAgrees,
+      issues: m.issues,
+    })),
+    files: [],
+    failures: [],
+    release: async () => {},
+  }));
 
 describe('the desk workspace with the controller', () => {
   it('sends no state on its own after one it could not read, until an edit', async () => {
@@ -605,6 +633,40 @@ describe('the desk workspace with the controller', () => {
     expect(same(new Uint8Array(first.state.data), original)).toBe(true);
     c.dispose();
   });
+
+  it("exports in the open's brief order after the host reordered its shots, before and after Update shots", async () => {
+    const host = origin();
+    // staged here as A, B
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    first.close();
+    // the host's brief now has B first
+    const reordered = EXAMPLE();
+    const [a, b] = reordered.shots;
+    reordered.shots = [
+      { ...b, index: 0 },
+      { ...a, index: 1 },
+    ];
+    const runExport = echoExport();
+    const ws = workspace();
+    const { c, ofType } = await controllerWith(ws, { hostOrigin: host, runExport });
+    c.message({ type: 'open', scene: reordered, state: null });
+    await vi.waitFor(() => expect(ofType('opened')).toHaveLength(1));
+    expect(ofType('opened')[0]).toMatchObject({ source: 'local' });
+    const resultShots = (i: number) =>
+      (ofType('result')[i] as Extract<DeskMessage, { type: 'result' }>).shots.map((s) => s.shotId);
+    c.message({ type: 'export', id: 'r-1', still: false });
+    await vi.waitFor(() => expect(ofType('result')).toHaveLength(1), { timeout: 10_000 });
+    expect(runExport.mock.calls[0][0].shots.map((m) => m.shotId)).toEqual([SHOT_B, SHOT_A]);
+    expect(resultShots(0)).toEqual([SHOT_B, SHOT_A]);
+    // Update shots brings the staging to the brief: still the brief's order
+    await c.updateShots();
+    c.message({ type: 'export', id: 'r-2', still: false });
+    await vi.waitFor(() => expect(ofType('result')).toHaveLength(2), { timeout: 10_000 });
+    expect(resultShots(1)).toEqual([SHOT_B, SHOT_A]);
+    expect(ofType('error')).toEqual([]);
+    c.dispose();
+  }, 30_000);
 
   it('tells the person when storage failed and the scene is in memory only', async () => {
     vi.spyOn(localIndex, 'put').mockRejectedValue(

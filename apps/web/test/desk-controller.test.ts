@@ -95,13 +95,14 @@ function setup(
     workspace?: Partial<SceneWorkspace>;
     support?: ControllerDeps['exportSupport'];
     runExport?: ControllerDeps['runExport'];
+    timers?: ControllerDeps['timers'];
   } = {},
 ) {
   const sent: { message: DeskMessage; transfer?: Transferable[]; at: number }[] = [];
   const { ws, edit } = fakeWorkspace(o.workspace);
   const c = new DeskController({
     send: (message, transfer) => {
-      sent.push({ message, transfer, at: Date.now() });
+      sent.push({ message, transfer, at: o.timers ? o.timers.now() : Date.now() });
       return true;
     },
     workspace: ws,
@@ -109,6 +110,7 @@ function setup(
     runExport: o.runExport,
     deskVersion: '1.2.3',
     log: () => {},
+    ...(o.timers ? { timers: o.timers } : {}),
   });
   const ofType = (t: DeskMessage['type']) => sent.map((s) => s.message).filter((m) => m.type === t) as any[];
   return { c, ws, edit, sent, ofType };
@@ -152,6 +154,35 @@ const waitUntil = <T>(fn: () => T | Promise<T>) => vi.waitFor(fn, { timeout: 10_
 const flush = async () => {
   for (let i = 0; i < 10; i++) await Promise.resolve();
 };
+
+/**
+ * Timers the test runs by hand: `busy` moves the clock on without running the timers that come due
+ * (the page is busy, so they run late: a browser queues a due timer behind the events posted before
+ * it), `runDue` then runs them, `advance` does both.
+ */
+function handTimers(start = 1000) {
+  let now = start;
+  let seq = 0;
+  const due = new Map<number, { at: number; fn: () => void }>();
+  const runDue = () => {
+    for (const [id, t] of [...due].sort((a, b) => a[1].at - b[1].at))
+      if (t.at <= now && due.delete(id)) t.fn();
+  };
+  return {
+    now: () => now,
+    setTimeout: (fn: () => void, ms: number) => {
+      due.set(++seq, { at: now + ms, fn });
+      return seq;
+    },
+    clearTimeout: (h: unknown) => void due.delete(h as number),
+    busy: (ms: number) => void (now += ms),
+    runDue,
+    advance(ms: number) {
+      now += ms;
+      runDue();
+    },
+  };
+}
 
 async function opened(t: ReturnType<typeof setup>, options?: object) {
   await t.c.connected('https://host.example');
@@ -833,6 +864,166 @@ describe('the desk controller', () => {
     await rw.c.updateShots();
     expect(rw.ws.updateFromBrief).toHaveBeenCalledTimes(1);
     expect(rw.c.changes.value).toBeNull();
+  });
+
+  it("sends the contract's lists in opened.changes, null when they are all empty; the banner keeps the desk's own notes", async () => {
+    const onlyOther = {
+      added: [],
+      removed: [],
+      retimed: [],
+      recast: [],
+      cast: { added: [], removed: [] },
+      other: ['2 shots renumbered'],
+    };
+    const t = setup({
+      workspace: { open: vi.fn(async () => ({ ...outcome, source: 'local' as const, changes: onlyOther })) },
+    });
+    await opened(t);
+    expect(t.ofType('opened')[0]).toEqual({
+      type: 'opened',
+      sceneId: 'clp_1',
+      source: 'local',
+      changes: null,
+    });
+    // the desk's banner still lists what else differs
+    expect(t.c.changes.value).toEqual(onlyOther);
+
+    const both = { ...CHANGES, other: ['the set'] };
+    const u = setup({
+      workspace: { open: vi.fn(async () => ({ ...outcome, source: 'state' as const, changes: both })) },
+    });
+    await opened(u);
+    const sent = u.ofType('opened')[0].changes;
+    expect(sent).toEqual(CHANGES);
+    expect(Object.keys(sent)).toEqual(['added', 'removed', 'retimed', 'recast', 'cast']);
+    expect(Object.keys(sent.cast)).toEqual(['added', 'removed']);
+    expect(u.c.changes.value).toEqual(both);
+    for (const s of [...t.sent, ...u.sent]) expect(deskMessageProblems(s.message), s.message.type).toBeNull();
+  });
+
+  it('tracks an edit made while the first state is written: it goes to the host on its own, and before Close', async () => {
+    let first = true;
+    let editNow = () => {};
+    const encodeState = vi.fn(async () => {
+      // the person edits the scene while its first state is encoded (the desk is open already)
+      if (first) {
+        first = false;
+        editNow();
+      }
+      return {
+        state: { format: '3d-editor.desk-state' as const, version: 1 as const, data: new ArrayBuffer(16) },
+        shots: 2,
+      };
+    });
+    const t = setup({ workspace: { encodeState } });
+    editNow = t.edit;
+    await opened(t);
+    expect(t.c.dirty.value).toBe(true);
+    // the edit goes as a state of its own (2 s after it, at most one every 5 s)
+    await vi.advanceTimersByTimeAsync(STATE_MIN_INTERVAL_MS);
+    expect(t.ofType('state')).toHaveLength(2);
+    expect(t.c.dirty.value).toBe(false);
+
+    first = true;
+    const c = setup({ workspace: { encodeState } });
+    editNow = c.edit;
+    await opened(c);
+    await c.c.close();
+    expect(c.sent.map((s) => s.message.type)).toEqual(['ready', 'opened', 'state', 'state', 'close']);
+  });
+
+  it('keeps progress messages 100 ms apart when the throttle timer runs late (a busy page)', async () => {
+    const clock = handTimers(1000);
+    let hooks: any = null;
+    let finish: (() => void) | null = null;
+    const runExport = vi.fn(
+      (req: any, h: any) =>
+        new Promise<DeskExportOutcome>((resolve) => {
+          hooks = h;
+          finish = () =>
+            resolve({
+              shots: req.shots.map((m: ShotResultMeta) => ({
+                shotId: m.shotId,
+                frames: m.frames,
+                durationSec: m.frames / 24,
+                references: {},
+                still: null,
+                camera: m.camera,
+                line: m.line,
+                moves: null,
+                planAgrees: null,
+                issues: [],
+              })),
+              files: [],
+              failures: [],
+              release: async () => {},
+            });
+        }),
+    );
+    const t = setup({ runExport, timers: clock });
+    await opened(t);
+    t.c.message({ type: 'export', id: 'p-1', still: false } as never);
+    await waitUntil(() => expect(hooks).not.toBeNull());
+    const render = (done: number) => hooks.onProgress({ phase: 'render', done, total: 36, shotId: SHOT_A });
+    // prepare went at 1000; render 1 waits, its timer due at 1100
+    clock.busy(10);
+    render(1);
+    // the page is busy past 1100: a later message comes before the due timer runs, 120 ms after
+    // the last one, and goes at once
+    clock.busy(110);
+    render(2);
+    // one more 1 ms later waits; the late timer runs 1 ms after that: it must not send it now
+    clock.busy(1);
+    render(3);
+    clock.busy(1);
+    clock.runDue();
+    // it goes 100 ms after render 2
+    clock.advance(100);
+    // the phase's last message goes when the next phase starts (early: the last of a phase always
+    // goes), and the next one 100 ms after it, though a timer was due sooner
+    clock.advance(10);
+    render(4);
+    clock.busy(20);
+    hooks.onProgress({ phase: 'encode', done: 0, total: 1 });
+    clock.advance(70);
+    clock.advance(30);
+    finish!();
+    await waitUntil(() => expect(t.ofType('result')).toHaveLength(1));
+    const progress = t.sent
+      .filter((s) => s.message.type === 'progress')
+      .map((s) => [(s.message as any).phase, (s.message as any).done, s.at]);
+    expect(progress).toEqual([
+      ['prepare', 0, 1000],
+      ['render', 2, 1120],
+      ['render', 3, 1222],
+      ['render', 4, 1252],
+      ['encode', 0, 1352],
+    ]);
+  });
+
+  it("reports the shots in the open's brief order when the host reordered them since staging", async () => {
+    // the host's brief now has B first; the staging (and the worker's results) still A, then B
+    const reordered = { ...brief, shots: [brief.shots[1], brief.shots[0]] } as unknown as SceneBrief;
+    const runExport = allShots();
+    const t = setup({
+      runExport,
+      workspace: {
+        results: vi.fn(async (_u: Uint8Array, shots?: string[]) =>
+          [SHOT_A, SHOT_B].filter((id) => !shots || shots.includes(id)).map(metaOf),
+        ),
+      },
+    });
+    await t.c.connected('https://host.example');
+    t.c.message({ type: 'open', scene: reordered, state: null } as never);
+    await waitUntil(() => expect(t.ofType('state')).toHaveLength(1));
+    t.c.message({ type: 'export', id: 'o-1', still: false } as never);
+    await waitUntil(() => expect(t.ofType('result')).toHaveLength(1));
+    expect(runExport.mock.calls[0][0].shots.map((m: ShotResultMeta) => m.shotId)).toEqual([SHOT_B, SHOT_A]);
+    expect(t.ofType('result')[0].shots.map((s: { shotId: string }) => s.shotId)).toEqual([SHOT_B, SHOT_A]);
+    // whatever order the host names them in
+    t.c.message({ type: 'export', id: 'o-2', shots: [SHOT_A, SHOT_B], still: false } as never);
+    await waitUntil(() => expect(t.ofType('result')).toHaveLength(2));
+    expect(t.ofType('result')[1].shots.map((s: { shotId: string }) => s.shotId)).toEqual([SHOT_B, SHOT_A]);
   });
 
   it('takes the contract defaults for options', () => {

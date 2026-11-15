@@ -271,13 +271,18 @@ test.describe('the embeddable desk', () => {
     expect(render.at(-1).done).toBe(72 + 60);
     expect(progress.filter((m) => m.phase === 'encode').at(-1)).toMatchObject({ done: 6, total: 6 });
     expect(progress.at(-1).phase).toBe('finish');
-    // about ten a second at most (one per 100 ms; a phase's last message goes at once; the host's
-    // clock sees them with the jitter of its event loop, so: any six render messages in a row but
-    // the phase's last span 400 ms or more)
-    const recs = (await allMessages(page))
-      .filter((r) => r.message.type === 'progress' && r.message.phase === 'render')
-      .slice(0, -1);
-    for (let i = 5; i < recs.length; i++) expect(recs[i].at - recs[i - 5].at).toBeGreaterThan(400);
+    // at most one message every 100 ms, by the desk's own clock when it sent them (the host's clock
+    // sees them with the stalls of its own event loop); a phase's last message goes at once when the
+    // next phase starts, so it may follow the one before it sooner
+    const sentAt: { id: string; phase: string; at: number }[] = (
+      await frame.evaluate(() => (window as any).__desk.progressSent())
+    ).filter((p: { id: string }) => p.id === 'exp-1');
+    expect(sentAt.length).toBe(progress.length);
+    for (let i = 1; i < sentAt.length; i++) {
+      const lastOfPhase = i === sentAt.length - 1 || sentAt[i + 1].phase !== sentAt[i].phase;
+      // 100 ms by the desk's Date.now, measured with performance.now: within 2 ms of it
+      if (!lastOfPhase) expect(sentAt[i].at - sentAt[i - 1].at, `progress ${i}`).toBeGreaterThanOrEqual(98);
+    }
 
     expect(result).toMatchObject({ id: 'exp-1', sceneId: EXAMPLE.id, fps: 24, width: 1280, height: 720 });
     expect(result.shots.map((s: any) => s.shotId)).toEqual([SHOT_A, SHOT_B]);

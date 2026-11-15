@@ -80,6 +80,8 @@ function makeController(send: (m: DeskMessage, transfer?: Transferable[]) => boo
 
 const root = document.getElementById('app')!;
 const timings = { bootMs: 0, helloAt: 0, readyAt: 0 };
+/** When each progress message went to the host (the tests check the pacing by the desk's own clock). */
+const progressSent: { id: string; phase: string; done: number; at: number }[] = [];
 
 /** The scene's objects, as the tests read them (a key that deletes objects changes the count). */
 function objectsNow(): number {
@@ -107,6 +109,7 @@ function exposeHook(c: DeskController): void {
       workspace: scene,
       run: runResult,
       timings,
+      progressSent: () => progressSent.slice(),
       shots: shotsNow,
       objects: objectsNow,
     },
@@ -167,6 +170,8 @@ if (window.parent !== window) {
   let bridge: DeskBridge | null = null;
   const c = makeController((m, transfer) => {
     if (m.type === 'ready') timings.readyAt = performance.now();
+    if (m.type === 'progress')
+      progressSent.push({ id: m.id, phase: m.phase, done: m.done, at: performance.now() });
     return bridge?.send(m, transfer) ?? false;
   });
   bridge = new DeskBridge(window, {

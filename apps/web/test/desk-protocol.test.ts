@@ -212,4 +212,17 @@ describe('protocol helpers', () => {
       deskMessageProblems({ type: 'progress', id: 'e', phase: 'render', done: -1, total: 2 } as never),
     ).toMatch(/done/);
   });
+
+  it("checks that opened.changes holds the contract's lists and nothing more", () => {
+    const changed = load(DIR, 'opened-changed.json');
+    expect(deskMessageProblems(changed)).toBeNull();
+    // the desk's own notes of what else differs are not the contract's
+    const other = { ...changed, changes: { ...changed.changes, other: ['2 shots renumbered'] } };
+    expect(deskMessageProblems(other)).toMatch(/other/);
+    const cast = {
+      ...changed,
+      changes: { ...changed.changes, cast: { ...changed.changes.cast, renamed: [] } },
+    };
+    expect(deskMessageProblems(cast)).toMatch(/renamed/);
+  });
 });

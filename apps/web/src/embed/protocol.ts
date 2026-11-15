@@ -108,12 +108,17 @@ export const OpenOptionsSchema = z.object({
 });
 export type OpenOptions = z.infer<typeof OpenOptionsSchema>;
 
-export const BriefChangesSchema = z.object({
+/**
+ * The brief's changes as `opened` carries them: the contract's lists and nothing else (the desk's own
+ * notes of what else differs stay in its banner: controller.ts contractChanges), so the desk's check
+ * of what it sends catches anything more.
+ */
+export const BriefChangesSchema = z.strictObject({
   added: z.array(IdSchema),
   removed: z.array(IdSchema),
   retimed: z.array(IdSchema),
   recast: z.array(IdSchema),
-  cast: z.object({ added: z.array(IdSchema), removed: z.array(IdSchema) }),
+  cast: z.strictObject({ added: z.array(IdSchema), removed: z.array(IdSchema) }),
 });
 export type ProtocolBriefChanges = z.infer<typeof BriefChangesSchema>;
 
