@@ -425,7 +425,8 @@ it, saying "This scene is open in another tab or window of this browser. The des
 soon as it is closed there.", and opens the scene once the first lets go of it: when that desk's
 page goes away or opens another scene (after Done or Close a desk keeps its scene, as the person
 may go back to it). It never clears the database under the first. A Close ends the wait. Browsers
-without Web Locks do not let desks wait for each other.
+without Web Locks (Safari before 15.4) do not let desks wait for each other, so there a second desk
+on the scene can still replace the copy under the first.
 
 ### The desk state
 
