@@ -6,6 +6,7 @@ import {
   buildManifest,
   buildPalette,
   contactSheet,
+  documentSimulationBytes,
   downscaleRGBA,
   encodePNG,
   encodeRawPNG,
@@ -21,6 +22,7 @@ import {
   renderExportFrame,
   resultBytes,
   rgbaToRGB,
+  sceneFrameAt,
   simulateRigidBodies,
   simulatesRigidBodies,
   stringLines,
@@ -130,6 +132,8 @@ export class ExportWorkerEngine {
     });
     const simulates = simulatesRigidBodies(doc);
     const bodies = simulates ? doc.listObjects().filter((o) => o.rigid_body?.enabled).length : 0;
+    // the simulation runs to the last scene frame rendered and keeps every frame from the world's start
+    const last = Math.max(...plan.shots.map((s) => Math.ceil(sceneFrameAt(plan, s, s.renderFrames - 1))));
     return {
       plan,
       palette,
@@ -139,6 +143,7 @@ export class ExportWorkerEngine {
       simulates,
       bodies,
       estimate,
+      simulation: simulates ? documentSimulationBytes(doc, last) : 0,
       pageHeap: pageHeapEstimate(doc),
       name: doc.name,
     };

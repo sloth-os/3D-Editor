@@ -38,6 +38,11 @@ export interface PlanReply {
   bodies: number;
   /** What one render worker holds rendering this export (core exportRenderEstimate). */
   estimate: ExportRenderEstimate;
+  /**
+   * Bytes the first worker's rigid body simulation keeps once it has simulated to the export's last
+   * frame (core documentSimulationBytes; 0 without one): it simulates for every worker.
+   */
+  simulation: number;
   /** The JavaScript heap of a page holding the snapshot's project (render/memory.ts pageHeapEstimate). */
   pageHeap: number;
   /** The snapshot's project name. */

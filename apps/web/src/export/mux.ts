@@ -217,6 +217,8 @@ export class StreamMuxer {
       throw new Error(`the sequence got ${s.packets} of its ${this.o.frames} frames from the encoder`);
     }
     await s.output.finalize();
+    // the muxer lets the file go (its samples, the buffer it was written to): the caller keeps the bytes
+    this.sequence = null;
     if (this.o.sequence !== 'memory') return null;
     const buffer = (s.target as BufferTarget).buffer;
     if (!buffer) throw new Error('the sequence was not written');

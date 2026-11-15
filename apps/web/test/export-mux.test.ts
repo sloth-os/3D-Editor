@@ -77,6 +77,11 @@ describe('stream muxer', () => {
     const keys = new Set([0, 3, 5, 7]);
     for (let f = 0; f < 9; f++) await m.add(chunk(f, keys.has(f)), f === 0 ? CONFIG : null);
     const seq = await m.finish();
+    // once it has handed them over the muxer keeps none of the files (each copy the page holds counts)
+    expect(m as unknown as { sequence: unknown; clip: unknown }).toMatchObject({
+      sequence: null,
+      clip: null,
+    });
     expect(clips.map(([s]) => s)).toEqual([0, 1, 2]);
     const counts = clips.map(([, b]) => mp4Info(b));
     expect(counts.map((c) => c.samples)).toEqual([3, 2, 4]);

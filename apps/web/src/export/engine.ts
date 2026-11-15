@@ -28,7 +28,8 @@ import {
   type StreamSpec,
   type VideoExportParams,
 } from '@3d-editor/core';
-import { tabMemory, type TabMemory } from '../render/memory';
+import type { TabMemory } from '../render/memory';
+import { tabMemoryWithRenders } from '../render/path-trace';
 import {
   KeyFrameSchedule,
   browserConfigProbe,
@@ -38,10 +39,12 @@ import {
   type VideoEncoding,
 } from './codec';
 import { StreamEncoder, type VideoEncoderFactory, type VideoFrameFactory } from './encode';
+import { holdExportMemory } from './held';
 import {
   MAX_BYTES_AHEAD,
   fewerWorkersWarning,
   frameReplyBytes,
+  framesInFlight,
   pageNeeds,
   planExportWorkers,
   workerNeeds,
@@ -115,13 +118,19 @@ export interface EngineOptions {
   store?: (id: string) => Promise<ExportStore>;
   /** Most render workers (default: the device's cores, at most MAX_EXPORT_WORKERS). */
   maxWorkers?: number;
-  /** The tab's memory, given the page heap of a page holding the project (default: tabMemory). */
+  /**
+   * The tab's memory, given the page heap of a page holding the project (default:
+   * tabMemoryWithRenders, with what the path traced renders and the other exports running in the
+   * tab hold).
+   */
   memory?: (pageHeap: number) => TabMemory;
   now?: () => Date;
   /** The raw pass digests and metadata of every rendered frame (the parity check with core in Node). */
   digests?: (shot: string, k: number, digests: Record<string, string>, meta: FrameMeta | null) => void;
   /** The screen wake lock and the page's visibility (default: the page's; see keepAwake). */
   wakeLock?: WakeLockEnv;
+  /** Bytes of frames rendered ahead of encoding at most (default MAX_BYTES_AHEAD; tests lower it). */
+  maxBytesAhead?: number;
 }
 
 /** A finished export as the engine returns it (index.ts gives it its public shape). */
@@ -334,9 +343,12 @@ export async function runBrowserExport(
 
   let store: ExportStore | null = null;
   const encoders: StreamEncoder[] = [];
-  const muxers: StreamMuxer[] = [];
+  /** The muxer of each video stream (null once its files are written: its buffers can go). */
+  const muxers: (StreamMuxer | null)[] = [];
   const pendingFiles: { abort(): Promise<void> }[] = [];
   const release = keepAwake(opts.wakeLock);
+  /** Lets the memory this export holds go (other renders of the tab count it while it runs). */
+  let unhold = () => {};
   try {
     if (opfsAvailable() && !opts.store) await sweepExportDirectories();
     store = await (opts.store ?? defaultStore)(id);
@@ -400,15 +412,33 @@ export async function runBrowserExport(
     // posters and contact sheet tiles show the beauty image when it is exported, else the first pass
     const primary = streams.find((s) => s.pass === 'beauty' && !s.lossless) ?? streams[0];
 
-    // the render workers the tab's memory holds
+    // the render workers the tab's memory holds, no more than can render at once (frames in
+    // flight are capped by bytes: at 4K with every pass, one)
     const totalRender = plan.shots.reduce((n, s) => n + s.renderFrames, 0);
     const cores = Math.max(1, Math.floor(navigator.hardwareConcurrency || 4));
+    const itemBytes = frameReplyBytes(width, height, videoSpecs.length, losslessSpecs.length);
     const maxWorkers = Math.max(
       1,
-      Math.min(opts.maxWorkers ?? Math.min(cores, MAX_EXPORT_WORKERS), totalRender || 1),
+      Math.min(
+        opts.maxWorkers ?? Math.min(cores, MAX_EXPORT_WORKERS),
+        totalRender || 1,
+        framesInFlight(itemBytes, opts.maxBytesAhead),
+      ),
     );
     const longestShot = plan.shots.reduce((n, s) => Math.max(n, s.outFrames), 0);
-    const memory = (opts.memory ?? ((h: number) => tabMemory(h)))(planned.pageHeap);
+    // the rigid body matrices of one segment, simulated once for every worker (fewer frames per
+    // segment for many bodies)
+    const bytesPerBody = 16 * 8;
+    const segmentFrames = Math.max(
+      1,
+      Math.min(
+        SEGMENT_FRAMES,
+        planned.bodies ? Math.floor(MAX_PHYSICS_BYTES / (planned.bodies * bytesPerBody)) : SEGMENT_FRAMES,
+      ),
+    );
+    const physicsBytes = planned.simulates ? segmentFrames * planned.bodies * bytesPerBody : 0;
+    // what the tab holds already: the path traced renders and the other exports running in it
+    const memory = (opts.memory ?? tabMemoryWithRenders)(planned.pageHeap);
     const page = (workers: number) =>
       pageNeeds({
         width,
@@ -429,9 +459,14 @@ export async function runBrowserExport(
         },
         onDisk: store!.onDisk,
         workers,
+        physics: physicsBytes,
       });
+    const worker = workerNeeds(planned.estimate);
+    // the first worker keeps every frame of the rigid body simulation it runs for all of them
+    const simulation = { total: planned.simulation, heap: planned.simulation };
     const workerPlan = planExportWorkers({
-      worker: workerNeeds(planned.estimate),
+      worker,
+      first: simulation,
       page: page(maxWorkers),
       maxWorkers,
       memory,
@@ -439,12 +474,12 @@ export async function runBrowserExport(
     });
     if (!workerPlan.workers)
       throw new BrowserExportError(workerPlan.refusal ?? 'The export does not fit this tab', 'OUT_OF_MEMORY');
-    if (
-      workerPlan.limited &&
-      workerPlan.workers < Math.min(cores, MAX_EXPORT_WORKERS) &&
-      workerPlan.workers < totalRender
-    )
-      warn(fewerWorkersWarning(workerPlan.workers, Math.min(cores, MAX_EXPORT_WORKERS)));
+    // held from now on: renders and exports that start while this one runs count it
+    unhold = holdExportMemory(id, {
+      total: page(workerPlan.workers) + workerPlan.workers * worker.total + simulation.total,
+      heap: workerPlan.workers * worker.heap + simulation.heap,
+    });
+    if (workerPlan.limited) warn(fewerWorkersWarning(workerPlan.workers, maxWorkers));
     for (let i = 1; i < workerPlan.workers; i++) threads.push(new ExportThread(i, factory));
     await Promise.all(threads.slice(1).map((t) => t.call({ type: 'init', update: req.update })));
     checkAbort();
@@ -554,15 +589,6 @@ export async function runBrowserExport(
     const tile = contactTileSize(plan.shots.length * 2, width, height);
     const tiles: { data: Uint8ClampedArray; label: string }[] = [];
     const shotTracks: ShotTracks[] = [];
-    const itemBytes = frameReplyBytes(width, height, videoSpecs.length, losslessSpecs.length);
-    const bytesPerBody = 16 * 8;
-    const segmentFrames = Math.max(
-      1,
-      Math.min(
-        SEGMENT_FRAMES,
-        planned.bodies ? Math.floor(MAX_PHYSICS_BYTES / (planned.bodies * bytesPerBody)) : SEGMENT_FRAMES,
-      ),
-    );
     let written = 0;
     const renderStart = performance.now();
 
@@ -630,7 +656,7 @@ export async function runBrowserExport(
           count: frames.length,
           threads,
           maxAhead: 2 * threads.length,
-          maxBytes: MAX_BYTES_AHEAD,
+          maxBytes: opts.maxBytesAhead ?? MAX_BYTES_AHEAD,
           itemBytes,
           signal,
           // a frame whose worker stopped (out of memory, most likely) is not rendered again
@@ -739,11 +765,17 @@ export async function runBrowserExport(
     let encodeDone = 0;
     progress({ phase: 'encode', done: 0, total: encodeTotal });
     const sequences: (StoredFile & { kind: BrowserExportFileKind })[] = [];
+    /** The codec string of the videos as written (the first stream's: they share their settings). */
+    let writtenCodec: string | null = null;
     for (let j = 0; j < encoders.length; j++) {
       checkAbort();
       await encoders[j].flush();
       encoders[j].close();
-      const bytes = await muxers[j].finish();
+      const muxer = muxers[j]!;
+      const bytes = await muxer.finish();
+      writtenCodec ??= muxer.codec;
+      // the stream's files are written (or about to be stored): its buffers can go
+      muxers[j] = null;
       const spec = videoSpecs[j];
       if (outputs.sequence) {
         const onDisk = sequenceFiles[j];
@@ -830,8 +862,7 @@ export async function runBrowserExport(
     });
     manifest.exporter = {
       kind: 'browser',
-      // the codec string of the videos as written (the first stream's: they share their settings)
-      video_codec: videoSpecs.length ? (muxers[0]?.codec ?? encoding!.config.codec) : null,
+      video_codec: videoSpecs.length ? (writtenCodec ?? encoding!.config.codec) : null,
       bitrate: videoSpecs.length && encoding!.quantizer === null ? (encoding!.config.bitrate ?? null) : null,
       vp9_quantizer: videoSpecs.length ? encoding!.quantizer : null,
       render_workers: threads.length,
@@ -862,12 +893,13 @@ export async function runBrowserExport(
     ac.abort();
     stopAll(aborted ? cancelled() : asError(err));
     for (const e of encoders) e.close();
-    await Promise.allSettled(muxers.map((m) => m.cancel()));
+    await Promise.allSettled(muxers.map((m) => m?.cancel()));
     await Promise.allSettled(pendingFiles.map((f) => f.abort()));
     await store?.dispose().catch(() => undefined);
     throw aborted ? cancelled() : exportError(err);
   } finally {
     outer?.removeEventListener('abort', onAbort);
+    unhold();
     release();
   }
 }

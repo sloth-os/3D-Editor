@@ -2,9 +2,26 @@ import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
-import { SceneDoc, newShotId, setDeskSettings, setShots } from '@3d-editor/core';
-import { keepAwake, runBrowserExport, type EngineOptions, type WakeLockEnv } from '../src/export/engine';
+import {
+  SceneDoc,
+  defaultRigidBody,
+  documentSimulationBytes,
+  newShotId,
+  setDeskSettings,
+  setShots,
+} from '@3d-editor/core';
+import {
+  SEGMENT_FRAMES,
+  keepAwake,
+  runBrowserExport,
+  type EngineOptions,
+  type WakeLockEnv,
+} from '../src/export/engine';
 import type { VideoEncoderFactory, VideoEncoderLike, VideoFrameFactory } from '../src/export/encode';
+import { exportsHeld, holdExportMemory, type HeldMemory } from '../src/export/held';
+import { ENCODER_BYTES, WORKER_SLACK_BYTES, fewerWorkersWarning } from '../src/export/memory';
+import { WORKER_BASE_BYTES } from '../src/render/memory';
+import { tabMemoryWithRenders } from '../src/render/path-trace';
 import { MemoryStore, type ExportStore } from '../src/export/store';
 import { BrowserExportError } from '../src/export/support';
 import { inProcessWorkerFactory } from '../src/export/workers';
@@ -149,8 +166,11 @@ function engine(extra: Partial<EngineOptions> = {}) {
   return { opts, encoders, stores, started: () => started };
 }
 
-/** A cube seen by a camera, two shots (7 and 2 frames); the video model's takes last at least 0.25 s. */
-function project(): { update: Uint8Array; shots: string[] } {
+/**
+ * A cube seen by a camera, two shots (7 and 2 frames); the video model's takes last at least 0.25 s.
+ * With `rigid`, the cube is an active rigid body of the scene's rigid body world.
+ */
+function project(o: { rigid?: boolean } = {}): { update: Uint8Array; shots: string[]; doc: SceneDoc } {
   const doc = SceneDoc.create();
   const cube = doc.listObjects().find((o) => o.type === 'MESH')!.id;
   const shots = [newShotId(), newShotId()];
@@ -187,8 +207,9 @@ function project(): { update: Uint8Array; shots: string[] } {
       },
     ]);
     setDeskSettings(doc, { min_shot_s: 0.25 });
+    if (o.rigid) doc.updateObject(cube, { rigid_body: defaultRigidBody('ACTIVE') });
   });
-  return { update: Y.encodeStateAsUpdate(doc.ydoc), shots };
+  return { update: Y.encodeStateAsUpdate(doc.ydoc), shots, doc };
 }
 
 const PARAMS = {
@@ -539,6 +560,158 @@ describe('browser export (in process)', () => {
     expect(e.started()).toBe(1);
     expect(e.encoders).toHaveLength(0);
     expect(e.stores[0].disposed).toBe(true);
+  });
+
+  it('plans with what the tab holds: the other exports and path traced renders running in it', async () => {
+    const { update } = project();
+    // another export of this tab holds all but 100 MB of the 4 GB a render may use in it (half the
+    // 8 GB taken where the browser does not report its memory)
+    const unhold = holdExportMemory('another export', { total: 3.9 * 1024 ** 3, heap: 0 });
+    try {
+      const e = engine({ memory: undefined });
+      const err = (await runBrowserExport({ update, params: PARAMS }, {}, e.opts).catch(
+        (x: unknown) => x,
+      )) as BrowserExportError;
+      expect(err).toBeInstanceOf(BrowserExportError);
+      expect(err.code).toBe('OUT_OF_MEMORY');
+      expect(err.message).toMatch(
+        /, more than the 0\.1 GB a render may use in this tab \(half the device memory, taken as 8 GB where the browser does not report it, at most 4\.0 GB, less 3\.9 GB the other renders and exports running in it hold\)/,
+      );
+      expect(err.message).toContain(
+        'kept in memory: wait for the other renders and exports running in this tab to end, or export fewer frames',
+      );
+      expect(e.encoders).toHaveLength(0);
+    } finally {
+      unhold();
+    }
+    // once it ends, the tab holds this one
+    const r = await runBrowserExport({ update, params: PARAMS }, {}, engine({ memory: undefined }).opts);
+    expect(r.stats.workers).toBe(2);
+  });
+
+  it('holds its plan while it runs, for the renders and exports that start meanwhile, and lets it go when it ends', async () => {
+    const { update } = project();
+    const seen: { exports: HeldMemory; tab: HeldMemory }[] = [];
+    const look = () => seen.push({ exports: exportsHeld(), tab: tabMemoryWithRenders().held });
+    const r = await runBrowserExport(
+      { update, params: PARAMS },
+      { onProgress: (p) => p.phase !== 'prepare' && look() },
+      engine().opts,
+    );
+    expect(r.stats.workers).toBe(2);
+    expect(seen.length).toBeGreaterThan(3);
+    // two render workers and the page: two video encoders (beauty and mask), at the least
+    const least = 2 * (WORKER_BASE_BYTES + WORKER_SLACK_BYTES) + 2 * ENCODER_BYTES.base;
+    for (const s of seen) {
+      expect(s.exports.total).toBeGreaterThan(least);
+      expect(s.exports.heap).toBeGreaterThanOrEqual(2 * WORKER_BASE_BYTES);
+      expect(s.exports.heap).toBeLessThan(s.exports.total);
+      // a RASTER render or another export started now plans with it
+      expect(s.tab).toEqual(s.exports);
+      expect(s.exports).toEqual(seen[0].exports);
+    }
+    expect(exportsHeld()).toEqual({ total: 0, heap: 0 });
+
+    // cancelled or failed, it lets it go as well
+    const ctrl = new AbortController();
+    let during: HeldMemory | null = null;
+    await expect(
+      runBrowserExport(
+        { update, params: PARAMS },
+        {
+          signal: ctrl.signal,
+          onProgress: (p) => {
+            if (p.phase === 'render' && p.done === 3) {
+              during = exportsHeld();
+              ctrl.abort();
+            }
+          },
+        },
+        engine().opts,
+      ),
+    ).rejects.toMatchObject({ code: 'CANCELLED' });
+    expect(during).toEqual(seen[0].exports);
+    expect(exportsHeld()).toEqual({ total: 0, heap: 0 });
+    const failing = engine({
+      workers: inProcessWorkerFactory(
+        async () => JPEG,
+        (reply: ExportWorkerResponse) => {
+          if (reply.ok && 'video' in (reply.result as object))
+            throw Object.assign(new Error('Data cannot be cloned, out of memory.'), {
+              name: 'DataCloneError',
+            });
+        },
+      ),
+    });
+    await expect(runBrowserExport({ update, params: PARAMS }, {}, failing.opts)).rejects.toMatchObject({
+      code: 'FAILED',
+    });
+    expect(exportsHeld()).toEqual({ total: 0, heap: 0 });
+  });
+
+  it('starts no more render workers than frames can be in flight at once, and warns of none', async () => {
+    const { update } = project();
+    // frames rendered ahead capped below one frame: one renders at a time
+    const e = engine({ maxBytesAhead: 1, maxWorkers: 4 });
+    const r = await runBrowserExport({ update, params: PARAMS }, {}, e.opts);
+    expect(r.stats.workers).toBe(1);
+    expect(e.started()).toBe(1);
+    expect(r.warnings.filter((w) => w.includes('render workers'))).toEqual([]);
+  });
+
+  it("counts the rigid body simulation the first worker keeps, and a segment's matrices on the page", async () => {
+    const held = async (rigid: boolean) => {
+      const { update, doc } = project({ rigid });
+      let h: HeldMemory | null = null;
+      const r = await runBrowserExport(
+        { update, params: PARAMS },
+        { onProgress: (p) => void (p.phase === 'render' && (h ??= exportsHeld())) },
+        engine().opts,
+      );
+      expect(r.stats.workers).toBe(2);
+      return { held: h! as HeldMemory, doc };
+    };
+    const plain = await held(false);
+    const rigid = await held(true);
+    // the last scene frame rendered is the second shot's last (9), from the world's start (1)
+    const simulation = documentSimulationBytes(rigid.doc, 9);
+    expect(simulation).toBeGreaterThan(0);
+    expect(documentSimulationBytes(plain.doc, 9)).toBe(0);
+    expect(rigid.held.heap - plain.held.heap).toBe(simulation);
+    // one body, a segment of SEGMENT_FRAMES frames of 4x4 doubles
+    expect(rigid.held.total - plain.held.total).toBe(simulation + SEGMENT_FRAMES * 128);
+  });
+
+  it('plans what it then holds, the simulation included: a byte less and it starts a worker fewer', async () => {
+    const { update } = project({ rigid: true });
+    let h: HeldMemory | null = null;
+    await runBrowserExport(
+      { update, params: PARAMS },
+      { onProgress: (p) => void (p.phase === 'render' && (h ??= exportsHeld())) },
+      engine().opts,
+    );
+    const total = (h as HeldMemory | null)!.total;
+    const budget = (bytes: number) => () => ({
+      budget: bytes,
+      heapLimit: 4 * 1024 ** 3,
+      heapUsed: 0,
+      deviceGB: 8,
+      held: { total: 0, heap: 0 },
+    });
+    const fits = await runBrowserExport(
+      { update, params: PARAMS },
+      {},
+      engine({ memory: budget(total) }).opts,
+    );
+    expect(fits.stats.workers).toBe(2);
+    expect(fits.warnings.filter((w) => w.includes('render workers'))).toEqual([]);
+    const less = await runBrowserExport(
+      { update, params: PARAMS },
+      {},
+      engine({ memory: budget(total - 1) }).opts,
+    );
+    expect(less.stats.workers).toBe(1);
+    expect(less.warnings).toContain(fewerWorkersWarning(1, 2));
   });
 
   it('reports invalid parameters and unknown shots with their codes', async () => {

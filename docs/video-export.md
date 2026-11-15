@@ -31,7 +31,8 @@ update; later edits never reach the export) and hands it to the export engine
 
 1. A first render worker (a module Web Worker) applies the snapshot and plans the export (core's
    `planExport`: shots, size, frames). The tab's memory then decides how many more start (one per
-   core, at most 8; [memory](#memory-in-the-browser)), each applying the snapshot once.
+   core, at most 8, and no more than can render at once; [memory](#memory-in-the-browser)), each
+   applying the snapshot once.
 2. Per shot, the first worker measures it (depth range, shadow box, occlusion reach); per segment
    of at most 200 frames it simulates the rigid bodies once for every worker. The segment's frames
    are rendered ahead on every worker and written in order (core's `renderInOrder`, as on the
@@ -54,21 +55,22 @@ update; later edits never reach the export) and hands it to the export engine
 5. The first worker makes the contact sheet and the manifest (core's `contactSheet`,
    `buildManifest`), the others having stopped once the frames were rendered.
 
-Files go to the browser's Origin Private File System (a directory per export, written as the
-export goes, so long sequences and frame archives do not stay in memory) where the browser has it,
-else stay in memory. Every file's SHA-256 is computed while it is written. Cancel stops the workers
-and the encoders and deletes what the export wrote. A render worker that stops, or one whose answer
-cannot reach the page (the browser could not copy it, most likely for want of memory), fails the
-export with that reason: the export never waits for an answer that cannot come. The screen is kept
-on while it runs (Screen Wake Lock, where the browser allows it: the browser lets the lock go while
-the tab is hidden, and the export asks for it again each time the tab is shown). The window then
-lists the files as download links with a preview of the sequence, and **Download all (.zip)** saves
-them as one ZIP archive (stored: the videos and PNGs are compressed already). The files stay until
-the next export on this device, or until the tab closes (a later export deletes the files of closed
-tabs). An export goes on when the window is closed, as long as the tab stays open. A tab runs one
-export on this device at a time, whichever project it exports: the export is registered as Export
-is pressed (a second press starts nothing), and while it runs every project's window shows it, with
-its progress and Cancel, instead of offering Export.
+Files go to the browser's Origin Private File System (a directory per export; sequences and frame
+archives are written as the export goes and do not stay in memory, while each clip is kept in memory
+until its shot is finished) where the browser has it, else stay in memory. Every file's SHA-256 is
+computed while it is written. Cancel stops the workers and the encoders and deletes what the export
+wrote. A render worker that stops, or one whose answer cannot reach the page (the browser could not
+copy it, most likely for want of memory), fails the export with that reason: the export never waits
+for an answer that cannot come. The screen is kept on while it runs (Screen Wake Lock, where the
+browser allows it: the browser lets the lock go while the tab is hidden, and the export asks for it
+again each time the tab is shown). The window then lists the files as download links with a preview
+of the sequence, and **Download all (.zip)** saves them as one ZIP archive (stored: the videos and
+PNGs are compressed already). The files stay until the next export on this device, or until the tab
+closes (a later export deletes the files of closed tabs). An export goes on when the window is
+closed, as long as the tab stays open. A tab runs one export on this device at a time, whichever
+project it exports: the export is registered as Export is pressed (a second press starts nothing),
+and while it runs every project's window shows it, with its progress and Cancel, instead of offering
+Export.
 
 **Requirements**: a secure page (HTTPS, or `localhost`; browsers offer WebCodecs and the Origin
 Private File System only there), Web Workers, and a WebCodecs `VideoEncoder` that encodes H.264 at
@@ -124,16 +126,33 @@ on 4 render workers:
 ### Memory in the browser
 
 The page and its render workers share one renderer process, and running out of memory ends the
-whole tab, so the export starts as many render workers as the tab's memory holds and refuses at
-once, with the figures, when not even one fits (code `OUT_OF_MEMORY`). A render worker counts its
-base (32 MiB), the snapshot's scene in its heap and the renderer's working buffers at the export's
-size and passes (core's estimates, as for the server's render processes), the frame in flight and
-128 MiB of slack; the page its video encoders (an estimate: 16 MiB and 24 bytes per pixel each),
-the frames rendered ahead (two per worker, at most 128 MiB), each shot's clips until they are
-finished, and every file when the browser has no Origin Private File System. All of it must fit
-the memory a render may use in the tab (half the device memory the browser reports, at most 4 GB;
-8 GB is assumed where it reports none), and the scenes the JavaScript heaps (85 % of the tab's heap
-limit). With fewer workers than cores the export adds a warning.
+whole tab, so the export starts as many render workers as the tab's memory holds next to what the
+tab holds already (the path traced renders and the other exports running in it), and refuses at
+once, with the figures, when not even one fits (code `OUT_OF_MEMORY`). It starts no more workers
+than can render at once: the frames rendered ahead are capped at 128 MiB, so at 3840 × 2160 with
+every pass (79 MiB a frame) one frame renders at a time, on one worker.
+
+A render worker counts its base (32 MiB), the snapshot's scene in its heap and the renderer's
+working buffers at the export's size and passes (core's estimates, as for the server's render
+processes), the frame in flight and 128 MiB of slack; the first worker also the rigid body
+simulation it runs for all of them, every frame of which it keeps until the export ends (core's
+`documentSimulationBytes`). The page counts its video encoders (an estimate: 16 MiB and 24 bytes
+per pixel each), the frames rendered ahead (two per worker, at most 128 MiB, and always the one
+rendering), a segment's rigid body matrices, and each video it keeps in memory as many times as it
+holds it at once: a shot's clips until the shot is finished (a frame range's one clip is its whole
+video), and while one is finished three copies of it for an MP4 (its samples, the file written from
+them and that file trimmed) or two for a WebM. Without an Origin Private File System every file
+stays in memory, and the page counts them all: the clips and the sequences, the sequence being
+finished with its copies, the frame archives (the one being finished twice), the posters and the
+stills.
+
+All of it must fit the memory a render may use in the tab (half the device memory the browser
+reports, at most 4 GB; 8 GB is assumed where it reports none) less what the other renders and
+exports running in it hold, and the scenes the JavaScript heaps (85 % of the tab's heap limit, less
+what the page and those renders use). While it runs the export holds its plan: a path traced or
+RASTER render, or another export, started meanwhile plans with what is left, and a refusal then
+says to wait for them to end. When the memory holds fewer workers than the export could use, it
+adds a warning.
 
 ### The engine's API
 
@@ -390,7 +409,7 @@ export. In the editor, Render › Export Video… (Ctrl+Shift+F12) exports on th
 | Symptom                                                                                 | Cause and remedy                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | the Export Video window says this browser cannot export                                 | open the editor over HTTPS or on localhost, use a current browser with WebCodecs, or lower the size or frame rate its H.264 encoder refused; or choose Server where the window offers it                |
-| a browser export refused at start: running out of memory would end the tab              | the tab's memory holds no render worker for this scene at this size: lower the resolution, the passes or the scene's triangles, or export on the server                                                 |
+| a browser export refused at start: running out of memory would end the tab              | the tab's memory holds no render worker for this scene at this size next to the renders and exports running in it: wait for those to end, lower the resolution, the passes or the scene's triangles, or export on the server |
 | `features.videoExport: false`; `FFMPEG_UNAVAILABLE` "is not installed on the server"    | ffmpeg was not found, or `FFMPEG_PATH` does not run it: install it (Debian/Ubuntu `apt-get install ffmpeg`, Alpine `apk add ffmpeg`) or set `FFMPEG_PATH`, then restart                                 |
 | `FFMPEG_UNAVAILABLE` "has no libx264 encoder" although `features.videoExport` is `true` | this ffmpeg runs but was built without libx264 (the flag only checks that ffmpeg runs): install one with it (the Debian/Ubuntu and Alpine packages have it) or point `FFMPEG_PATH` to one, then restart |
 | `UNAVAILABLE` "needs render processes"                                                  | `RENDER_WORKERS=0`: set it to 1 or more                                                                                                                                                                 |

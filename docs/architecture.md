@@ -315,8 +315,9 @@ refreshes the preview row by row; at the end a worker denoises and tone maps the
 
 The tab's memory decides how many workers a render uses (`memory.ts`): the JavaScript heap, whose
 limit the page and its workers share (Chrome's `performance.memory`), and a budget of half the
-device memory the browser reports (at most 4 GB), next to the path traced renders already running
-in the tab. Only the workers an estimate of the document leaves room for start with the render, more
+device memory the browser reports (at most 4 GB), next to the path traced renders and browser video
+exports already running in the tab. Only the workers an estimate of the document leaves room for
+start with the render, more
 once the first worker reports the compiled scene; the render window shows "(memory)" after the
 thread count when the memory allows fewer threads than the pool has. A render that does not fit one
 worker is refused with the reason instead of ending the tab (V8 ends the whole tab when a worker
@@ -332,8 +333,9 @@ A RASTER render (F12, Ctrl+F12, or an RPC request for the WebGL rasterizer) eval
 the render settings on the page itself, with an evaluator of its own next to the viewport's
 (`ViewportEngine.evaluateFinal`). The geometry it builds and keeps (curve and text surfaces,
 modifier and shape key results; meshes as stored are the page's already) must fit the part of the
-heap limit a render may fill, less the page's own heap and what the path traced renders running in
-the tab hold. The page's own heap, here and in the plan of a path traced render, is estimated from
+heap limit a render may fill, less the page's own heap and what the path traced renders and browser
+video exports running in the tab hold. The page's own heap, here and in the plan of a path traced
+render, is estimated from
 its scene, as Chrome holds it (measured: 12 MiB for a new project, 31 to 34 KB per object, 84 to 89
 bytes per triangle of its meshes and of the geometry its viewport evaluation builds; counted with a
 quarter more), not read from Chrome's `usedJSHeapSize`, which counts the page's ArrayBuffers too
