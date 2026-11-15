@@ -16,6 +16,7 @@ import {
 } from '../src/ui/assets/AssetBrowser';
 import { ASSET_DRAG_TYPE } from '../src/ui/assets/drop';
 import { SEARCH_DEBOUNCE_MS } from '../src/ui/assets/search';
+import { failedThumbnailTitle } from '../src/ui/assets/thumbnail';
 import { ThumbnailService, setThumbnailService } from '../src/assets/thumbnails';
 import { MemoryThumbnailCache } from '../src/assets/thumbnails/cache';
 import { ThumbnailWorkerPool, type ThumbnailWorkerLike } from '../src/assets/thumbnails/pool';
@@ -405,9 +406,13 @@ describe('Asset Browser', () => {
     const box = byTestId(container, 'asset-thumb-box-builtin:chair')!;
     await waitFor(() => expect(box.dataset.thumbState).toBe('failed'));
     expect(box.classList.contains('failed')).toBe(true);
-    expect(box.title).toBe(
-      'The thumbnail could not be made: The thumbnail of builtin:chair could not be made: boom',
+    // core's message says what failed: the tooltip says it once
+    expect(box.title).toBe('The thumbnail of builtin:chair could not be made: boom');
+    // a reason that does not say it (a worker's failure) is introduced
+    expect(failedThumbnailTitle('Thumbnail worker failed: out of memory')).toBe(
+      'The thumbnail could not be made: Thumbnail worker failed: out of memory',
     );
+    expect(failedThumbnailTitle(null)).toBe('The thumbnail could not be made: unknown error');
     expect(byTestId(container, 'asset-thumb-error-builtin:chair')).not.toBeNull();
     expect(byTestId(container, 'asset-thumb-builtin:chair')).toBeNull();
     expect(box.querySelector('svg')).not.toBeNull();

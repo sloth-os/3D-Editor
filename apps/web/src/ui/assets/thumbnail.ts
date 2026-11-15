@@ -54,6 +54,15 @@ const IDLE: State = { status: 'idle', src: null, source: null, error: null };
 /** Whether `r`'s thumbnail is made in this browser (the built-in models). */
 export const thumbnailMadeHere = (r: StoreResult) => r.provider === BUILTIN_PROVIDER;
 
+/**
+ * The tooltip of a card whose thumbnail could not be made: the reason, said once (core's own
+ * message already says the thumbnail could not be made; a worker's failure does not).
+ */
+export function failedThumbnailTitle(error: string | null): string {
+  const reason = error?.trim() || 'unknown error';
+  return /\bcould not be made\b/i.test(reason) ? reason : `The thumbnail could not be made: ${reason}`;
+}
+
 /** The thumbnail of card `r` (its element `el`), following the list's watchers. */
 export function useCardThumbnail(
   r: StoreResult,

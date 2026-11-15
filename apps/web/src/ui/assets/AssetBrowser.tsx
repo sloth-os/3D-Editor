@@ -11,7 +11,7 @@ import { insertBlocker, insertStoreModel, insertsInFlight } from './insert';
 import { setAssetDragData } from './drop';
 import { AssetSearch, localBackend, serverBackend, type AssetQuery, type ProviderChoice } from './search';
 import { VisibilityWatcher } from './visibility';
-import { thumbnailMadeHere, useCardThumbnail, type CardWatchers } from './thumbnail';
+import { failedThumbnailTitle, thumbnailMadeHere, useCardThumbnail, type CardWatchers } from './thumbnail';
 import './assets.css';
 
 /*
@@ -367,7 +367,7 @@ function AssetCard({
         data-thumb-state={thumb.status}
         data-thumb-source={thumb.source ?? undefined}
         aria-busy={waiting}
-        title={failedHere ? `The thumbnail could not be made: ${thumb.error ?? 'unknown error'}` : undefined}
+        title={failedHere ? failedThumbnailTitle(thumb.error) : undefined}
       >
         {/* the category's icon until the thumbnail is there (made here, or fetched from the server) */}
         {!shown && <CategoryIcon category={r.category} size={34} />}
