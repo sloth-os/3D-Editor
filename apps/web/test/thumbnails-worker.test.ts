@@ -14,6 +14,7 @@ import {
   ThumbnailRenderError,
   ThumbnailWorkerPool,
   defaultWorkerCount,
+  type ThumbnailEngineLoader,
   type ThumbnailWorkerLike,
 } from '../src/assets/thumbnails/pool';
 
@@ -21,7 +22,9 @@ import {
  * The thumbnail worker (engine.ts, run by thumbnail.worker.ts) and its protocol: a render request
  * answered with core's PNG of the model (the editor server's, byte for byte) or an error code; and
  * the page's pool of one or two workers: one render per worker, workers replaced when they crash,
- * rendering on the page when they cannot start, stopped when idle or when the page goes away.
+ * rendering on the page when they cannot start (the render given to such a worker marked as never
+ * run), a stand-in whose code does not load failing its renders rather than holding its place,
+ * stopped when idle or when the page goes away.
  */
 
 /** A worker the test answers for. */
@@ -164,11 +167,48 @@ describe('the thumbnail worker pool', () => {
     const p = pool(1);
     const r = p.run({ model: 'chair', size: 64 });
     FakeWorker.all[0].crash('script not found');
-    await expect(r).rejects.toMatchObject({ code: 'CRASHED' });
+    // the render never ran: it can be asked for again (on the page)
+    await expect(r).rejects.toMatchObject({ code: 'CRASHED', notStarted: true });
     // the next render runs on the page itself, with the worker's code
     const again = await p.run({ model: 'chair', size: 64 });
     expect(FakeWorker.all).toHaveLength(1);
     expect(again.png).toEqual(renderBuiltinThumbnailPng({ id: 'chair' }, 64).png);
+    // a worker that crashed after it answered: its render ran (no asking again at once)
+    const q = pool(1);
+    const first = q.run({ model: 'chair', size: 64 });
+    FakeWorker.all[1].answer({ type: 'done' });
+    await first;
+    const second = q.run({ model: 'sofa', size: 64 });
+    FakeWorker.all[1].crash('out of memory');
+    await expect(second).rejects.toMatchObject({ code: 'CRASHED', notStarted: false });
+  });
+
+  it("fails the stand-in's renders when its code does not load, freeing the worker's place", async () => {
+    // a deploy removed the engine's chunk this page would load (or the network is gone)
+    const missing: ThumbnailEngineLoader = () =>
+      Promise.reject(new TypeError('Failed to fetch dynamically imported module: /assets/engine-0ld.js'));
+    const w = new InProcessThumbnailWorker(missing);
+    const errors: string[] = [];
+    w.onerror = (e) => void errors.push(e.message);
+    w.postMessage({ type: 'render', id: 1, model: 'chair', size: 32 });
+    w.postMessage({ type: 'render', id: 2, model: 'chair', size: 32 });
+    // every request gets an answer: an error (none is left waiting)
+    await vi.waitFor(() => expect(errors).toHaveLength(2));
+    expect(errors[0]).toContain('Failed to fetch dynamically imported module');
+    // in the pool: the render fails, the worker's place is free again, the next render runs
+    let load = missing;
+    const p = new ThumbnailWorkerPool({
+      factory: () => new InProcessThumbnailWorker(() => load()),
+      workers: 1,
+    });
+    const r = p.run({ model: 'chair', size: 32 });
+    await expect(r).rejects.toBeInstanceOf(ThumbnailRenderError);
+    // (already on the page: nowhere else to make it)
+    await expect(r).rejects.toMatchObject({ code: 'CRASHED', notStarted: false });
+    expect(p.free).toBe(1);
+    expect(p.alive).toBe(0);
+    load = () => import('../src/assets/thumbnails/engine');
+    await expect(p.run({ model: 'chair', size: 32 })).resolves.toMatchObject({ type: 'done', width: 32 });
   });
 
   it('stops every worker on stop() (the page goes away) and when idle', async () => {

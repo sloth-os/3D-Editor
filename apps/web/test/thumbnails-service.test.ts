@@ -1,15 +1,21 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { MemoryThumbnailCache } from '../src/assets/thumbnails/cache';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { IdbThumbnailCache, MemoryThumbnailCache, type ThumbnailCache } from '../src/assets/thumbnails/cache';
 import { thumbnailKey } from '../src/assets/thumbnails/keys';
-import { ThumbnailWorkerPool, type ThumbnailWorkerLike } from '../src/assets/thumbnails/pool';
+import {
+  InProcessThumbnailWorker,
+  ThumbnailWorkerPool,
+  type ThumbnailWorkerLike,
+} from '../src/assets/thumbnails/pool';
 import type { ThumbnailWorkerRequest } from '../src/assets/thumbnails/protocol';
 import { ThumbnailError, ThumbnailService } from '../src/assets/thumbnails/service';
 
 /*
  * The page's thumbnail service (service.ts): memory, then the persistent cache, then a worker;
  * one render for several tiles asking for the same thumbnail; tiles on screen first; a thumbnail
- * nobody waits for leaves the queue; failures of the model kept, failures of the worker not; the
- * workers stopped when the page goes away and started again when it comes back.
+ * nobody waits for leaves the queue; failures of the model kept, failures of the worker not; a
+ * render given to a worker that could not start made on the page instead, once; a cache whose
+ * database never answers not holding renders up; the workers stopped when the page goes away and
+ * started again when it comes back.
  */
 
 /** A worker the test answers for, one request at a time. */
@@ -53,12 +59,15 @@ const made: string[] = [];
 const revoked: string[] = [];
 const services: ThumbnailService[] = [];
 
-function service(opts: { workers?: number; cache?: MemoryThumbnailCache; memoryEntries?: number } = {}) {
-  const cache = opts.cache ?? new MemoryThumbnailCache();
+function service<C extends ThumbnailCache = MemoryThumbnailCache>(
+  opts: { workers?: number; cache?: C; memoryEntries?: number; pool?: ThumbnailWorkerPool } = {},
+) {
+  const cache = opts.cache ?? (new MemoryThumbnailCache() as ThumbnailCache as C);
   const s = new ThumbnailService({
     build: 'B',
     cache,
-    pool: new ThumbnailWorkerPool({ factory: () => new FakeWorker(), workers: opts.workers ?? 1 }),
+    pool:
+      opts.pool ?? new ThumbnailWorkerPool({ factory: () => new FakeWorker(), workers: opts.workers ?? 1 }),
     urls: {
       create: (png) => {
         const url = `blob:t/${++urls}/${png[0]}`;
@@ -78,7 +87,11 @@ afterEach(() => {
   FakeWorker.all = [];
   made.length = 0;
   revoked.length = 0;
+  vi.unstubAllGlobals();
 });
+
+/** A worker's error event before it ever answered (its module script did not load). */
+const scriptFailed = { message: '', preventDefault() {} } as unknown as ErrorEvent;
 
 describe('the thumbnail service', () => {
   it('reads the cache first and renders only what it lacks, keeping what it renders', async () => {
@@ -208,6 +221,65 @@ describe('the thumbnail service', () => {
     FakeWorker.all[1].done();
     await expect(retry.promise).resolves.toMatchObject({ source: 'render' });
     expect(s.stats().failures).toBe(2);
+  });
+
+  it('makes on the page the thumbnails it gave workers that could not start (no warning)', async () => {
+    // two module workers whose script does not load: each fails before it ever answers
+    const { s } = service({ workers: 2 });
+    const chair = s.request({ model: 'chair', size: 32 }, 'visible');
+    const sofa = s.request({ model: 'sofa', size: 32 }, 'visible');
+    await tick();
+    expect(asked()).toEqual(['chair', 'sofa']);
+    for (const w of FakeWorker.all) w.onerror?.(scriptFailed);
+    // made on the page instead (the stand-in runs the worker's code), first: not failed
+    await expect(chair.promise).resolves.toMatchObject({ source: 'render' });
+    await expect(sofa.promise).resolves.toMatchObject({ source: 'render' });
+    expect(FakeWorker.all).toHaveLength(2);
+    expect(s.stats()).toMatchObject({ renders: 2, failures: 0, queued: 0, running: 0 });
+  });
+
+  it('answers the failure when the page cannot make the thumbnail either (asked again once only)', async () => {
+    const pageWorkers: InProcessThumbnailWorker[] = [];
+    const missing = () => Promise.reject(new TypeError('Failed to fetch dynamically imported module'));
+    const pool = new ThumbnailWorkerPool({
+      factory: () => new FakeWorker(),
+      pageWorker: () => {
+        const w = new InProcessThumbnailWorker(missing);
+        pageWorkers.push(w);
+        return w;
+      },
+      workers: 1,
+    });
+    const { s } = service({ pool });
+    const chair = s.request({ model: 'chair' });
+    await tick();
+    FakeWorker.all[0].onerror?.(scriptFailed);
+    const err = await chair.promise.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ThumbnailError);
+    expect(err).toMatchObject({ code: 'CRASHED' });
+    expect((err as Error).message).toContain('Failed to fetch dynamically imported module');
+    // the module worker, then the page once: the worker's place is free, nothing waits
+    expect(pageWorkers).toHaveLength(1);
+    expect(pool.free).toBe(1);
+    expect(s.stats()).toMatchObject({ failures: 1, queued: 0, running: 0 });
+    // a card that comes back asks again (on the page)
+    const again = s.request({ model: 'chair' });
+    await expect(again.promise).rejects.toMatchObject({ code: 'CRASHED' });
+    expect(pageWorkers).toHaveLength(2);
+  });
+
+  it("renders when the cache's database never answers (kept in memory then)", async () => {
+    vi.stubGlobal('indexedDB', { open: () => new IDBOpenDBRequest() });
+    const { s, cache } = service({
+      cache: new IdbThumbnailCache({ build: 'B', name: 'thumbs-never-answers', timeoutMs: 50 }),
+    });
+    const chair = s.request({ model: 'chair' });
+    await vi.waitFor(() => expect(asked()).toEqual(['chair']));
+    FakeWorker.all[0].done(4);
+    await expect(chair.promise).resolves.toMatchObject({ source: 'render' });
+    await vi.waitFor(async () =>
+      expect(await cache.get(thumbnailKey('B', { model: 'chair' }))).toEqual(new Uint8Array([4, 4])),
+    );
   });
 
   it('stops the workers when the page goes away and renders what waits when it comes back', async () => {

@@ -12,7 +12,12 @@ import {
  * take the cores the page and its viewport need. Each runs one render at a time; the queue stays on
  * the page (service.ts). Workers start on first use and stop after a while without work (they hold
  * core and its caches), and at once when the page goes away. Where Web Workers cannot start, a
- * stand-in renders on the page itself, one thumbnail per event loop turn.
+ * stand-in renders on the page itself, one thumbnail per event loop turn: from the start where the
+ * browser has none or refuses one, else from the first worker that fails before it ever answered
+ * (its script did not load). The render that worker was given did not run: it fails with
+ * `notStarted`, so the service asks for it again (on the page now). A stand-in whose own code does
+ * not load (the engine's chunk, after a deploy removed it) fails its render the same way and frees
+ * its place.
  */
 
 /** URL of the worker bundle (its file name carries the hash of its content in a build). */
@@ -44,6 +49,11 @@ export class ThumbnailRenderError extends Error {
   constructor(
     message: string,
     readonly code: ThumbnailErrorCode | 'STOPPED' | 'CRASHED',
+    /**
+     * The render never ran: its Web Worker failed before it ever answered (its script did not
+     * load), and the pool renders on the page from now on, so asking again renders it there.
+     */
+    readonly notStarted = false,
   ) {
     super(message);
     this.name = 'ThumbnailRenderError';
@@ -58,6 +68,11 @@ function moduleWorker(index: number): ThumbnailWorkerLike {
   }) as unknown as ThumbnailWorkerLike;
 }
 
+/** The worker's code, loaded on the page by the stand-in (a chunk of its own in a build). */
+export type ThumbnailEngineLoader = () => Promise<Pick<typeof import('./engine'), 'handleThumbnailMessage'>>;
+
+const loadEngine: ThumbnailEngineLoader = () => import('./engine');
+
 /** The worker code run on the page, one request per event loop turn (no Web Workers). */
 export class InProcessThumbnailWorker implements ThumbnailWorkerLike {
   onmessage: ((e: MessageEvent<unknown>) => void) | null = null;
@@ -65,14 +80,26 @@ export class InProcessThumbnailWorker implements ThumbnailWorkerLike {
   private queue: Promise<void> = Promise.resolve();
   private closed = false;
 
+  /** @param load loads the worker's code (tests give one that fails) */
+  constructor(private readonly load: ThumbnailEngineLoader = loadEngine) {}
+
   postMessage(msg: ThumbnailWorkerRequest): void {
-    this.queue = this.queue.then(async () => {
-      await new Promise<void>((r) => setTimeout(r, 0));
-      if (this.closed) return;
-      const { handleThumbnailMessage } = await import('./engine');
-      const { response } = handleThumbnailMessage(msg);
-      if (!this.closed) this.onmessage?.({ data: response } as MessageEvent<unknown>);
-    });
+    this.queue = this.queue
+      .then(async () => {
+        await new Promise<void>((r) => setTimeout(r, 0));
+        if (this.closed) return;
+        const { handleThumbnailMessage } = await this.load();
+        const { response } = handleThumbnailMessage(msg);
+        if (!this.closed) this.onmessage?.({ data: response } as MessageEvent<unknown>);
+      })
+      .catch((err: unknown) => {
+        // the code did not load (offline after a deploy removed its chunk, a network failure):
+        // the request fails like a worker whose script did not load, and later ones are still
+        // answered
+        if (this.closed) return;
+        const message = err instanceof Error ? err.message : String(err);
+        this.onerror?.({ message, preventDefault() {} } as unknown as ErrorEvent);
+      });
   }
 
   terminate(): void {
@@ -100,6 +127,8 @@ class ThumbnailThread {
 
   constructor(
     private readonly worker: ThumbnailWorkerLike,
+    /** Whether the worker renders on the page (the stand-in): nowhere else to go when it fails. */
+    private readonly onPage: boolean,
     private readonly onDead: (thread: ThumbnailThread, neverStarted: boolean) => void,
   ) {
     worker.onmessage = (e) => this.onMessage(e.data);
@@ -133,7 +162,10 @@ class ThumbnailThread {
     else run.reject(new ThumbnailRenderError(res.message, res.code));
   }
 
-  /** Stops the worker; its render fails with `err`. */
+  /**
+   * Stops the worker; its render fails with `err`, marked `notStarted` when a Web Worker failed
+   * before it ever answered (the pool renders on the page from then on: the render can go there).
+   */
   die(err: ThumbnailRenderError): void {
     if (this.dead) return;
     this.dead = true;
@@ -142,13 +174,16 @@ class ThumbnailThread {
     this.worker.terminate();
     const run = this.running;
     this.running = null;
-    run?.reject(err);
-    this.onDead(this, !this.answered && err.code === 'CRASHED');
+    const neverStarted = !this.answered && err.code === 'CRASHED';
+    this.onDead(this, neverStarted);
+    run?.reject(neverStarted && !this.onPage ? new ThumbnailRenderError(err.message, err.code, true) : err);
   }
 }
 
 export interface PoolOptions {
   factory?: ThumbnailWorkerFactory;
+  /** The worker that renders on the page where Web Workers cannot start (default: the stand-in). */
+  pageWorker?: () => ThumbnailWorkerLike;
   /** Workers at most (default: defaultWorkerCount()). */
   workers?: number;
   idleMs?: number;
@@ -157,7 +192,10 @@ export interface PoolOptions {
 /** The thumbnail workers, started as renders need them. */
 export class ThumbnailWorkerPool {
   private readonly threads: ThumbnailThread[] = [];
-  private factory: ThumbnailWorkerFactory;
+  private readonly factory: ThumbnailWorkerFactory;
+  private readonly pageWorker: () => ThumbnailWorkerLike;
+  /** Whether renders run on the page from now on (Web Workers could not start). */
+  private onPage = false;
   readonly size: number;
   private readonly idleMs: number;
   private idleTimer: ReturnType<typeof setTimeout> | null = null;
@@ -166,6 +204,7 @@ export class ThumbnailWorkerPool {
 
   constructor(opts: PoolOptions = {}) {
     this.factory = opts.factory ?? defaultWorkerFactory;
+    this.pageWorker = opts.pageWorker ?? (() => new InProcessThumbnailWorker());
     this.size = Math.max(1, Math.floor(opts.workers ?? defaultWorkerCount()));
     this.idleMs = opts.idleMs ?? WORKER_IDLE_MS;
   }
@@ -199,19 +238,22 @@ export class ThumbnailWorkerPool {
 
   private start(): ThumbnailThread {
     if (this.threads.length >= this.size) throw new Error('No thumbnail worker is free');
-    let worker: ThumbnailWorkerLike;
-    try {
-      worker = this.factory(this.started);
-    } catch {
-      // Web Workers cannot start here (a policy, a sandbox): render on the page
-      this.factory = () => new InProcessThumbnailWorker();
-      worker = this.factory(this.started);
+    let worker: ThumbnailWorkerLike | null = null;
+    if (!this.onPage) {
+      try {
+        worker = this.factory(this.started);
+      } catch {
+        // Web Workers cannot start here (a policy, a sandbox): render on the page
+        this.onPage = true;
+      }
     }
+    const onPage = !worker || worker instanceof InProcessThumbnailWorker;
+    worker ??= this.pageWorker();
     this.started++;
-    const thread = new ThumbnailThread(worker, (t, neverStarted) => {
+    const thread = new ThumbnailThread(worker, onPage, (t, neverStarted) => {
       this.threads.splice(this.threads.indexOf(t), 1);
       // a worker that never answered could not load its script: render on the page from now on
-      if (neverStarted) this.factory = () => new InProcessThumbnailWorker();
+      if (neverStarted) this.onPage = true;
     });
     this.threads.push(thread);
     return thread;

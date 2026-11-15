@@ -168,7 +168,12 @@ other providers' thumbnails come from the server, which proxies and caches them.
   thumbnail at a time, so the page and its viewport keep the other cores. They start with the first
   thumbnail, stop after 30 s without one and at once when the page goes away (`pagehide`); a
   thumbnail they were making then is made when the page comes back. Where Web Workers cannot
-  start, the page renders the thumbnails itself, one per event loop turn.
+  start, the page renders the thumbnails itself, one per event loop turn: from the start where the
+  browser has none or refuses one, else from the first worker that fails before it ever answered
+  (its script did not load). The thumbnails such a worker was given are made on the page first,
+  so the cards in view get them rather than a warning. Where the page cannot load that code either
+  (offline after a deploy removed it), the thumbnail fails with a warning instead of waiting for
+  good, and the next one is tried.
 - **Only what is seen.** A card asks for its thumbnail once it comes within the list's height of
   the view; the cards in view go first, then the others in the order they asked. A card that leaves
   that band before its thumbnail started takes its request back.
@@ -176,9 +181,12 @@ other providers' thumbnails come from the server, which proxies and caches them.
   and offline, under a key of the app's version, the build of the thumbnail worker (the hash in its
   file name), the model, its parameters and the size. The thumbnails of other builds are dropped
   when the cache opens, and beyond 16 MiB or 4000 thumbnails the least recently used go first (the
-  170 built-in thumbnails take 1.3 MB). The last 400 shown also stay in the page's memory. Where
-  IndexedDB cannot be used (storage blocked, a sandboxed frame) they are kept for the page only;
-  under the development server (`vite dev`) every page load is a build of its own.
+  170 built-in thumbnails take 1.3 MB). The bounds are the database's, whichever tabs wrote it:
+  each write reads its totals again before dropping any. The last 400 shown also stay in the
+  page's memory. Where IndexedDB cannot be used (storage blocked, a sandboxed frame), does not
+  answer within 3 s (opening the database or reading a thumbnail), or another tab upgrades or
+  deletes the database (this one lets it), they are kept for the page only; under the development
+  server (`vite dev`) every page load is a build of its own.
 - **On the card**, the category's icon stands in, with a light sweep while the thumbnail is made
   (none with reduced motion). A thumbnail that cannot be made shows a warning badge with the reason
   in its tooltip; one whose worker crashed is made again when the card comes near the view again. A

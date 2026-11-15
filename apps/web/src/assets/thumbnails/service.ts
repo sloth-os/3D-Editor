@@ -15,7 +15,9 @@ import type { ThumbnailErrorCode } from './protocol';
  * Several tiles asking for one thumbnail share one render. A tile that leaves the view lets its
  * request go: a thumbnail nobody waits for leaves the queue (one already rendering is finished and
  * kept). When the page goes away the workers stop; a page restored from the back/forward cache
- * starts them again for what is still waiting.
+ * starts them again for what is still waiting. A render given to a worker that could not start
+ * (its script did not load: the pool renders on the page from then on) is queued again first,
+ * once, so the tiles that were waiting for it get their thumbnail rather than a warning.
  */
 
 /** Where a thumbnail came from. */
@@ -116,6 +118,8 @@ interface Entry {
   error: ThumbnailError | null;
   /** The render run (a pause re-queues the entry; the run's late answer is then ignored). */
   run: number;
+  /** Queued again after its worker could not start (once: the page's own failure is the answer). */
+  rerun: boolean;
 }
 
 export interface ThumbnailServiceOptions {
@@ -211,6 +215,7 @@ export class ThumbnailService {
       image: null,
       error: null,
       run: 0,
+      rerun: false,
     };
     this.entries.set(key, entry);
     return entry;
@@ -298,6 +303,13 @@ export class ThumbnailService {
       void this.cache.put(entry.key, done.png).catch(() => undefined);
     } catch (err) {
       if (entry.run !== run || this.disposed) return;
+      if (err instanceof ThumbnailRenderError && err.notStarted && !entry.rerun && entry.tickets.size) {
+        // its worker could not start, and the pool renders on the page now: made there, first
+        entry.rerun = true;
+        entry.state = 'queued';
+        this.queue.add(entry.key, entry, this.priorityOf(entry), true);
+        return;
+      }
       const e =
         err instanceof ThumbnailRenderError
           ? new ThumbnailError(err.message, err.code)

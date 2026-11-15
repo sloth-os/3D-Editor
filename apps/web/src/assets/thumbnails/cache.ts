@@ -7,8 +7,15 @@ import { openDB, type IDBPDatabase } from 'idb';
  * read-only transactions, which run side by side (a screen of cards reads its thumbnails at once);
  * their last uses are written together a moment later, in one transaction. Thumbnails of other
  * builds are dropped when the cache opens (they can never be asked for again); beyond
- * MAX_CACHE_BYTES or MAX_CACHE_ENTRIES the least recently used ones go. Where IndexedDB cannot be
- * used (blocked storage, a sandboxed frame), the cache lives in memory for the page's lifetime.
+ * MAX_CACHE_BYTES or MAX_CACHE_ENTRIES the least recently used ones go. The bounds are the
+ * database's, whichever pages wrote it: each write reads the totals of the database again (other
+ * tabs' thumbnails included) before deciding to drop any.
+ *
+ * Where IndexedDB cannot be used (blocked storage, a sandboxed frame), or does not answer within
+ * IDB_TIMEOUT_MS (a context that blocks storage by never answering, a database held for another
+ * page's upgrade), the cache lives in memory for the page's lifetime. So does a page whose
+ * database another page wants to upgrade or delete (it closes its connection and lets it), or
+ * whose database the browser closed.
  */
 
 /** The cache's IndexedDB database. */
@@ -21,6 +28,11 @@ export const MAX_CACHE_ENTRIES = 4000;
 const PRUNE_TO = 0.75;
 /** Last uses are written this long after the first read since the last write (milliseconds). */
 export const USE_WRITE_MS = 1000;
+/**
+ * How long IndexedDB may take to open the database or to answer a read before the cache keeps to
+ * memory for the rest of the page (milliseconds; the desk gives its storage probe as long).
+ */
+export const IDB_TIMEOUT_MS = 3000;
 
 const IMAGES = 'images';
 const ENTRIES = 'entries';
@@ -46,6 +58,8 @@ export interface CacheOptions {
   now?: () => number;
   /** Delay of the writes of last uses (default USE_WRITE_MS). */
   useWriteMs?: number;
+  /** How long IndexedDB may take to open or to answer a read (default IDB_TIMEOUT_MS). */
+  timeoutMs?: number;
 }
 
 interface EntryMeta {
@@ -82,14 +96,30 @@ export function entriesToDrop(
   return drop;
 }
 
+/** Whether the entries kept in the database (of every build) are beyond the bounds. */
+export function overBounds(all: readonly EntryMeta[], maxBytes: number, maxEntries: number): boolean {
+  return all.length > maxEntries || all.reduce((n, e) => n + e.bytes, 0) > maxBytes;
+}
+
+/** What IndexedDB did not answer in time. */
+const NO_ANSWER: unique symbol = Symbol('no answer');
+
+/** What `p` gives, or NO_ANSWER when it takes longer than `ms` milliseconds. */
+function within<T>(p: Promise<T>, ms: number): Promise<T | typeof NO_ANSWER> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<typeof NO_ANSWER>((resolve) => {
+    timer = setTimeout(() => resolve(NO_ANSWER), ms);
+  });
+  return Promise.race([p, late]).finally(() => clearTimeout(timer));
+}
+
 /** The thumbnail cache in IndexedDB (falling back to memory when the database fails). */
 export class IdbThumbnailCache implements ThumbnailCache {
   private dbp: Promise<IDBPDatabase | null> | null = null;
   private readonly maxBytes: number;
   private readonly maxEntries: number;
   private readonly now: () => number;
-  /** Bytes and entries of this build kept (null: not counted yet). */
-  private count: { bytes: number; entries: number } | null = null;
+  private readonly timeoutMs: number;
   private pruning: Promise<void> | null = null;
   /** Where thumbnails go once the database failed. */
   private fallback: MemoryThumbnailCache | null = null;
@@ -101,27 +131,61 @@ export class IdbThumbnailCache implements ThumbnailCache {
     this.maxBytes = opts.maxBytes ?? MAX_CACHE_BYTES;
     this.maxEntries = opts.maxEntries ?? MAX_CACHE_ENTRIES;
     this.now = opts.now ?? Date.now;
+    this.timeoutMs = opts.timeoutMs ?? IDB_TIMEOUT_MS;
   }
 
-  /** The database (opened once; null after it failed, the memory fallback is used then). */
+  /** The database (opened once; null when it failed or did not answer: the memory fallback then). */
   private db(): Promise<IDBPDatabase | null> {
-    this.dbp ??= (async () => {
-      try {
-        const db = await openDB(this.opts.name ?? THUMBNAIL_DB, 1, {
-          upgrade(d) {
-            d.createObjectStore(IMAGES, { keyPath: 'key' });
-            d.createObjectStore(ENTRIES, { keyPath: 'key' });
-          },
-        });
-        // other builds' thumbnails can never be asked for again
-        void this.prune();
-        return db;
-      } catch {
+    this.dbp ??= this.open();
+    return this.dbp;
+  }
+
+  private async open(): Promise<IDBPDatabase | null> {
+    let conn: IDBPDatabase | null = null;
+    let blocked!: () => void;
+    const held = new Promise<typeof NO_ANSWER>((resolve) => {
+      blocked = () => resolve(NO_ANSWER);
+    });
+    let opening: Promise<IDBPDatabase>;
+    try {
+      opening = openDB(this.opts.name ?? THUMBNAIL_DB, 1, {
+        upgrade(d) {
+          d.createObjectStore(IMAGES, { keyPath: 'key' });
+          d.createObjectStore(ENTRIES, { keyPath: 'key' });
+        },
+        // an older version of the database is open in another page: this one does without it
+        blocked,
+        // another page upgrades or deletes the database: let it, and keep to memory from now on
+        blocking: () => {
+          this.useMemory();
+          conn?.close();
+        },
+        // the browser closed the database (site data cleared, a storage failure)
+        terminated: () => void this.useMemory(),
+      });
+    } catch {
+      this.useMemory();
+      return null;
+    }
+    try {
+      const db = await within(Promise.race([opening, held]), this.timeoutMs);
+      if (db === NO_ANSWER) {
+        // memory for this page; a connection that opens after all is closed at once
+        void opening.then(
+          (late) => late.close(),
+          () => undefined,
+        );
         this.useMemory();
         return null;
       }
-    })();
-    return this.dbp;
+      conn = db;
+      // other builds' thumbnails can never be asked for again
+      void this.prune();
+      return db;
+    } catch {
+      this.useMemory();
+      return null;
+    }
   }
 
   private useMemory(): MemoryThumbnailCache {
@@ -133,7 +197,15 @@ export class IdbThumbnailCache implements ThumbnailCache {
     if (!db || this.fallback) return this.useMemory().get(key);
     try {
       // read-only: reads do not wait for one another; the last use is written later (writeUses)
-      const image = (await db.get(IMAGES, key)) as { png?: unknown } | undefined;
+      const image = await within(
+        db.get(IMAGES, key) as Promise<{ png?: unknown } | undefined>,
+        this.timeoutMs,
+      );
+      if (image === NO_ANSWER) {
+        // the database stopped answering: the thumbnail is made, and kept in memory from now on
+        this.useMemory();
+        return null;
+      }
       const png = image?.png instanceof Uint8Array ? image.png : null;
       if (png) this.used(key);
       return png;
@@ -157,7 +229,7 @@ export class IdbThumbnailCache implements ThumbnailCache {
     this.useTimer = null;
     const uses = [...this.uses];
     this.uses.clear();
-    if (!db || !uses.length) return;
+    if (!db || this.fallback || !uses.length) return;
     try {
       const tx = db.transaction(ENTRIES, 'readwrite');
       for (const [key, used] of uses) {
@@ -173,22 +245,21 @@ export class IdbThumbnailCache implements ThumbnailCache {
   async put(key: string, png: Uint8Array): Promise<void> {
     const db = await this.db();
     if (!db || this.fallback) return this.useMemory().put(key, png);
+    let all: EntryMeta[];
     try {
       const tx = db.transaction([IMAGES, ENTRIES], 'readwrite');
+      const entries = tx.objectStore(ENTRIES);
       const meta: EntryMeta = { key, build: this.opts.build, bytes: png.byteLength, used: this.now() };
-      const before = (await tx.objectStore(ENTRIES).get(key)) as EntryMeta | undefined;
       await tx.objectStore(IMAGES).put({ key, png });
-      await tx.objectStore(ENTRIES).put(meta);
+      await entries.put(meta);
+      // the totals of the database, other pages' thumbnails included: each page keeps the bounds
+      all = (await entries.getAll()) as EntryMeta[];
       await tx.done;
-      if (this.count && !before) {
-        this.count.bytes += meta.bytes;
-        this.count.entries++;
-      }
-      if (!this.count || this.count.bytes > this.maxBytes || this.count.entries > this.maxEntries)
-        await this.prune();
     } catch {
       // a thumbnail not kept is made again next time
+      return;
     }
+    if (overBounds(all, this.maxBytes, this.maxEntries)) await this.prune();
   }
 
   prune(): Promise<void> {
@@ -200,22 +271,20 @@ export class IdbThumbnailCache implements ThumbnailCache {
 
   private async pruneNow(): Promise<void> {
     const db = await this.db();
-    if (!db) return;
+    if (!db || this.fallback) return;
     // the thumbnails read lately count as used
     await this.writeUses(db);
     try {
+      // the totals read again in the transaction that drops: whatever other pages wrote meanwhile
       const tx = db.transaction([IMAGES, ENTRIES], 'readwrite');
       const all = (await tx.objectStore(ENTRIES).getAll()) as EntryMeta[];
-      const drop = new Set(entriesToDrop(all, this.opts.build, this.maxBytes, this.maxEntries));
-      for (const key of drop) {
+      for (const key of entriesToDrop(all, this.opts.build, this.maxBytes, this.maxEntries)) {
         await tx.objectStore(IMAGES).delete(key);
         await tx.objectStore(ENTRIES).delete(key);
       }
       await tx.done;
-      const kept = all.filter((e) => !drop.has(e.key));
-      this.count = { bytes: kept.reduce((n, e) => n + e.bytes, 0), entries: kept.length };
     } catch {
-      this.count = null;
+      // the next write checks the bounds again
     }
   }
 
