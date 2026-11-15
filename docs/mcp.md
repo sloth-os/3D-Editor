@@ -1707,12 +1707,12 @@ the download fails with `NOT_DOWNLOADABLE`, a provider without its key with `NEE
 as described in [director-desk.md](director-desk.md#staging-from-a-brief): the set and its sun, the
 cast as actors, the props, a shot per brief shot with its camera solved. Called again with a later
 brief of the same scene on that project, it updates the staging instead: what the brief changed is
-staged again, and what was done by hand to the rest stays (shots retimed, removed or staged again,
-cameras and actors moved). A brief that does not validate, a project staged from another scene, one
-holding shots of its own, or a new project's name that another project has are refused
-(`INVALID_PARAMS`). A brief the server has no memory to stage is refused with
-`{"code": "OUT_OF_MEMORY"}` after the message, which says what to lower (the number and length of
-the brief's shots or its frame rate, and the number of its cast members, kites and balloons). An
+staged again, and what was done by hand to the rest stays (shots retimed, reordered, removed or
+staged again, cameras and actors moved, actors renamed). A brief that does not validate, a project
+staged from another scene, one holding shots of its own, or a new project's name that another
+project has are refused (`INVALID_PARAMS`). A brief the server has no memory to stage is refused
+with `{"code": "OUT_OF_MEMORY"}` after the message, which says what to lower (the number and length
+of the brief's shots or its frame rate, and the number of its cast members, kites and balloons). An
 update is counted with the checks it runs afterwards over every shot it keeps, as `desk.check`
 counts them, so it needs that memory however few shots the brief changed. A project the call made
 for a brief that then fails to stage is deleted again, so that the brief can be sent again; when
