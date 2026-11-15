@@ -48,13 +48,27 @@ export function parseDeskEmbedCoep(value: string | undefined): DeskEmbedCoep {
 const CSP_HOST = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.?$/;
 
 /**
+ * Ports browsers refuse to load anything from, so no framing page's origin has one: the Fetch
+ * standard's bad ports (its "port blocking", which browsers apply to navigations as to every other
+ * request) but 4190 and 6679, which are on that list and which Chromium still loads (checked in
+ * Chromium 153), and port 0, on which no server listens (Chromium refuses it too).
+ */
+export const BAD_PORTS: ReadonlySet<number> = new Set([
+  0, 1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102, 103, 104,
+  109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465, 512, 513, 514, 515,
+  526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993, 995, 1719, 1720, 1723, 2049,
+  3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080,
+]);
+
+/**
  * One origin of DESK_EMBED_ORIGINS as a frame-ancestors source: `scheme://host[:port]` as the
  * browser writes the origin (URL-parsed: lowercased, international names in punycode, a default
  * port dropped), or with CSP's wildcards, `*.` before the host and `*` as the port. Whatever no
  * framing page's origin can match is refused with the reason, so that a typo stops the server at
  * startup rather than leaving a source that frames nothing: a value that is no URL, a scheme other
- * than http(s), a port outside 1 to 65535, a path, query, fragment or user name, and IPv6
- * addresses, which CSP's host-source cannot express (browsers drop such a source).
+ * than http(s), a port outside 1 to 65535 or one browsers refuse (BAD_PORTS), a path, query,
+ * fragment or user name, and IPv6 addresses, which CSP's host-source cannot express (browsers drop
+ * such a source).
  */
 function originSource(raw: string): string {
   const refused = (why: string) => new Error(`Invalid configuration: DESK_EMBED_ORIGINS: '${raw}' ${why}`);
@@ -76,15 +90,17 @@ function originSource(raw: string): string {
   const anyPort = rest.endsWith(':*');
   if (anyPort) rest = rest.slice(0, -2);
   const notAnOrigin = () =>
-    refused('is not an origin: expected scheme://host[:port] with a valid host and a port from 1 to 65535');
+    refused(
+      "is not an origin: expected scheme://host[:port] with a valid host and a port from 1 to 65535 other than the ports browsers refuse (Fetch's bad ports, such as 1, 25 or 6000)",
+    );
   let url: URL;
   try {
     url = new URL(`${scheme}://${rest}`);
   } catch {
     throw notAnOrigin();
   }
-  // port 0 is no server's: no page has it (it is also the first of Fetch's bad ports)
-  if (url.port === '0') throw notAnOrigin();
+  // no page has a port browsers refuse, or port 0 (a default port is '' here)
+  if (url.port && BAD_PORTS.has(Number(url.port))) throw notAnOrigin();
   if (url.username || url.password)
     throw refused('has a user name or password: an origin is scheme://host[:port]');
   if (url.pathname !== '/' || url.search || url.hash || /[?#]/.test(rest))

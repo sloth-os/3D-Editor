@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config';
 import {
+  BAD_PORTS,
   DEFAULT_DESK_EMBED,
   DESK_PAGE_PATHS,
   deskAssetHeaders,
@@ -88,20 +89,24 @@ describe('DESK_EMBED_ORIGINS', () => {
     // hosts the URL parser refuses: no page has such an origin
     for (const bad of ['http://1.2.3.4.5.6', 'http://999.999.999.999', 'https://a.example:*:*'])
       expect(refusal(bad), bad).toMatch(/^Invalid configuration: DESK_EMBED_ORIGINS: '.+' is not an origin/);
-    // nor a port above 65535 or port 0, which no server listens on (the first of Fetch's bad ports)
+    // nor a port above 65535, port 0, which no server listens on, or a port browsers refuse
     for (const bad of [
       'https://a.example:0',
       'https://a.example:00',
       'http://127.0.0.1:0',
       'https://*.a.example:0',
       'https://a.example:65536',
+      'https://a.example:1',
+      'http://127.0.0.1:6000',
+      'https://*.a.example:10080',
+      'https://a.example:06667',
     ])
       expect(refusal(bad), bad).toMatch(
-        /^Invalid configuration: DESK_EMBED_ORIGINS: '.+' is not an origin: .* a port from 1 to 65535$/,
+        /^Invalid configuration: DESK_EMBED_ORIGINS: '.+' is not an origin: .* a port from 1 to 65535 other than the ports browsers refuse \(Fetch's bad ports, such as 1, 25 or 6000\)$/,
       );
     expect(
-      parseDeskEmbedOrigins('https://a.example:1, http://b.example:65535, https://c.example:0443'),
-    ).toEqual(['https://a.example:1', 'http://b.example:65535', 'https://c.example']);
+      parseDeskEmbedOrigins('https://a.example:2, http://b.example:65535, https://c.example:0443'),
+    ).toEqual(['https://a.example:2', 'http://b.example:65535', 'https://c.example']);
     // CSP has no IPv6 sources: browsers drop them from frame-ancestors, valid or not
     for (const bad of [
       'http://[::1]:3000',
@@ -120,6 +125,35 @@ describe('DESK_EMBED_ORIGINS', () => {
     expect(refusal('https://*.10.0.0.1')).toMatch(/puts \*\. before an IP address/);
     expect(refusal('https://a.example:8443:*')).toMatch(/has two ports/);
     expect(refusal('https://a.exa\nmple')).toMatch(/has spaces or control characters/);
+  });
+
+  it("refuses the ports browsers refuse to load from (Fetch's bad ports), and only those", async () => {
+    // Node's own Fetch refuses each of them before it connects anywhere ('bad port'): the list is
+    // Fetch's (port 0 aside, which no server listens on)
+    const fetchRefusal = (port: number) =>
+      fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(2000) }).then(
+        () => 'loaded',
+        (err: unknown) => (err as { cause?: { message?: string } }).cause?.message ?? String(err),
+      );
+    expect(BAD_PORTS.size).toBe(81);
+    for (const port of BAD_PORTS) {
+      if (port) expect(await fetchRefusal(port), `port ${port}`).toBe('bad port');
+      expect(() => parseDeskEmbedOrigins(`https://a.example:${port}`), `port ${port}`).toThrow(
+        /is not an origin: .* other than the ports browsers refuse/,
+      );
+    }
+    // 4190 and 6679 are on Fetch's list too, but Chromium loads them: a framing page can have them
+    for (const port of [4190, 6679]) expect(await fetchRefusal(port)).toBe('bad port');
+    // they and the neighbours of the bad ports are ports like any other
+    const taken = [4190, 6679, 2, 8, 10, 24, 26, 5999, 6001, 6664, 6670, 6696, 6698, 10079, 10081];
+    for (const port of taken) expect(BAD_PORTS.has(port), `port ${port}`).toBe(false);
+    expect(parseDeskEmbedOrigins(taken.map((p) => `https://a.example:${p}`).join(','))).toEqual(
+      taken.map((p) => `https://a.example:${p}`),
+    );
+    // the default ports are no bad ports, and a default port is dropped before the check
+    expect(parseDeskEmbedOrigins('http://a.example:80, https://b.example:443, http://c.example:443')).toEqual(
+      ['http://a.example', 'https://b.example', 'http://c.example:443'],
+    );
   });
 });
 

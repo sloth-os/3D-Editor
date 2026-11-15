@@ -285,11 +285,14 @@ dev and preview servers read the same two and send the same headers.
 | `DESK_EMBED_COEP`    | `require-corp` | `Cross-Origin-Embedder-Policy` of the desk page and the built files: `require-corp`, `credentialless` or `off` (none sent)                                                                                                             |
 
 An origin is `http` or `https`, a host name (its first label may be `*`) or an IPv4 address, and an
-optional port (1 to 65535, or `*`), with no path, query or user name. The server writes
-each as the browser writes origins: trailing slashes dropped, lowercased, an international name in
-punycode, a default port (`:443`, `:80`) dropped. No IPv6 address: Content Security Policy has no
-way to name one, and browsers drop such a source from `frame-ancestors`, so give that host a name.
-`*` admits every site (other entries are then redundant), and `'none'` cannot be combined with
+optional port (1 to 65535 other than the ports browsers refuse, or `*`), with no path, query or user
+name. The ports browsers refuse are Fetch's bad ports, such as 1, 25 or 6000: browsers load nothing
+from them, so no page that frames the desk has one (`BAD_PORTS` in `apps/server/src/desk-embed.ts`;
+4190 and 6679 are on Fetch's list, but Chromium still loads them, so they are taken). The server
+writes each as the browser writes origins: trailing slashes dropped, lowercased, an international
+name in punycode, a default port (`:443`, `:80`) dropped. No IPv6 address: Content Security Policy
+has no way to name one, and browsers drop such a source from `frame-ancestors`, so give that host a
+name. `*` admits every site (other entries are then redundant), and `'none'` cannot be combined with
 origins. The server checks both variables when it starts and stops for a value it cannot use, with
 the reason, such as `Invalid configuration: DESK_EMBED_ORIGINS: 'https://a.example/x' has a path, …`
 or `Invalid configuration: DESK_EMBED_COEP: …`. `credentialless` serves cross-origin isolated hosts

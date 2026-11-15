@@ -70,13 +70,33 @@ describe("the editor's Update while a desk page is open", () => {
 });
 
 describe('docs/embedding.md: the ports of DESK_EMBED_ORIGINS', () => {
-  it('are the ones the server takes: 1 to 65535, or *', () => {
+  it('are the ones the server takes: 1 to 65535 other than the ports browsers refuse, or *', () => {
     const config = flat(section(read('docs/embedding.md'), '### Configuration'));
-    expect(config).toContain('an optional port (1 to 65535, or `*`)');
+    expect(config).toContain('an optional port (1 to 65535 other than the ports browsers refuse, or `*`)');
+    expect(config).toContain("The ports browsers refuse are Fetch's bad ports, such as 1, 25 or 6000");
+    expect(config).toContain(
+      "4190 and 6679 are on Fetch's list, but Chromium still loads them, so they are taken",
+    );
     expect(
-      parseDeskEmbedOrigins('https://a.example:1, https://b.example:65535, https://c.example:*'),
-    ).toEqual(['https://a.example:1', 'https://b.example:65535', 'https://c.example:*']);
-    for (const bad of ['https://a.example:0', 'https://a.example:65536'])
-      expect(() => parseDeskEmbedOrigins(bad), bad).toThrow(/is not an origin: .* a port from 1 to 65535$/);
+      parseDeskEmbedOrigins(
+        'https://a.example:2, https://b.example:65535, https://c.example:*, https://d.example:4190, https://e.example:6679',
+      ),
+    ).toEqual([
+      'https://a.example:2',
+      'https://b.example:65535',
+      'https://c.example:*',
+      'https://d.example:4190',
+      'https://e.example:6679',
+    ]);
+    for (const bad of [
+      'https://a.example:0',
+      'https://a.example:65536',
+      'https://a.example:1',
+      'https://a.example:25',
+      'https://a.example:6000',
+    ])
+      expect(() => parseDeskEmbedOrigins(bad), bad).toThrow(
+        /is not an origin: .* a port from 1 to 65535 other than the ports browsers refuse \(Fetch's bad ports, such as 1, 25 or 6000\)$/,
+      );
   });
 });
