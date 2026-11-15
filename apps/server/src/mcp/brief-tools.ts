@@ -133,7 +133,7 @@ export function registerBriefTools(tool: ToolRegistrar, ctx: ToolContext): void 
     {
       title: 'Shot results',
       description:
-        "Each shot of a project staged from a brief (desk_stage_brief), in brief order or the order asked: frames and duration at the scene's fps, the staged camera's lens (integer mm) and move, where everyone stands and faces through the camera at its first frame, who walks where, whether the camera shows the planned layout (null without one) and the desk's checks (errors and warnings). Read-only.",
+        "Each shot of a project staged from a brief (desk_stage_brief), in brief order: frames and duration at the brief's fps (as an export at that rate counts them), the staged camera's lens (integer mm) and move, where everyone stands and faces through the camera at its first frame, who walks where, whether the camera shows the planned layout (null without one) and the desk's checks (errors and warnings). Read-only.",
       annotations: READ_ONLY,
     },
     {

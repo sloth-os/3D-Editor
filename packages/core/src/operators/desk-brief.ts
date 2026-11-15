@@ -95,7 +95,7 @@ export function registerDeskBriefOperators(reg: OperatorRegistry): void {
           .max(200)
           .optional()
           .describe(
-            "The host's shot ids to report, in this order (default: every staged shot in brief order)",
+            "The host's shot ids to report (default: every staged shot); the results keep brief order",
           ),
       }),
       execute: (ctx, p): { shots: ShotResultMeta[] } => ({ shots: shotResults(ctx.doc, { shots: p.shots }) }),

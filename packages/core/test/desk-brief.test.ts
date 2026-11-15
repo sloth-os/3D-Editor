@@ -499,8 +499,8 @@ describe('shotResults', () => {
     expect(b.line).not.toMatch(/Pip/);
   });
 
-  it('reports the shots asked for, in that order, and refuses unknown ones', () => {
-    expect(shotResults(doc, { shots: [SHOT_B, SHOT_A] }).map((r) => r.shotId)).toEqual([SHOT_B, SHOT_A]);
+  it('reports the shots asked for, in brief order, and refuses unknown ones', () => {
+    expect(shotResults(doc, { shots: [SHOT_B, SHOT_A] }).map((r) => r.shotId)).toEqual([SHOT_A, SHOT_B]);
     expect(refusal(() => shotResults(doc, { shots: ['nope'] })).code).toBe('NOT_FOUND');
     expect(refusal(() => shotResults(newDoc())).code).toBe('INVALID_PARAMS');
   });
