@@ -88,6 +88,20 @@ describe('DESK_EMBED_ORIGINS', () => {
     // hosts the URL parser refuses: no page has such an origin
     for (const bad of ['http://1.2.3.4.5.6', 'http://999.999.999.999', 'https://a.example:*:*'])
       expect(refusal(bad), bad).toMatch(/^Invalid configuration: DESK_EMBED_ORIGINS: '.+' is not an origin/);
+    // nor a port above 65535 or port 0, which no server listens on (the first of Fetch's bad ports)
+    for (const bad of [
+      'https://a.example:0',
+      'https://a.example:00',
+      'http://127.0.0.1:0',
+      'https://*.a.example:0',
+      'https://a.example:65536',
+    ])
+      expect(refusal(bad), bad).toMatch(
+        /^Invalid configuration: DESK_EMBED_ORIGINS: '.+' is not an origin: .* a port from 1 to 65535$/,
+      );
+    expect(
+      parseDeskEmbedOrigins('https://a.example:1, http://b.example:65535, https://c.example:0443'),
+    ).toEqual(['https://a.example:1', 'http://b.example:65535', 'https://c.example']);
     // CSP has no IPv6 sources: browsers drop them from frame-ancestors, valid or not
     for (const bad of [
       'http://[::1]:3000',

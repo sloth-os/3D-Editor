@@ -53,8 +53,8 @@ const CSP_HOST = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z
  * port dropped), or with CSP's wildcards, `*.` before the host and `*` as the port. Whatever no
  * framing page's origin can match is refused with the reason, so that a typo stops the server at
  * startup rather than leaving a source that frames nothing: a value that is no URL, a scheme other
- * than http(s), a path, query, fragment or user name, and IPv6 addresses, which CSP's host-source
- * cannot express (browsers drop such a source).
+ * than http(s), a port outside 1 to 65535, a path, query, fragment or user name, and IPv6
+ * addresses, which CSP's host-source cannot express (browsers drop such a source).
  */
 function originSource(raw: string): string {
   const refused = (why: string) => new Error(`Invalid configuration: DESK_EMBED_ORIGINS: '${raw}' ${why}`);
@@ -75,12 +75,16 @@ function originSource(raw: string): string {
   if (anySubdomain) rest = rest.slice(2);
   const anyPort = rest.endsWith(':*');
   if (anyPort) rest = rest.slice(0, -2);
+  const notAnOrigin = () =>
+    refused('is not an origin: expected scheme://host[:port] with a valid host and a port from 1 to 65535');
   let url: URL;
   try {
     url = new URL(`${scheme}://${rest}`);
   } catch {
-    throw refused('is not an origin: expected scheme://host[:port] with a valid host and a port up to 65535');
+    throw notAnOrigin();
   }
+  // port 0 is no server's: no page has it (it is also the first of Fetch's bad ports)
+  if (url.port === '0') throw notAnOrigin();
   if (url.username || url.password)
     throw refused('has a user name or password: an origin is scheme://host[:port]');
   if (url.pathname !== '/' || url.search || url.hash || /[?#]/.test(rest))

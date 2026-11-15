@@ -285,7 +285,7 @@ dev and preview servers read the same two and send the same headers.
 | `DESK_EMBED_COEP`    | `require-corp` | `Cross-Origin-Embedder-Policy` of the desk page and the built files: `require-corp`, `credentialless` or `off` (none sent)                                                                                                             |
 
 An origin is `http` or `https`, a host name (its first label may be `*`) or an IPv4 address, and an
-optional port (a number up to 65535, or `*`), with no path, query or user name. The server writes
+optional port (1 to 65535, or `*`), with no path, query or user name. The server writes
 each as the browser writes origins: trailing slashes dropped, lowercased, an international name in
 punycode, a default port (`:443`, `:80`) dropped. No IPv6 address: Content Security Policy has no
 way to name one, and browsers drop such a source from `frame-ancestors`, so give that host a name.
