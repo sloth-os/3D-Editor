@@ -110,8 +110,8 @@ else the videos are H.264 MP4 with a warning, as on a server without libvpx.
   and level of the stream's decoder configuration, which the encoder chooses itself; Chrome's
   writes `avc1.640c1f` at 1280 × 720 when asked for `avc1.64001f`, and a lower level for small
   frames; for VP9 the string asked for, which the WebM file's header repeats), `bitrate` (bit/s;
-  null in VP9 quantizer mode), `vp9_quantizer` and `render_workers`. The project's id is the one the page gives (the
-  editor's project id).
+  null in VP9 quantizer mode), `vp9_quantizer` and `render_workers`. The project's id is the one
+  the page gives (the editor's project id).
 
 **Speed**, measured in headless Chromium 153 on a 4-core machine shared with other work (load 2–5),
 exporting the over-the-shoulder shot of the
@@ -227,8 +227,8 @@ Preset `reference` makes reference clips for a video model: quality `draft`, loo
 clips only (no sequence, posters or contact sheet), with the passes `beauty`, `depth` and `pose`,
 one for each reference mode (`motion`, `camera` and `pose`), at the render resolution at 100 % and
 the scene's fps. The parameters given win over the preset, `outputs` key by key. Its former name
-`rideo` is still accepted (and stored as `reference`; a job an older server queued with it is sized
-as the preset says too).
+`rideo` is still accepted (and stored as `reference`). A job an older server queued with it is
+sized as the preset says too.
 
 ## Quality presets and speed
 
@@ -414,7 +414,7 @@ export. In the editor, Render › Export Video… (Ctrl+Shift+F12) exports on th
 | Symptom                                                                                 | Cause and remedy                                                                                                                                                                                        |
 | --------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | the Export Video window says this browser cannot export                                 | open the editor over HTTPS or on localhost, use a current browser with WebCodecs, or lower the size or frame rate its H.264 encoder refused; or choose Server where the window offers it                |
-| a browser export refused at start: running out of memory would end the tab              | the tab's memory holds no render worker for this scene at this size next to the renders and exports running in it: wait for those to end, lower the resolution, the passes or the scene's triangles, or export on the server |
+| a browser export refused at start: running out of memory would end the tab              | no render worker fits the tab's memory next to the renders and exports running in it: wait for those to end, lower the resolution, the passes or the scene's triangles, or export on the server         |
 | `features.videoExport: false`; `FFMPEG_UNAVAILABLE` "is not installed on the server"    | ffmpeg was not found, or `FFMPEG_PATH` does not run it: install it (Debian/Ubuntu `apt-get install ffmpeg`, Alpine `apk add ffmpeg`) or set `FFMPEG_PATH`, then restart                                 |
 | `FFMPEG_UNAVAILABLE` "has no libx264 encoder" although `features.videoExport` is `true` | this ffmpeg runs but was built without libx264 (the flag only checks that ffmpeg runs): install one with it (the Debian/Ubuntu and Alpine packages have it) or point `FFMPEG_PATH` to one, then restart |
 | `UNAVAILABLE` "needs render processes"                                                  | `RENDER_WORKERS=0`: set it to 1 or more                                                                                                                                                                 |
