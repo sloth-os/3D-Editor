@@ -10,11 +10,11 @@ import type { SceneBrief } from '../src/desk/brief';
  * gender, build; marks; wearing …") is the animal its own words name only when they name it before
  * any person and not as something the member has, does or wears; an identity line that gives a
  * gender is a person's unless an item before its first ";" names an animal as what the member is
- * ("golden retriever", "sturdy pony build"; not "bull neck" or "bear build"), whatever animal words
- * follow in its marks, and its age and gender make the person a child, an elder, a woman or a man; a
- * set without `interior` is one only when a room is named, not an outdoor place that "inside",
- * "flat", "bar", "cafe", "factory" or "museum" qualifies, and an outdoor word naming a building ("the
- * lake house") is not the place.
+ * ("golden retriever", "sturdy pony build", "brown, hulking bear build"; not "bull neck" or "White,
+ * bear build"), whatever animal words follow in its marks, and its age and gender make the person a
+ * child, an elder, a woman or a man; a set without `interior` is one only when a room is named, not
+ * an outdoor place that "inside", "flat", "bar", "cafe", "factory" or "museum" qualifies, and an
+ * outdoor word naming a building ("the lake house") is not the place.
  */
 
 function kindOf(name: string, description: string, hint: string | null = null) {
@@ -246,6 +246,83 @@ describe('a cast member without a kind hint', () => {
       expect(kindOf(name, description).kind).toBe(kind);
     },
   );
+
+  // ... and so does "bear", "bull", "ox" or "gorilla" before a build word after an animal's coat: it
+  // is a person's build only in the line of a people, its ethnicity written with a capital ("Rob: 35
+  // male, White, bear build" above)
+  it.each([
+    [
+      'Bruno',
+      'Bruno: 6 male, brown, hulking bear build; scar over one eye. Raids the campsite every night.',
+      'bear',
+      'bear',
+    ],
+    [
+      'Ferdinand',
+      'Ferdinand: 5 male, black, massive bull build; ring through his nose. Would rather smell the flowers than fight.',
+      'cow',
+      'cow',
+    ],
+    [
+      'Babe',
+      'Babe: 4 male, blue, giant ox frame; long curved horns. Pulls the logging sledge.',
+      'cow',
+      'cow',
+    ],
+    ['Koko', 'Koko: 12 female, black, gorilla build; grey hair on her back.', 'gorilla', 'bear'],
+  ])('%s (%s) is an animal (%s): its build word after a coat names it', (name, description, word, kind) => {
+    expect(animalOf(name, description)).toMatchObject({ word, kind });
+    expect(kindOf(name, description).kind).toBe(kind);
+  });
+
+  it('keeps a bull whose build names it the mount the shot says it is', () => {
+    const brief = {
+      id: 'scene',
+      name: 'Scene',
+      fps: 24,
+      width: 640,
+      height: 360,
+      set: { description: 'A dusty rodeo arena.', interior: false, timeOfDay: null },
+      cast: [
+        {
+          id: 'colt',
+          name: 'Colt',
+          description: 'Colt: 25 male, White, lanky; stubble; wearing a denim jacket. A young rodeo rider.',
+          kind: null,
+          heightM: null,
+        },
+        {
+          id: 'tornado',
+          name: 'Tornado',
+          description:
+            'Tornado: 7 male, black, massive bull build; ring through his nose. Has never been ridden for eight seconds.',
+          kind: null,
+          heightM: null,
+        },
+      ],
+      elements: [],
+      shots: [
+        {
+          id: 's1',
+          index: 0,
+          durationSec: 3,
+          description: 'Wide: the arena.',
+          action: 'Colt rides Tornado out of the chute.',
+          castIds: ['colt', 'tornado'],
+          elementIds: [],
+          framing: 'wide',
+          movement: 'static',
+          move: null,
+          lensMm: null,
+          continuity: 'cut',
+          layout: [],
+        },
+      ],
+    } as SceneBrief;
+    const { kinds } = castKinds(brief);
+    expect(kinds.get('tornado')).toEqual({ kind: 'cow', reason: 'a cow another character rides' });
+    expect(kinds.get('colt')).toEqual({ kind: 'man', reason: 'a person' });
+  });
 
   // ... and one before another animal word is that one's: the later is the animal ("a cattle dog" is a
   // dog, not a cow), unless it is the young, the sex or a breed word ("Shetland pony mare", "bear
