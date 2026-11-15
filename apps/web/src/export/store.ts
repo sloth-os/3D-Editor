@@ -9,9 +9,10 @@ import { crc32Update } from './zip';
  * memory. Every file gets its size, SHA-256 and CRC-32 (the one-download zip needs it) while it is
  * written, chunk after chunk; a video written out of order (an MP4 sequence whose index is written
  * last, at the start of the file) is read back once when it is finished. Cancelling deletes what
- * an export wrote. An export's directory lives until the page releases the export (or another
- * page of the origin starts an export after this one ended without releasing it: export
- * directories nobody holds a Web Lock for are deleted then).
+ * an export wrote. An export's files live until the page releases the export: its directory is
+ * deleted, or the in-memory store lets its Blobs go (reading a file fails from then on). A page
+ * that closes or reloads first leaves its directory on disk until a later export, in any page of
+ * the origin, deletes the export directories no page holds a Web Lock for.
  */
 
 /** The kinds of files of a browser export. */
@@ -103,12 +104,23 @@ function stored(
 /** Files kept in memory (Blobs of their chunks). */
 export class MemoryStore implements ExportStore {
   readonly onDisk = false;
+  /** The files' Blobs, by name, until the export is released (then its files can no longer be read). */
+  private readonly blobs = new Map<string, Blob>();
+
+  /** The file as stored: its Blob read from this store while it holds it. */
+  private keep(info: FileInfo, d: ReturnType<FileHash['digest']>, blob: Blob): StoredFile {
+    this.blobs.set(info.name, blob);
+    return stored(info, d, async () => {
+      const b = this.blobs.get(info.name);
+      if (!b) throw new Error(`${info.name} was released with its export`);
+      return b;
+    });
+  }
 
   async bytes(info: FileInfo, data: Uint8Array): Promise<StoredFile> {
     const h = new FileHash();
     h.update(data);
-    const blob = new Blob([data as Uint8Array<ArrayBuffer>], { type: info.mime });
-    return stored(info, h.digest(), async () => blob);
+    return this.keep(info, h.digest(), new Blob([data as Uint8Array<ArrayBuffer>], { type: info.mime }));
   }
 
   async sequential(info: FileInfo): Promise<SequentialFile> {
@@ -123,7 +135,7 @@ export class MemoryStore implements ExportStore {
       close: async () => {
         const blob = new Blob(chunks, { type: info.mime });
         chunks.length = 0;
-        return stored(info, h.digest(), async () => blob);
+        return this.keep(info, h.digest(), blob);
       },
       abort: async () => {
         chunks.length = 0;
@@ -135,7 +147,10 @@ export class MemoryStore implements ExportStore {
     return null;
   }
 
-  async dispose(): Promise<void> {}
+  /** Lets the files go: the store's Blobs are freed once nothing else holds them (object URLs, readers). */
+  async dispose(): Promise<void> {
+    this.blobs.clear();
+  }
 }
 
 /** The directory of the browser exports in the Origin Private File System. */
@@ -171,8 +186,11 @@ async function holdLock(id: string): Promise<() => void> {
 }
 
 /**
- * Deletes the export directories of this origin nobody uses any more: those whose Web Lock no page
- * holds (without Web Locks: those older than a day, by their name's time).
+ * Deletes the export directories of this origin nobody uses any more, each one only while this page
+ * holds its Web Lock, taken only if no page holds it: an export holds it from before its directory
+ * is made until its files are released, so a directory an export uses, or starts to use while the
+ * sweep runs (in this tab or another), is never deleted. Without Web Locks: those older than a day,
+ * by their name's time.
  */
 export async function sweepExportDirectories(keep: ReadonlySet<string> = new Set()): Promise<void> {
   if (!opfsAvailable()) return;
@@ -180,17 +198,21 @@ export async function sweepExportDirectories(keep: ReadonlySet<string> = new Set
     const root = await navigator.storage.getDirectory();
     const dir = await root.getDirectoryHandle(EXPORTS_DIRECTORY, { create: true });
     const locks = (navigator as { locks?: LockManager }).locks;
-    const held = new Set<string>();
-    if (locks) for (const l of (await locks.query()).held ?? []) if (l.name) held.add(l.name);
     const names: string[] = [];
     for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) names.push(name);
     for (const name of names) {
-      if (keep.has(name) || held.has(lockName(name))) continue;
-      if (!locks) {
-        const t = parseInt(name.split('-')[0] ?? '', 36);
-        if (Number.isFinite(t) && Date.now() - t < STALE_MS) continue;
+      if (keep.has(name)) continue;
+      const remove = () => dir.removeEntry(name, { recursive: true }).catch(() => undefined);
+      if (locks) {
+        // null when a page holds the lock: its export uses the directory
+        await locks.request(lockName(name), { ifAvailable: true }, async (lock) => {
+          if (lock) await remove();
+        });
+        continue;
       }
-      await dir.removeEntry(name, { recursive: true }).catch(() => undefined);
+      const t = parseInt(name.split('-')[0] ?? '', 36);
+      if (Number.isFinite(t) && Date.now() - t < STALE_MS) continue;
+      await remove();
     }
   } catch {
     // nothing to sweep, or the storage refused: nothing to do

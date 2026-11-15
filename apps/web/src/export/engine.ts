@@ -96,7 +96,8 @@ import { ZipStreamWriter } from './zip';
  * - Worker 0 makes the contact sheet and the manifest (core contactSheet, buildManifest), the other
  *   workers having stopped once the frames were rendered.
  * Files go to the Origin Private File System when the browser has it, else stay in memory
- * (store.ts); every file's SHA-256 is computed as it is written. Cancelling (the AbortSignal) stops
+ * (store.ts); every file's SHA-256 is computed as it is written (a sequence written to disk, whose
+ * index is written last at its start, by reading it back once). Cancelling (the AbortSignal) stops
  * the workers and the encoders and deletes what was written. The screen is kept awake while the
  * export runs where the browser allows it.
  */

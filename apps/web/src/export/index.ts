@@ -115,7 +115,11 @@ export async function zipExport(result: BrowserExportResult): Promise<Blob> {
   return zipBlob(entries);
 }
 
-/** Deletes the files of an export this page made (its downloads stop working). */
+/**
+ * Deletes the files of an export this page made: its directory on disk, or the in-memory store's
+ * Blobs (freed once nothing else holds them, such as an object URL). Its files cannot be read from
+ * then on.
+ */
 export async function releaseBrowserExport(result: BrowserExportResult | string): Promise<void> {
   const id = typeof result === 'string' ? result : result.id;
   const store = live.get(id);

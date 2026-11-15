@@ -26,7 +26,7 @@ export interface BrowserExportFile {
   shot: string | null;
   mime: string;
   size: number;
-  /** SHA-256 of the file (hex), computed while it was written. */
+  /** SHA-256 of the file (hex): computed while it was written, or read back once it was finished. */
   sha256: string;
   frames: number | null;
   duration_s: number | null;

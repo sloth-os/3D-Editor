@@ -58,19 +58,20 @@ update; later edits never reach the export) and hands it to the export engine
 Files go to the browser's Origin Private File System (a directory per export; sequences and frame
 archives are written as the export goes and do not stay in memory, while each clip is kept in memory
 until its shot is finished) where the browser has it, else stay in memory. Every file's SHA-256 is
-computed while it is written. Cancel stops the workers and the encoders and deletes what the export
-wrote. A render worker that stops, or one whose answer cannot reach the page (the browser could not
-copy it, most likely for want of memory), fails the export with that reason: the export never waits
-for an answer that cannot come. The screen is kept on while it runs (Screen Wake Lock, where the
-browser allows it: the browser lets the lock go while the tab is hidden, and the export asks for it
-again each time the tab is shown). The window then lists the files as download links with a preview
-of the sequence, and **Download all (.zip)** saves them as one ZIP archive (stored: the videos and
-PNGs are compressed already). The files stay until the next export on this device, or until the tab
-closes (a later export deletes the files of closed tabs). An export goes on when the window is
-closed, as long as the tab stays open. A tab runs one export on this device at a time, whichever
-project it exports: the export is registered as Export is pressed (a second press starts nothing),
-and while it runs every project's window shows it, with its progress and Cancel, instead of offering
-Export.
+computed as it is written (a sequence written to disk, whose index comes last at its start, by
+reading it back once). Cancel stops the workers and the encoders and deletes what the export wrote.
+A render worker that stops, or one whose answer cannot reach the page (the browser could not copy
+it, most likely for want of memory), fails the export with that reason: the export never waits for
+an answer that cannot come. The screen is kept on while it runs (Screen Wake Lock, where the browser
+allows it: the browser lets the lock go while the tab is hidden, and the export asks for it again
+each time the tab is shown). The window then lists the files as download links with a preview of the
+sequence, and **Download all (.zip)** saves them as one ZIP archive (stored: the videos and PNGs are
+compressed already). The files stay until the next export started in this tab (an export in another
+tab leaves them alone) or until the tab is closed or reloaded; files on disk outlive the tab until a
+later export, in any tab, deletes them. An export goes on when the window is closed, as long as the
+tab stays open. A tab runs one export on this device at a time, whichever project it exports: the
+export is registered as Export is pressed (a second press starts nothing), and while it runs every
+project's window shows it, with its progress and Cancel, instead of offering Export.
 
 **Requirements**: a secure page (HTTPS, or `localhost`; browsers offer WebCodecs and the Origin
 Private File System only there), Web Workers, and a WebCodecs `VideoEncoder` that encodes H.264 at
@@ -163,7 +164,9 @@ adds a warning.
   (kind, pass, shot, MIME type, size, SHA-256, frames, duration and a `blob()`), the manifest, the
   shots and the warnings; it rejects with a `BrowserExportError` whose `code` is `INVALID_PARAMS`,
   `NOT_FOUND`, `UNSUPPORTED`, `OUT_OF_MEMORY`, `CANCELLED` or `FAILED`;
-- `zipExport(result)`: one ZIP Blob of all the files; `releaseBrowserExport(result)` deletes them.
+- `zipExport(result)`: one ZIP Blob of all the files; `releaseBrowserExport(result)` deletes them
+  (the export's directory on disk, or the in-memory Blobs, freed once nothing else holds them): its
+  files cannot be read afterwards.
 
 ## Requirements
 
