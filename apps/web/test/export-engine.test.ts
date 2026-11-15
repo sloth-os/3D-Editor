@@ -466,9 +466,9 @@ describe('browser export (in process)', () => {
           terminate();
         };
         const post = w.postMessage.bind(w);
-        w.postMessage = (m) => {
+        w.postMessage = (m, transfer) => {
           if (cancelledAt) seen.askedAfterCancel++;
-          post(m);
+          post(m, transfer);
         };
         return w;
       },

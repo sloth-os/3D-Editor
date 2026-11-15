@@ -208,6 +208,12 @@ test.describe('browser video export (no server)', () => {
     const seq = mp4Info(files.get('sequence.mp4')!);
     expect(seq.samples).toBe(7);
     expect(seq.sync.slice(0, 2)).toEqual([1, 5]);
+    // the manifest names the codec as written: the profile, constraints and level of the avcC
+    // (Chrome's encoder writes another profile compatibility byte than the one it was asked for)
+    const hex = (v: number) => v.toString(16).padStart(2, '0');
+    expect(manifest.exporter.video_codec).toBe(
+      `avc1.${hex(seq.avcC![1])}${hex(seq.avcC![2])}${hex(seq.avcC![3])}`,
+    );
     expect(mp4Info(files.get('sequence.mask.mp4')!).samples).toBe(7);
 
     // the mask frames: indexed PNGs, one per frame
