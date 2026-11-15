@@ -93,11 +93,19 @@ function StateStatus({ c }: { c: DeskController }) {
   const dirty = c.dirty.value;
   useTick(at !== null);
   const host = c.options.value.hostName;
-  if (dirty) return <span class="desk-pill warn">Changes not sent to {host} yet</span>;
+  // a note the header may cut short (.note): its tooltip has it whole
+  if (dirty) {
+    const text = `Changes not sent to ${host} yet`;
+    return (
+      <span class="desk-pill note warn" data-testid="desk-state-unsent" title={text}>
+        {text}
+      </span>
+    );
+  }
   if (at === null) return null;
   return (
     <span
-      class="desk-pill"
+      class="desk-pill note"
       data-testid="desk-state-sent"
       title={`The scene's state went to ${host} ${ago(Date.now() - at)}`}
     >
@@ -324,7 +332,12 @@ function DeskHeader(p: { c: DeskController; lengthChecks: () => LengthCheck[] })
           {brief?.name ?? '3D director’s desk'}
         </span>
         {source && (
-          <span class="desk-pill hide-narrow" data-testid="desk-source" data-source={source}>
+          <span
+            class="desk-pill note hide-narrow"
+            data-testid="desk-source"
+            data-source={source}
+            title={SOURCE_LABEL[source](options.hostName)}
+          >
             {SOURCE_LABEL[source](options.hostName)}
           </span>
         )}

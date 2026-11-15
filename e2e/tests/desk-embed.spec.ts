@@ -28,7 +28,9 @@ import { PLAIN } from './helpers';
  *   panel, nothing kept: the next open stages the scene again)
  * - offline: the desk loads from its service worker, stages and exports with no network at all
  * - on its own: the explanation, the editor link and the sample scene; the phone layout, also at
- *   360 px with the longest host and scene names (Done and Close in the frame, Close works)
+ *   360 px with the longest host and scene names (Done and Close in the frame, Close works); at
+ *   1024 px with those names the header's notes are cut short as the scene's name is, never to
+ *   less than their first word, whole in their tooltips
  */
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -161,6 +163,44 @@ async function expectValidMessages(page: Page): Promise<void> {
     const r = schema.safeParse(revive(m));
     expect(r.success, `${m.type}: ${JSON.stringify(r.error?.issues?.slice(0, 3))}`).toBe(true);
   }
+}
+
+/**
+ * In the desk's page: the room the scene's name and the header's notes `ids` have for their text
+ * (`shown`), the width of their text whole (`full`), a note's first word's width (`word`) and its
+ * tooltip, and where Close ends. With `wait` it first waits for the notes (a frame at a time, 2 s
+ * at most).
+ */
+async function notesInHeader({ ids, wait = false }: { ids: string[]; wait?: boolean }) {
+  const find = (id: string) => document.querySelector<HTMLElement>(`[data-testid="${id}"]`);
+  for (const t0 = performance.now(); wait && ids.some((id) => !find(id));) {
+    if (performance.now() - t0 > 2000) throw new Error(`no ${ids.join(', ')} in the header`);
+    await new Promise((r) => requestAnimationFrame(r));
+  }
+  const textWidth = (start: Node, end?: { node: Text; offset: number }) => {
+    const range = document.createRange();
+    range.selectNodeContents(start);
+    if (end) range.setEnd(end.node, end.offset);
+    return range.getBoundingClientRect().width;
+  };
+  const note = (id: string) => {
+    const el = find(id)!;
+    const s = getComputedStyle(el);
+    const first = el.firstChild as Text;
+    const space = first.data.search(/\s/);
+    return {
+      shown: el.clientWidth - parseFloat(s.paddingLeft) - parseFloat(s.paddingRight),
+      full: textWidth(el),
+      word: textWidth(el, { node: first, offset: space < 0 ? first.data.length : space }),
+      title: el.getAttribute('title'),
+    };
+  };
+  const name = find('desk-scene-name')!;
+  return {
+    name: { shown: name.clientWidth, full: textWidth(name) },
+    notes: Object.fromEntries(ids.map((id) => [id, note(id)])),
+    closeRight: find('desk-close')!.getBoundingClientRect().right,
+  };
 }
 
 const fileBytes = async (page: Page, name: string): Promise<Uint8Array> => {
@@ -959,6 +999,50 @@ test.describe('the embeddable desk', () => {
     const [close] = await waitFor(page, 'close');
     expect(close).toEqual({ type: 'close', reason: 'cancel' });
     await expect(frame.getByTestId('desk-closed')).toBeVisible();
+    await expectValidMessages(page);
+  });
+
+  test("on a 1024 px screen, with the longest host and scene names: the notes give way as the scene's name does, never to less than their first word", async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    await page.setViewportSize({ width: 1024, height: 768 });
+    await openHost(page);
+    await waitFor(page, 'ready');
+    const hostName = 'Storyboard Studio Online for Film Crews!';
+    const scene = smallBrief('clp_widehostname001');
+    scene.name = 'The long walk up the windy hill, kites in hand, '.repeat(5).slice(0, 199) + '!';
+    await send(page, { type: 'open', scene, state: null, options: { ...OPTIONS, hostName } });
+    await waitFor(page, 'opened', 1, 120_000);
+    await waitFor(page, 'state');
+    const frame = await deskFrame(page);
+    await expect(frame.getByTestId('desk-state-sent')).toBeVisible();
+    const header = await frame.evaluate(notesInHeader, { ids: ['desk-source', 'desk-state-sent'] });
+    // the scene's name and both notes are cut short, the name keeping the most room; each note still
+    // shows its first word ("Staged", "Sent"), and its tooltip has it whole
+    expect(header.name.full).toBeGreaterThan(header.name.shown);
+    for (const [id, note] of Object.entries(header.notes)) {
+      expect(note.full, `${id} is cut short`).toBeGreaterThan(note.shown);
+      expect(note.shown, `${id} shows its first word`).toBeGreaterThanOrEqual(note.word);
+      expect(header.name.shown, `the name has more room than ${id}`).toBeGreaterThan(note.shown);
+    }
+    expect(header.notes['desk-source'].title).toBe('Staged from the brief');
+    expect(header.notes['desk-state-sent'].title).toMatch(`The scene's state went to ${hostName}`);
+    expect(header.closeRight).toBeLessThanOrEqual(1024);
+    // after an edit the note says the host does not have it yet (until the state goes, 2 s after
+    // the edit): cut short the same way, whole in its tooltip
+    const shot = await frame.evaluate(() => (window as any).__desk.shots()[1].id);
+    const r = await frame.evaluate(
+      (id) => (window as any).__desk.run('desk.shot_update', { shot: id, duration_s: 1 }),
+      shot,
+    );
+    expect(r.ok, r.error).toBe(true);
+    const edited = await frame.evaluate(notesInHeader, { ids: ['desk-state-unsent'], wait: true });
+    const unsent = edited.notes['desk-state-unsent'];
+    expect(unsent.full).toBeGreaterThan(unsent.shown);
+    expect(unsent.shown).toBeGreaterThanOrEqual(unsent.word);
+    expect(unsent.title).toBe(`Changes not sent to ${hostName} yet`);
+    expect(edited.name.shown).toBeGreaterThan(unsent.shown);
     await expectValidMessages(page);
   });
 

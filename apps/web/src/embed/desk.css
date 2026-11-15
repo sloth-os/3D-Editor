@@ -46,12 +46,18 @@
 .desk-pill.lock {
   color: var(--select-active);
 }
-/* the notes give way to the scene's name, cut short */
+/* the notes that can be long (where the scene was opened from, whether the host has its latest
+   state) give way as the scene's name does, each in proportion to its length, cut short (their
+   tooltips have them whole) but never to less than 6em, about their first word (a fifth of the
+   title where that is less); the short ones (Opening…, Read-only) stay whole. On a phone all of
+   them give way first (below) */
 .desk-title .desk-pill {
-  flex: 0 4 auto;
-  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.desk-title .desk-pill.note {
+  flex: 0 1 auto;
+  min-width: min(6em, 20%);
 }
 /* the actions keep one line: only Send's label gives way (the host's name cut short), so Done and
    Close are always in the frame, whatever the host's name (up to 40 characters) */
@@ -253,7 +259,7 @@
 
 /* phones (the editor's phone layout starts at 760 px): the header keeps its buttons and Follow on
    one line, Follow without its label, Send without the host's name (in its title), Close without
-   its word, the scene's name and notes cut short to make room */
+   its word, the scene's name and the notes cut short to make room, the notes first */
 @media (max-width: 760px) {
   .hide-narrow {
     display: none !important;
@@ -268,6 +274,11 @@
   .desk-actions .btn {
     padding-left: 6px;
     padding-right: 6px;
+  }
+  .desk-title .desk-pill,
+  .desk-title .desk-pill.note {
+    flex: 0 4 auto;
+    min-width: 0;
   }
   .desk-banner {
     flex-wrap: wrap;

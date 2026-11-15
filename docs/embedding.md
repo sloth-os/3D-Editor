@@ -416,7 +416,10 @@ state, the brief's changes with **Update shots**, **Follow** (the reference clip
 when the host takes more than one), **Send to …** (the host's name), **Done** and **Close**, and an
 export's progress with **Cancel**. They keep one line at every width, Done and Close always in the
 frame whatever the host's name (it may have 40 characters): where the header is narrow the scene's
-name, the notes and the host's name in Send are cut short, and on a phone Follow has no label, Send
+name and the host's name in Send are cut short, and so are the notes on where the scene came from
+and whether the host has its latest state, with the name, each in proportion to its length but never
+to less than about its first word (or a fifth of the room the actions leave, where that is less),
+their tooltips having them whole; on a phone the notes give way first, Follow has no label, Send
 says just "Send" (the host's name in its tooltip) and Close is its icon. It has no top-bar menus,
 workspaces, project list, presence, share or update button, Console, Diagnostics, UV editor, Dope
 Sheet or Properties editor; the viewport's menus grey out what it hides (Import…). The desk ignores

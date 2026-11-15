@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render } from '@testing-library/preact';
+import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import { OperatorRegistry, defineOperator, type SceneBrief } from '@3d-editor/core';
 import { z } from 'zod';
 import { DESK_HIDDEN_OPERATORS, DESK_IGNORED_KEYS, deskRefusal, guardRegistry } from '../src/embed/guards';
@@ -16,10 +16,11 @@ vi.mock('../src/pwa/register', () => ({ pwaUpdate: { value: false }, applyPwaUpd
  * operators always, every operator that changes the scene in a read-only open (refused in the
  * registry's poll, so every way of running them fails), the keys of the chrome it hides, the
  * editor's preferences (never read or written by the desk), and storage that may be blocked; and
- * the desk's header: where the state went, the Follow menu in the host's order, Send off for a
- * brief over the export's size, the Send check (the brief's retimed shots apart from the desk's,
- * with Update shots). (The chrome taking the viewport's keys away is checked in a real browser:
- * e2e/tests/desk-embed.spec.ts.)
+ * the desk's header: where the state went or that the host does not have the latest edits yet (the
+ * notes whole in their tooltips), the Follow menu in the host's order, Send off for a brief over the
+ * export's size, the Send check (the brief's retimed shots apart from the desk's, with Update
+ * shots). (The chrome taking the viewport's keys away, and how the header gives way at each width,
+ * are checked in a real browser: e2e/tests/desk-embed.spec.ts.)
  */
 
 const ctx = {} as never;
@@ -181,7 +182,7 @@ describe("the desk's header", () => {
     ],
   } as unknown as SceneBrief;
 
-  async function openDesk(options: object, scene: SceneBrief = brief) {
+  async function openDesk(options: object, scene: SceneBrief = brief, more: Partial<SceneWorkspace> = {}) {
     const ws: SceneWorkspace = {
       open: async () => ({
         source: 'brief',
@@ -203,6 +204,7 @@ describe("the desk's header", () => {
       updateFromBrief: async () => null,
       results: async () => [],
       projectId: 'desk-1',
+      ...more,
     };
     const c = new DeskController({
       send: () => true,
@@ -322,6 +324,31 @@ describe("the desk's header", () => {
     const named = label.querySelector('.hide-narrow');
     expect(named?.textContent).toBe(` to ${host}`);
     expect(send.classList.contains('desk-send')).toBe(true);
+  });
+
+  it('says when the host does not have the latest edits; the notes the header may cut short have them whole in their tooltips', async () => {
+    const host = 'Storyboard Studio Online for Film Crews!';
+    let edit = () => {};
+    const c = await openDesk({ hostName: host }, brief, {
+      onEdit: (cb) => {
+        edit = cb;
+        return () => {};
+      },
+    });
+    const v = await header(c);
+    // where the scene was opened from and where its state went: notes the header cuts short where
+    // it is narrow (desk.css: .desk-title .desk-pill.note)
+    const source = v.getByTestId('desk-source');
+    expect(source.classList.contains('note')).toBe(true);
+    expect(source.getAttribute('title')).toBe('Staged from the brief');
+    expect(v.getByTestId('desk-state-sent').classList.contains('note')).toBe(true);
+    // an edit: the host does not have it yet (the state goes 2 s after the last edit)
+    act(() => edit());
+    const unsent = v.getByTestId('desk-state-unsent');
+    expect(unsent.textContent).toBe(`Changes not sent to ${host} yet`);
+    expect(unsent.getAttribute('title')).toBe(`Changes not sent to ${host} yet`);
+    expect(unsent.classList.contains('note')).toBe(true);
+    expect(v.queryByTestId('desk-state-sent')).toBeNull();
   });
 
   it("turns Send off for a brief over the export's size and says why", async () => {
