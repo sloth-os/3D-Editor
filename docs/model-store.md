@@ -137,8 +137,9 @@ file. Format, version 1:
   answers.
 - **Nothing is downloaded before an insert** (or a request for a model's files). Thumbnails of the
   other providers' models are proxied and cached. The server renders a built-in model's thumbnail
-  the first time its route is asked for it and serves it from the cache after that; the Asset
-  Browser makes the built-in thumbnails itself and never asks for them ([thumbnails](#thumbnails)).
+  the first time its route is asked for it and serves it from the cache after that (until it is
+  upgraded); the Asset Browser makes the built-in thumbnails itself and never asks for them
+  ([thumbnails](#thumbnails)).
 - **Downloads** are checked (sizes, checksums the provider gives, the GLB header, images that are
   images), at most 200 MB and 512 files per model, archives unpacked, and stored in the cache under
   `MODEL_CACHE_MAX_MB` (least recently used first; a model in use stays).
@@ -163,7 +164,11 @@ other providers' thumbnails come from the server, which proxies and caches them.
   samples, 256 × 256 on a transparent background, and encoded by core's PNG encoder
   (`packages/core/src/store/thumbnail.ts`). The server's `GET /api/store/models/:model/thumbnail`
   runs the same code, so for the same model and size the two are the same PNG, byte for byte (the
-  unit and e2e tests compare them).
+  unit and e2e tests compare them). The server keeps its PNG in the model cache under a key of the
+  thumbnail version, its own version (`APP_VERSION`, which the CI images stamp with the commit) and
+  a digest of its code (the server's bundle and the render processes' beside it), so a server of
+  another version or build renders it again rather than serving an older one's; run from the
+  sources, each start is a build of its own.
 - **Workers.** One module worker renders them, or two on machines with four cores or more, each one
   thumbnail at a time, so the page and its viewport keep the other cores. They start with the first
   thumbnail, stop after 30 s without one and at once when the page goes away (`pagehide`); a

@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   BUILTIN_CATALOG,
@@ -12,6 +16,7 @@ import {
 import { Renderer, type RenderImageRequest, type RenderImageResult } from '../../src/render';
 import { RenderPool } from '../../src/render/pool';
 import { ToolError } from '../../src/mcp/agent';
+import { serverCodeBuild } from '../../src/store';
 import {
   THUMBNAIL_LOOK,
   THUMBNAIL_SIZE,
@@ -178,6 +183,70 @@ describe('ModelStore.thumbnail', () => {
     } finally {
       await again.cleanup();
     }
+  });
+
+  it("renders a built-in thumbnail again for a server of another version or build, never serving an older one's", async () => {
+    const renderer = fakeRenderer();
+    const services = { renderer: renderer as never, registry: createOperatorRegistry() };
+    t = await makeStore({
+      env: { APP_VERSION: '1.0.0-aaaaaaa' },
+      options: { thumbnailBuild: 'build-1' },
+      services,
+    });
+    await t.store.thumbnail(`builtin:${MODEL.id}`);
+    expect(renderer.calls).toHaveLength(1);
+    /** A server started on the same data directory (DATA_DIR kept across an upgrade). */
+    const restart = async (version: string, build: string) => {
+      const s = await makeStore({
+        dir: t!.dir,
+        env: { APP_VERSION: version },
+        options: { thumbnailBuild: build },
+        services,
+      });
+      try {
+        await s.store.thumbnail(`builtin:${MODEL.id}`);
+      } finally {
+        await s.cleanup();
+      }
+    };
+    // the same server again: its PNG from the cache
+    await restart('1.0.0-aaaaaaa', 'build-1');
+    expect(renderer.calls).toHaveLength(1);
+    // an upgrade (the CI images stamp APP_VERSION with the commit): made again
+    await restart('1.0.1-bbbbbbb', 'build-1');
+    expect(renderer.calls).toHaveLength(2);
+    // another build that says the same version (an image built without APP_VERSION): made again
+    await restart('1.0.1-bbbbbbb', 'build-2');
+    expect(renderer.calls).toHaveLength(3);
+  });
+
+  it('keys built-in thumbnails on a digest of the bundles that run, or one build per start from the sources', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'server-build-'));
+    try {
+      const main = path.join(dir, 'main.js');
+      await writeFile(main, 'console.log(1);\n');
+      const url = pathToFileURL(main).href;
+      const a = await serverCodeBuild(url);
+      expect(a).toMatch(/^[0-9a-f]{16}$/);
+      expect(await serverCodeBuild(url)).toBe(a);
+      // the render processes' bundle beside it (the renderer) counts
+      await writeFile(path.join(dir, 'render-worker.js'), 'render(1);\n');
+      const b = await serverCodeBuild(url);
+      expect(b).not.toBe(a);
+      await writeFile(path.join(dir, 'render-worker.js'), 'render(2);\n');
+      const c = await serverCodeBuild(url);
+      expect(c).not.toBe(b);
+      // and so does the server's own (catalog, store.add, framing)
+      await writeFile(main, 'console.log(2);\n');
+      expect(await serverCodeBuild(url)).not.toBe(c);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    // run from the TypeScript sources (as here): one build per start of the server
+    const src = await serverCodeBuild();
+    expect(src).toMatch(/^src-[0-9a-z]+$/);
+    expect(await serverCodeBuild()).toBe(src);
+    expect(await serverCodeBuild(pathToFileURL(path.join(tmpdir(), 'missing', 'main.js')).href)).toBe(src);
   });
 
   it('renders built-in thumbnails one at a time in one document, holding only the model rendered', async () => {
