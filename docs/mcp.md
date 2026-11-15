@@ -1712,10 +1712,12 @@ cameras and actors moved). A brief that does not validate, a project staged from
 holding shots of its own, or a new project's name that another project has are refused
 (`INVALID_PARAMS`). A brief the server has no memory to stage is refused with
 `{"code": "OUT_OF_MEMORY"}` after the message, which says what to lower (the number and length of
-the brief's shots or its frame rate, and the number of its cast members, kites and balloons). A
-project the call made for a brief that then fails to stage is deleted again, so that the brief can
-be sent again; when storage does not delete it, the error names it (pass it as `project`, or delete
-it). `desk_shot_results` reports each staged shot as the contract's `ShotResult` without its files;
+the brief's shots or its frame rate, and the number of its cast members, kites and balloons). An
+update is counted with the checks it runs afterwards over every shot it keeps, as `desk.check`
+counts them, so it needs that memory however few shots the brief changed. A project the call made
+for a brief that then fails to stage is deleted again, so that the brief can be sent again; when
+storage does not delete it, the error names it (pass it as `project`, or delete it).
+`desk_shot_results` reports each staged shot as the contract's `ShotResult` without its files;
 render the references with `export_video {project, preset: 'reference'}`.
 
 ### Resources

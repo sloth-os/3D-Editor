@@ -464,7 +464,10 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
     sampling(ctx.doc, 2 * targetShots(ctx.doc, null).length, 'the number of shots'),
   /** A brief's staging: its cast standing on their marks, its shots' cameras, its props and set (briefEstimate). */
   'desk.stage_brief': (ctx, p) => briefEstimate(ctx, p.brief, null),
-  /** An update stages what the brief changed since the record of the one staged (briefUpdateScope). */
+  /**
+   * An update stages what the brief changed since the record of the one staged (briefUpdateScope),
+   * then checks every shot it keeps of the brief, as desk.check does (briefEstimate).
+   */
   'desk.update_from_brief': (ctx, p) => {
     const b = record(p.brief);
     const r = readBriefRecord(ctx.doc);
@@ -553,7 +556,9 @@ function briefUpdateScope(r: BriefRecord, b: Record<string, unknown>): BriefScop
  * keyed once in its pose and in each shot where it stands and whether it is shown (nobody walks); a
  * camera per shot, keyed as its move; a built-in model per prop, a held kite or balloon flown on every
  * frame of the shots; the set and its water; three frames sampled per shot by the solve and the
- * checks. `scope`: only what an update stages (null: the whole brief).
+ * checks. `scope`: only what an update stages (null: the whole brief); an update solves only those
+ * shots, but checks every shot of the brief the desk holds afterwards (update.ts runs the checks
+ * over all of them), three frames each as desk.check counts them, on the staged document.
  */
 function briefEstimate(
   ctx: OperatorContext,
@@ -571,7 +576,8 @@ function briefEstimate(
   const rate = Math.max(1, num(b.fps, fps(ctx.doc)));
   let frames = 0;
   let cameraKeyCount = 0;
-  let sampled = 0;
+  // an update's checks: every shot of the brief it keeps (at most all of them), as desk.check's
+  let sampled = scope ? DESK_FRAMES_PER_SHOT * items(b.shots).length : 0;
   for (const s of shots) {
     const n = clampFrames(num(s.durationSec, DEFAULT_SHOT_SECONDS) * rate);
     frames += n;

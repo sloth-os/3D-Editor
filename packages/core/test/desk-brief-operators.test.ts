@@ -112,6 +112,24 @@ describe('brief memory estimates', () => {
     updateFromBrief(doc, next);
     expect(keysOf(doc) - before).toBeLessThanOrEqual(e.keyframes!);
   });
+
+  it('estimate an update with the checks it runs over every shot it keeps, as desk.check counts them', () => {
+    // 60 shots of 5 s with 8 people, one shot retimed: the update solves that shot but checks all
+    // 60 afterwards. Counting only the shot it solves, the estimate said 34 MB, where the update
+    // needed 90–140 MB above the staged project (out of memory at a 128 MB heap, fine at 176 MB, the
+    // project taking 38 MB), and desk.check alone on it estimates 163 MB.
+    const { doc, estimate } = setup();
+    const brief = crowd(60, 5, 8);
+    stageBrief(doc, brief);
+    const next = structuredClone(brief);
+    next.shots[1].durationSec = 6;
+    const update = estimate('desk.update_from_brief', { brief: next })!;
+    const check = estimate('desk.check', {})!;
+    expect(check.bytes).toBeGreaterThan(100 * 2 ** 20);
+    expect(update.bytes).toBeGreaterThanOrEqual(check.bytes);
+    // the brief as staged changes nothing, but the update still checks every shot
+    expect(estimate('desk.update_from_brief', { brief })!.bytes).toBeGreaterThanOrEqual(check.bytes);
+  });
 });
 
 describe('the pre-roll before a cut where a rider gets on or off', () => {
