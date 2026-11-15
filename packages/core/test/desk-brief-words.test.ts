@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { isHumanoid } from '../src/desk/rideo/rules';
-import { castKinds } from '../src/desk/brief/plan';
+import { castKinds, planBrief } from '../src/desk/brief/plan';
 import { animalOf, interiorFromWords } from '../src/desk/brief/words';
 import type { SceneBrief } from '../src/desk/brief';
 
@@ -155,6 +155,90 @@ describe('a cast member without a kind hint', () => {
     });
     expect(kindOf('Quackers', 'Quackers: 2 female, approx. 30 cm; white feathers. A duck.').kind).toBe('cat');
   });
+
+  // an animal the identity line names before its marks (as its age, ethnicity or build: rideo's pets
+  // and mounts) is what the member is, whatever gender word follows the age
+  it.each([
+    ['Pip2', 'Pip2: puppy male, small; golden fur. Loves to chase balls.', 'small_dog'],
+    ['Pip3', 'Pip3: puppy male, small; golden fur.', 'small_dog'],
+    ['Rex', 'Rex: young male, golden retriever; floppy ears.', 'dog'],
+    ['Kit2', 'Kit2: kitten female; white paws.', 'cat'],
+    ['Pip', 'Pip: 3 male, golden retriever, small; golden fur; wearing a red collar.', 'dog'],
+    ['Bella2', 'Bella2: adult female, chestnut mare; white blaze.', 'horse'],
+    ['Clover', 'Clover: 7 female, Shetland pony, small; white mane.', 'pony'],
+  ])('%s (%s) is the animal its identity line names', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
+  });
+
+  // ... but not one it names as a feature or a figure of speech, nor one among its marks
+  it.each([
+    ['Tom', 'Tom: 45 male, bull-necked; broken nose.', 'man'],
+    ['Dee', 'Dee: 25 female, doe-eyed; freckles.', 'woman'],
+    ['Bob', 'Bob: 60 male, owl-eyed, stocky; grey beard.', 'man'],
+    ['Sam', 'Sam: 40 male, bear of a man; beard.', 'man'],
+    ['Leo', 'Leo: 8 boy, slim; lion tattoo.', 'child'],
+    ['Ned', 'A bull-necked farmer.', 'adult'],
+  ])('%s (%s) is a person: its animal word is a feature', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
+  });
+});
+
+describe("a shot's sentences", () => {
+  // Mira and Pip (rideo sends no kind hints) and a kite: who holds it is read sentence by sentence
+  function kiteShot(description: string, action: string) {
+    const brief = {
+      id: 'scene',
+      name: 'Scene',
+      fps: 24,
+      width: 640,
+      height: 360,
+      set: { description: 'A meadow.', interior: false, timeOfDay: null },
+      cast: [
+        {
+          id: 'mira',
+          name: 'Mira',
+          description: 'A girl of 8 in a yellow raincoat.',
+          kind: null,
+          heightM: null,
+        },
+        { id: 'pip', name: 'Pip', description: 'A golden retriever puppy.', kind: null, heightM: null },
+      ],
+      elements: [{ id: 'kite', name: 'Red kite', description: 'A red diamond kite.', kind: 'prop' }],
+      shots: [
+        {
+          id: 's1',
+          index: 0,
+          durationSec: 2,
+          description,
+          action,
+          castIds: ['mira', 'pip'],
+          elementIds: ['kite'],
+          framing: 'wide',
+          movement: 'static',
+          move: null,
+          lensMm: null,
+          continuity: 'cut',
+          layout: [],
+        },
+      ],
+    } as SceneBrief;
+    const plan = planBrief(brief);
+    return { holder: plan.holders.get('kite') ?? null, pip: plan.cast.get('pip')!.kind };
+  }
+
+  it('give a prop to the subject of the sentence that says so, not to one named in the sentence before', () => {
+    // "in." ends the description: "She" names nobody, so nobody holds the kite and Pip stays a dog
+    expect(kiteShot('Wide: Pip bounds in.', 'She grabs the kite and runs.')).toEqual({
+      holder: null,
+      pip: 'dog',
+    });
+    expect(kiteShot('Wide: Pip bounds in', 'Mira grabs the kite and runs.')).toEqual({
+      holder: 'mira',
+      pip: 'dog',
+    });
+    // a dog that holds a prop in its own sentence is a person
+    expect(kiteShot('Wide: Pip bounds in and grabs the kite.', '')).toEqual({ holder: 'pip', pip: 'adult' });
+  });
 });
 
 describe('a set without `interior`', () => {
@@ -222,6 +306,19 @@ describe('a set without `interior`', () => {
       expect(interiorFromWords(words)).toBe(false);
     },
   );
+
+  // a deck is a boat's or a house's (outdoors), not a deck of cards, a tape deck or a deck chair
+  it.each([
+    ['A deck of cards lies on the kitchen table.', true],
+    ['A tape deck plays in the bedroom.', true],
+    ['A cassette deck hums in the living room.', true],
+    ['A deck chair in the living room.', true],
+    ["The ship's deck at dawn, a cabin below.", false],
+    ['On deck, the crew hauls the sail.', false],
+    ['The deck of the ferry, a deck of cards on the bench.', false],
+  ])('%s', (words, interior) => {
+    expect(interiorFromWords(words)).toBe(interior);
+  });
 
   // "inside" or "indoors" opening a clause says where the scene is, of itself or of a room or a
   // building, whatever outdoor words came before

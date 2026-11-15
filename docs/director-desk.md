@@ -361,17 +361,22 @@ undo step, and runs in a web worker as well as on the server:
   that opens with rideo's identity line, `Name: <age> <gender>, <build>; <marks>; wearing …`, gives
   the person's age and gender (`Bo: 6 male` a child, `Tom: 72 male` an elder,
   `Ana: early 30s female` a woman; 3 and under a toddler, 12 and under a child, 65 and over an
-  elder). The line runs to its first sentence end: a period inside a number (`1.85 m`), after a
-  title (`Dr.`, `Mrs.`, `St.`) or an initial, or after an abbreviation no capital follows
-  (`approx. 160 cm`, `e.g. a scar`) does not end it. An age may be written out: `early twenties`,
-  `30-ish`, `thirty-something`, `18 months` (a toddler); early, mid and late put an age 2, 5 and 8
-  years into its decade, so `late sixties` or `late 60s` is an elder (teens, and words such as
-  "elderly", are not read as an age but as age words). A line whose first item ends with a gender
-  word (male, female, man, woman, boy, girl, non-binary) is a person's whatever its age says and
-  whatever animal words follow in it ("bull neck", "doe eyes", "a parrot on his shoulder") or the
-  name says ("Wolf"), unless the sentence after it names the animal ("A curious white duck."). An
-  animal word that says what a member has or resembles is not what it is: a possessive ("crow's
-  feet") or one before "-like" ("a crow-like old woman"), as before "tattoo", "costume" or "ears".
+  elder). The line runs to its first sentence end (see [Briefs](#limits-and-known-gaps) for where
+  a sentence ends): a period inside a number (`1.85 m`), after a title (`Dr.`, `Mrs.`, `St.`) or
+  an initial, or after an abbreviation no capital follows (`approx. 160 cm`, `e.g. a scar`) does
+  not end it. An age may be written out: `early twenties`, `30-ish`, `thirty-something`,
+  `18 months` (a toddler); early, mid and late put an age 2, 5 and 8 years into its decade, so
+  `late sixties` or `late 60s` is an elder (teens, and words such as "elderly", are not read as an
+  age but as age words). A line whose first item ends with a gender word (male, female, man,
+  woman, boy, girl, non-binary) is a person's whatever its age says, unless the line names an
+  animal as what the member is before its first `;`, as its age, ethnicity or build
+  (`Pip: 3 male, golden retriever, small`, `Kit: kitten female`, `Rex: young male, beagle`): then
+  it is that animal. Animal words among its marks ("bull neck", "doe eyes", "a parrot on his
+  shoulder") or in the name ("Wolf") do not make a person an animal, unless the sentence after the
+  line names the animal ("A curious white duck."). An animal word that says what a member has or
+  resembles is not what it is: a possessive ("crow's feet"), one before "-like" ("a crow-like old
+  woman") or before a hyphened "-ed" word ("bull-necked", "doe-eyed"), "a bear of a man", as
+  before "tattoo", "costume" or "ears".
   An animal the desk has no figure for stands in as the built kind nearest its size, with a warning:
   birds and small animals as a `cat`, foxes and wolves as a `dog`, goats as a `sheep`, big cats as a
   `bear`, big grazers as a `cow`, camels and zebras as a `horse`. `heightM` sets its height (an
@@ -394,7 +399,8 @@ undo step, and runs in a web worker as well as on the server:
   sheds, tents, caravans and other shelters are buildings: "inside the river boat", "inside the
   garden shed"), or when "inside" or "indoors" opens a clause after outdoor words, on its own or of
   a room or a building ("a cabin in the woods, inside by the fire", not "the garden, inside the
-  gate"); a deck is outdoors, unless "below deck"; its ground from the first ground word they name
+  gate"); a deck (a boat's or a house's) is outdoors, unless "below deck", but a deck of cards, a
+  tape or cassette deck and a deck chair are not; its ground from the first ground word they name
   (grass, sand, snow, ice, wood, carpet, dirt, stone), else a wooden floor inside and plain ground
   outside; the sun from the time of day (below). Open water that the set or a location names (a
   puddle, pond, pool, fountain, stream, brook, creek, canal, river, lake, lagoon, loch, reservoir,
@@ -768,15 +774,21 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   shot's first frame. Depth of field is a camera setting, so a `rack_focus` shot's focus reaches
   other shots on the same camera.
 - **Briefs**: the kinds of the cast, who rides whom, who holds what and where the water lies are
-  read from English words only, without following pronouns across sentences; a brief places nobody,
-  so the cast starts on the planned sides or in a row and moves only as it is staged afterwards
-  (`desk.actor_move` …). An update keeps hand edits of unchanged shots and the desk's cut order but
-  does not follow a new order of the brief, and a recast or replanned shot's camera is solved again
-  unless it was set by hand. Staging a brief took 0.1–0.4 s for 2 shots and 2 cast members, 1.3 s
-  for 20 shots and 6, 8 s for 60 and 12, and 34 s for 200 and 12 (a 4-core machine shared with other
-  work); `shotResults` and an update each took about 40 % of that. Most of it is the camera solve
-  and the checks, which measure every actor of the scene in every shot: stage long scenes in a
-  worker and show progress.
+  read from English words only, without following pronouns across sentences ("Mira walks in. She
+  grabs the kite." gives the kite to nobody). Sentences are split in the text's own case, at ".",
+  "!", "?", ";" or a line break, but not at a period inside a number, after an abbreviation no
+  capital follows (`approx.`, `e.g.`; "in", "no", "max" and a few more only beside a number, as in
+  `6 ft 2 in.` or `No. 5`), or after a title written with a capital or an initial (`Dr. Okafor`,
+  `St. Ives`, `J. A. Smith`) unless the next word opens a sentence ("He", "The", "Then"), so
+  "Exit at Gate C. Pip barks." stays one sentence. A brief places nobody, so the cast starts on the
+  planned sides or in a row and moves only as it is staged afterwards (`desk.actor_move` …). An
+  update keeps hand edits of unchanged shots and the desk's cut order but does not follow a new
+  order of the brief, and a recast or replanned shot's camera is solved again unless it was set by
+  hand. Staging a brief took 0.1–0.4 s for 2 shots and 2 cast members, 1.3 s for 20 shots and 6,
+  8 s for 60 and 12, and 34 s for 200 and 12 (a 4-core machine shared with other work);
+  `shotResults` and an update each took about 40 % of that. Most of it is the camera solve and the
+  checks, which measure every actor of the scene in every shot: stage long scenes in a worker and
+  show progress.
 - **SceneBlocking import**: the kind of each character and who rides whom are read from English
   text only; hand-made keys on imported actors and props are replaced on re-import (user objects,
   shots, physics and materials are kept), and the re-import's warnings name the actors, props,

@@ -58,10 +58,11 @@ const INDOORS =
   /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|cafe|caf|restaurant|(?<!sand |candy |chocolate |crow)bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat(?=\s*(?:$|[,.;:!?)]|(?:in|on|at|of|with|where|above|below|near|by|and|that|which)\b))|cabin interior|staircase|stairwell|elevator|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/g;
 /**
  * Words that say a place is outdoors (they win over a room named as being nearby); a deck too (a
- * boat's or a house's), but not "below deck".
+ * boat's or a house's), but not "below deck", nor a deck of cards, a tape or cassette deck or a deck
+ * chair.
  */
 const OUTDOORS =
-  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under )decks?|car park|parking lot)\b/g;
+  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:[a-z0-9-]+\s+)?cards\b)|car park|parking lot)\b/g;
 
 /**
  * Indoor words that may say where or whose an outdoor place is rather than name a room ("deep inside
@@ -431,9 +432,12 @@ const TOY_BEFORE =
 
 /**
  * Words after which the word before is not what the member is: a possessive names whose something
- * is ("crow's feet", "the farmer's duck"), "-like" what it resembles ("a crow-like old woman").
+ * is ("crow's feet", "the farmer's duck"), "-like" what it resembles ("a crow-like old woman"), a
+ * hyphened "-ed" word a feature ("bull-necked", "doe-eyed", "pigeon-toed"), and "of a man" (or a
+ * woman …) a figure of speech ("a bear of a man").
  */
-const OWNED_OR_LIKE = /^(?:'s\b|-like\b)/;
+const OWNED_OR_LIKE =
+  /^(?:'s\b|-like\b|-[a-z]+ed\b|\s+of\s+an?\s+(?:m[ae]n|wom[ae]n|boy|girl|guy|fellow|lad|lass|lady|gentleman)\b)/;
 
 /** `text` with the words a modifier makes something else (see MODIFIED, OWNED_OR_LIKE, TOY_BEFORE) blanked, same length. */
 function blankModifiers(text: string): string {
@@ -476,7 +480,7 @@ export interface AnimalWords {
   word: string;
 }
 
-/** A gender rideo's identity line gives ("<age> <gender>"): a person's word, whatever its age says. */
+/** A gender rideo's identity line gives ("<age> <gender>"). */
 const IDENTITY_GENDER = /^(?:male|female|non-?binary|man|woman|boy|girl)$/;
 
 /**
@@ -503,9 +507,11 @@ export function identityLine(name: string, description: string): { line: string;
 /**
  * The age and gender a cast member's description opens with as rideo writes them: the first item of
  * its identity line (identityLine), "<age> <gender>" ("45 male", "early 30s female", "8 girl", "6",
- * "male", "early twenties female", "30-ish female"). A gender word last in it (male, female, man,
- * woman, boy, girl, non-binary) makes it a person's line whatever the age says; without one, the item
- * must be an age alone ("8", "thirty", "6 years old"). Null otherwise.
+ * "male", "early twenties female", "30-ish female", "puppy male"). A gender word last in it (male,
+ * female, man, woman, boy, girl, non-binary) makes it an identity line whatever the age says; without
+ * one, the item must be an age alone ("8", "thirty", "6 years old"). Null otherwise. Whether the
+ * member is a person or an animal is animalOf's: an animal the line names before its marks wins over
+ * the gender word.
  */
 export function identityOf(name: string, description: string): { age: string; gender: string } | null {
   const id = identityLine(name, description);
@@ -518,6 +524,21 @@ export function identityOf(name: string, description: string): { age: string; ge
 }
 
 /**
+ * The animal the first part of rideo's identity line (before its first ";": the age and gender, the
+ * ethnicity and the build items) names as what the member is, each item read alone: "Pip: 3 male,
+ * golden retriever, small", "Kit: kitten female", "Bella: adult female, chestnut mare". Null when it
+ * names none, or names one only as a feature ("Tom: 45 male, bull-necked") or a figure of speech ("a
+ * bear of a man"); the marks after the ";" ("bull neck", "doe eyes") are never read here.
+ */
+function identityAnimal(line: string): AnimalWords | null {
+  for (const item of line.split(';')[0].split(',')) {
+    const k = sentenceKind(item);
+    if (k && k !== 'person') return k;
+  }
+  return null;
+}
+
+/**
  * The animal a cast member is by its own words, or null for a person (the actor kind of a member
  * without a kind hint, before what the shots say: who rides and holds what). The words read are the
  * description's first sentence (after rideo's "Name:" its identity line: identityLine) and, when that
@@ -527,9 +548,11 @@ export function identityOf(name: string, description: string): { age: string; ge
  * makes it something the member has, does, wears, is with or resembles: "A white duck" and "Pip: 3
  * male, small; golden fur. A golden retriever puppy." are animals; "A farmer with a goat", "Mira: 8
  * girl, slim; a small bird tattoo …", "A girl in a rabbit costume", "wearing a fox-fur hat", "Jo:
- * tall, thin; crow's feet.", "A crow-like old woman" and "Deep in love with birds" are not. An identity
- * line that gives a gender (identityOf: "Tom: 45 male, stocky; bull neck, broken nose", "Dee: early
- * twenties female; doe eyes") is a person's: an animal word in it is a feature ("bull neck", "doe
+ * tall, thin; crow's feet.", "A crow-like old woman", "A bull-necked farmer" and "Deep in love with
+ * birds" are not. An identity line that gives a gender (identityOf: "Tom: 45 male, stocky; bull neck,
+ * broken nose", "Dee: early twenties female; doe eyes") is a person's unless its first part names an
+ * animal as what the member is (identityAnimal: "Pip: puppy male, small", "Rex: young male, golden
+ * retriever", "Kit: kitten female"): an animal word among its marks is a feature ("bull neck", "doe
  * eyes", "a parrot on his shoulder"), and neither it nor the name ("Wolf: 40 male, tall.") makes the
  * member an animal; only the sentence after it (rideo's summary: "Quackers: 2 female, small; white
  * feathers. A curious white duck.") still can.
@@ -541,6 +564,8 @@ export function animalOf(name: string, description: string): AnimalWords | null 
     .filter(Boolean)
     .slice(0, 2);
   if (id && identityOf(name, description)?.gender) {
+    const named = identityAnimal(id.line);
+    if (named) return named;
     const next = id.rest ? sentenceKind(sentencesOf(id.rest)[0] ?? '') : null;
     return next && next !== 'person' ? next : null;
   }
