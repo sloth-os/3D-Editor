@@ -194,6 +194,76 @@ describe('the staging client', () => {
     client.dispose();
   });
 
+  it("stops a staging when its signal aborts (the open's Close): out of the queue, or its worker stopped", async () => {
+    // workers that answer only when the test says so
+    const workers: {
+      onmessage: ((e: MessageEvent) => void) | null;
+      onerror: ((e: ErrorEvent) => void) | null;
+      posted: { id: number; request: StagingRequest }[];
+      terminate: ReturnType<typeof vi.fn>;
+      postMessage(m: { id: number; request: StagingRequest }): void;
+    }[] = [];
+    const factory: StagingWorkerFactory = () => {
+      const w = {
+        onmessage: null as ((e: MessageEvent) => void) | null,
+        onerror: null as ((e: ErrorEvent) => void) | null,
+        posted: [] as { id: number; request: StagingRequest }[],
+        terminate: vi.fn(),
+        postMessage: (m: { id: number; request: StagingRequest }) => void w.posted.push(m),
+      };
+      workers.push(w);
+      return w;
+    };
+    const answer = (w: (typeof workers)[number], i: number) =>
+      w.onmessage!({ data: { id: w.posted[i].id, reply: runStaging(w.posted[i].request) } } as MessageEvent);
+    const kinds = (w: (typeof workers)[number] | undefined) => w?.posted.map((p) => p.request.kind);
+    /** What a request came to within `ms`: 'answered', its error's name, or 'pending'. */
+    const within = (p: Promise<unknown>, ms = 1000) =>
+      Promise.race([
+        p.then(
+          () => 'answered',
+          (e: Error) => e.name,
+        ),
+        new Promise<string>((r) => setTimeout(() => r('pending'), ms)),
+      ]);
+    const client = new StagingClient(factory);
+    // a staging running in the worker: the abort ends it at once, and stops the worker
+    const open = new AbortController();
+    const staging = client.stage(empty(), EXAMPLE(), 'lin-3', 'test', open.signal);
+    await vi.waitFor(() => expect(kinds(workers[0])).toEqual(['stage']));
+    open.abort();
+    expect(await within(staging)).toBe('AbortError');
+    expect(workers[0].terminate).toHaveBeenCalledTimes(1);
+    // the next request runs on a new worker
+    const check = client.check(empty());
+    await vi.waitFor(() => expect(kinds(workers[1])).toEqual(['check']));
+    answer(workers[1], 0);
+    expect((await check).check.summary).toMatch(/^0 shots/);
+    // a staging waiting behind another request leaves the queue: it is never sent
+    const busy = client.check(empty());
+    const second = new AbortController();
+    const waiting = client.stage(empty(), EXAMPLE(), 'lin-4', 'test', second.signal);
+    await vi.waitFor(() => expect(kinds(workers[1])).toEqual(['check', 'check']));
+    second.abort();
+    expect(await within(waiting)).toBe('AbortError');
+    answer(workers[1], 1);
+    await busy;
+    await new Promise((r) => setTimeout(r, 20));
+    expect(kinds(workers[1])).toEqual(['check', 'check']);
+    expect(workers[1].terminate).not.toHaveBeenCalled();
+    // one whose signal aborted already is refused at once
+    expect(await within(client.stage(empty(), EXAMPLE(), 'lin-5', 'test', second.signal))).toBe('AbortError');
+    expect(kinds(workers[1])).toEqual(['check', 'check']);
+    // in process (no workers) the work cannot be stopped: the staging rejects, its result is dropped
+    const inProcess = new StagingClient(() => null);
+    const third = new AbortController();
+    const dropped = inProcess.stage(empty(), EXAMPLE(), 'lin-6', 'test', third.signal);
+    third.abort();
+    expect(await within(dropped)).toBe('AbortError');
+    expect((await inProcess.stage(empty(), EXAMPLE(), 'lin-7', 'test')).summary.shots).toBe(2);
+    client.dispose();
+  });
+
   it('answers requests in order through its worker, and makes a new worker after one dies', async () => {
     const { factory, made } = fakeWorkers();
     const client = new StagingClient(factory);

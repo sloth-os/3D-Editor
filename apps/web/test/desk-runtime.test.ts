@@ -289,6 +289,9 @@ describe("the desk's header", () => {
     await vi.waitFor(() => expect(c.status.value).toBe('closed'));
     expect(cancelOpen).toHaveBeenCalledTimes(1);
     expect(sent).toEqual(['ready', 'close']);
+    // the work is not shown over the closed desk (it is stopped), whose Back to the desk is free
+    expect(v.queryByTestId('desk-work')).toBeNull();
+    expect(v.getByTestId('desk-closed').textContent).toContain('Back to the desk');
     // once the scene is open, the work of an update offers no Close (the header has it)
     cleanup();
     const open = await openDesk({ hostName: 'rideo' });
@@ -302,6 +305,23 @@ describe("the desk's header", () => {
     );
     expect(u.getByTestId('desk-work')).toBeTruthy();
     expect(u.queryByTestId('desk-work-close')).toBeNull();
+  });
+
+  it('names the host in Send, its name the part that gives way: cut short, or left out on a phone', async () => {
+    const host = 'Storyboard Studio Online for Film Crews!';
+    expect(host).toHaveLength(40);
+    const c = await openDesk({ hostName: host });
+    const v = await header(c);
+    const send = v.getByTestId('desk-send');
+    expect(send.getAttribute('aria-label')).toBe(`Send to ${host}`);
+    expect(send.getAttribute('title')).toContain(`send them to ${host}`);
+    const label = v.getByTestId('desk-send-label');
+    expect(label.textContent).toBe(`Send to ${host}`);
+    // the host's name is the part a phone leaves out (.hide-narrow), and the label is cut short
+    // (desk.css: .desk-send-label, .desk-actions .desk-send) where the header is narrow
+    const named = label.querySelector('.hide-narrow');
+    expect(named?.textContent).toBe(` to ${host}`);
+    expect(send.classList.contains('desk-send')).toBe(true);
   });
 
   it("turns Send off for a brief over the export's size and says why", async () => {

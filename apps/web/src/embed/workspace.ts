@@ -49,9 +49,11 @@ import { StagingClient } from './staging';
  *   the person is told (OpenOutcome.notice): opening never hangs on it.
  * - One desk per host and scene in this browser: the desk holds a Web Lock named after the project
  *   while the scene is open, and a second desk (another tab or frame) waits for it with a notice,
- *   so it never throws away the database under the first one. A Close at any moment of an open
- *   (while the state unpacks, while it asks for the lock or waits for it, while storage opens) ends
- *   it before anything of the local copy changes.
+ *   so it never throws away the database under the first one. A Close at any moment of an open ends
+ *   it: while the state unpacks, while it asks for the lock or waits for it, or while storage opens,
+ *   before anything of the local copy changes; while it clears a copy it replaces, or while it
+ *   stages (the staging worker is stopped, its result dropped), before anything new is written
+ *   into the copy.
  * - Opening follows the merge rule (state.ts restorePlan): a host state from the same staging as the
  *   local copy is merged into it, any other readable state replaces it; without a state the local
  *   copy is used, else the brief is staged (in the staging worker). A state that does not read
@@ -400,13 +402,24 @@ export class DeskWorkspace {
     return briefRecord(s.doc)?.sceneId === sceneId;
   }
 
-  private async stage(s: ProjectSession, brief: SceneBrief): Promise<number> {
+  /**
+   * Stages `brief` into session `s` (empty). The open's `signal` stops it at any moment: the worker's
+   * staging is stopped, and a staging that came back is not applied (the local copy gets none of it).
+   */
+  private async stage(s: ProjectSession, brief: SceneBrief, signal: AbortSignal): Promise<number> {
     this.onWork({
       label: `Staging ${brief.shots.length} shot${brief.shots.length === 1 ? '' : 's'}…`,
       startedAt: Date.now(),
     });
     try {
-      const r = await this.staging.stage(Y.encodeStateAsUpdate(s.doc.ydoc), brief, newLineage(), GENERATOR);
+      const r = await this.staging.stage(
+        Y.encodeStateAsUpdate(s.doc.ydoc),
+        brief,
+        newLineage(),
+        GENERATOR,
+        signal,
+      );
+      stopIfCancelled(signal);
       Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
       // nobody edits the scene before it opens: the checks are of the document as it is now
       this.keepCheck(s, r.check, s.revision.peek());
@@ -439,9 +452,10 @@ export class DeskWorkspace {
 
   /**
    * Opens the scene of `brief` for `hostOrigin` (see the module comment). cancelOpen (a Close) ends
-   * it with an AbortError at any moment until the local copy is read: while the state unpacks,
-   * while it asks for the scene's lock or waits for another desk, and while storage opens; nothing
-   * of the copy is changed then.
+   * it with an AbortError at any moment: until the local copy is read (while the state unpacks,
+   * while it asks for the scene's lock or waits for another desk, and while storage opens) nothing
+   * of the copy is changed; later (while a copy it replaces is cleared, while it stages) nothing new
+   * is written into the copy, and a staging under way is stopped.
    */
   async open(o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null }): Promise<OpenOutcome> {
     const cancel = new AbortController();
@@ -498,6 +512,8 @@ export class DeskWorkspace {
         s = null;
         stored = await this.resetStored(old, id);
         s = stored.session;
+        // a Close while the old copy was cleared: nothing new is written into the copy
+        stopIfCancelled(signal);
       }
       let kept: Omit<Kept, 'session'> | null = null;
       if ((plan === 'merge' || plan === 'replace') && decoded && o.state) {
@@ -512,7 +528,7 @@ export class DeskWorkspace {
           };
       }
       let stageMs: number | null = null;
-      if (plan === 'stage') stageMs = await this.stage(s, brief);
+      if (plan === 'stage') stageMs = await this.stage(s, brief, signal);
       s.undo.clear();
       this.session = s;
       this.release = release;

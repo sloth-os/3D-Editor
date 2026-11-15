@@ -24,8 +24,11 @@ import { PLAIN } from './helpers';
  *   (source local), with a changed brief (changes listed, Update shots, one undo step)
  * - what the desk ignores or refuses: a connect from another frame, a version it does not speak,
  *   a second connect, unknown types, bad messages, export before open, a second open
+ * - Close while a long brief stages: close at once, the staging stopped (no work over the closed
+ *   panel, nothing kept: the next open stages the scene again)
  * - offline: the desk loads from its service worker, stages and exports with no network at all
- * - on its own: the explanation, the editor link and the sample scene; the phone layout
+ * - on its own: the explanation, the editor link and the sample scene; the phone layout, also at
+ *   360 px with a host name of 40 characters (Done and Close in the frame, Close works)
  */
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -49,6 +52,19 @@ function smallBrief(id = 'clp_small0000000001') {
   b.height = 180;
   b.shots[0].durationSec = 0.5;
   b.shots[1].durationSec = 0.5;
+  return b;
+}
+
+/** A brief of `n` shots (copies of the example's): it takes seconds to stage. */
+function longBrief(id: string, n: number) {
+  const b = smallBrief(id);
+  const base = b.shots;
+  b.shots = Array.from({ length: n }, (_, i) => ({
+    ...structuredClone(base[i % base.length]),
+    id: `sht_long${String(i).padStart(8, '0')}`,
+    index: i,
+    durationSec: 2,
+  }));
   return b;
 }
 
@@ -557,6 +573,40 @@ test.describe('the embeddable desk', () => {
     await second.close();
   });
 
+  test("Close while a long brief stages: the staging stops, the closed panel is the desk's at once, nothing is kept", async ({
+    page,
+  }) => {
+    test.setTimeout(240_000);
+    await openHost(page);
+    await waitFor(page, 'ready');
+    const scene = longBrief('clp_closestaging001', 120);
+    await send(page, { type: 'open', scene, state: null, options: OPTIONS });
+    const frame = await deskFrame(page);
+    await expect(frame.getByTestId('desk-work')).toContainText('Staging 120 shots', { timeout: 60_000 });
+    await frame.getByTestId('desk-work-close').click();
+    const [close] = await waitFor(page, 'close');
+    expect(close).toEqual({ type: 'close', reason: 'cancel' });
+    // at once: no work over the closed panel, whose Back to the desk is the element at its centre
+    // (staging these 120 shots takes seconds: it is stopped, not waited for)
+    await expect(frame.getByTestId('desk-work')).toHaveCount(0, { timeout: 1_000 });
+    await expect(frame.getByTestId('desk-closed')).toBeVisible();
+    const backOnTop = await frame.evaluate(() => {
+      const back = [...document.querySelectorAll('[data-testid="desk-closed"] button')].find((b) =>
+        /Back to the desk/.test(b.textContent ?? ''),
+      )!;
+      const r = back.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+      return !!hit && back.contains(hit);
+    });
+    expect(backOnTop).toBe(true);
+    // the host opens the scene again: staged anew (the cancelled staging left no local copy)
+    await send(page, { type: 'open', scene, state: null, options: OPTIONS });
+    const [opened] = await waitFor(page, 'opened', 1, 120_000);
+    expect(opened).toMatchObject({ sceneId: scene.id, source: 'brief' });
+    expect((await portMessages(page)).map((m) => m.type).slice(0, 3)).toEqual(['ready', 'close', 'opened']);
+    await expectValidMessages(page);
+  });
+
   test('a shot made longer in the desk: Send warns, the clip goes with its issue', async ({ page }) => {
     test.setTimeout(240_000);
     await openHost(page);
@@ -845,6 +895,66 @@ test.describe('the embeddable desk', () => {
     expect(await frame.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await frame.getByTestId('bottom-tab-shots').click();
     await expect(frame.locator('[data-testid="shot-list"]:visible')).toHaveCount(1);
+  });
+
+  test('on a phone of 360 px, with a host name of 40 characters: Done and Close stay in the frame', async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    await page.setViewportSize({ width: 360, height: 740 });
+    await openHost(page);
+    await waitFor(page, 'ready');
+    // the longest host name the contract allows; three modes, so Follow shows too
+    const hostName = 'Storyboard Studio Online for Film Crews!';
+    expect(hostName).toHaveLength(40);
+    await send(page, {
+      type: 'open',
+      scene: smallBrief('clp_phonehostname01'),
+      state: null,
+      options: { ...OPTIONS, hostName },
+    });
+    await waitFor(page, 'opened', 1, 120_000);
+    await waitFor(page, 'state');
+    const frame = await deskFrame(page);
+    await expect(frame.getByTestId('desk-state-sent')).toBeVisible();
+    // Send says just "Send" here; the host's name stays in its title and accessible name
+    await expect(frame.getByTestId('desk-send-label')).toHaveText(`Send to ${hostName}`);
+    expect(await frame.getByTestId('desk-send-label').evaluate((e) => (e as HTMLElement).innerText)).toBe(
+      'Send',
+    );
+    await expect(frame.getByTestId('desk-send')).toHaveAttribute('aria-label', `Send to ${hostName}`);
+    await expect(frame.getByTestId('desk-send')).toHaveAttribute(
+      'title',
+      new RegExp(`send them to ${hostName}`),
+    );
+    // Follow, Send, Done and Close on the header's line, inside the frame, each the element at its centre
+    const header = (await frame.getByTestId('desk-header').boundingBox())!;
+    const inFrame = await frame.evaluate(
+      (ids) => {
+        const out: Record<string, { right: number; bottom: number; top: boolean }> = {};
+        for (const id of ids) {
+          const el = document.querySelector(`[data-testid="${id}"]`)!;
+          const r = el.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+          out[id] = { right: r.right, bottom: r.bottom, top: !!hit && (el === hit || el.contains(hit)) };
+        }
+        return { out, width: innerWidth, scroll: document.documentElement.scrollWidth };
+      },
+      ['desk-mode', 'desk-send', 'desk-done', 'desk-close'],
+    );
+    expect(inFrame.width).toBe(360);
+    expect(inFrame.scroll).toBeLessThanOrEqual(360);
+    for (const [id, box] of Object.entries(inFrame.out)) {
+      expect(box.right, id).toBeLessThanOrEqual(360);
+      expect(box.bottom, id).toBeLessThanOrEqual(header.y + header.height);
+      expect(box.top, `${id} is the element at its centre`).toBe(true);
+    }
+    // Close works from there
+    await frame.getByTestId('desk-close').click();
+    const [close] = await waitFor(page, 'close');
+    expect(close).toEqual({ type: 'close', reason: 'cancel' });
+    await expect(frame.getByTestId('desk-closed')).toBeVisible();
+    await expectValidMessages(page);
   });
 
   test('on its own: the explanation, the editor link and the sample scene', async ({ page }) => {

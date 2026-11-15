@@ -414,8 +414,11 @@ the timeline and playback, the staging tools and the Asset Browser with the buil
 a compact header: the scene's name, where it was opened from and whether the host has its latest
 state, the brief's changes with **Update shots**, **Follow** (the reference clip **Send** renders,
 when the host takes more than one), **Send to …** (the host's name), **Done** and **Close**, and an
-export's progress with **Cancel**. On a phone they keep one line: Follow without its label, the
-scene's name and the notes cut short. It has no top-bar menus, workspaces, project list, presence,
+export's progress with **Cancel**. They keep one line at every width, Done and Close always in the
+frame whatever the host's name (it may have 40 characters): where the header is narrow the scene's
+name, the notes and the host's name in Send are cut short, and on a phone Follow has no label, Send
+says just "Send" (the host's name in its tooltip) and Close is its icon. It has no top-bar menus,
+workspaces, project list, presence,
 share or update button, Console, Diagnostics, UV editor, Dope Sheet or Properties editor; the
 viewport's menus grey out what it hides (Import…). The desk ignores their keys: Ctrl/Cmd+S and
 Ctrl/Cmd+O do nothing at all (not the browser's Save Page or Open File either, also on a keyboard
@@ -523,9 +526,14 @@ did not read). A brief that validates but cannot be staged is answered with `err
 without an `id`; it does not count as the connection's `open`, and the host may send another.
 **Close** while the scene opens cancels the open, at any moment of it (while the host's state
 unpacks, while the desk waits for another desk, while it stages; the work it shows offers
-**Close**): `close` goes at once and nothing after it (no `opened`, no `state`). An open cancelled
-before the local copy is read changes nothing of it. The desk lets go of the scene and takes a
-later `open`, as it does after a Close before any `open`.
+**Close**): `close` goes at once and nothing after it (no `opened`, no `state`), and the work stops
+there: a staging under way is stopped in its worker and never applied, and the desk shows its
+closed panel, not the work. An open cancelled before the local copy is read changes nothing of it;
+one cancelled later writes nothing new into it (a copy the open was replacing, a staging of
+another lineage or a copy with no staging of the scene, may be cleared already: the next open then
+starts from the host's state or the brief). From the Close on, also while the cancelled open still
+lets go of its scene, no scene is open: `save` and `export` are answered with `not_open`. The desk
+lets go of the scene and takes a later `open`, as it does after a Close before any `open`.
 
 The shot list shows the staging's checks at once (their issues), and once the scene is open,
 whatever it opened from, the desk runs the full checks in the background (each shot's blocking
@@ -770,10 +778,13 @@ Where the contract leaves room, the desk takes the most robust reading:
 - **`unsupported_version`** answers, on its port, a `connect` of a version the desk does not speak;
   the desk then closes that port and keeps waiting for a `connect` it can take.
 - **A `cancel` of an id that is not the running export** is ignored (and logged).
-- **`save` before `open`**, and after a Close that came before any scene opened, is answered with
-  `not_open`; after Done or Close of an open scene the desk still answers `save`.
-- **Close while the scene opens** cancels the open: nothing follows `close`, and a later `open` is
-  taken (one sent before the cancelled open let go of its scene waits for it).
+- **`save` before `open`**, and after a Close that came before any scene opened (one that cancelled
+  an open too, also while that open still lets go of its scene), is answered with `not_open`, and
+  the person is shown nothing about it; after Done or Close of an open scene the desk still
+  answers `save`.
+- **Close while the scene opens** cancels the open: nothing follows `close`, the open's work stops
+  (a staging under way is not kept), and a later `open` is taken (one sent before the cancelled
+  open let go of its scene waits for it).
 - **A state the desk does not read** (another scene, format or version, or one that does not
   unpack or holds no staging of the scene). The contract has the brief staged; the desk opens its
   local copy of the scene where it has one (`source` `local`: work the host never got is not
@@ -818,10 +829,12 @@ Where the contract leaves room, the desk takes the most robust reading:
   exactly the shot's frames, a key frame first; each still an RGB PNG), `result-ack`, `save` and
   Done, with nothing going to the network after the page has loaded; reopening from the host's state
   and from the local copy, and with a changed brief and Update shots; what the desk ignores or
-  refuses; Send of a shot made longer; Follow and Send of one mode, the viewport's keys only over
-  the viewport, a portrait brief over the export's size, and the wake lock with and without
-  `screen-wake-lock`; read-only; offline; a phone's 390 × 844; and the page on its own. Every
-  message the desk sends is checked against the schemas. Run it with
+  refuses; Close while a long brief stages (the staging stopped, nothing of it kept); Send of a
+  shot made longer; Follow and Send of one mode, the viewport's keys only over the viewport, a
+  portrait brief over the export's size, and the wake lock with and without `screen-wake-lock`;
+  read-only; offline; a phone's 390 × 844, and 360 px with a host name of 40 characters (Done and
+  Close in the frame); and the page on its own. Every message the desk sends is checked against
+  the schemas. Run it with
   `cd e2e && npx playwright test tests/desk-embed.spec.ts --trace off` after `npm run build`.
 - **Storage partitioning.** The desk's specs (`e2e/tests/desk-*.spec.ts`) run in the `desk`
   Playwright project, with Chromium's third-party storage partitioning on as browsers ship it

@@ -21,8 +21,10 @@ import './desk.css';
  * sequence strip, the timeline and playback, the staging tools and the Asset Browser — under a
  * compact header: the scene's name, where it came from and whether the host has its latest state,
  * the brief's changes with Update shots, Follow (the reference clip Send renders, when the host
- * takes more than one), Send to <host>, Done and Close, and an export's progress with Cancel; on a
- * phone they keep one line (Follow without its label, the notes cut short). No menus, workspaces,
+ * takes more than one), Send to <host>, Done and Close, and an export's progress with Cancel. They
+ * keep one line at every width, Done and Close always in the frame: the notes and the host's name
+ * in Send are cut short where the header is narrow, and on a phone Follow has no label and Send
+ * says just "Send" (the host's name in its title). No menus, workspaces,
  * project list, presence, share, update button, Console, Diagnostics, UV, Dope Sheet or Properties.
  *
  * The viewport's keys (X and Delete, G/R/S, …) act only while the pointer or the focus is in the
@@ -358,16 +360,21 @@ function DeskHeader(p: { c: DeskController; lengthChecks: () => LengthCheck[] })
           </label>
         )}
         <button
-          class="btn primary"
+          class="btn primary desk-send"
           data-testid="desk-send"
           disabled={!open || busy || !!tooLarge}
+          aria-label={`Send to ${options.hostName}`}
           title={
             tooLarge ??
             `Render the ${MODE_LABEL[mode]} reference clip and a still of every shot in this browser and send them to ${options.hostName}`
           }
           onClick={send}
         >
-          <Icon name="film" size={12} /> Send to {options.hostName}
+          <Icon name="film" size={12} />
+          {/* the host's name gives way first: cut short where the header is narrow, left out on a phone */}
+          <span class="desk-send-label" data-testid="desk-send-label">
+            Send<span class="hide-narrow"> to {options.hostName}</span>
+          </span>
         </button>
         <button
           class="btn"
@@ -448,7 +455,8 @@ function DeskEditor({ s }: { s: ProjectSession }) {
 
 /**
  * What the desk is busy with, over the desk (and its header). While the scene opens (staging, a
- * wait for another desk of this browser) it offers Close, as the header would: it cancels the open.
+ * wait for another desk of this browser) it offers Close, as the header would: it cancels the open
+ * and stops that work. Once the desk is closed it is not shown.
  */
 function WorkOverlay({ work, onClose }: { work: WorkProgress | null; onClose: (() => void) | null }) {
   useTick(!!work, 500);
@@ -524,7 +532,11 @@ export function DeskApp(p: DeskAppProps) {
           </div>
         </div>
       )}
-      <WorkOverlay work={p.work} onClose={status === 'opening' ? () => void c.close() : null} />
+      {/* never over a closed desk: a Close stopped the open it showed (an update goes on behind) */}
+      <WorkOverlay
+        work={status === 'closed' ? null : p.work}
+        onClose={status === 'opening' ? () => void c.close() : null}
+      />
       <PopupMenuHost />
       <Toasts />
     </div>

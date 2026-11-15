@@ -672,6 +672,43 @@ describe('the desk controller', () => {
     expect(t.c.status.value).toBe('open');
   });
 
+  it('answers save with not_open while an open that Close cancelled still lets go of its scene, with no error shown', async () => {
+    const gates: ((o: OpenOutcome) => void)[] = [];
+    const close = vi.fn();
+    // as the real workspace: there is no scene to write until an open completes
+    const encodeState = vi.fn(() => Promise.reject(new Error('no scene is open')));
+    const t = setup({
+      workspace: { open: vi.fn(() => new Promise<OpenOutcome>((r) => gates.push(r))), close, encodeState },
+    });
+    await t.c.connected('https://h.example');
+    t.c.message({ type: 'open', scene: brief, state: null } as never);
+    await flush();
+    await t.c.close();
+    // the cancelled open has not let go of its scene yet
+    expect(close).not.toHaveBeenCalled();
+    t.c.message({ type: 'save', id: 's-1' } as never);
+    t.c.message({ type: 'export', id: 'e-1' } as never);
+    await flush();
+    const notOpen = { type: 'error', code: 'not_open', message: 'No scene is open yet: send open first.' };
+    expect(t.ofType('error')).toEqual([
+      { ...notOpen, id: 's-1' },
+      { ...notOpen, id: 'e-1' },
+    ]);
+    expect(encodeState).not.toHaveBeenCalled();
+    expect(t.c.notice.value).toBeNull();
+    // Back to the desk: there is no scene to go back to, the desk waits for an open
+    t.c.reopen();
+    expect(t.c.status.value).toBe('connected');
+    // the cancelled open lets go of its scene: nothing goes, and save is answered the same
+    gates[0](outcome);
+    await waitUntil(() => expect(close).toHaveBeenCalledTimes(1));
+    t.c.message({ type: 'save', id: 's-2' } as never);
+    await flush();
+    expect(t.ofType('error').at(-1)).toEqual({ ...notOpen, id: 's-2' });
+    expect(t.sent.map((x) => x.message.type)).toEqual(['ready', 'close', 'error', 'error', 'error']);
+    expect(t.c.status.value).toBe('connected');
+  });
+
   it('answers requests after Done or Close with not_open saying the desk was closed; save is answered', async () => {
     const t = setup({ runExport: allShots() });
     await opened(t);

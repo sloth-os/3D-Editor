@@ -7,7 +7,8 @@ import { session } from '../src/app/store';
 import { DeskController, type ControllerDeps } from '../src/embed/controller';
 import type { DeskExportOutcome, DeskExportRequest } from '../src/embed/export';
 import type { DeskMessage } from '../src/embed/protocol';
-import { StagingClient } from '../src/embed/staging';
+import { StagingClient, type StagingWorkerFactory } from '../src/embed/staging';
+import { runStaging, type StagingRequest } from '../src/embed/staging-engine';
 import { decodeDeskState, encodeDeskState, readLineage } from '../src/embed/state';
 import {
   DeskWorkspace,
@@ -30,8 +31,9 @@ import { lastCheck } from '../src/ui/director/state';
  * (the very bytes it opened from), gzip read without DecompressionStream, storage that fails after
  * the probe (memory, a notice, no hang), one desk per host and scene (a second waits for the
  * scene's lock), the checks stamped with the revision they checked (and the full check after staging
- * and Update shots), the brief's changes and Update shots as one undo step; and with the real
- * controller: no state sent on its own after one it could not read.
+ * and Update shots), the brief's changes and Update shots as one undo step, a Close while it stages
+ * (the staging stopped, nothing of it kept); and with the real controller: no state sent on its own
+ * after one it could not read, Close while the scene stages (its worker stopped, a later open taken).
  */
 
 const fixture = (name: string) =>
@@ -533,6 +535,38 @@ describe('the desk workspace', () => {
     }
   });
 
+  it('ends an open cancelled while it stages: the staging gets the Close, nothing of it is kept, the next open stages again', async () => {
+    const host = origin();
+    const work: (WorkProgress | null)[] = [];
+    const ws = workspace({}, (w) => work.push(w));
+    // a staging that comes back after the Close all the same (one that does not stop by itself)
+    const stage = ws.staging.stage.bind(ws.staging);
+    let given: AbortSignal | undefined;
+    let comeBack!: () => void;
+    const back = new Promise<void>((r) => (comeBack = r));
+    vi.spyOn(ws.staging, 'stage').mockImplementation(async (update, brief, lineage, generator, signal) => {
+      given = signal;
+      const r = await stage(update, brief, lineage, generator);
+      await back;
+      return r;
+    });
+    const opening = ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    await vi.waitFor(() => expect(work.at(-1)?.label).toBe('Staging 2 shots…'));
+    ws.cancelOpen();
+    // the staging was given the open's signal: Close stops it in the worker
+    expect(given?.aborted).toBe(true);
+    comeBack();
+    expect(await settledWithin(opening)).toBe('AbortError');
+    expect(ws.session).toBeNull();
+    expect(work.at(-1)).toBeNull();
+    // nothing of the staging became the local copy: the next open stages the brief again
+    const again = workspace();
+    expect(await again.open({ hostOrigin: host, brief: EXAMPLE(), state: null })).toMatchObject({
+      source: 'brief',
+      plan: 'stage',
+    });
+  });
+
   it('stamps a background check with the revision it checked, and shows the blocking line after staging and Update shots', async () => {
     const host = origin();
     const ws = workspace();
@@ -773,6 +807,46 @@ describe('the desk workspace with the controller', () => {
     expect(sent.map((m) => m.type)).toEqual(['ready', 'close', 'opened', 'state']);
     expect(ofType('opened')[0]).toMatchObject({ sceneId: 'clp_fedcba9876543211' });
     expect(first.session).not.toBeNull();
+    c.dispose();
+  }, 20_000);
+
+  it('stops the staging worker when Close cancels the open while it stages; a later open stages the scene anew', async () => {
+    // the first staging worker never answers (a long brief); the workers made after it answer
+    const workers: { posted: string[]; terminate: ReturnType<typeof vi.fn> }[] = [];
+    const factory: StagingWorkerFactory = () => {
+      const first = workers.length === 0;
+      const w = {
+        onmessage: null as ((e: MessageEvent) => void) | null,
+        onerror: null as ((e: ErrorEvent) => void) | null,
+        posted: [] as string[],
+        terminate: vi.fn(),
+        postMessage(m: { id: number; request: StagingRequest }) {
+          w.posted.push(m.request.kind);
+          if (!first)
+            setTimeout(() =>
+              w.onmessage?.({ data: { id: m.id, reply: runStaging(m.request) } } as MessageEvent),
+            );
+        },
+      };
+      workers.push(w);
+      return w;
+    };
+    const work: (WorkProgress | null)[] = [];
+    const ws = new DeskWorkspace(new StagingClient(factory), (w) => work.push(w), { locks });
+    open.push(ws);
+    const { c, sent, ofType } = await controllerWith(ws, { hostOrigin: origin() });
+    c.message({ type: 'open', scene: EXAMPLE(), state: null });
+    await vi.waitFor(() => expect(workers[0]?.posted).toEqual(['stage']));
+    await c.close();
+    // the staging stops at once, its worker with it, and the work it showed is over
+    expect(workers[0].terminate).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(work.at(-1)).toBeNull());
+    // the host opens the scene again: staged anew, nothing of the cancelled staging was kept
+    c.message({ type: 'open', scene: EXAMPLE(), state: null });
+    await vi.waitFor(() => expect(ofType('state')).toHaveLength(1), { timeout: 10_000 });
+    expect(sent.map((m) => m.type)).toEqual(['ready', 'close', 'opened', 'state']);
+    expect(ofType('opened')[0]).toMatchObject({ source: 'brief' });
+    expect(workers[1].posted[0]).toBe('stage');
     c.dispose();
   }, 20_000);
 

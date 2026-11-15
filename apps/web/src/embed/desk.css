@@ -13,12 +13,14 @@
   border-bottom: 1px solid var(--border);
   flex: none;
 }
+/* the title gets the room the actions leave; what does not fit in it is cut short, never pushed out */
 .desk-title {
   display: flex;
   align-items: center;
   gap: 6px;
   min-width: 0;
   flex: 1;
+  overflow: hidden;
 }
 .desk-title .logo {
   flex: none;
@@ -44,13 +46,36 @@
 .desk-pill.lock {
   color: var(--select-active);
 }
+/* the notes give way to the scene's name, cut short */
+.desk-title .desk-pill {
+  flex: 0 4 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* the actions keep one line: only Send's label gives way (the host's name cut short), so Done and
+   Close are always in the frame, whatever the host's name (up to 40 characters) */
 .desk-actions {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.desk-actions > * {
   flex: none;
 }
 .desk-actions .btn {
+  white-space: nowrap;
+}
+.desk-actions .desk-send {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.desk-send-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 .desk-mode {
@@ -227,7 +252,8 @@
 }
 
 /* phones (the editor's phone layout starts at 760 px): the header keeps its buttons and Follow on
-   one line, the scene's name and notes cut short to make room */
+   one line, Follow without its label, Send without the host's name (in its title), Close without
+   its word, the scene's name and notes cut short to make room */
 @media (max-width: 760px) {
   .hide-narrow {
     display: none !important;
@@ -235,12 +261,6 @@
   .desk-header {
     padding: 2px 6px;
     gap: 4px;
-  }
-  .desk-title .desk-pill {
-    flex: 0 1 auto;
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
   }
   .desk-mode {
     margin-right: 0;

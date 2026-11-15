@@ -39,8 +39,8 @@ import type { LengthMismatch, OpenOutcome } from './workspace';
  *   desk's own notes) and a first `state` (none after a state it could not read: the host's copy
  *   stays until an edit, Done or save). A second open is answered with busy. An open that fails (a
  *   brief the desk cannot stage) is answered with invalid_scene and does not count: the host may
- *   send another. Close at any moment of an open cancels it: nothing more is sent, and the host may
- *   send another.
+ *   send another. Close at any moment of an open cancels it: nothing more is sent, no scene is
+ *   open (also while the cancelled open still lets go of its scene), and the host may send another.
  * - `state` after `opened`, after edits (2 s after the last change, at most one every 5 s; edits
  *   are followed from `opened` on, those made while the first state is written too), when the
  *   person presses Done, and in answer to `save` (with its id; not_open when no scene is open).
@@ -843,7 +843,10 @@ export class DeskController {
     if (st === 'opening') {
       this.openCancelled = true;
       this.cancelledOpen = this.opening;
-      // an open waiting for another desk of this browser to let go of the scene stops waiting
+      // no scene opened: from now on, also while the cancelled open still lets go of its scene, a
+      // save or an export is answered not_open, and Back to the desk waits for an open
+      this.brief.value = null;
+      // the open stops where it is: a wait for another desk of this browser, or its staging
       this.deps.workspace.cancelOpen?.();
       this.finish('cancel');
       return;
