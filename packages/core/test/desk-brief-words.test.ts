@@ -358,12 +358,17 @@ describe('a set without `interior`', () => {
     },
   );
 
-  // a deck is a boat's or a house's (outdoors), not a deck of (old playing) cards, a tape, DJ or
-  // skateboard deck or a deck chair; the deck of a ship where cards are dealt is still the ship's
+  // a deck is a boat's or a house's (outdoors), not a deck of (old playing, his) cards, a tape, DJ
+  // or skateboard deck or a deck chair; the deck of a ship where cards are dealt is still the ship's
   it.each([
     ['A deck of cards lies on the kitchen table.', true],
     ['A deck of old playing cards lies on the kitchen table.', true],
     ['A deck of worn old playing cards in the bedroom.', true],
+    ['The deck of his cards lies on the kitchen table.', true],
+    ['Grandpa shuffles the deck of his cards in the kitchen.', true],
+    ['She deals from a deck of the cards in the living room.', true],
+    ['On the deck of the ship as cards are dealt.', false],
+    ['On the deck of the ship his cards lie scattered.', false],
     ['A tape deck plays in the bedroom.', true],
     ['A cassette deck hums in the living room.', true],
     ['DJ decks spin in the bedroom.', true],
