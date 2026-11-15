@@ -461,11 +461,13 @@ the desk stages a brief from scratch, and kept by every copy and state made from
 written with a `savedAt` (as earlier desks wrote it) still reads; the desk ignores keys it does
 not know.
 
-`updateBytes` is the document's length unpacked, at most 256 MiB. The desk unpacks a gzipped
-payload a piece at a time and stops as soon as it gives more than the header says, so a state
-never takes more memory than its header claims, and refuses a header that claims more than
-256 MiB before it unpacks anything. Every desk reads both payloads: where the browser has no
-`DecompressionStream` it unpacks gzip with a script (fflate), checking its CRC-32 and length.
+`updateBytes` is the document's length unpacked, at most 256 MiB. The desk refuses a header that
+claims more than 256 MiB before it unpacks anything. It unpacks a gzipped payload 4 KiB at a time,
+copies what each slice gives into one buffer of the size the header claims, and stops as soon as
+the payload gives more than the header says. Every desk reads both payloads: where the browser has
+no `DecompressionStream` it unpacks gzip with a script (fflate), checking its CRC-32 and length.
+Unpacking a state takes the memory its header claims and what one slice unpacks to (at most about
+4 MiB, and up to 8 MiB more for fflate's work), never the document twice.
 
 An unchanged scene gives the same bytes. The header holds no time and keeps its keys in one order,
 and the gzip header's time is 0 and its system byte 255. While the scene still holds what the

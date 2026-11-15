@@ -34,9 +34,11 @@ import {
  *   the workspace also sends the very bytes it opened from, or sent last, while nothing changed).
  * - Every desk reads what any desk writes: a gzipped payload unpacks with DecompressionStream, or
  *   with fflate where the browser has none (it then writes its own states uncompressed).
- * - Unpacking is bounded: the payload goes in small slices and the output is counted as it comes;
- *   past the header's `updateBytes` (itself at most 256 MiB) it stops and the state does not read,
- *   so a small state cannot make the page unpack, or hold, more than that.
+ * - Unpacking is bounded: the payload goes in 4 KiB slices and the output is copied, as it comes,
+ *   into one buffer of the header's `updateBytes` (itself at most 256 MiB); past that it stops and
+ *   the state does not read. A small state cannot make the page unpack more than it says, and
+ *   unpacking holds that buffer and what one slice unpacks to (≤ ~4 MiB; fflate also keeps its
+ *   working copy of it, ≤ ~8 MiB), never the pieces of the whole document beside it.
  * - A state reads only when its document holds a staging of its scene (a probe document is made
  *   from it before anything touches the local copy).
  */
@@ -49,8 +51,11 @@ const PREFIX_BYTES = 16;
 export const MAX_HEADER_BYTES = 64 * 1024;
 /** Largest document (the Yjs update, unpacked) a state may hold: 256 MiB. */
 export const MAX_UPDATE_BYTES = 256 * 1024 * 1024;
-/** Packed bytes handed to DecompressionStream at a time (each write unpacks in full: ≤ ~16 MiB). */
-const INFLATE_SLICE = 16 * 1024;
+/**
+ * Packed bytes handed to DecompressionStream at a time: a write unpacks in full before the next
+ * goes in, and Chromium queues all it gives at once (gzip unpacks at most ~1032 times: ≤ ~4 MiB).
+ */
+const INFLATE_SLICE = 4 * 1024;
 /** Packed bytes handed to the JS inflate at a time (≤ ~4 MiB of output per push). */
 const JS_INFLATE_SLICE = 4 * 1024;
 /** The header's keys, in the order the desk writes them. */
@@ -143,32 +148,68 @@ async function gzip(bytes: Uint8Array): Promise<Uint8Array> {
   return out;
 }
 
-/** The unpacked bytes of a payload as they come, refused once they pass `limit`. */
-class Unpacked {
-  readonly chunks: Uint8Array[] = [];
-  total = 0;
+let crcTable: Uint32Array | null = null;
 
-  constructor(private readonly limit: number) {}
+/** `crc` (a running CRC-32, gzip's: CRC_START at first, xor CRC_START at the end) with `data` added. */
+function crc32(crc: number, data: Uint8Array): number {
+  if (!crcTable) {
+    crcTable = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      crcTable[n] = c >>> 0;
+    }
+  }
+  const t = crcTable;
+  for (let i = 0; i < data.length; i++) crc = t[(crc ^ data[i]) & 0xff] ^ (crc >>> 8);
+  return crc;
+}
+const CRC_START = 0xffffffff;
+
+/**
+ * The unpacked bytes of a payload, copied as they come into one buffer of `limit` bytes (the size
+ * the header claims, made with the first bytes) and refused once they would pass it: no piece is
+ * kept once copied. With `sumCrc`, the CRC-32 of the bytes is summed as they are copied.
+ */
+class Unpacked {
+  private buffer: Uint8Array | null = null;
+  total = 0;
+  private sum = CRC_START;
+
+  constructor(
+    private readonly limit: number,
+    private readonly sumCrc = false,
+  ) {}
 
   add(chunk: Uint8Array): void {
+    if (!chunk.length) return;
+    if (this.total + chunk.length > this.limit)
+      throw new StateUnreadable('the desk state unpacks to more than it says');
+    if (!this.buffer) {
+      try {
+        this.buffer = new Uint8Array(this.limit);
+      } catch {
+        throw new StateUnreadable(
+          `the desk state unpacks to ${mib(this.limit)} MiB, more than this browser can hold`,
+        );
+      }
+    }
+    this.buffer.set(chunk, this.total);
+    if (this.sumCrc) this.sum = crc32(this.sum, chunk);
     this.total += chunk.length;
-    if (this.total > this.limit) throw new StateUnreadable('the desk state unpacks to more than it says');
-    this.chunks.push(chunk);
+  }
+
+  /** The CRC-32 of the bytes (with `sumCrc`). */
+  get checksum(): number {
+    return (this.sum ^ CRC_START) >>> 0;
   }
 
   bytes(): Uint8Array {
-    if (this.chunks.length === 1) return this.chunks[0];
-    const out = new Uint8Array(this.total);
-    let at = 0;
-    for (const c of this.chunks) {
-      out.set(c, at);
-      at += c.length;
-    }
-    return out;
+    return this.buffer ? this.buffer.subarray(0, this.total) : new Uint8Array(0);
   }
 }
 
-/** Unpacks with DecompressionStream: written in slices, read and counted as it comes. */
+/** Unpacks with DecompressionStream: written in slices, read and copied as it comes. */
 async function gunzipStream(payload: Uint8Array, out: Unpacked): Promise<void> {
   const ds = new DecompressionStream('gzip');
   const writer = ds.writable.getWriter();
@@ -197,27 +238,10 @@ async function gunzipStream(payload: Uint8Array, out: Unpacked): Promise<void> {
   }
 }
 
-let crcTable: Uint32Array | null = null;
-
-/** CRC-32 (gzip's) of `chunks`. */
-function crc32(chunks: readonly Uint8Array[]): number {
-  if (!crcTable) {
-    crcTable = new Uint32Array(256);
-    for (let n = 0; n < 256; n++) {
-      let c = n;
-      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-      crcTable[n] = c >>> 0;
-    }
-  }
-  const t = crcTable;
-  let crc = 0xffffffff;
-  for (const d of chunks) for (let i = 0; i < d.length; i++) crc = t[(crc ^ d[i]) & 0xff] ^ (crc >>> 8);
-  return (crc ^ 0xffffffff) >>> 0;
-}
-
 /**
- * Unpacks with fflate where the browser has no DecompressionStream: pushed in slices and counted
- * as it comes; one gzip member only, its CRC-32 and size checked (fflate's stream does not).
+ * Unpacks with fflate where the browser has no DecompressionStream: pushed in slices and copied as
+ * it comes; one gzip member only, its CRC-32 (summed while copying) and size checked (fflate's
+ * stream does not). `out` sums the CRC-32.
  */
 function gunzipJs(payload: Uint8Array, out: Unpacked): void {
   // a gzip member has a 10-byte header and an 8-byte trailer at least
@@ -237,14 +261,16 @@ function gunzipJs(payload: Uint8Array, out: Unpacked): void {
   const t = payload.subarray(payload.length - 8);
   const crc = (t[0] | (t[1] << 8) | (t[2] << 16) | (t[3] << 24)) >>> 0;
   const size = (t[4] | (t[5] << 8) | (t[6] << 16) | (t[7] << 24)) >>> 0;
-  if (members > 1 || size !== out.total >>> 0 || crc !== crc32(out.chunks))
+  if (members > 1 || size !== out.total >>> 0 || crc !== out.checksum)
     throw new StateUnreadable('the desk state does not unpack');
 }
 
 /** A gzipped payload unpacked to at most `limit` bytes (StateUnreadable past it, or for bad data). */
 async function gunzip(payload: Uint8Array, limit: number): Promise<Uint8Array> {
-  const out = new Unpacked(limit);
-  if (typeof DecompressionStream === 'function') await gunzipStream(payload, out);
+  // DecompressionStream checks the CRC-32 itself; the JS unpacking sums it while it copies
+  const stream = typeof DecompressionStream === 'function';
+  const out = new Unpacked(limit, !stream);
+  if (stream) await gunzipStream(payload, out);
   else gunzipJs(payload, out);
   return out.bytes();
 }

@@ -1,5 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
 import { gzipSync } from 'node:zlib';
 import { Gunzip } from 'fflate';
 import * as Y from 'yjs';
@@ -312,9 +314,10 @@ describe('the desk state', () => {
     vi.stubGlobal('DecompressionStream', Counting);
     await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
     expect(unpacked).toBeGreaterThan(1024 * 1024);
-    expect(unpacked).toBeLessThan(24 * 1024 * 1024);
-    // a DecompressionStream as the Compression Streams spec has it: each write unpacked and queued
-    // in full before the write settles (Node's waits for the reader): only small writes stop early
+    expect(unpacked).toBeLessThan(6 * 1024 * 1024);
+    // a DecompressionStream as the Compression Streams spec has it (and Chromium): each write
+    // unpacked and queued in full before the write settles (Node's waits for the reader): only
+    // small writes stop early (4 KiB, at most about 4 MiB queued; 16 KiB writes queued 16 MiB)
     let queued = 0;
     class WholeWrites {
       readonly readable: ReadableStream<Uint8Array>;
@@ -342,11 +345,99 @@ describe('the desk state', () => {
     vi.stubGlobal('DecompressionStream', WholeWrites);
     await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
     expect(queued).toBeGreaterThan(1024 * 1024);
-    expect(queued).toBeLessThan(24 * 1024 * 1024);
+    expect(queued).toBeLessThan(6 * 1024 * 1024);
     // the same with the JS unpacking (no DecompressionStream)
     vi.stubGlobal('DecompressionStream', undefined);
     await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
   });
+
+  it('holds the claimed bytes and one piece at most while a gzip bomb of its claim unpacks', async () => {
+    // The ArrayBuffer memory the page holds, measured after a full garbage collection (which frees
+    // dead buffers before it returns: no sweeping left to a background thread) whenever the
+    // unpacking makes a buffer of 1 MiB or more from script and after every 4 MiB it copies.
+    setFlagsFromString('--expose-gc');
+    setFlagsFromString('--no-concurrent-array-buffer-sweeping');
+    const gc = runInNewContext('gc') as () => void;
+    const settled = () => {
+      gc();
+      return process.memoryUsage().arrayBuffers;
+    };
+    // what the page holds before, once the buffers of the work before are gone (zlib lets go of
+    // the 48 MiB it packed only after its handle closes)
+    const before = async () => {
+      let last = -1;
+      for (let i = 0; i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        const now = settled();
+        if (now === last) return now;
+        last = now;
+      }
+      return last;
+    };
+    const MIB = 1024 * 1024;
+    const claim = 48 * MIB;
+    // 48 MiB of zeros in about 48 KiB, exactly what its header says
+    const state = container(
+      { ...header(), updateBytes: claim },
+      new Uint8Array(gzipSync(Buffer.alloc(claim), { level: 9 })),
+      1,
+    );
+    const peakOf = async (js: boolean) => {
+      const base = await before();
+      let peak = 0;
+      let samples = 0;
+      const sample = () => {
+        samples++;
+        peak = Math.max(peak, settled() - base);
+      };
+      const RealU8 = Uint8Array;
+      let copied = 0;
+      class Sampling extends RealU8 {
+        constructor(...args: unknown[]) {
+          super(...(args as []));
+          if (typeof args[0] === 'number' && args[0] >= MIB) sample();
+        }
+        override set(source: ArrayLike<number>, offset?: number) {
+          super.set(source, offset);
+          copied += source.length;
+          if (copied >= 4 * MIB) {
+            copied = 0;
+            sample();
+          }
+        }
+        static [Symbol.hasInstance](v: unknown) {
+          return v instanceof RealU8;
+        }
+      }
+      if (js) vi.stubGlobal('DecompressionStream', undefined);
+      vi.stubGlobal('Uint8Array', Sampling);
+      let failure: unknown = null;
+      try {
+        await decodeDeskState(state, SCENE);
+      } catch (e) {
+        failure = e;
+      } finally {
+        vi.unstubAllGlobals();
+      }
+      // it unpacked in full (zeros are no staging of the scene)
+      expect(String(failure)).toMatch(/holds no staging of this scene/);
+      expect(samples).toBeGreaterThan(8);
+      return peak;
+    };
+    try {
+      // Measured: DecompressionStream (Node's, 16 KiB pieces) the claim and 0.03 MiB; fflate the
+      // claim and 12.04 MiB (a 4 MiB piece and its 8 MiB working buffer). Keeping every piece and
+      // putting them together after held twice the claim (+48 MiB on both).
+      const stream = await peakOf(false);
+      expect(stream).toBeGreaterThanOrEqual(claim);
+      expect(stream).toBeLessThan(claim + 2 * MIB);
+      const js = await peakOf(true);
+      expect(js).toBeGreaterThanOrEqual(claim);
+      expect(js).toBeLessThan(claim + 14 * MIB);
+    } finally {
+      setFlagsFromString('--concurrent-array-buffer-sweeping');
+    }
+  }, 60_000);
 
   it('is described in docs/embedding.md as it reads and writes', () => {
     const raw = readFileSync(resolve(__dirname, '../../../docs/embedding.md'), 'utf8');
