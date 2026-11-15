@@ -1077,10 +1077,60 @@ describe('Export Video window', () => {
     await waitFor(() =>
       expect(byTestId(second.container, 'export-video-status')!.textContent).toMatch(/^Cancelled/),
     );
-    // the export it followed stays shown until New Export
-    expect(byTestId(second.container, 'export-video-other-project')).not.toBeNull();
+    // the export it followed stays shown until New Export; cancelled, it kept no files to release
+    expect(byTestId(second.container, 'export-video-other-project')!.textContent).toBe(
+      'This export was of Kite Day.',
+    );
     fireEvent.click(byTestId(second.container, 'export-video-new')!);
     expect(byTestId(second.container, 'export-video-settings')).not.toBeNull();
+  });
+
+  it("says another project's finished export keeps its files until the next export, and a failed one none", async () => {
+    const outcomes: { resolve(r: BrowserExportResult): void; reject(e: Error): void }[] = [];
+    browser.start = () => new Promise((resolve, reject) => outcomes.push({ resolve, reject }));
+    /** Kite Day's export starts; another project's window then follows it. */
+    const followed = async () => {
+      sessionSignal.value = fakeSession();
+      const first = await open();
+      // Kite Day's window shows its last export: New Export offers the settings again
+      const again = byTestId(first.container, 'export-video-new');
+      if (again) fireEvent.click(again);
+      await waitFor(() =>
+        expect((byTestId(first.container, 'export-video-start') as HTMLButtonElement).disabled).toBe(false),
+      );
+      fireEvent.click(byTestId(first.container, 'export-video-start')!);
+      await waitFor(() => expect(browserJob.value?.status).toBe('running'));
+      fireEvent.keyDown(document.body, { key: 'Escape' });
+      cleanup();
+      sessionSignal.value = {
+        ...fakeSession(projectDoc(false)),
+        id: 'proj-2',
+        title: { value: 'Other' },
+      } as unknown as ProjectSession;
+      const other = await open();
+      await waitFor(() => expect(byTestId(other.container, 'export-video-job')).not.toBeNull());
+      return other;
+    };
+    // finished: its files stay until the next export starts
+    const done = await followed();
+    await act(async () => outcomes[0].resolve(browserResult()));
+    await waitFor(() =>
+      expect(byTestId(done.container, 'export-video-job')!.getAttribute('data-status')).toBe('done'),
+    );
+    expect(byTestId(done.container, 'export-video-other-project')!.textContent).toBe(
+      'This export was of Kite Day; its files are released when the next export starts.',
+    );
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    cleanup();
+    // failed: it deleted its files when it ended
+    const failed = await followed();
+    await act(async () => outcomes[1].reject(new BrowserExportError('the render worker stopped', 'FAILED')));
+    await waitFor(() =>
+      expect(byTestId(failed.container, 'export-video-job')!.getAttribute('data-status')).toBe('failed'),
+    );
+    expect(byTestId(failed.container, 'export-video-other-project')!.textContent).toBe(
+      'This export was of Kite Day.',
+    );
   });
 
   it("says in the Quality buttons' tooltip how the export that would run encodes", async () => {

@@ -12,7 +12,7 @@ import { showShot } from '../ui/director/playback';
 import { DeskBridge } from './bridge';
 import { DeskController } from './controller';
 import { DeskApp, SampleBar, StandalonePage } from './DeskApp';
-import { lengthChecks, wakeLockAllowed } from './export';
+import { lengthChecks } from './export';
 import { DESK_IGNORED_KEYS, guardRegistry } from './guards';
 import type { DeskMessage } from './protocol';
 import { registerDeskServiceWorker } from './pwa';
@@ -38,15 +38,6 @@ installKeymap({ ignore: DESK_IGNORED_KEYS });
 // the viewport's keys act once the pointer or the focus is in the viewport (DeskApp.tsx), not before
 hoveredArea.value = 'other';
 void registerDeskServiceWorker();
-// an export keeps the screen on only where the permissions policy lets this frame do so (the host's
-// iframe `allow` names screen-wake-lock): elsewhere it never asks, so the host sees no policy violation
-if (!wakeLockAllowed()) {
-  try {
-    Object.defineProperty(navigator, 'wakeLock', { value: undefined, configurable: true });
-  } catch {
-    // a navigator that keeps its wakeLock: the export's request is refused, as before
-  }
-}
 
 const work = signal<WorkProgress | null>(null);
 const staging = new StagingClient();

@@ -47,6 +47,7 @@ import {
   framesInFlight,
   pageNeeds,
   planExportWorkers,
+  prepareNeeds,
   workerNeeds,
 } from './memory';
 import { StreamMuxer } from './mux';
@@ -83,7 +84,9 @@ import { ZipStreamWriter } from './zip';
  *
  * - Worker 0 applies the snapshot and plans the export (core planExport: shots, size, frames);
  *   the tab's memory then decides how many more workers start (memory.ts), each applying the
- *   snapshot once.
+ *   snapshot once. From worker 0's start the export holds what it uses in the tab (held.ts), for
+ *   the renders and exports that start meanwhile: an estimate of worker 0, then its plan, and at
+ *   the end, where the files stay in memory, their bytes until the export is released.
  * - Per shot, worker 0 measures it (depth range, shadow box); per segment of at most
  *   SEGMENT_FRAMES frames it simulates the rigid bodies once for every worker; then the segment's
  *   frames are rendered ahead on every worker and written in order (core renderInOrder, as the
@@ -99,7 +102,7 @@ import { ZipStreamWriter } from './zip';
  * (store.ts); every file's SHA-256 is computed as it is written (a sequence written to disk, whose
  * index is written last at its start, by reading it back once). Cancelling (the AbortSignal) stops
  * the workers and the encoders and deletes what was written. The screen is kept awake while the
- * export runs where the browser allows it.
+ * export runs where the browser and the page's permissions policy allow it.
  */
 
 /** Frames of one segment at most (rigid bodies are simulated once per segment, as the server leases per segment). */
@@ -122,7 +125,7 @@ export interface EngineOptions {
   /**
    * The tab's memory, given the page heap of a page holding the project (default:
    * tabMemoryWithRenders, with what the path traced renders and the other exports running in the
-   * tab hold).
+   * tab hold, and the files of finished exports it keeps in memory).
    */
   memory?: (pageHeap: number) => TabMemory;
   now?: () => Date;
@@ -141,7 +144,10 @@ export interface EngineResult {
   manifest: Record<string, unknown>;
   shots: { id: string; slug: string; frames: number }[];
   warnings: string[];
-  /** The export's store (released with the result). */
+  /**
+   * The export's store (released with the result: disposing it deletes the files and, for files kept
+   * in memory, lets go what the tab counts of them).
+   */
   store: ExportStore;
   /** Measurements: render workers used, frames per second of the render phase, its seconds. */
   stats: { workers: number; renderFps: number; seconds: number };
@@ -239,6 +245,11 @@ export interface WakeLockSentinelLike {
   release(): Promise<void>;
 }
 
+/** A document's permissions policy (Document.permissionsPolicy; featurePolicy in older Chromes). */
+interface PermissionsPolicyLike {
+  allowsFeature?(feature: string): boolean;
+}
+
 /** What keeping the screen on needs of the page (navigator.wakeLock and the document; fakes in tests). */
 export interface WakeLockEnv {
   wakeLock?: { request(type: 'screen'): Promise<WakeLockSentinelLike> };
@@ -246,7 +257,24 @@ export interface WakeLockEnv {
     readonly visibilityState: string;
     addEventListener(type: 'visibilitychange', listener: () => void): void;
     removeEventListener(type: 'visibilitychange', listener: () => void): void;
+    readonly permissionsPolicy?: PermissionsPolicyLike;
+    readonly featurePolicy?: PermissionsPolicyLike;
   };
+}
+
+/**
+ * Whether the permissions policy lets this document keep the screen on ('screen-wake-lock'): a framed
+ * page only where its frame's `allow` names it. True where the browser cannot tell (a request is then
+ * refused if it may not).
+ */
+export function wakeLockAllowed(doc: WakeLockEnv['document']): boolean {
+  const policy = doc?.permissionsPolicy ?? doc?.featurePolicy;
+  if (!policy || typeof policy.allowsFeature !== 'function') return true;
+  try {
+    return policy.allowsFeature('screen-wake-lock') !== false;
+  } catch {
+    return true;
+  }
 }
 
 function pageWakeLockEnv(): WakeLockEnv {
@@ -260,12 +288,14 @@ function pageWakeLockEnv(): WakeLockEnv {
 /**
  * Keeps the screen on while the export runs (Screen Wake Lock, where the browser allows it): the
  * browser lets the lock go whenever the page is hidden, so it is asked for again each time the page
- * is shown (and first when it is shown, for an export started in a hidden page). Returns the
- * release, which lets the lock go and stops asking.
+ * is shown (and first when it is shown, for an export started in a hidden page). A document whose
+ * permissions policy does not allow 'screen-wake-lock' (a frame whose `allow` does not name it)
+ * never asks: the request would be refused and the browser would report a policy violation. Returns
+ * the release, which lets the lock go and stops asking.
  */
 export function keepAwake(env: WakeLockEnv = pageWakeLockEnv()): () => void {
   const { wakeLock, document: doc } = env;
-  if (!wakeLock || typeof wakeLock.request !== 'function') return () => {};
+  if (!wakeLock || typeof wakeLock.request !== 'function' || !wakeLockAllowed(doc)) return () => {};
   let lock: WakeLockSentinelLike | null = null;
   let asking = false;
   let stopped = false;
@@ -360,6 +390,9 @@ export async function runBrowserExport(
     progress({ phase: 'prepare', done: 0, total: prepareTotal });
     const first = new ExportThread(0, factory);
     threads.push(first);
+    // the first worker holds the snapshot's document from now on: renders and exports that start
+    // while it prepares count it (until its plan replaces it, below)
+    unhold = holdExportMemory(id, prepareNeeds(req.update.length));
     await first.call({ type: 'init', update: req.update });
     checkAbort();
     progress({ phase: 'prepare', done: 1, total: prepareTotal });
@@ -438,7 +471,10 @@ export async function runBrowserExport(
       ),
     );
     const physicsBytes = planned.simulates ? segmentFrames * planned.bodies * bytesPerBody : 0;
-    // what the tab holds already: the path traced renders and the other exports running in it
+    // what the tab holds already: the path traced renders and the other exports running in it, and
+    // the files of finished exports it keeps in memory; not this export's own estimate, which the
+    // plan made below (with no await between) replaces
+    unhold();
     const memory = (opts.memory ?? tabMemoryWithRenders)(planned.pageHeap);
     const page = (workers: number) =>
       pageNeeds({
@@ -463,19 +499,22 @@ export async function runBrowserExport(
         physics: physicsBytes,
       });
     const worker = workerNeeds(planned.estimate);
-    // the first worker keeps every frame of the rigid body simulation it runs for all of them
-    const simulation = { total: planned.simulation, heap: planned.simulation };
+    // the first worker keeps every frame of the rigid body simulation it runs for all of them, in its
+    // heap only the part V8 keeps there (the rest are ArrayBuffers)
+    const simulation = { total: planned.simulation, heap: planned.simulationHeap ?? planned.simulation };
+    // each number of workers with what the page needs for it (its frames rendered ahead)
     const workerPlan = planExportWorkers({
       worker,
       first: simulation,
-      page: page(maxWorkers),
+      page,
       maxWorkers,
       memory,
       onDisk: store.onDisk,
     });
     if (!workerPlan.workers)
       throw new BrowserExportError(workerPlan.refusal ?? 'The export does not fit this tab', 'OUT_OF_MEMORY');
-    // held from now on: renders and exports that start while this one runs count it
+    // held from now on, in place of the first worker's estimate: renders and exports that start
+    // while this one runs count it
     unhold = holdExportMemory(id, {
       total: page(workerPlan.workers) + workerPlan.workers * worker.total + simulation.total,
       heap: workerPlan.workers * worker.heap + simulation.heap,
@@ -876,6 +915,9 @@ export async function runBrowserExport(
     files.push(keep(mf, 'manifest'));
     progress({ phase: 'finish', done: 2, total: 2 });
     first.terminate();
+    // files kept in memory stay counted, in place of the plan, until the export is released (the
+    // store is disposed); files on disk hold no memory
+    store.holdFiles?.(id);
     return {
       id,
       files,

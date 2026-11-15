@@ -315,19 +315,19 @@ refreshes the preview row by row; at the end a worker denoises and tone maps the
 
 The tab's memory decides how many workers a render uses (`memory.ts`): the JavaScript heap, whose
 limit the page and its workers share (Chrome's `performance.memory`), and a budget of half the
-device memory the browser reports (at most 4 GB), next to the path traced renders and browser video
-exports already running in the tab. Only the workers an estimate of the document leaves room for
-start with the render, more
-once the first worker reports the compiled scene; the render window shows "(memory)" after the
-thread count when the memory allows fewer threads than the pool has. A render that does not fit one
-worker is refused with the reason instead of ending the tab (V8 ends the whole tab when a worker
-runs out of heap): before any worker starts, when the estimate shows it (the document at the
-render's frame, with its animated and driven values); else on the first worker, before a modifier
-that would not fit runs, counted from its real input (`guard.ts`: the edges a Bevel limited by angle
-bevels, for one), or once the scene is evaluated, before it is compiled. After a render, the workers
-that adopted copies of the compiled scene are stopped when the copies take an eighth of the budget
-or more, and those a refused render started are stopped at once, unless another path traced render
-runs in the tab.
+device memory the browser reports (at most 4 GB), next to what the path traced renders and browser
+video exports running in the tab hold, and the files of finished browser exports it keeps in memory
+until they are released. Only the workers an estimate of the document leaves room for start with the
+render, more once the first worker reports the compiled scene; the render window shows "(memory)"
+after the thread count when the memory allows fewer threads than the pool has. A render that does
+not fit one worker is refused with the reason instead of ending the tab (V8 ends the whole tab when
+a worker runs out of heap): before any worker starts, when the estimate shows it (the document at
+the render's frame, with its animated and driven values); else on the first worker, before a
+modifier that would not fit runs, counted from its real input (`guard.ts`: the edges a Bevel limited
+by angle bevels, for one), or once the scene is evaluated, before it is compiled. After a render,
+the workers that adopted copies of the compiled scene are stopped when the copies take an eighth of
+the budget or more, and those a refused render started are stopped at once, unless another path
+traced render runs in the tab.
 
 A RASTER render (F12, Ctrl+F12, or an RPC request for the WebGL rasterizer) evaluates the scene with
 the render settings on the page itself, with an evaluator of its own next to the viewport's
@@ -335,24 +335,23 @@ the render settings on the page itself, with an evaluator of its own next to the
 modifier and shape key results; meshes as stored are the page's already) must fit the part of the
 heap limit a render may fill, less the page's own heap and what the path traced renders and browser
 video exports running in the tab hold. The page's own heap, here and in the plan of a path traced
-render, is estimated from
-its scene, as Chrome holds it (measured: 12 MiB for a new project, 31 to 34 KB per object, 84 to 89
-bytes per triangle of its meshes and of the geometry its viewport evaluation builds; counted with a
-quarter more), not read from Chrome's `usedJSHeapSize`, which counts the page's ArrayBuffers too
-(631 MiB for a page whose heap held 262 MiB). The RASTER render is checked like the first worker of
-a path traced render, and refused with the reason when it does not fit: before the evaluation, from
-the document at the frame it renders (120 bytes of heap per triangle built; Chrome took 88 to 94),
-and during it, before each modifier, from its real input (`RasterEvaluationGuard`). A render that
-builds nothing beyond what the page holds (no curve or text surface, modifier or shape key result,
-no particle or collection instances) is not refused, whatever the estimate of the page says
-(measured with V8's old space limited to 400 MB: a page of four grids of 1,036,800 triangles each,
-estimated at 0.449 GB while its heap held 345 MiB after a garbage collection, rendered from F12 in
-7.8 s, where it was refused before). The geometry an earlier final render kept goes first when it
-and the new one would not fit together, or when a modifier does not fit next to it: the scene is
-then evaluated once more without it. A path traced render counts that geometry as part of the
-page's heap; this check leaves it out, and a path tracing refusal suggests the RASTER engine only
-where this check passes. The MCP `render_image` with `renderer: auto` renders on the server when the
-editor refuses.
+render, is estimated from its scene, as Chrome holds it (measured: 12 MiB for a new project, 31 to
+34 KB per object, 84 to 89 bytes per triangle of its meshes and of the geometry its viewport
+evaluation builds; counted with a quarter more), not read from Chrome's `usedJSHeapSize`, which
+counts the page's ArrayBuffers too (631 MiB for a page whose heap held 262 MiB). The RASTER render
+is checked like the first worker of a path traced render, and refused with the reason when it does
+not fit: before the evaluation, from the document at the frame it renders (120 bytes of heap per
+triangle built; Chrome took 88 to 94), and during it, before each modifier, from its real input
+(`RasterEvaluationGuard`). A render that builds nothing beyond what the page holds (no curve or text
+surface, modifier or shape key result, no particle or collection instances) is not refused, whatever
+the estimate of the page says (measured with V8's old space limited to 400 MB: a page of four grids
+of 1,036,800 triangles each, estimated at 0.449 GB while its heap held 345 MiB after a garbage
+collection, rendered from F12 in 7.8 s, where it was refused before). The geometry an earlier final
+render kept goes first when it and the new one would not fit together, or when a modifier does not
+fit next to it: the scene is then evaluated once more without it. A path traced render counts that
+geometry as part of the page's heap; this check leaves it out, and a path tracing refusal suggests
+the RASTER engine only where this check passes. The MCP `render_image` with `renderer: auto` renders
+on the server when the editor refuses.
 
 Animation frames are rendered one after the other (path traced on the workers, or rasterized with
 WebGL) and streamed to an APNG or GIF encoder on a worker, so the main thread keeps no frames.

@@ -14,15 +14,16 @@ import { i420Size } from './yuv';
  * Memory of a browser export, decided before its frames are rendered (the tab's model:
  * render/memory.ts). The page and its render workers share one renderer process, and running out of
  * memory ends the whole tab, so the export starts as many render workers as the tab's memory holds
- * next to what the tab already holds (the path traced renders and other exports running in it:
- * TabMemory.held), at most one per core, MAX_EXPORT_WORKERS and as many as can render at once (the
- * frames rendered ahead are capped at MAX_BYTES_AHEAD: framesInFlight), and refuses at once, with the
- * figures, when not even one fits:
+ * next to what the tab already holds (the path traced renders and other exports running in it, and
+ * the files of finished exports it keeps in memory: TabMemory.held), at most one per core,
+ * MAX_EXPORT_WORKERS and as many as can render at once (the frames rendered ahead are capped at
+ * MAX_BYTES_AHEAD: framesInFlight), and refuses at once, with the figures, when not even one fits:
  * - each render worker: its base, the snapshot's scene evaluated in its JavaScript heap, the
  *   renderer's working buffers at the export's size and passes, the frame in flight (core
  *   `exportRenderEstimate`, as the server's render processes are estimated) and some slack; the
  *   first worker also the rigid body simulation it runs for all of them, every frame of which it
- *   keeps to the export's end (core `documentSimulationBytes`);
+ *   keeps to the export's end (core `documentSimulationBytes`; in its heap only the part V8 keeps
+ *   there); before the plan is made, the first worker is held at prepareNeeds;
  * - the page: one video encoder per stream, the frames rendered ahead of encoding, a segment's rigid
  *   body matrices, and the videos it keeps in memory as many times as they are held at once: each
  *   shot's clips until they are finished, and when one is finished, its copies (FINISH_COPIES) and,
@@ -74,6 +75,24 @@ export const LOSSLESS_PNG_BYTES_PER_PIXEL = 0.5;
 
 /** VP9 in quantizer mode has no bit rate: its files are counted at this multiple of H.264's. */
 const VP9_SIZE_FACTOR = 1.5;
+
+/**
+ * Bytes a render worker's document takes per byte of the export's snapshot (a Yjs update) once the
+ * worker has applied it, in its heap and outside it: Node 22 measured 300 cubes at 12.8 times the
+ * snapshot's bytes in the heap and 0.7 outside it, six actors at 2.5 and 1.7, a grid of 320,000
+ * triangles at none in the heap and 2 outside it (its meshes are ArrayBuffers). Rounded up.
+ */
+export const SNAPSHOT_DOCUMENT_FACTOR = 16;
+
+/**
+ * What the first render worker of an export holds while it applies the snapshot and plans the
+ * export, before its plan says more: its base, the snapshot's document (SNAPSHOT_DOCUMENT_FACTOR
+ * times its bytes, all of it counted in the heap) and the slack.
+ */
+export function prepareNeeds(snapshotBytes: number): { total: number; heap: number } {
+  const doc = SNAPSHOT_DOCUMENT_FACTOR * Math.max(0, snapshotBytes);
+  return { total: WORKER_BASE_BYTES + doc + WORKER_SLACK_BYTES, heap: WORKER_BASE_BYTES + doc };
+}
 
 /** What one render worker of an export holds (bytes): in all, and in its JavaScript heap. */
 export function workerNeeds(e: ExportRenderEstimate): { total: number; heap: number } {
@@ -165,13 +184,16 @@ const gb = (b: number) => (b / GB).toFixed(1);
 
 /**
  * The render workers an export of these needs may use, at most `maxWorkers`: the most that fit the
- * tab's memory budget and its heap, or a refusal when not even one does.
+ * tab's memory budget and its heap, each number of workers with what the page needs while they
+ * render (`page(n)`: the frames rendered ahead grow with the workers), or a refusal with the figures
+ * of one worker when not even one fits.
  */
 export function planExportWorkers(o: {
   worker: { total: number; heap: number };
   /** What the first worker holds besides (the rigid body simulation it runs for every worker). */
   first?: { total: number; heap: number };
-  page: number;
+  /** What the page needs (bytes, outside its heap) while `workers` render workers render: pageNeeds. */
+  page: (workers: number) => number;
   maxWorkers: number;
   memory: TabMemory;
   /** Whether the files go to disk (the refusal says what to lower). */
@@ -182,12 +204,12 @@ export function planExportWorkers(o: {
   const max = Math.max(1, Math.floor(o.maxWorkers));
   const heapRoom = usableHeap(mem.heapLimit) - mem.heapUsed - mem.held.heap;
   const fits = (n: number) =>
-    o.page + n * o.worker.total + first.total + mem.held.total <= mem.budget &&
+    o.page(n) + n * o.worker.total + first.total + mem.held.total <= mem.budget &&
     n * o.worker.heap + first.heap <= heapRoom;
   let workers = 0;
   while (workers < max && fits(workers + 1)) workers++;
   if (workers > 0) return { workers, limited: workers < max, refusal: null };
-  const need = o.page + o.worker.total + first.total;
+  const need = o.page(1) + o.worker.total + first.total;
   let reason: string;
   if (need + mem.held.total > mem.budget) {
     const f = refusalFigures(need, mem.budget, mem.held.total, 1);
@@ -198,7 +220,7 @@ export function planExportWorkers(o: {
       `it needs about ${f.need} GB of memory with one render worker` +
       (first.total >= 64 * MB ? ` (${gb(first.total)} GB of it the rigid body simulation's frames)` : '') +
       `, more than the ${f.room ?? f.total} GB a render may use in this tab (half ${device}, at most ${gb(MAX_RENDER_BUDGET)} GB` +
-      (mem.held.total > 0 ? `, less ${f.used} GB the other renders and exports running in it hold)` : ')');
+      (mem.held.total > 0 ? `, less ${f.used} GB the other renders and exports in it hold)` : ')');
   } else {
     const f = refusalFigures(
       o.worker.heap + first.heap,
@@ -215,11 +237,10 @@ export function planExportWorkers(o: {
       (mem.held.heap > 0 ? ' and the other renders and exports running in it are' : ' is') +
       ` estimated to use ${f.used} GB)`;
   }
-  // what the other renders and exports of the tab hold is free again once they end
-  const wait =
-    mem.held.total > 0 || mem.held.heap > 0
-      ? 'wait for the other renders and exports running in this tab to end, or '
-      : '';
+  // what the other renders and exports running in the tab hold is free again once they end (the
+  // files of finished exports it keeps in memory, once they are released)
+  const running = mem.held.total - (mem.held.kept ?? 0) > 0 || mem.held.heap > 0;
+  const wait = running ? 'wait for the other renders and exports running in this tab to end, or ' : '';
   const advice = o.onDisk
     ? `${wait}lower the resolution or the passes, or the triangles of the scene`
     : `${wait}export fewer frames, or lower the resolution or the passes`;

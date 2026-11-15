@@ -134,6 +134,8 @@ export class ExportWorkerEngine {
     const bodies = simulates ? doc.listObjects().filter((o) => o.rigid_body?.enabled).length : 0;
     // the simulation runs to the last scene frame rendered and keeps every frame from the world's start
     const last = Math.max(...plan.shots.map((s) => Math.ceil(sceneFrameAt(plan, s, s.renderFrames - 1))));
+    const simulation = simulates ? documentSimulationBytes(doc, last) : 0;
+    const outsideHeap = simulates ? documentSimulationBytes(doc, last, { outsideHeap: true }) : 0;
     return {
       plan,
       palette,
@@ -143,7 +145,8 @@ export class ExportWorkerEngine {
       simulates,
       bodies,
       estimate,
-      simulation: simulates ? documentSimulationBytes(doc, last) : 0,
+      simulation,
+      simulationHeap: Math.max(0, simulation - outsideHeap),
       pageHeap: pageHeapEstimate(doc),
       name: doc.name,
     };

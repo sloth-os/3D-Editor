@@ -220,10 +220,13 @@ export interface TabMemory {
   /** The device memory the budget comes from (GB, navigator.deviceMemory), null when unknown. */
   deviceGB: number | null;
   /**
-   * What the other path traced renders running in the tab hold (bytes, their {@link renderMemory}):
-   * a render gets the budget and the heap they leave.
+   * What the other renders and exports of the tab hold (bytes): the path traced renders running in
+   * it (their {@link renderMemory}), the browser video exports running in it (their plans,
+   * export/held.ts) and, as `kept` (part of `total`, none of it in a JavaScript heap), the files of
+   * finished exports it keeps in memory until they are released. A render gets the budget and the
+   * heap they leave.
    */
-  held: { total: number; heap: number };
+  held: { total: number; heap: number; kept?: number };
   /**
    * The part of `heapUsed` that the evaluator of RASTER final renders keeps from its last render
    * (bytes, its geometry; `ViewportEngine`). A path traced render counts it; a RASTER render does
@@ -884,16 +887,17 @@ export function refusalFigures(need: number, total: number, used: number, digits
 /**
  * Why `subject` (e.g. "its render thread") does not fit with `need` bytes of JavaScript heap: the
  * room a render has in the tab's heap is the share of its limit a render may fill ({@link
- * usableHeap}) less what the page, and the path traced renders running in it, use. That use is an
+ * usableHeap}) less what the page, and the renders and exports running in it, use. That use is an
  * estimate ({@link TabMemory.heapUsed}: from the page's scene, with a quarter more; the renders'
- * {@link renderMemory}), and the message says so: it can exceed what the heap holds.
+ * {@link renderMemory}, the exports' plans), and the message says so: it can exceed what the heap
+ * holds. (The files of finished exports kept in memory are Blobs: none of them is in the heap.)
  */
 function heapReason(subject: string, need: number, mem: TabMemory): string {
   const used = mem.heapUsed + mem.held.heap;
   const f = refusalFigures(need, usableHeap(mem.heapLimit), used, 2);
   const users =
     mem.held.heap > 0
-      ? 'the page and the path traced renders running in it are estimated to use'
+      ? 'the page and the renders and exports running in it are estimated to use'
       : 'the page is estimated to use';
   const share =
     `a render may fill ${f.total} GB of its ${gbText(mem.heapLimit, f.digits)} GB heap limit, the rest ` +
@@ -944,7 +948,8 @@ export function planRenderThreads(needs: RenderNeeds, maxThreads: number, mem: T
   const overBudget = m.total + mem.held.total > mem.budget;
   let reason: string;
   if (overBudget) {
-    // the budget, less what the renders running in the tab hold
+    // the budget, less what the other renders and exports of the tab hold (those running, and the
+    // files of finished exports kept in memory)
     const f = refusalFigures(m.total, mem.budget, mem.held.total, 1);
     const device = mem.deviceGB
       ? `the device memory the browser reports, ${mem.deviceGB} GB`
@@ -954,10 +959,10 @@ export function planRenderThreads(needs: RenderNeeds, maxThreads: number, mem: T
     reason = !(mem.held.total > 0)
       ? `${needs1}, more than the ${f.total} GB ${budget}`
       : f.room === null
-        ? `${needs1}, and none is left of the ${f.total} GB ${budget}: other path traced renders running ` +
-          `in it hold ${f.used} GB`
+        ? `${needs1}, and none is left of the ${f.total} GB ${budget}: other renders and exports in it ` +
+          `hold ${f.used} GB`
         : `${needs1}, more than the ${f.room} GB left of the ${f.total} GB ${budget}, ${f.used} GB of which ` +
-          'other path traced renders running in it hold';
+          'other renders and exports in it hold';
   } else reason = heapReason('its render thread', m.heap, mem);
   // every triangle the render evaluates; objects hidden in renders are evaluated all the same: say so
   // when they hold much of it
@@ -1040,7 +1045,7 @@ const LOWER_INSTANCES = 'the instances (particle counts, instanced collections, 
 
 /**
  * Why a RASTER render of `needs` is not started: its geometry does not fit the room the tab's heap
- * has for a render (see {@link usableHeap}, next to the page and the path traced renders running in
+ * has for a render (see {@link usableHeap}, next to the page and the renders and exports running in
  * it), and running out of it would end the tab; null when it fits, and for a render that builds
  * nothing beyond what the page holds ({@link RasterNeeds.buildsNothing}). The geometry the evaluator
  * of RASTER renders keeps from its last render is not counted ({@link TabMemory.rasterKept}): it goes

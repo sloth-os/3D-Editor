@@ -43,6 +43,12 @@ export interface PlanReply {
    * frame (core documentSimulationBytes; 0 without one): it simulates for every worker.
    */
   simulation: number;
+  /**
+   * Of `simulation`, the bytes in the worker's JavaScript heap: the rest (the poses of two or more
+   * bodies, the matrices of animated and delayed bodies) are ArrayBuffers outside it (core
+   * documentSimulationBytes with outsideHeap).
+   */
+  simulationHeap: number;
   /** The JavaScript heap of a page holding the snapshot's project (render/memory.ts pageHeapEstimate). */
   pageHeap: number;
   /** The snapshot's project name. */

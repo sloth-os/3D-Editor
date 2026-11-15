@@ -1436,7 +1436,10 @@ function BrowserJobView({
         <div class="hint" data-testid="export-video-other-project" style={{ fontSize: '12px' }}>
           {job.status === 'running'
             ? `This export is of ${job.projectName}: this tab runs one export on this device at a time.`
-            : `This export was of ${job.projectName}; its files are released when the next export starts.`}
+            : job.status === 'done'
+              ? `This export was of ${job.projectName}; its files are released when the next export starts.`
+              : // a cancelled or failed export deleted its files when it ended
+                `This export was of ${job.projectName}.`}
         </div>
       )}
       {!finished && <ProgressBar fraction={fraction} label="Export progress" />}

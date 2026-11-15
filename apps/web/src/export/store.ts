@@ -1,5 +1,6 @@
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
+import { holdExportFiles } from './held';
 import { crc32Update } from './zip';
 
 /*
@@ -10,9 +11,10 @@ import { crc32Update } from './zip';
  * written, chunk after chunk; a video written out of order (an MP4 sequence whose index is written
  * last, at the start of the file) is read back once when it is finished. Cancelling deletes what
  * an export wrote. An export's files live until the page releases the export: its directory is
- * deleted, or the in-memory store lets its Blobs go (reading a file fails from then on). A page
- * that closes or reloads first leaves its directory on disk until a later export, in any page of
- * the origin, deletes the export directories no page holds a Web Lock for.
+ * deleted, or the in-memory store lets its Blobs go (reading a file fails from then on); until then
+ * the files an export keeps in memory are counted in the tab's held memory (held.ts). A page that
+ * closes or reloads first leaves its directory on disk until a later export, in any page of the
+ * origin, deletes the export directories no page holds a Web Lock for.
  */
 
 /** The kinds of files of a browser export. */
@@ -89,6 +91,12 @@ export interface ExportStore {
   sequential(info: FileInfo): Promise<SequentialFile>;
   /** A file written at positions; null when files stay in memory (mediabunny then keeps the video). */
   randomAccess(info: FileInfo): Promise<RandomAccessFile | null>;
+  /**
+   * Counts the files this store keeps in memory as held by finished export `id` (held.ts), until the
+   * store is disposed: renders and exports that start before then plan without their bytes. Files
+   * on disk hold no memory (a store without it keeps none).
+   */
+  holdFiles?(id: string): void;
   /** Deletes every file of the export (it failed or was cancelled, or it is released). */
   dispose(): Promise<void>;
 }
@@ -106,6 +114,8 @@ export class MemoryStore implements ExportStore {
   readonly onDisk = false;
   /** The files' Blobs, by name, until the export is released (then its files can no longer be read). */
   private readonly blobs = new Map<string, Blob>();
+  /** Lets go what holdFiles holds in the tab's held memory. */
+  private unhold: () => void = () => {};
 
   /** The file as stored: its Blob read from this store while it holds it. */
   private keep(info: FileInfo, d: ReturnType<FileHash['digest']>, blob: Blob): StoredFile {
@@ -147,9 +157,26 @@ export class MemoryStore implements ExportStore {
     return null;
   }
 
-  /** Lets the files go: the store's Blobs are freed once nothing else holds them (object URLs, readers). */
+  /** Bytes of the files it keeps. */
+  get bytesKept(): number {
+    let n = 0;
+    for (const b of this.blobs.values()) n += b.size;
+    return n;
+  }
+
+  holdFiles(id: string): void {
+    this.unhold();
+    this.unhold = holdExportFiles(id, this.bytesKept);
+  }
+
+  /**
+   * Lets the files go: the store's Blobs are freed once nothing else holds them (object URLs,
+   * readers), and the tab no longer counts them.
+   */
   async dispose(): Promise<void> {
     this.blobs.clear();
+    this.unhold();
+    this.unhold = () => {};
   }
 }
 

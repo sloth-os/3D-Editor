@@ -906,7 +906,7 @@ describe('memory of browser path traced renders', () => {
         held: { total: 0.6 * GB, heap: 0 },
       }).refusal,
     ).toMatch(
-      /^Path tracing was not started: it needs about \d+\.\d GB of memory with one render thread, and none is left of the 0\.5 GB a render may use in this tab \(half the device memory the browser reports, 1 GB, at most 4\.0 GB\): other path traced renders running in it hold 0\.6 GB \(about 1\.0 million triangles/,
+      /^Path tracing was not started: it needs about \d+\.\d GB of memory with one render thread, and none is left of the 0\.5 GB a render may use in this tab \(half the device memory the browser reports, 1 GB, at most 4\.0 GB\): other renders and exports in it hold 0\.6 GB \(about 1\.0 million triangles/,
     );
     // small scenes by their count
     expect(planRenderThreads({ ...needs, triangles: 12 }, 4, { ...roomy, budget: 0 }).refusal).toContain(
@@ -949,7 +949,7 @@ describe('memory of browser path traced renders', () => {
     const held = planRenderThreads(needs, 1, { ...roomy, held: { total: 0, heap: others } });
     expect(held.threads).toBe(0);
     const figures = held.refusal!.match(
-      /more than the (\d\.\d+) GB the tab has left for it: a render may fill (\d\.\d+) GB of its \d\.\d+ GB heap limit, .*, and the page and the path traced renders running in it are estimated to use (\d\.\d+) GB of that/,
+      /more than the (\d\.\d+) GB the tab has left for it: a render may fill (\d\.\d+) GB of its \d\.\d+ GB heap limit, .*, and the page and the renders and exports running in it are estimated to use (\d\.\d+) GB of that/,
     );
     expect(figures, held.refusal!).not.toBeNull();
     // one byte short: three decimals, the need rounded up, the share down and the use up, keep the
@@ -1418,7 +1418,7 @@ describe('memory of browser path traced renders', () => {
     const first = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory });
     // started in the same moment: the first one's worker has not reported its scene yet
     const second = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory });
-    await expect(second.result).rejects.toThrow(/of which other path traced renders running in it hold/);
+    await expect(second.result).rejects.toThrow(/of which other renders and exports in it hold/);
     expect((await first.result).threads).toBeGreaterThan(0);
     // refused before its first worker evaluated anything: only the first render prepared
     expect(sent.flat().filter((t) => t.startsWith('prepare'))).toHaveLength(1);
@@ -1466,7 +1466,7 @@ describe('memory of browser path traced renders', () => {
       (err: Error) => err.message,
     );
     const figures = message.match(
-      /it needs about (0\.\d{3}) GB of memory with one render thread, more than the (0\.\d{3}) GB left of the (0\.\d{3}) GB a render may use in this tab \(.*\), (0\.\d{3}) GB of which other path traced renders running in it hold/,
+      /it needs about (0\.\d{3}) GB of memory with one render thread, more than the (0\.\d{3}) GB left of the (0\.\d{3}) GB a render may use in this tab \(.*\), (0\.\d{3}) GB of which other renders and exports in it hold/,
     );
     expect(figures, message).not.toBeNull();
     expect(Number(figures![1])).toBeGreaterThan(Number(figures![2]));
@@ -1591,7 +1591,7 @@ describe('RASTER renders on the page', () => {
     const held = { ...tab, held: { total: 0, heap: room / 2 } };
     expect(rasterRefusal({ ...needs, heap: room / 2 }, held)).toBeNull();
     expect(rasterRefusal({ ...needs, heap: room / 2 + MB }, held)).toContain(
-      'and the page and the path traced renders running in it are estimated to use',
+      'and the page and the renders and exports running in it are estimated to use',
     );
     // the modifier its evaluation would not run, by name
     expect(

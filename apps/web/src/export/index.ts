@@ -63,7 +63,8 @@ export function setBrowserExportOptions(opts: EngineOptions): EngineOptions {
  * WebCodecs, and written as files (the Origin Private File System where the browser has it, else
  * memory). Rejects with a BrowserExportError (its `code` says why) after deleting what it wrote.
  * The files stay until `releaseBrowserExport` (or until the page closes and a later export cleans
- * up).
+ * up); files kept in memory are counted in the tab's held memory until then (held.ts), so the
+ * renders and exports that start meanwhile plan without their bytes.
  */
 export async function startBrowserExport(
   req: BrowserExportRequest,
@@ -117,8 +118,8 @@ export async function zipExport(result: BrowserExportResult): Promise<Blob> {
 
 /**
  * Deletes the files of an export this page made: its directory on disk, or the in-memory store's
- * Blobs (freed once nothing else holds them, such as an object URL). Its files cannot be read from
- * then on.
+ * Blobs (freed once nothing else holds them, such as an object URL), which the tab no longer counts
+ * then. Its files cannot be read from then on.
  */
 export async function releaseBrowserExport(result: BrowserExportResult | string): Promise<void> {
   const id = typeof result === 'string' ? result : result.id;

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { WORKER_BASE_BYTES, type TabMemory } from '../src/render/memory';
+import { WORKER_BASE_BYTES, refusalFigures, type TabMemory } from '../src/render/memory';
 import {
   ENCODER_BYTES,
   FINISH_COPIES,
@@ -140,14 +140,14 @@ describe('export memory', () => {
   it("counts the first worker's rigid body simulation once, and what the tab's other renders hold", () => {
     const worker = { total: 500 * MB, heap: 300 * MB };
     expect(
-      planExportWorkers({ worker, page: 100 * MB, maxWorkers: 8, memory: tab(), onDisk: true }).workers,
+      planExportWorkers({ worker, page: () => 100 * MB, maxWorkers: 8, memory: tab(), onDisk: true }).workers,
     ).toBe(7);
     // the simulation's frames: in the first worker only
     expect(
       planExportWorkers({
         worker,
         first: { total: 1024 * MB, heap: 1024 * MB },
-        page: 100 * MB,
+        page: () => 100 * MB,
         maxWorkers: 8,
         memory: tab(),
         onDisk: true,
@@ -156,7 +156,7 @@ describe('export memory', () => {
     const simulated = planExportWorkers({
       worker,
       first: { total: 3.5 * GB, heap: 0 },
-      page: 100 * MB,
+      page: () => 100 * MB,
       maxWorkers: 8,
       memory: tab(),
       onDisk: true,
@@ -168,19 +168,19 @@ describe('export memory', () => {
     // other renders and exports of the tab: their memory and their heaps
     const held = planExportWorkers({
       worker,
-      page: 100 * MB,
+      page: () => 100 * MB,
       maxWorkers: 8,
       memory: tab({ held: { total: 3.5 * GB, heap: 0 } }),
       onDisk: true,
     });
     expect(held.workers).toBe(0);
     expect(held.refusal).toMatch(
-      /more than the 0\.5 GB a render may use in this tab \(half the device memory the browser reports, 8 GB, at most 4\.0 GB, less 3\.5 GB the other renders and exports running in it hold\), and running out of memory would end the tab\. Wait for the other renders and exports running in this tab to end, or lower the resolution or the passes, or the triangles of the scene, or export on the server where one is available\.$/,
+      /more than the 0\.5 GB a render may use in this tab \(half the device memory the browser reports, 8 GB, at most 4\.0 GB, less 3\.5 GB the other renders and exports in it hold\), and running out of memory would end the tab\. Wait for the other renders and exports running in this tab to end, or lower the resolution or the passes, or the triangles of the scene, or export on the server where one is available\.$/,
     );
     expect(
       planExportWorkers({
         worker,
-        page: 100 * MB,
+        page: () => 100 * MB,
         maxWorkers: 8,
         memory: tab({ held: { total: 2 * GB, heap: 0 } }),
         onDisk: true,
@@ -188,7 +188,7 @@ describe('export memory', () => {
     ).toBe(3);
     const heap = planExportWorkers({
       worker: { total: 100 * MB, heap: 1 * GB },
-      page: 0,
+      page: () => 0,
       maxWorkers: 8,
       memory: tab({ held: { total: 0, heap: 2.5 * GB } }),
       onDisk: true,
@@ -197,11 +197,34 @@ describe('export memory', () => {
     expect(heap.refusal).toMatch(
       /and the page and the other renders and exports running in it are estimated to use 2\.50 GB\), and running out of memory would end the tab\. Wait for the other renders/,
     );
+    // the files of finished exports the tab keeps in memory count, but nothing runs to wait for
+    const kept = planExportWorkers({
+      worker,
+      page: () => 100 * MB,
+      maxWorkers: 8,
+      memory: tab({ held: { total: 3.5 * GB, heap: 0, kept: 3.5 * GB } }),
+      onDisk: true,
+    });
+    expect(kept.workers).toBe(0);
+    expect(kept.refusal).toMatch(
+      /less 3\.5 GB the other renders and exports in it hold\), and running out of memory would end the tab\. Lower the resolution or the passes, or the triangles of the scene, or export on the server where one is available\.$/,
+    );
+    expect(
+      planExportWorkers({
+        worker,
+        page: () => 100 * MB,
+        maxWorkers: 8,
+        memory: tab({ held: { total: 3.5 * GB, heap: 0, kept: 3 * GB } }),
+        onDisk: true,
+      }).refusal,
+    ).toContain(
+      '. Wait for the other renders and exports running in this tab to end, or lower the resolution',
+    );
     // without a disk
     expect(
       planExportWorkers({
         worker: { total: 100 * MB, heap: 1 * GB },
-        page: 0,
+        page: () => 0,
         maxWorkers: 8,
         memory: tab({ held: { total: 0, heap: 2.5 * GB } }),
         onDisk: false,
@@ -211,26 +234,70 @@ describe('export memory', () => {
     );
   });
 
+  it('checks each number of workers with what the page needs for it, and refuses with the figures of one', () => {
+    // 2560×1440 with four video passes and two lossless ones: five frames in flight at most, and the
+    // page holds two frames ahead per worker
+    const input = page({ width: 2560, height: 1440, videoStreams: 4, lossless: 2 });
+    expect(framesInFlight(frameReplyBytes(2560, 1440, 4, 2))).toBe(5);
+    const pageOf = (workers: number) => pageNeeds({ ...input, workers });
+    expect(pageOf(5) - pageOf(1)).toBeGreaterThan(64 * MB);
+    const worker = { total: 900 * MB, heap: 100 * MB };
+    // room for one worker next to what the page needs for one, not for five
+    expect(
+      planExportWorkers({
+        worker,
+        page: pageOf,
+        maxWorkers: 5,
+        memory: tab({ budget: pageOf(1) + worker.total + 10 * MB }),
+        onDisk: true,
+      }),
+    ).toEqual({ workers: 1, limited: true, refusal: null });
+    // and two where two fit with what the page needs for two
+    expect(
+      planExportWorkers({
+        worker,
+        page: pageOf,
+        maxWorkers: 5,
+        memory: tab({ budget: pageOf(2) + 2 * worker.total }),
+        onDisk: true,
+      }).workers,
+    ).toBe(2);
+    // the refusal gives the figures of one worker and the page it needs
+    const budget = pageOf(1) + worker.total - 1;
+    const refused = planExportWorkers({
+      worker,
+      page: pageOf,
+      maxWorkers: 5,
+      memory: tab({ budget }),
+      onDisk: true,
+    });
+    expect(refused.workers).toBe(0);
+    const f = refusalFigures(pageOf(1) + worker.total, budget, 0, 1);
+    expect(refused.refusal).toContain(
+      `it needs about ${f.need} GB of memory with one render worker, more than the ${f.total} GB a render may use`,
+    );
+  });
+
   it('starts as many workers as the budget and the heap hold', () => {
     const worker = { total: 500 * MB, heap: 300 * MB };
-    expect(planExportWorkers({ worker, page: 100 * MB, maxWorkers: 8, memory: tab(), onDisk: true })).toEqual(
-      {
-        workers: 7,
-        limited: true,
-        refusal: null,
-      },
-    );
-    expect(planExportWorkers({ worker, page: 100 * MB, maxWorkers: 4, memory: tab(), onDisk: true })).toEqual(
-      {
-        workers: 4,
-        limited: false,
-        refusal: null,
-      },
-    );
+    expect(
+      planExportWorkers({ worker, page: () => 100 * MB, maxWorkers: 8, memory: tab(), onDisk: true }),
+    ).toEqual({
+      workers: 7,
+      limited: true,
+      refusal: null,
+    });
+    expect(
+      planExportWorkers({ worker, page: () => 100 * MB, maxWorkers: 4, memory: tab(), onDisk: true }),
+    ).toEqual({
+      workers: 4,
+      limited: false,
+      refusal: null,
+    });
     // the heap: a render may fill min(85 %, limit − 136 MB) of it, less the page's own
     const heapBound = planExportWorkers({
       worker,
-      page: 0,
+      page: () => 0,
       maxWorkers: 8,
       memory: tab({ budget: 16 * GB, heapLimit: 2 * GB, heapUsed: 500 * MB }),
       onDisk: true,
@@ -241,7 +308,7 @@ describe('export memory', () => {
   it('refuses with the figures when not even one worker fits', () => {
     const budget = planExportWorkers({
       worker: { total: 3 * GB, heap: 100 * MB },
-      page: 500 * MB,
+      page: () => 500 * MB,
       maxWorkers: 4,
       memory: tab({ budget: 2 * GB, deviceGB: 4 }),
       onDisk: true,
@@ -252,7 +319,7 @@ describe('export memory', () => {
     );
     const heap = planExportWorkers({
       worker: { total: 1 * GB, heap: 3 * GB },
-      page: 0,
+      page: () => 0,
       maxWorkers: 4,
       memory: tab({ budget: 8 * GB, heapUsed: 512 * MB }),
       onDisk: false,

@@ -613,13 +613,39 @@ test.describe('the embeddable desk', () => {
   test("Follow and Send; the viewport's keys only over the viewport; a brief over the export's size; the wake lock", async ({
     page,
   }) => {
-    test.setTimeout(300_000);
+    test.setTimeout(360_000);
+    /** Counts a frame's wake lock requests and the permissions policy violations reported to it. */
+    const watchWakeLock = (f: Frame) =>
+      f.evaluate(() => {
+        const w = window as any;
+        const seen = (w.__wakeLockSeen = { requests: 0, violations: [] as string[] });
+        const proto = w.WakeLock?.prototype;
+        const request = proto?.request;
+        if (request)
+          proto.request = function (this: unknown, ...args: unknown[]) {
+            seen.requests++;
+            return request.apply(this, args);
+          };
+        new w.ReportingObserver(
+          (reports: { type: string; body?: { featureId?: string } }[]) => {
+            for (const r of reports) seen.violations.push(`${r.type}: ${r.body?.featureId ?? ''}`);
+          },
+          { types: ['permissions-policy-violation'], buffered: true },
+        ).observe();
+      });
+    const wakeLockSeen = (f: Frame) =>
+      f.evaluate(() => (window as any).__wakeLockSeen as { requests: number; violations: string[] });
+    const policyLog: string[] = [];
+    page.on('console', (m) => {
+      if (/permissions policy/i.test(m.text())) policyLog.push(m.text());
+    });
     await openHost(page);
     await waitFor(page, 'ready');
     const frame = await deskFrame(page);
-    // the host's frame allows screen-wake-lock (as docs/embedding.md shows): an export may keep the
-    // screen on
+    // the host's frame allows screen-wake-lock (as docs/embedding.md shows): an export asks to keep
+    // the screen on (headless Chromium then refuses the permission, which is no policy violation)
     expect(await frame.evaluate(() => typeof (navigator as any).wakeLock)).toBe('object');
+    await watchWakeLock(frame);
     await send(page, {
       type: 'open',
       scene: smallBrief(),
@@ -664,20 +690,50 @@ test.describe('the embeddable desk', () => {
       [`${SHOT_A}.pose.mp4`, `${SHOT_A}.still.png`, `${SHOT_B}.pose.mp4`, `${SHOT_B}.still.png`].sort(),
     );
     await expectValidMessages(page);
+    expect((await wakeLockSeen(frame)).requests).toBeGreaterThan(0);
 
-    // a frame without screen-wake-lock: the desk never asks for one
+    // a frame without screen-wake-lock: an export there never asks for the wake lock, so the browser
+    // reports no permissions policy violation (the export engine reads the frame's policy)
     await page.evaluate(() => (window as any).host.mount({ allow: 'fullscreen; clipboard-write' }));
     await waitFor(page, 'ready', 2, 30_000);
     const second = await deskFrame(page);
-    expect(await second.evaluate(() => typeof (navigator as any).wakeLock)).toBe('undefined');
+    await watchWakeLock(second);
+    await send(page, {
+      type: 'open',
+      scene: smallBrief('clp_small0000000002'),
+      state: null,
+      options: { hostName: 'rideo', modes: ['camera'] },
+    });
+    await waitFor(page, 'opened', 2, 120_000);
+    await send(page, { type: 'export', id: 'nolock-1', shots: [SHOT_A], modes: ['camera'], still: false });
+    const results = await waitFor(page, 'result', 2, 180_000);
+    expect(results.at(-1).id).toBe('nolock-1');
+    expect(await wakeLockSeen(second)).toEqual({ requests: 0, violations: [] });
+    expect(policyLog).toEqual([]);
+    // (a request there would be refused, and reported as one)
+    expect(
+      await second.evaluate(() =>
+        (navigator as any).wakeLock.request('screen').then(
+          () => 'granted',
+          (e: Error) => e.name,
+        ),
+      ),
+    ).toBe('NotAllowedError');
+    await expect
+      .poll(async () => (await wakeLockSeen(second)).violations)
+      .toEqual(['permissions-policy-violation: screen-wake-lock']);
     // a portrait brief over 2160 pixels high: said when it opens, Send off, an export refused at once
+    // (in a new frame: one open per connection)
+    await page.evaluate(() => (window as any).host.mount());
+    await waitFor(page, 'ready', 3, 30_000);
+    const third = await deskFrame(page);
     const tall = smallBrief('clp_tall0000000001');
     tall.width = 2160;
     tall.height = 3840;
     await send(page, { type: 'open', scene: tall, state: null, options: { hostName: 'rideo' } });
-    await waitFor(page, 'opened', 2, 120_000);
-    await expect(second.getByTestId('desk-notice')).toContainText('too high');
-    await expect(second.getByTestId('desk-send')).toBeDisabled();
+    await waitFor(page, 'opened', 3, 120_000);
+    await expect(third.getByTestId('desk-notice')).toContainText('too high');
+    await expect(third.getByTestId('desk-send')).toBeDisabled();
     await send(page, { type: 'export', id: 'tall-1' });
     await expect
       .poll(async () => (await ofType(page, 'error')).find((e) => e.id === 'tall-1')?.code, {
