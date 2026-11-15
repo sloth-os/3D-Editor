@@ -2,11 +2,14 @@ import type { RawPixelFormat } from '@3d-editor/core';
 
 /*
  * Rendered pixels as the video encoder takes them: 8-bit I420 (planar Y, then U and V at half the
- * width and height) with the BT.709 matrix in limited ("TV") range, what the server's ffmpeg makes
- * with `scale=out_color_matrix=bt709:out_range=tv,format=yuv420p`. The conversion runs in the
- * render worker (1.5 bytes per pixel then cross to the encoder instead of 4), and the frames are
- * tagged BT.709 limited range, so the encoder writes those tags (the video's VUI and the MP4's colr
- * box) instead of the full-range sRGB a browser gives RGBA frames.
+ * width and height) with the BT.709 matrix in limited ("TV") range: the matrix, range and luma the
+ * server's ffmpeg makes with `scale=out_color_matrix=bt709:out_range=tv,format=yuv420p` (within one
+ * step), but not its chroma: each chroma sample here is the average of its 2 × 2 pixels, where
+ * ffmpeg's scaler averages pixel pairs across and filters down the rows with its bicubic filter, so
+ * the two differ near edges. The conversion runs in the render worker (1.5 bytes per pixel then
+ * cross to the encoder instead of 4), and the frames are tagged BT.709 limited range, so the
+ * encoder writes those tags (the video's VUI and the MP4's colr box) instead of the full-range sRGB
+ * a browser gives RGBA frames.
  *
  * Y  = 16 + 219/255 × (0.2126 R + 0.7152 G + 0.0722 B)
  * Cb = 128 + 224/255 × (B − Y′) / 1.8556,  Cr = 128 + 224/255 × (R − Y′) / 1.5748

@@ -39,9 +39,11 @@ update; later edits never reach the export) and hands it to the export engine
    server), a padded shot holding its last frame (`match_model_duration`).
 3. Each worker renders a frame with core's `renderExportFrame`, the function the server's render
    processes call, and converts it for the page: 8-bit I420 in BT.709 limited range for each video
-   stream (each chroma sample the average of its 2 × 2 pixels; what the server's ffmpeg makes with
-   `scale=out_color_matrix=bt709:out_range=tv`), a PNG frame for the lossless passes, the posters
-   (an RGB PNG and a JPEG), the stills and the contact sheet tiles.
+   stream (the matrix, range and luma the server's ffmpeg makes with
+   `scale=out_color_matrix=bt709:out_range=tv`, within one step; each chroma sample the average of
+   its 2 × 2 pixels, where ffmpeg's scaler averages pixel pairs across and filters down the rows
+   with its bicubic filter, so the chroma differs near edges), a PNG frame for the lossless passes,
+   the posters (an RGB PNG and a JPEG), the stills and the contact sheet tiles.
 4. The page encodes every video stream with one WebCodecs `VideoEncoder`: H.264 High, else Main,
    else Constrained Baseline, at the lowest level from 3.0 that holds the size, rate and bit rate
    (VP9: profile 0 at the lowest level that holds the picture size, the samples per second, the

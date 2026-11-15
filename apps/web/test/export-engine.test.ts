@@ -22,7 +22,7 @@ import { exportsHeld, holdExportMemory, type HeldMemory } from '../src/export/he
 import { ENCODER_BYTES, WORKER_SLACK_BYTES, fewerWorkersWarning } from '../src/export/memory';
 import { WORKER_BASE_BYTES } from '../src/render/memory';
 import { tabMemoryWithRenders } from '../src/render/path-trace';
-import { MemoryStore, type ExportStore } from '../src/export/store';
+import { MemoryStore, type ExportStore, type StoredFile } from '../src/export/store';
 import { BrowserExportError } from '../src/export/support';
 import { inProcessWorkerFactory } from '../src/export/workers';
 import type { ExportWorkerResponse } from '../src/export/protocol';
@@ -446,18 +446,88 @@ describe('browser export (in process)', () => {
     expect(e.stores[0].disposed).toBeFalsy();
   });
 
-  it('cancels: its workers stop, its encoders close and its files are deleted', async () => {
+  it('cancels: its workers stop at once, its encoders close and its files are deleted', async () => {
     const { update } = project();
-    const e = engine();
+    // the workers: stopped when, and asked anything after the cancel?
+    let cancelledAt = false;
+    const started: { terminated: boolean; askedAfterCancel: number }[] = [];
+    const inProcess = inProcessWorkerFactory(async () => JPEG);
+    // the store: every file written, and those still being written
+    const written: StoredFile[] = [];
+    const open = new Map<string, { aborted: boolean }>();
+    const e = engine({
+      workers: (i) => {
+        const w = inProcess(i);
+        const seen = { terminated: false, askedAfterCancel: 0 };
+        started.push(seen);
+        const terminate = w.terminate.bind(w);
+        w.terminate = () => {
+          seen.terminated = true;
+          terminate();
+        };
+        const post = w.postMessage.bind(w);
+        w.postMessage = (m) => {
+          if (cancelledAt) seen.askedAfterCancel++;
+          post(m);
+        };
+        return w;
+      },
+      store: async () => {
+        const s = new MemoryStore();
+        const bytes = s.bytes.bind(s);
+        const sequential = s.sequential.bind(s);
+        s.bytes = async (info, data) => {
+          const f = await bytes(info, data);
+          written.push(f);
+          return f;
+        };
+        s.sequential = async (info) => {
+          const f = await sequential(info);
+          const state = { aborted: false };
+          open.set(info.name, state);
+          return {
+            write: f.write,
+            close: async () => {
+              open.delete(info.name);
+              const done = await f.close();
+              written.push(done);
+              return done;
+            },
+            abort: async () => {
+              state.aborted = true;
+              await f.abort();
+            },
+          };
+        };
+        return s as ExportStore;
+      },
+    });
     const ctrl = new AbortController();
+    let terminatedAtCancel: boolean[] = [];
     const run = runBrowserExport(
       { update, params: PARAMS },
-      { signal: ctrl.signal, onProgress: (p) => p.phase === 'render' && p.done === 3 && ctrl.abort() },
+      {
+        signal: ctrl.signal,
+        onProgress: (p) => {
+          if (p.phase !== 'render' || p.done !== 3 || cancelledAt) return;
+          ctrl.abort();
+          cancelledAt = true;
+          terminatedAtCancel = started.map((w) => w.terminated);
+        },
+      },
       e.opts,
     );
     await expect(run).rejects.toMatchObject({ name: 'BrowserExportError', code: 'CANCELLED' });
-    expect(e.stores[0].disposed).toBe(true);
+    // every worker stopped as the export was cancelled, and none was asked anything afterwards
+    expect(terminatedAtCancel).toEqual([true, true]);
+    expect(started.map((w) => w.askedAfterCancel)).toEqual([0, 0]);
+    expect(e.encoders.length).toBeGreaterThan(0);
     expect(e.encoders.every((x) => x.closed)).toBe(true);
+    // the files written are deleted, and those being written (the mask frame archive) were aborted
+    expect(written.length).toBeGreaterThan(0);
+    for (const f of written) await expect(f.blob(), f.name).rejects.toThrow(/released with its export/);
+    expect([...open.keys()]).toEqual(['sequence.mask.zip']);
+    expect([...open.values()].every((f) => f.aborted)).toBe(true);
   });
 
   it('fails, rather than hangs, when a render worker cannot post a frame', async () => {
