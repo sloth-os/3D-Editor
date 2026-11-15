@@ -46,8 +46,9 @@ export const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, 
 
 /**
  * Titles before a name, written with a capital ("Dr. Okafor", "St. Ives", "Elm St."): a period after
- * one ends a sentence only before a word that opens one (OPENS). In lower case they are words ("the
- * engine's rev.", "thanks, hon.").
+ * one ends a sentence only before a word that opens one, written with a capital (OPENS), and never
+ * after a personal title (PERSONAL_TITLES). In lower case they are words ("the engine's rev.",
+ * "thanks, hon.").
  */
 const TITLES = new Set([
   'dr',
@@ -79,6 +80,14 @@ const TITLES = new Set([
   'mme',
   'mlle',
 ]);
+
+/**
+ * Titles a person's name always follows (TITLES written with a capital): what comes after the period
+ * is the name, even a word that may open a sentence ("Dr. An arrives", "Mr. Soon waves"), so the
+ * period ends a sentence only where the text ends. Not "St.", which may be a street that ends one
+ * ("Elm St. A car stops").
+ */
+const PERSONAL_TITLES = new Set(['dr', 'mr', 'mrs', 'ms', 'mx']);
 
 /**
  * Abbreviations: a period after one ends a sentence only when a capital comes next ("approx. 160 cm",
@@ -138,11 +147,15 @@ const NUMBER_ABBREVIATIONS: Readonly<Record<string, 'before' | 'after' | 'either
 
 /**
  * Words that open a sentence (a pronoun, an article or determiner, a linking word), not a name: a
- * period after a title or an initial ends a sentence before one ("Elm St. A car stops", "Gate C. He
- * waits", but "St. Ives", "J. Smith", "J. A. Smith").
+ * period after a title or an initial ends a sentence before one written with a capital (CAPITAL_NEXT:
+ * "Elm St. A car stops", "Gate C. He waits", but not "St. Ives", "J. Smith", "J. A. Smith", nor "Elm
+ * St. in the rain", "the U.S. in 1990"), never after a personal title (PERSONAL_TITLES).
  */
 const OPENS =
   /^\s+["“'‘(]*(?:i|a|an|the|this|that|these|those|he|she|it|we|they|you|his|her|its|our|their|my|your|there|here|then|now|next|later|meanwhile|suddenly|finally|soon|again|also|when|while|as|after|before|but|in|on|at)\b(?!\.)/i;
+
+/** The next word (after spaces, opening quotes or brackets) is written with a capital. */
+const CAPITAL_NEXT = /^\s+["“'‘(]*\p{Lu}/u;
 
 /**
  * Whether the period at `at` (its marks end at `next`) ends a sentence (see sentenceBreak). A period
@@ -158,8 +171,11 @@ function periodEnds(text: string, at: number, next: number): boolean {
   if (!word || /^\p{N}/u.test(word)) return true;
   const parts = word.split('.');
   const w = parts.join('').toLowerCase();
-  if (parts.every((p) => p.length === 1 && p !== p.toLowerCase()) || (TITLES.has(w) && /^\p{Lu}/u.test(word)))
-    return OPENS.test(after);
+  const title = parts.length === 1 && TITLES.has(w) && /^\p{Lu}/u.test(word);
+  // a personal title's name follows it ("Dr. An arrives"); "M.S." is initials, not the title
+  if (title && PERSONAL_TITLES.has(w)) return false;
+  if (title || parts.every((p) => p.length === 1 && p !== p.toLowerCase()))
+    return CAPITAL_NEXT.test(after) && OPENS.test(after);
   const before = lead.slice(0, lead.length - word.length);
   const side = NUMBER_ABBREVIATIONS[w];
   const abbreviation =
@@ -167,7 +183,7 @@ function periodEnds(text: string, at: number, next: number): boolean {
     (side !== undefined &&
       ((side !== 'after' && /\p{N}\s*$/u.test(before)) || (side !== 'before' && /^\s+\p{N}/u.test(after)))) ||
     (w === 'al' && /\bet\s+$/i.test(before));
-  if (abbreviation || parts.length > 1 || word.length === 1) return /^\s+["“'‘(]*\p{Lu}/u.test(after);
+  if (abbreviation || parts.length > 1 || word.length === 1) return CAPITAL_NEXT.test(after);
   return true;
 }
 
@@ -175,11 +191,12 @@ function periodEnds(text: string, at: number, next: number): boolean {
  * Where the first sentence of `text` ends: `end`, where its end mark starts (the text's length when it
  * has none), and `next`, where the text after it starts. A sentence ends at a line break, at ".", "!",
  * "?" or "…" followed by a space or the end of the text (closing quotes or brackets between), and
- * with `semicolons` at ";". A period does not end it inside a number; after a title written with a
- * capital ("Dr.", "Mrs.", "St.") or an initial ("J.", "U.S.") unless the next word opens a sentence
- * (OPENS: "He", "The", "Then" …); after an abbreviation ("approx.", "e.g.", "6 ft 2 in.", "No. 5")
- * unless a capital follows. Read in the text's own case: lowered, "walks in. he" and "approx. he"
- * look alike.
+ * with `semicolons` at ";". A period does not end it inside a number; after a personal title ("Dr.",
+ * "Mr.", "Mrs.", "Ms.", "Mx.": PERSONAL_TITLES), unless the text ends there; after another title
+ * written with a capital ("St.", "Prof.") or an initial ("J.", "U.S.") unless the next word opens a
+ * sentence and is written with a capital (OPENS: "He", "The", "Then" …; not "Elm St. in the rain");
+ * after an abbreviation ("approx.", "e.g.", "6 ft 2 in.", "No. 5") unless a capital follows. Read in
+ * the text's own case: lowered, "walks in. he" and "approx. he" look alike.
  */
 export function sentenceBreak(text: string, semicolons = false): { end: number; next: number } {
   const re = semicolons ? /[.!?…]+["”'’)\]]*(?=\s|$)|[\n;]/g : /[.!?…]+["”'’)\]]*(?=\s|$)|\n/g;

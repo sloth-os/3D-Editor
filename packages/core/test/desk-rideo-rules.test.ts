@@ -286,6 +286,62 @@ describe('rideo reading rules', () => {
     ]);
   });
 
+  // after a title or an initial only a word that opens a sentence written with a capital ends it: in
+  // lower case the sentence goes on ("Elm St. in the rain", "the U.S. in 1990")
+  it('goes on after a title or an initial before a word in lower case', () => {
+    expect(
+      [
+        'Tom runs along Elm St. in the rain with the kite.',
+        'He moved to the U.S. in 1990.',
+        'They land in Washington D.C. at dawn.',
+        'She walks down Elm St. as the sun sets.',
+        // a capital opener still ends one after a street or an initial
+        'Elm St. A car stops.',
+        'Exit at Gate C. He waits.',
+      ].map((t) => sentencesOf(t, true)),
+    ).toEqual([
+      ['Tom runs along Elm St. in the rain with the kite'],
+      ['He moved to the U.S. in 1990'],
+      ['They land in Washington D.C. at dawn'],
+      ['She walks down Elm St. as the sun sets'],
+      ['Elm St', 'A car stops'],
+      ['Exit at Gate C', 'He waits'],
+    ]);
+    // the shot's reading: Tom holds the kite, the pan goes the way its sentence says
+    const tom = { id: 'tom', name: 'Tom' };
+    const kite = { id: 'kite', name: 'Kite' };
+    expect(holdersByText('Tom runs along Elm St. in the rain with the kite.', [tom], [kite])).toEqual([
+      { holder: 'tom', prop: 'kite' },
+    ]);
+    expect(moveOfMovement('pan', 'The camera pans down Elm St. as Mira runs left.')).toBe('pan_left');
+  });
+
+  // after a personal title (Dr., Mr., Mrs., Ms., Mx.; not St., which may be a street) the word written
+  // with a capital is the person's name, even one that may open a sentence ("Dr. An", "Mr. Soon")
+  it("reads the word after a personal title as the person's name", () => {
+    expect(
+      ['Dr. An arrives.', 'Mr. Soon waves.', 'She has an M.S. The work was hard.'].map((t) =>
+        sentencesOf(t, true),
+      ),
+    ).toEqual([
+      ['Dr. An arrives'],
+      ['Mr. Soon waves'],
+      // initials that spell a title are initials
+      ['She has an M.S', 'The work was hard'],
+    ]);
+    const tom = { id: 'tom', name: 'Tom' };
+    const an = { id: 'an', name: 'Dr. An' };
+    const soon = { id: 'soon', name: 'Mr. Soon' };
+    const kite = { id: 'kite', name: 'Kite' };
+    const pepper = { id: PEPPER, name: 'Pepper', kind: 'pony' as const };
+    expect(holdersByText('Dr. An grabs the kite.', [an, tom], [kite])).toEqual([
+      { holder: 'an', prop: 'kite' },
+    ]);
+    expect(ridersByText('Mr. Soon rides Pepper.', [soon, tom], [pepper])).toEqual([
+      { rider: 'soon', mount: PEPPER },
+    ]);
+  });
+
   // shot texts are split in their own case before they are lowered: lowered, "walks in. he" and
   // "approx. he" look alike, and the subject of one sentence became the next one's
   it("reads a shot's holders, riders and pan from the sentence that says them", () => {

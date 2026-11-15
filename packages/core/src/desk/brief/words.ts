@@ -519,10 +519,11 @@ const IDENTITY_GENDER = /^(?:male|female|non-?binary|man|woman|boy|girl)$/;
  * writes its identity line ("Name: <age> <gender>, <ethnicity>, <build>; <marks>; wearing …." —
  * rideo's compactIdentity, followed by its summary), and the text after it (accents folded, case
  * kept). The line runs to its first sentence end (rideo/rules.ts sentenceBreak): a period inside a
- * number ("1.85 m"), after a title ("Dr.", "Mr.", "Mrs.", "Ms.", "St.") or an initial, or after an
- * abbreviation no capital follows ("approx. 160 cm", "e.g. a scar") does not end it, so whatever
- * follows such a period is still the line, not the summary. Null when the description does not open
- * with the name and a colon.
+ * number ("1.85 m"), after a personal title ("Dr.", "Mr.", "Mrs.", "Ms.", "Mx."), after another
+ * title or an initial unless a capitalised word that opens a sentence follows ("St. Ives",
+ * "J. Smith"), or after an abbreviation no capital follows ("approx. 160 cm", "e.g. a scar") does
+ * not end it, so whatever follows such a period is still the line, not the summary. Null when the
+ * description does not open with the name and a colon.
  */
 export function identityLine(name: string, description: string): { line: string; rest: string } | null {
   const own = foldText(name).trim().split(/\s+/).filter(Boolean);
