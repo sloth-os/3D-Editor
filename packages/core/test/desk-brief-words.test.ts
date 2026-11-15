@@ -342,6 +342,20 @@ describe('a cast member without a kind hint', () => {
     expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
   });
 
+  // ... but a breed of dog before it names the dog, as in a sentence: a cross of a retriever, a husky
+  // or a Labrador with a poodle is no small dog ("puppy" before "dog" is still its young, a feature
+  // in "puppy-dog eyes")
+  it('reads a cross of two breeds of dog as its first breed', () => {
+    for (const [name, description] of [
+      ['Barney', 'Barney: 4 male, golden retriever-poodle mix, fluffy; apricot coat.'],
+      ['Juno', 'Juno: 3 female, husky-poodle mix, fluffy; one blue eye.'],
+      ['Biscuit3', 'Biscuit3: 2 male, Labrador poodle mix, curly; cream coat.'],
+      ['Rover', 'Rover: 5 male, Labrador-poodle cross, curly; cream coat.'],
+    ])
+      expect(kindOf(name, description), name).toMatchObject({ kind: 'dog', warnings: [] });
+    expect(animalOf('Joel', 'Joel: 27 male, White, lanky, puppy-dog eyes; mop of curls.')).toBeNull();
+  });
+
   // a summary that names a person does not undo it: dogs are "good boys", and a companion who follows
   // the boy is not the boy
   it.each([

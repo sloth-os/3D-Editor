@@ -378,13 +378,14 @@ undo step, and runs in a web worker as well as on the server:
   "Black, ox frame"; after a coat, "brown, hulking bear build" is a bear, and "sturdy pony build" is
   a pony), and after "as a" or "like a" ("strong as an ox", "as strong as a big old bull", "built
   like a bear"); before another animal word the later is the animal ("cattle dog" is a dog), unless
-  it is the young, the sex or a breed word ("Shetland pony mare", "bear cub"). In the first item
-  only the age can name the animal (`puppy male`). Animal words among its marks ("bull neck", "doe
-  eyes", "a parrot on his shoulder") or in the name ("Wolf") do not make a person an animal, unless
-  the sentence after the line names the animal ("A curious white duck."). An animal word that says
-  what a member has or resembles is not what it is: a possessive ("crow's feet"), one before "-like"
-  ("a crow-like old woman") or before a hyphened "-ed" word ("bull-necked", "doe-eyed"), "a bear of
-  a man", as before "tattoo", "costume" or "ears".
+  it is the young, the sex or a breed word ("Shetland pony mare", "bear cub"), or the first is a
+  breed of dog: the first breed of a cross names it ("golden retriever-poodle mix" is a retriever,
+  not a small dog). In the first item only the age can name the animal (`puppy male`). Animal words
+  among its marks ("bull neck", "doe eyes", "a parrot on his shoulder") or in the name ("Wolf") do
+  not make a person an animal, unless the sentence after the line names the animal ("A curious white
+  duck."). An animal word that says what a member has or resembles is not what it is: a possessive
+  ("crow's feet"), one before "-like" ("a crow-like old woman") or before a hyphened "-ed" word
+  ("bull-necked", "doe-eyed"), "a bear of a man", as before "tattoo", "costume" or "ears".
   An animal the desk has no figure for stands in as the built kind nearest its size, with a warning:
   birds and small animals as a `cat`, foxes and wolves as a `dog`, goats as a `sheep`, big cats as a
   `bear`, big grazers as a `cow`, camels and zebras as a `horse`. `heightM` sets its height (an
