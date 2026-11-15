@@ -9,11 +9,12 @@ import type { SceneBrief } from '../src/desk/brief';
  * without a kind hint (rideo sends none: its descriptions open with an identity line, "Name: age
  * gender, build; marks; wearing …") is the animal its own words name only when they name it before
  * any person and not as something the member has, does or wears; an identity line that gives a
- * gender is a person's unless an item before its first ";" names an animal as its head ("golden
- * retriever", not "bull neck"), whatever animal words follow in its marks, and its age and gender
- * make the person a child, an elder, a woman or a man; a set without `interior` is one only when a
- * room is named, not an outdoor place that "inside", "flat", "bar", "cafe", "factory" or "museum"
- * qualifies, and an outdoor word naming a building ("the lake house") is not the place.
+ * gender is a person's unless an item before its first ";" names an animal as what the member is
+ * ("golden retriever", "sturdy pony build"; not "bull neck" or "bear build"), whatever animal words
+ * follow in its marks, and its age and gender make the person a child, an elder, a woman or a man; a
+ * set without `interior` is one only when a room is named, not an outdoor place that "inside",
+ * "flat", "bar", "cafe", "factory" or "museum" qualifies, and an outdoor word naming a building ("the
+ * lake house") is not the place.
  */
 
 function kindOf(name: string, description: string, hint: string | null = null) {
@@ -183,8 +184,9 @@ describe('a cast member without a kind hint', () => {
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
   });
 
-  // an item before the ";" names what the member is only by its head: an animal word another word
-  // follows is a feature, whichever item it is in, as is one after "as a(n)"
+  // an animal word in an item before the ";" is a feature of a person, whichever item it is in: before
+  // a body part or a look ("bull neck", "pony tail"), as a build ("bear build", "gorilla build"), or
+  // likened ("strong as an ox", "as strong as a big old bull", "built like a bear")
   it.each([
     ['Tom', 'Tom: 45 male, stocky, bull neck; broken nose.', 'man'],
     ['Dee', 'Dee: 25 female, Latina, petite, doe eyes. A shy librarian.', 'woman'],
@@ -194,17 +196,60 @@ describe('a cast member without a kind hint', () => {
     ['Ned', 'Ned: 50 male, bull-neck; scar.', 'man'],
     ['Al', 'Al: 40 male, strong as an ox; scar.', 'man'],
     ['Gus', 'Gus: 70 male, as strong as a young bull; scar.', 'elder'],
+    ['Gil', 'Gil: 40 male, White, gorilla build; beard.', 'man'],
+    ['Abe', 'Abe: 45 male, Black, ox build; shaved head.', 'man'],
+    ['Kai', 'Kai: 35 male, Pacific Islander, as strong as a big old bull; tattoos.', 'man'],
+    ['Bo', 'Bo: 40 male, White, built like a bear; beard.', 'man'],
+    ['Mia', 'Mia: 7 female, slim, pony tail; freckles.', 'child'],
+  ])('%s (%s) is a person: its animal word is a feature or a likeness', (name, description, kind) => {
+    expect(animalOf(name, description)).toBeNull();
+    expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
+  });
+
+  // ... but an animal word before another word names what the member is: a species in the build item
+  // ("sturdy pony build", "lean collie build", "heavy cow build") or before its type, its sex, its
+  // age or a size ("golden retriever type", "tabby tom", "pony yearling", "mare sixteen hands")
+  it.each([
+    [
+      'Clover',
+      'Clover: 7 female, chestnut, sturdy pony build; white mane; wearing a red saddle. Loves apples.',
+      'pony',
+      'pony',
+    ],
+    ['Moss', 'Moss: 4 male, black and white, lean collie build; one blue eye.', 'dog', 'dog'],
+    ['Bruiser', 'Bruiser: 4 male, brindle, muscular terrier build; scarred ear.', 'small dog', 'small_dog'],
+    ['Pip', 'Pip: 3 male, golden, retriever build; floppy ears.', 'dog', 'dog'],
+    ['Pip11', 'Pip11: 3 male, golden retriever type, medium; floppy ears.', 'dog', 'dog'],
+    ['Tibbs', 'Tibbs: 5 male, ginger tabby tom, lean; torn ear.', 'cat', 'cat'],
+    ['Hoot3', 'Hoot3: 4 female, barn owl species, small; white face.', 'owl', 'cat'],
+    ['Star2', 'Star2: 1 female, pony yearling, leggy; white star.', 'pony', 'pony'],
+    ['Jack', 'Jack: 5 male, donkey jack, grey; long ears.', 'donkey', 'donkey'],
+    ['Bella4', 'Bella4: 10 female, chestnut mare sixteen hands; white blaze.', 'horse', 'horse'],
+    [
+      'Bella',
+      'Bella: 8 female, chestnut, sleek horse build; white blaze; wearing a leather saddle.',
+      'horse',
+      'horse',
+    ],
+    ['Pip16', 'Pip16: 3 male, golden, medium-sized dog build; floppy ears.', 'dog', 'dog'],
+    ['Tibbs2', 'Tibbs2: 5 male, ginger, lean cat build; torn ear.', 'cat', 'cat'],
+    ['Billy', 'Billy: 3 male, white, scruffy goat build; horns.', 'goat', 'sheep'],
+    ['Daisy', 'Daisy: 4 female, brown, heavy cow build; bell around her neck.', 'cow', 'cow'],
+    ['Clover3', 'Clover3: 7 female, chestnut, sturdy pony body; white mane.', 'pony', 'pony'],
+    ['Pepper', 'Pepper: 6 female, dapple grey, stocky pony shape; braided mane.', 'pony', 'pony'],
+    ['Clover6', 'Clover6: 7 female, chestnut, small pony size; white mane.', 'pony', 'pony'],
+    ['Moss3', 'Moss3: 4 male, black and white, lean sheepdog body; one blue eye.', 'dog', 'dog'],
   ])(
-    '%s (%s) is a person: an animal word that is not its item’s head is a feature',
-    (name, description, kind) => {
-      expect(animalOf(name, description)).toBeNull();
-      expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
+    '%s (%s) is an animal (%s): an animal word before another word names it',
+    (name, description, word, kind) => {
+      expect(animalOf(name, description)).toMatchObject({ word, kind });
+      expect(kindOf(name, description).kind).toBe(kind);
     },
   );
 
-  // ... and the animal its head names is what the member is: the item's last word, or one followed
-  // by its young, its sex or a breed word, by "and" or "or", or by words that say what it has; an
-  // animal word before the head is the head's ("a cattle dog" is a dog, not a cow)
+  // ... and one before another animal word is that one's: the later is the animal ("a cattle dog" is a
+  // dog, not a cow), unless it is the young, the sex or a breed word ("Shetland pony mare", "bear
+  // cub"); "and", "or" and the words that say what it has or is with do not change it
   it.each([
     ['Blue', 'Blue: 3 male, Australian cattle dog; merle coat.', 'dog'],
     ['Scout', 'Scout: 2 female, bird dog, lean; liver spots.', 'dog'],
@@ -216,7 +261,7 @@ describe('a cast member without a kind hint', () => {
     ['Clover2', 'Clover2: 9 female, Shetland pony mare; white mane.', 'pony'],
     ['Pip4', 'Pip4: 3 male, golden retriever with a white chest; floppy ears.', 'dog'],
     ['Bella3', 'Bella3: adult female, chestnut mare (Arabian); white blaze.', 'horse'],
-  ])('%s (%s) is the animal its identity line names as an item’s head', (name, description, kind) => {
+  ])('%s (%s) is the animal its identity line names', (name, description, kind) => {
     expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
   });
 

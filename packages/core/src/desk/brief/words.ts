@@ -463,20 +463,39 @@ const KEEPS_ANIMAL =
 const isAnimalWord = (w: string): boolean =>
   speciesOf({ name: w, summary: '', identity: undefined }) !== null || standInKind(w) !== null;
 
+/** Body parts and looks that make the animal word before them a person's feature ("bull neck", "doe eyes", "a pony tail"). */
+const FEATURE_NOUNS =
+  /^(?:neck|eyes?|face|nose|legs?|arms?|shoulders?|chest|jaw|jowls|lips|mouth|teeth|ears?|hands?|feet|foot|toes|hair|head|brows?|lashes|cheeks|chin|belly|gut|back|hips|thighs|skin|grin|smile|gaze|stare|glare|walk|gait|stance|posture|tail)$/;
+
+/** Animal words used for a person's build ("a bear build", "an ox frame"). */
+const FIGURATIVE = /^(?:bear|bull|ox|gorilla|ape)$/;
+
+/** Words for a build, after which a FIGURATIVE word is a person's build ("bear build", "ox frame", "gorilla-sized"). */
+const BUILD_NOUNS = /^(?:build|frame|physique|body|shape|size|type|[a-z]*sized)$/;
+
 /**
  * The words an item of rideo's identity line is read by for an animal (sentenceKind: those before
- * any person and any word of NOT_ITSELF) with the animal words that do not say what the member is
- * blanked, same length: one followed (after spaces or a hyphen) by another word, other than "and",
- * "or" or a word that keeps it the animal (KEEPS_ANIMAL), modifies that word ("bull neck", "doe
- * eyes", "horse face", "bear build", "a cattle dog"), and one after "as a" or "as an" (an adjective
- * between) is what the member is likened to ("strong as an ox").
+ * any person and any word of NOT_ITSELF) with the animal words that are a person's feature or
+ * likeness, or another animal's modifier, blanked, same length: one whose next word (after spaces or
+ * a hyphen) is a body part or a look (FEATURE_NOUNS: "bull neck", "doe eyes", "horse face", "chicken
+ * legs", "pony tail"), one used for a person's build before a build word (FIGURATIVE before
+ * BUILD_NOUNS: "bear build", "ox frame"; not "sturdy pony build"), one after "as a(n)" or "like
+ * a(n)" with at most two words between ("strong as an ox", "as strong as a big old bull"), and one
+ * whose next word is another animal word, not its young, its sex or a breed word (KEEPS_ANIMAL): the
+ * later word is the animal ("Australian cattle dog", "bird dog" and "bull terrier" are dogs, but
+ * "Shetland pony mare" is a pony and "bear cub" a bear). Any other animal word is read as in a
+ * sentence ("sturdy pony build", "golden retriever type", "donkey jack").
  */
 function blankFeatures(head: string): string {
   return head.replace(/[a-z]+/g, (w, at: number) => {
-    const next = /^[\s-]+([a-z]+)/.exec(head.slice(at + w.length))?.[1];
-    const modifies = next !== undefined && !KEEPS_ANIMAL.test(next) && !/^(?:and|or)$/.test(next);
-    const likened = /\bas\s+an?\s+(?:[a-z-]+\s+)?$/.test(head.slice(0, at));
-    return (modifies || likened) && isAnimalWord(w) ? ' '.repeat(w.length) : w;
+    if (!isAnimalWord(w)) return w;
+    const next = /^[\s-]+([a-z]+)/.exec(head.slice(at + w.length))?.[1] ?? '';
+    const feature =
+      FEATURE_NOUNS.test(next) ||
+      (FIGURATIVE.test(w) && BUILD_NOUNS.test(next)) ||
+      /\b(?:as|like)\s+an?\s+(?:[a-z-]+\s+){0,2}$/.test(head.slice(0, at)) ||
+      (isAnimalWord(next) && !KEEPS_ANIMAL.test(next));
+    return feature ? ' '.repeat(w.length) : w;
   });
 }
 
@@ -484,8 +503,9 @@ function blankFeatures(head: string): string {
  * What one sentence of a cast member's own words makes it: an animal (a built kind, or a stand-in for
  * one the desk has no figure for) named before any person and before any word that makes the animal
  * something the member has, does or wears; 'person' when a person is named first; null when it says
- * neither. In an `item` of rideo's identity line the animal must also be the head of the words
- * before them, not a feature or a likeness (blankFeatures: "bull neck", "strong as an ox").
+ * neither. In an `item` of rideo's identity line an animal word that is a person's feature or
+ * likeness, or another animal's modifier, does not count (blankFeatures: "bull neck", "bear build",
+ * "strong as an ox", "cattle dog").
  */
 function sentenceKind(sentence: string, item = false): AnimalWords | 'person' | null {
   const t = blankModifiers(plainText(sentence));
@@ -559,18 +579,18 @@ export function identityOf(name: string, description: string): { age: string; ge
 
 /**
  * The animal the first part of rideo's identity line (before its first ";": the age and gender, the
- * ethnicity and the build items) names as what the member is, each item read alone and only by its
- * head: an animal word whose next word (past spaces or a hyphen) is "and", "or", a word that keeps
- * it the animal (KEEPS_ANIMAL) or none — "Pip: 3 male, golden retriever, small", "Bella: adult
- * female, chestnut mare", "Cub: 2 male, bear cub", "Mutt: 4 male, terrier mix", "Blue: 3 male,
+ * ethnicity and the build items) names as what the member is, each item read alone, as a sentence
+ * but for the animal words that are a person's feature or likeness or another animal's modifier
+ * (blankFeatures) — "Pip: 3 male, golden retriever, small", "Bella: adult female, chestnut mare",
+ * "Clover: 7 female, chestnut, sturdy pony build", "Cub: 2 male, bear cub", "Blue: 3 male,
  * Australian cattle dog" (a dog). The words read end before a word that makes it something the
  * member has, does or is with ("golden retriever with a white chest"), and in the first item only
  * the age, before the gender, can name it ("Kit: kitten female", "Pip: puppy male"). Null when it
- * names none, or names one only as a feature: with another next word ("Tom: 45 male, stocky, bull
- * neck", "Dee: 25 female, Latina, petite, doe eyes", "Ken: 40 male, Asian, horse face"), after "as
- * a(n)" ("strong as an ox") or "like" ("built like a bear"), before a hyphened "-ed" word
- * ("bull-necked") or as a figure of speech ("a bear of a man"); the marks after the ";" ("bull
- * neck", "doe eyes") are never read here.
+ * names none, or names one only as a feature: before a body part or a look ("Tom: 45 male, stocky,
+ * bull neck", "Dee: 25 female, Latina, petite, doe eyes", "Ken: 40 male, Asian, horse face"), as a
+ * build ("Rob: 35 male, White, bear build"), after "as a(n)" ("strong as an ox") or "like" ("built
+ * like a bear"), before a hyphened "-ed" word ("bull-necked") or as a figure of speech ("a bear of a
+ * man"); the marks after the ";" ("bull neck", "doe eyes") are never read here.
  */
 function identityAnimal(line: string): AnimalWords | null {
   const [first, ...others] = line.split(';')[0].split(',');
@@ -597,7 +617,7 @@ function identityAnimal(line: string): AnimalWords | null {
  * tall, thin; crow's feet.", "A crow-like old woman", "A bull-necked farmer" and "Deep in love with
  * birds" are not. An identity line that gives a gender (identityOf: "Tom: 45 male, stocky; bull neck,
  * broken nose", "Dee: early twenties female; doe eyes") is a person's unless its first part names an
- * animal as what the member is, as an item's head (identityAnimal: "Pip: puppy male, small", "Rex:
+ * animal as what the member is, not as a feature (identityAnimal: "Pip: puppy male, small", "Rex:
  * young male, golden retriever", "Kit: kitten female"; not "Tom: 45 male, stocky, bull neck"): an
  * animal word among its marks is a feature ("bull neck", "doe eyes", "a parrot on his shoulder"),
  * and neither it nor the name ("Wolf: 40 male, tall.") makes the member an animal; only the sentence

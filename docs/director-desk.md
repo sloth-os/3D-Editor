@@ -372,12 +372,12 @@ undo step, and runs in a web worker as well as on the server:
   woman, boy, girl, non-binary) is a person's whatever its age says, unless the line names an
   animal as what the member is before its first `;`, as its age, ethnicity or build
   (`Pip: 3 male, golden retriever, small`, `Kit: kitten female`, `Rex: young male, beagle`): then
-  it is that animal. An item there names an animal only by its head: an animal word whose next word
-  is its young, its sex or a breed word ("bear cub", "pony mare", "terrier mix"), "and" or "or"
-  ("Labrador and poodle mix"), a word that says what it has or is with ("golden retriever with a
-  white chest"), or none; the head is the animal ("cattle dog" is a dog). An animal word with
-  another next word ("bull neck", "doe eyes", "horse face", "bear build") or after "as a" ("strong
-  as an ox") is a feature of a person, and in the first item only the age can name the animal
+  it is that animal. An animal word there is a feature of a person instead before a body part or a
+  look ("bull neck", "doe eyes", "horse face", "pony tail"), as "bear", "bull", "ox" or "gorilla"
+  before a build word ("bear build", "ox frame"; "sturdy pony build" is a pony), and after "as a" or
+  "like a" ("strong as an ox", "as strong as a big old bull", "built like a bear"); before another
+  animal word the later is the animal ("cattle dog" is a dog), unless it is the young, the sex or a
+  breed word ("Shetland pony mare", "bear cub"). In the first item only the age can name the animal
   (`puppy male`). Animal words among its marks ("bull neck", "doe eyes", "a parrot on his
   shoulder") or in the name ("Wolf") do not make a person an animal, unless the sentence after the
   line names the animal ("A curious white duck."). An animal word that says what a member has or
