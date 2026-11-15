@@ -9,10 +9,11 @@ import type { SceneBrief } from '../src/desk/brief';
  * without a kind hint (rideo sends none: its descriptions open with an identity line, "Name: age
  * gender, build; marks; wearing …") is the animal its own words name only when they name it before
  * any person and not as something the member has, does or wears; an identity line that gives a
- * gender is a person's, whatever animal words follow in it, and its age and gender make the person
- * a child, an elder, a woman or a man; a set without `interior` is one only when a room is named,
- * not an outdoor place that "inside", "flat", "bar", "cafe", "factory" or "museum" qualifies, and an
- * outdoor word naming a building ("the lake house") is not the place.
+ * gender is a person's unless an item before its first ";" names an animal as its head ("golden
+ * retriever", not "bull neck"), whatever animal words follow in its marks, and its age and gender
+ * make the person a child, an elder, a woman or a man; a set without `interior` is one only when a
+ * room is named, not an outdoor place that "inside", "flat", "bar", "cafe", "factory" or "museum"
+ * qualifies, and an outdoor word naming a building ("the lake house") is not the place.
  */
 
 function kindOf(name: string, description: string, hint: string | null = null) {
@@ -180,6 +181,56 @@ describe('a cast member without a kind hint', () => {
     ['Ned', 'A bull-necked farmer.', 'adult'],
   ])('%s (%s) is a person: its animal word is a feature', (name, description, kind) => {
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
+  });
+
+  // an item before the ";" names what the member is only by its head: an animal word another word
+  // follows is a feature, whichever item it is in, as is one after "as a(n)"
+  it.each([
+    ['Tom', 'Tom: 45 male, stocky, bull neck; broken nose.', 'man'],
+    ['Dee', 'Dee: 25 female, Latina, petite, doe eyes. A shy librarian.', 'woman'],
+    ['Ken', 'Ken: 40 male, Asian, horse face; scar.', 'man'],
+    ['Rob', 'Rob: 35 male, White, bear build; beard.', 'man'],
+    ['Tim', 'Tim: 30 male, slim, chicken legs; freckles.', 'man'],
+    ['Ned', 'Ned: 50 male, bull-neck; scar.', 'man'],
+    ['Al', 'Al: 40 male, strong as an ox; scar.', 'man'],
+    ['Gus', 'Gus: 70 male, as strong as a young bull; scar.', 'elder'],
+  ])(
+    '%s (%s) is a person: an animal word that is not its item’s head is a feature',
+    (name, description, kind) => {
+      expect(animalOf(name, description)).toBeNull();
+      expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
+    },
+  );
+
+  // ... and the animal its head names is what the member is: the item's last word, or one followed
+  // by its young, its sex or a breed word, by "and" or "or", or by words that say what it has; an
+  // animal word before the head is the head's ("a cattle dog" is a dog, not a cow)
+  it.each([
+    ['Blue', 'Blue: 3 male, Australian cattle dog; merle coat.', 'dog'],
+    ['Scout', 'Scout: 2 female, bird dog, lean; liver spots.', 'dog'],
+    ['Spike', 'Spike: 4 male, bull terrier, stocky; scarred ear.', 'small_dog'],
+    ['Cub', 'Cub: 2 male, bear cub, small; brown fur.', 'bear'],
+    ['Mutt', 'Mutt: 4 male, terrier mix, scruffy; one ear up.', 'small_dog'],
+    ['Lab', 'Lab: 6 female, Labrador cross; grey muzzle.', 'dog'],
+    ['Mix', 'Mix: 6 female, Labrador and poodle mix; curly coat.', 'dog'],
+    ['Clover2', 'Clover2: 9 female, Shetland pony mare; white mane.', 'pony'],
+    ['Pip4', 'Pip4: 3 male, golden retriever with a white chest; floppy ears.', 'dog'],
+    ['Bella3', 'Bella3: adult female, chestnut mare (Arabian); white blaze.', 'horse'],
+  ])('%s (%s) is the animal its identity line names as an item’s head', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
+  });
+
+  // a summary that names a person does not undo it: dogs are "good boys", and a companion who follows
+  // the boy is not the boy
+  it.each([
+    ['Max', 'Max: 5 male, Labrador. A good boy.', 'dog'],
+    [
+      'Pip5',
+      'Pip5: 3 male, golden retriever, small. A loyal companion who follows the boy everywhere.',
+      'dog',
+    ],
+  ])('%s (%s) stays the animal its identity line names', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
   });
 });
 
