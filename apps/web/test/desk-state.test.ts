@@ -351,9 +351,13 @@ describe('the desk state', () => {
   it('is described in docs/embedding.md as it reads and writes', () => {
     const raw = readFileSync(resolve(__dirname, '../../../docs/embedding.md'), 'utf8');
     const doc = raw.replace(/\s+/g, ' ');
-    // the container table's header row: the keys state.ts writes, in its order
+    // the container table's header row: the keys state.ts writes, in its order, then the one earlier
+    // desks also wrote (it still reads)
     const row = raw.split('\n').find((l) => l.startsWith('| header '))!;
-    expect([...row.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual([...STATE_HEADER_KEYS]);
+    const [written, earlier] = row.split(', in order');
+    expect([...written.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual([...STATE_HEADER_KEYS]);
+    expect([...earlier.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual(['savedAt']);
+    expect(STATE_HEADER_KEYS).not.toContain('savedAt');
     expect(doc).toContain(`UTF-8 JSON of at most ${MAX_HEADER_BYTES / 1024} KiB`);
     expect(doc).toContain(`unpacked, at most ${MAX_UPDATE_BYTES / 1024 / 1024} MiB`);
     expect(doc).toContain('An unchanged scene gives the same bytes.');

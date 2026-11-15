@@ -68,6 +68,8 @@ export interface SceneWorkspace {
   readonly projectId: string | null;
   /** Lets go of the scene (an open cancelled by Close); a later open opens it again. */
   close?(): void;
+  /** Stops an open that waits for another desk to let go of the scene (Close while it opens). */
+  cancelOpen?(): void;
 }
 
 export interface ControllerDeps {
@@ -782,6 +784,8 @@ export class DeskController {
     if (st === 'opening') {
       this.openCancelled = true;
       this.cancelledOpen = this.opening;
+      // an open waiting for another desk of this browser to let go of the scene stops waiting
+      this.deps.workspace.cancelOpen?.();
       this.finish('cancel');
       return;
     }

@@ -634,6 +634,11 @@ export class DeskWorkspace {
     return this.session?.id ?? null;
   }
 
+  /** Ends a wait for another desk's lock (the open rejects); the open scene, if any, stays. */
+  cancelOpen(): void {
+    this.waiting?.abort();
+  }
+
   /** Lets go of the scene and its lock (a wait for another desk's lock ends). */
   close(): void {
     this.waiting?.abort();

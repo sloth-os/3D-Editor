@@ -432,15 +432,15 @@ without Web Locks do not let desks wait for each other.
 `state.data` is opaque to the host, at most 64 MiB. The desk writes a container of its own there
 (version 1, `apps/web/src/embed/state.ts`):
 
-| Bytes   | Content                                                                                               |
-| ------- | ----------------------------------------------------------------------------------------------------- |
-| 0–7     | the magic `3DDESK\r\n`                                                                                |
-| 8       | the container version, `1`                                                                            |
-| 9       | the payload's compression: `0` none, `1` gzip                                                         |
-| 10–11   | `0`                                                                                                   |
-| 12–15   | the header's length in bytes (unsigned 32-bit, little-endian)                                         |
-| header  | UTF-8 JSON of at most 64 KiB: `sceneId`, `lineage`, `shots`, `deskVersion`, `updateBytes`, in order   |
-| payload | the scene's Yjs document (`Y.encodeStateAsUpdate`), gzipped where the browser has `CompressionStream` |
+| Bytes   | Content                                                                                                                                  |
+| ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| 0–7     | the magic `3DDESK\r\n`                                                                                                                   |
+| 8       | the container version, `1`                                                                                                               |
+| 9       | the payload's compression: `0` none, `1` gzip                                                                                            |
+| 10–11   | `0`                                                                                                                                      |
+| 12–15   | the header's length in bytes (unsigned 32-bit, little-endian)                                                                            |
+| header  | UTF-8 JSON of at most 64 KiB: `sceneId`, `lineage`, `shots`, `deskVersion`, `updateBytes`, in order (earlier desks also wrote `savedAt`) |
+| payload | the scene's Yjs document (`Y.encodeStateAsUpdate`), gzipped where the browser has `CompressionStream`                                    |
 
 The header reads without unpacking the payload, so another scene's state is recognized at once.
 `lineage` names the staging the document comes from: a random id written into the document when

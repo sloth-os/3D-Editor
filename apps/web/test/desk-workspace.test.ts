@@ -575,6 +575,25 @@ describe('the desk workspace with the controller', () => {
     c.dispose();
   });
 
+  it('stops waiting for another desk when Close cancels the open, so a later open is not held up', async () => {
+    // another desk of this browser has the scene open (same host origin as the controller's)
+    const first = workspace();
+    await first.open({ hostOrigin: 'https://host.example', brief: EXAMPLE(), state: null });
+    const work: (WorkProgress | null)[] = [];
+    const ws = workspace({}, (w) => work.push(w));
+    const { c, ofType } = await controllerWith(ws);
+    c.message({ type: 'open', scene: EXAMPLE(), state: null });
+    await vi.waitFor(() => expect(work.some((w) => w?.label === OTHER_DESK_WAIT)).toBe(true));
+    await c.close();
+    // the host opens another scene: it opens now, while the first desk still holds its own
+    c.message({ type: 'open', scene: { ...EXAMPLE(), id: 'clp_fedcba9876543210' }, state: null });
+    await vi.waitFor(() => expect(ofType('opened')).toHaveLength(1), { timeout: 10_000 });
+    expect(ofType('opened')[0]).toMatchObject({ sceneId: 'clp_fedcba9876543210' });
+    expect(ofType('error')).toEqual([]);
+    expect(first.session).not.toBeNull();
+    c.dispose();
+  }, 20_000);
+
   it("sends the host's own bytes as the first state when it opened from them unchanged", async () => {
     const given = await stateOf(origin());
     const original = bytes(given).slice();
