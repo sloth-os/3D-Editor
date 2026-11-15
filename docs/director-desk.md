@@ -430,13 +430,14 @@ retimed, whose frame count changed, by a new duration or a new frame rate, to a 
 does not have already; shots recast; cast members added that a shot casts, and removed ones whose
 actor is staged), and in `other` (the desk's own, left out when empty) what else an update acts on:
 the frame rate and size, the set, the props, shots with a new camera plan, shots of the desk with
-new words or numbers, cast members with an actor renamed or of another kind or height. A shot
-removed in the desk counts only when the brief changes its length, cast or camera plan (an update
-stages it again). It is null exactly when an update would change nothing of the staging; such an
-update gives only the warnings every update of the brief repeats (how the desk reads the brief, a
-shot whose length was changed in the desk, a cast member kept as the kind staged), so a desk that
-offers the update on a non-null value offers it whenever it does something. A lens and move the host
-gives back as the desk staged them (copied from the shot results) are no change.
+new words or numbers, cast members with an actor renamed (not one the desk gave the new name
+already) or of another kind or height. A shot removed in the desk counts only when the brief changes
+its length, cast or camera plan (an update stages it again). It is null exactly when an update would
+change nothing of the staging; such an update gives only the warnings every update of the brief
+repeats (how the desk reads the brief, a shot whose length was changed in the desk, a cast member
+kept as the kind staged), so a desk that offers the update on a non-null value offers it whenever it
+does something. A lens and move the host gives back as the desk staged them (copied from the shot
+results) are no change.
 
 `shotResults(doc, {shots?})` (`desk.shot_results`, and `desk_shot_results` over MCP) is what the
 desk tells a host about each staged shot besides its files, in brief order: its frames and duration,
@@ -475,8 +476,10 @@ and no other shot's keys are cut:
   size changed;
 - a camera set by hand in the desk is never solved again: the update keeps it and warns;
 - cast members the brief drops go; new ones stand on a free spot of the front row, shown in their
-  shots; one the brief renames is renamed (one the desk renamed keeps the desk's name, with a
-  warning), and one whose kind or height the brief changes stays the actor staged, with a warning;
+  shots; one the brief renames is renamed, also one whose name was made unique (`Guard.001` beside
+  another `Guard`: the record keeps the name the desk gave each actor), while one the desk renamed
+  keeps the desk's name, with a warning; one whose kind or height the brief changes stays the actor
+  staged, with a warning;
 - props whose element went go and new ones are placed; a held prop whose holder or holder's shots
   changed is held (or flown) again; the set is built again when its plan changed;
 - notes the desk did not edit follow the brief's words, and the desk's own shot names (`Shot 3`)

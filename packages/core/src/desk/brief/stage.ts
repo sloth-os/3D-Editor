@@ -147,8 +147,9 @@ export function briefIssues(issues: readonly DeskIssue[], hostOf: ReadonlyMap<st
 }
 
 /**
- * The record of brief `b` staged with the desk shots `desk` (by host shot id), the cast's kinds, the
- * held elements' holders and the set as planned. `notes`: the digest to keep for shots whose notes
+ * The record of brief `b` staged with the desk shots `desk` (by host shot id), the cast's kinds and
+ * the names the desk gave their actors (`actorName`: what an actor renamed in the desk is told from),
+ * the held elements' holders and the set as planned. `notes`: the digest to keep for shots whose notes
  * were edited in the desk (the staged notes' digest, so that a later update still keeps them).
  * `removed`: the recorded shots that were removed in the desk and stay removed (an update keeps them
  * in the record, with the brief's values, so that only a later change of the brief stages them
@@ -158,7 +159,7 @@ export function briefIssues(issues: readonly DeskIssue[], hostOf: ReadonlyMap<st
 export function recordOf(
   b: SceneBrief,
   desk: ReadonlyMap<string, ShotData>,
-  kinds: ReadonlyMap<string, { kind: ActorKind }>,
+  kinds: ReadonlyMap<string, { kind: ActorKind; actorName?: string }>,
   holders: ReadonlyMap<string, string>,
   plannedSet: unknown,
   notes: ReadonlyMap<string, string> = new Map(),
@@ -192,13 +193,17 @@ export function recordOf(
           move: s.move,
         };
       }),
-    cast: b.cast.map((c) => ({
-      id: c.id,
-      name: c.name,
-      kind: kinds.get(c.id)?.kind ?? null,
-      heightM: c.heightM,
-      digest: castDigest(c),
-    })),
+    cast: b.cast.map((c) => {
+      const actorName = kinds.get(c.id)?.actorName;
+      return {
+        id: c.id,
+        name: c.name,
+        kind: kinds.get(c.id)?.kind ?? null,
+        heightM: c.heightM,
+        ...(actorName === undefined ? {} : { actorName }),
+        digest: castDigest(c),
+      };
+    }),
     elements: b.elements.map((e) => ({
       id: e.id,
       kind: e.kind,
@@ -252,7 +257,13 @@ export function stageBriefIn(
     warnings.push(`${e.name} ${s.why}`);
   }
   const desk = hostShots(doc, brief.id);
-  writeBriefRecord(doc, recordOf(brief, desk, plan.cast, plan.holders, plan.set));
+  // the names the import gave the actors ("Guard.001" beside another "Guard"): a later update renames
+  // an actor that still has it, and keeps a name given in the desk
+  const actors = stagedActors(doc, brief.id);
+  const kinds = new Map(
+    [...plan.cast].map(([cid, k]) => [cid, { kind: k.kind, actorName: actors.get(cid)?.name }]),
+  );
+  writeBriefRecord(doc, recordOf(brief, desk, kinds, plan.holders, plan.set));
   const hostOf = new Map([...desk].map(([host, s]) => [s.id, host]));
   return {
     sceneId: brief.id,

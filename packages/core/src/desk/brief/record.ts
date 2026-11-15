@@ -13,10 +13,11 @@ import { BRIEF_ELEMENT_KINDS, type SceneBrief } from './schema';
  * shot staged (host id, desk shot id, duration, the frames the brief gives it, cast, elements, the
  * lens and move it gave, and digests of its words, of the notes it was given and of its camera's
  * plan; a shot removed in the desk that an update kept removed stays in it), the cast (with the kind
- * staged and the height given) and the elements (with who holds them), and a digest of the set as
- * planned. It records the brief, not the desk: a shot made longer or shorter in the desk keeps the
- * brief's frames here, so that a later brief is compared with the brief before it. Reads are
- * validated and cached until the document changes.
+ * staged, the height given and the name the desk gave its actor) and the elements (with who holds
+ * them), and a digest of the set as planned. It records the brief, not the desk: a shot made longer
+ * or shorter in the desk keeps the brief's frames here, so that a later brief is compared with the
+ * brief before it; an actor renamed in the desk keeps the name staged here, so that an update tells
+ * the desk's names from its own. Reads are validated and cached until the document changes.
  */
 
 /** The scene settings key the record is kept under. */
@@ -50,6 +51,13 @@ const RecordCastSchema = z.object({
   kind: z.enum(ACTOR_KINDS).nullable(),
   /** The height the brief gave (records written before it have only `digest`). */
   heightM: z.number().nullable().optional(),
+  /**
+   * The name the desk gave the member's actor when it staged it or an update renamed it: the brief's
+   * name, or that name made unique ("Guard.001" beside another "Guard"). An actor whose name differs
+   * from it was renamed in the desk. Absent for a member without an actor, and in records written
+   * before it (renamedInDesk then reads the brief's name, or it made unique, as the staged one).
+   */
+  actorName: z.string().optional(),
   /** Digest of the member's name, description, kind hint and height. */
   digest: z.string(),
 });
@@ -78,6 +86,19 @@ export const BriefRecordSchema = z.object({
 });
 export type BriefRecord = z.infer<typeof BriefRecordSchema>;
 export type BriefRecordShot = BriefRecord['shots'][number];
+export type BriefRecordCast = BriefRecord['cast'][number];
+
+/** A name without the suffix that made it unique ("Guard.001": "Guard"), trimmed as the desk trims names. */
+const nameStem = (name: string): string => name.trim().replace(/\.\d{3,}$/, '');
+
+/**
+ * Whether the actor of recorded cast member `was`, named `name` now, was renamed in the desk: its
+ * name is not the one the desk staged it with or an update gave it (`actorName`). For a record written
+ * before it kept that name, the brief's name or that name made unique ("Guard.001") is the staged one.
+ */
+export function renamedInDesk(name: string, was: Pick<BriefRecordCast, 'name' | 'actorName'>): boolean {
+  return was.actorName !== undefined ? name !== was.actorName : nameStem(name) !== nameStem(was.name);
+}
 
 // ---------------------------------------------------------------- digests
 

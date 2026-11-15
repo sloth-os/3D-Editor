@@ -10,6 +10,7 @@ import { HIDE_SCALE } from '../src/desk/hide';
 import { attachSpans } from '../src/desk/characters/attach';
 import { RIDE_PREFIX } from '../src/desk/characters/rig';
 import { briefChanges, stageBrief, updateFromBrief, type SceneBrief } from '../src/desk/brief';
+import { readBriefRecord, writeBriefRecord } from '../src/desk/brief/record';
 import { deleteSceneTime, insertSceneTime } from '../src/desk/brief/timeline';
 
 /*
@@ -18,7 +19,8 @@ import { deleteSceneTime, insertSceneTime } from '../src/desk/brief/timeline';
  * a shot removed, a brief sent again as it was; it never cuts another shot's keys, and a curve keeps
  * its values on both sides of a ripple edit (an actor hidden in the next shot stays shown in its own).
  * A new first shot stays inside the scene's range, a ripple edit removes what lay inside the frames it
- * deletes, and an update says when a shot's words ask for a rider it does not seat.
+ * deletes, and an update says when a shot's words ask for a rider it does not seat. A rename reaches
+ * an actor whose staged name was made unique ("Guard.001"); only a name given in the desk is kept.
  */
 
 const FIXTURES = new URL('./fixtures/desk-embed/', import.meta.url);
@@ -278,6 +280,72 @@ describe('updateFromBrief keeps what was done in the desk to shots the brief did
     renamed.cast[1].name = 'Pippin';
     updateFromBrief(other, renamed);
     expect(other.getObject(pip)!.name).toBe('Pippin');
+  });
+
+  it('renames an actor whose staged name was made unique, and says nothing of a rename in the desk', () => {
+    // two guards of the same name: the desk stages them as 'Guard' and 'Guard.001'
+    const brief = openScene();
+    brief.cast.push(
+      { id: 'chr_guard00000001', name: 'Guard', description: 'A man of 40.', kind: 'person', heightM: null },
+      { id: 'chr_guard00000002', name: 'Guard', description: 'A man of 50.', kind: 'person', heightM: null },
+    );
+    brief.shots[0].castIds.push('chr_guard00000001', 'chr_guard00000002');
+    const doc = staged(brief);
+    const first = actorOf(doc, 'chr_guard00000001').id;
+    const second = actorOf(doc, 'chr_guard00000002').id;
+    const names = () => [doc.getObject(first)!.name, doc.getObject(second)!.name];
+    expect(names()).toEqual(['Guard', 'Guard.001']);
+    const next = structuredClone(brief);
+    next.cast[3].name = 'Second guard';
+    expect(briefChanges(doc, next)?.other).toEqual(['1 cast member renamed']);
+    const r = updateFromBrief(doc, next);
+    expect(names()).toEqual(['Guard', 'Second guard']);
+    expect(r.warnings.join('\n')).not.toMatch(/keeps the name it was given in the desk/);
+    expect(briefChanges(doc, next)).toBeNull();
+    // a name then given in the desk is the desk's: kept, with a warning, when the brief renames again
+    doc.rename('objects', second, 'Captain');
+    const again = structuredClone(next);
+    again.cast[3].name = 'Head guard';
+    const kept = updateFromBrief(doc, again);
+    expect(names()).toEqual(['Guard', 'Captain']);
+    expect(kept.warnings).toContain(
+      'Captain keeps the name it was given in the desk; the brief renamed Second guard to Head guard',
+    );
+    // and stays the desk's at the brief's next rename
+    const third = structuredClone(again);
+    third.cast[3].name = 'Night guard';
+    updateFromBrief(doc, third);
+    expect(names()).toEqual(['Guard', 'Captain']);
+  });
+
+  it('reads a record written before it kept the actors’ names: the brief’s name made unique is the staged one', () => {
+    const brief = openScene();
+    brief.cast.push(
+      { id: 'chr_guard00000001', name: 'Guard', description: 'A man of 40.', kind: 'person', heightM: null },
+      { id: 'chr_guard00000002', name: 'Guard', description: 'A man of 50.', kind: 'person', heightM: null },
+    );
+    brief.shots[0].castIds.push('chr_guard00000001', 'chr_guard00000002');
+    const doc = staged(brief);
+    const old = readBriefRecord(doc)!;
+    expect(old.cast.map((c) => c.actorName)).toEqual(['Mira', 'Pip', 'Guard', 'Guard.001']);
+    for (const c of old.cast) delete c.actorName;
+    writeBriefRecord(doc, old);
+    expect(readBriefRecord(doc)!.cast.some((c) => 'actorName' in c)).toBe(false);
+    const next = structuredClone(brief);
+    next.cast[3].name = 'Second guard';
+    const r = updateFromBrief(doc, next);
+    expect(doc.getObject(actorOf(doc, 'chr_guard00000002').id)!.name).toBe('Second guard');
+    expect(r.warnings.join('\n')).not.toMatch(/keeps the name it was given in the desk/);
+  });
+
+  it('keeps the scene camera the desk cleared when the same brief comes again', () => {
+    const doc = staged();
+    expect(doc.getScene().camera).not.toBeNull();
+    doc.updateScene({ camera: null });
+    expect(briefChanges(doc, openScene())).toBeNull();
+    const r = updateFromBrief(doc, openScene());
+    expect(r.changes).toBeNull();
+    expect(doc.getScene().camera).toBeNull();
   });
 
   it('changes nothing when the brief is the one staged, whatever was done by hand', () => {

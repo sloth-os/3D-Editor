@@ -33,6 +33,7 @@ const openScene = (): SceneBrief =>
 
 const SHOT_A = 'sht_0123456789aaaa';
 const SHOT_B = 'sht_0123456789bbbb';
+const MIRA = 'chr_0123456789mira';
 const PIP = 'chr_0123456789pipd';
 
 function staged(brief: SceneBrief = openScene()): SceneDoc {
@@ -220,6 +221,16 @@ describe('briefChanges reports whatever an update acts on', () => {
       (doc) => run(doc, 'desk.shot_move', { shot: deskShot(doc, SHOT_B).id, index: 0 }),
       () => {},
     ],
+    [
+      'the brief as staged, with the scene camera cleared in the desk',
+      (doc) => doc.updateScene({ camera: null }),
+      () => {},
+    ],
+    [
+      'a new name of a cast member that the desk gave its actor already',
+      (doc) => doc.rename('objects', actorOf(doc, PIP).id, 'Pippin'),
+      (b) => void (b.cast[1].name = 'Pippin'),
+    ],
   ];
   for (const [what, desk, edit] of quietAfterDesk)
     it(`is null for ${what}, and the update changes nothing`, () => {
@@ -235,6 +246,38 @@ describe('briefChanges reports whatever an update acts on', () => {
       expect(warningsOf(r.warnings)).toEqual([]);
       expect(staging(doc)).toBe(before);
     });
+
+  it('does not list as removed a cast member whose actor was deleted in the desk, and the update removes nothing', () => {
+    const doc = staged();
+    run(doc, 'object.delete', { objects: [actorOf(doc, PIP).id] });
+    const next = openScene();
+    next.cast.splice(1, 1);
+    next.shots[0].castIds = [MIRA];
+    next.shots[0].layout = next.shots[0].layout.filter((e) => e.castId !== PIP);
+    const changes = briefChanges(doc, next);
+    expect(changes).toEqual({
+      ...NOTHING_LISTED,
+      recast: [SHOT_A],
+      other: ['1 shot with a new camera plan'],
+    });
+    const objects = doc.listObjects().map((o) => o.id);
+    const r = updateFromBrief(doc, next);
+    expect(r.changes).toEqual(changes);
+    expect(doc.listObjects().map((o) => o.id)).toEqual(objects);
+    expect(r.cast.map((c) => c.castId)).toEqual([MIRA]);
+  });
+
+  it('does not count a rename the desk already made among what else changed', () => {
+    const doc = staged();
+    doc.rename('objects', actorOf(doc, PIP).id, 'Pippin');
+    const next = openScene();
+    next.cast[1].name = 'Pippin';
+    next.shots[1].description = 'Close-up: Mira squints up at the kite.';
+    expect(briefChanges(doc, next)).toEqual({ ...NOTHING_LISTED, other: ['1 shot with new words'] });
+    const r = updateFromBrief(doc, next);
+    expect(warningsOf(r.warnings)).toEqual([]);
+    expect(actorOf(doc, PIP).name).toBe('Pippin');
+  });
 
   it('a warning of what an update keeps comes again with the brief, while briefChanges is null', () => {
     const doc = staged();

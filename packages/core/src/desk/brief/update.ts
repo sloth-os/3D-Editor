@@ -36,7 +36,14 @@ import { editorPose, flyerKind, isHumanoid, isRideable, ridersByText, shotText }
 import { RideoImportInputSchema, type RideoBlockingMark, type RideoBlockingProp } from '../rideo/schema';
 import { briefFrames, diffBrief, holderRuns } from './changes';
 import { planBrief, shotCast } from './plan';
-import { digest, readBriefRecord, shotTextDigest, writeBriefRecord, type BriefRecordShot } from './record';
+import {
+  digest,
+  readBriefRecord,
+  renamedInDesk,
+  shotTextDigest,
+  writeBriefRecord,
+  type BriefRecordShot,
+} from './record';
 import type { BriefShot, SceneBrief } from './schema';
 import {
   briefContext,
@@ -89,7 +96,10 @@ import {
  * - cast members the brief no longer stages go; new ones stand on a free mark, shown in their shots
  *   (an actor removed in the desk is staged again only for a shot the update stages or recasts); a
  *   member the brief renames is renamed, unless the desk renamed it (it keeps the desk's name, with a
- *   warning); one whose kind or height the brief changes stays the actor staged, with a warning;
+ *   warning): an actor is renamed in the desk when its name is not the one the record keeps of it,
+ *   the name staging or an update gave it (made unique, "Guard.001" beside another "Guard", it is
+ *   still the desk's own); one whose kind or height the brief changes stays the actor staged, with a
+ *   warning;
  * - props whose element went go, new ones are placed, and a held prop whose holder or holder's shots
  *   changed is held (or flown) again; the set is rebuilt when its plan changed;
  * - notes the desk did not edit follow the brief's words; shot names that are the desk's own
@@ -324,18 +334,28 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
     actors.set(cid, doc.getObject(id)!);
     created.add(cid);
   }
+  // the name each actor has as the desk staged it, for the record: what a later update tells a name
+  // given in the desk from (an actor made unique, "Guard.001" beside another "Guard", is not renamed)
+  const actorNames = new Map<string, string>();
   for (const [cid, o] of actors) {
     const c = castById.get(cid)!;
-    if (created.has(cid)) continue;
+    if (created.has(cid)) {
+      actorNames.set(cid, doc.getObject(o.id)!.name);
+      continue;
+    }
     // a name the brief changed: the actor takes it, unless the desk renamed it (its name stays)
     const was = recordCast.get(cid);
+    const inDesk = was !== undefined && renamedInDesk(o.name, was);
+    let name = o.name;
     if (was && was.name !== c.name && o.name !== c.name) {
-      if (o.name === was.name) doc.rename('objects', o.id, c.name);
+      if (!inDesk) name = doc.rename('objects', o.id, c.name);
       else
         warnings.push(
           `${o.name} keeps the name it was given in the desk; the brief renamed ${was.name} to ${c.name}`,
         );
     }
+    // a name given in the desk stays the desk's (the staged one is kept), unless it is the brief's
+    actorNames.set(cid, was && inDesk && name !== c.name ? (was.actorName ?? was.name) : name);
     const kind = o.custom_props?.[DESK_PROPS.kind];
     const now = plan.cast.get(cid)!.kind;
     if (typeof kind === 'string' && kind !== now)
@@ -631,10 +651,13 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
   for (const o of [...actors.values(), ...props.values()])
     if (doc.getObject(o.id) && staged.get(o.id) !== false) recordMotion(doc, o.id);
 
-  const kinds = new Map<string, { kind: ActorKind }>();
+  const kinds = new Map<string, { kind: ActorKind; actorName?: string }>();
   for (const [cid, o] of actors) {
     const k = doc.getObject(o.id)?.custom_props?.[DESK_PROPS.kind];
-    kinds.set(cid, { kind: typeof k === 'string' && isActorKind(k) ? k : plan.cast.get(cid)!.kind });
+    kinds.set(cid, {
+      kind: typeof k === 'string' && isActorKind(k) ? k : plan.cast.get(cid)!.kind,
+      actorName: actorNames.get(cid),
+    });
   }
   const next = recordOf(brief, desk, kinds, plan.holders, plan.set, keptNotes, removedKept);
   writeBriefRecord(doc, next);
