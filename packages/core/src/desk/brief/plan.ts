@@ -23,6 +23,7 @@ import type { BriefShot, SceneBrief } from './schema';
 import {
   WATER_SIZES,
   animalOf,
+  castWords,
   framingFromWords,
   groundFromWords,
   interiorFromWords,
@@ -171,11 +172,7 @@ export function castKinds(
   const warnings: string[] = [];
   const kinds = new Map<string, BriefCastPlan>();
   const fixed = new Map<string, BriefCastPlan>();
-  const words = (c: SceneBrief['cast'][number]) => ({
-    name: c.name,
-    summary: c.description,
-    identity: undefined,
-  });
+  const words = (c: SceneBrief['cast'][number]) => castWords(c.name, c.description);
   for (const c of brief.cast) {
     if (c.kind === null) continue;
     const h = readKindHint(c.kind);
@@ -253,7 +250,7 @@ export function castKinds(
  */
 function kindOfAnimal(
   animal: AnimalWords | null,
-  c: { name: string; summary: string; identity: undefined },
+  c: ReturnType<typeof castWords>,
   ev: KindEvidence,
 ): BriefCastPlan {
   if (!animal) return { kind: humanKindOf(c), reason: 'a person' };

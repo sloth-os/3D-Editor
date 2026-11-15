@@ -52,22 +52,55 @@ const OUTDOORS =
   /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|car park|parking lot)\b/g;
 
 /**
+ * Indoor words that may say where or whose an outdoor place is rather than name a room ("deep inside
+ * the forest", "the cafe terrace", "the factory yard", "the museum garden"). A room's name ("kitchen",
+ * "hall", "office", "lobby") always names a room.
+ */
+const QUALIFIERS = /^(?:inside|flat|bar|cafe|caf|factory|museum)$/;
+
+/**
+ * Buildings an outdoor word before them says which of ("the lake house", "the beach house", "the
+ * mountain lodge", "the forest hotel"): the outdoor word then names the building, not the place.
+ */
+const BUILDING =
+  /^[\s-]+(?:house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace)s?\b/;
+
+/**
  * Whether a place is an interior by its words: "indoors", "inside" or a room's name make it one unless
  * outdoor words come first ("a meadow behind the house's kitchen"); null when the words say neither.
- * An indoor word with an outdoor one right after it names where that outdoor place is or whose it is
- * ("deep inside the forest", "the cafe terrace", "the factory yard"): it says nothing of a room.
+ * "inside", "flat", "bar", "cafe", "factory" or "museum" with an outdoor place right after it says
+ * where or whose that place is ("deep inside the forest", "the cafe terrace", "the factory yard"),
+ * nothing of a room; a room's name always names one ("the kitchen of the farm"). An outdoor word that
+ * names a building ("the lake house", "the forest hotel") or owns a room or building ("the park's
+ * cafe") says which building, not that the place is outdoors.
  */
 export function interiorFromWords(text: string): boolean | null {
   const t = plainText(text);
-  const outdoors = [...t.matchAll(OUTDOORS)];
-  const nearOutdoor = (end: number) =>
-    outdoors.some(
-      (o) =>
-        o.index >= end &&
-        /^\W*(?:(?:the|a|an|of|its|their)\W+)?(?:[a-z'-]+\W+)?$/.test(t.slice(end, o.index)),
+  const indoors = [...t.matchAll(INDOORS)];
+  const building = (at: number) => BUILDING.test(` ${t.slice(at)}`) || indoors.some((m) => m.index === at);
+  const namesBuilding = (end: number) => {
+    if (BUILDING.test(t.slice(end))) return true;
+    const own = /^'s\s+/.exec(t.slice(end));
+    if (!own) return false;
+    // the word after "'s", or the one after that ("the park's old cafe")
+    const at = end + own[0].length;
+    const next = /^[a-z'-]+\s+/.exec(t.slice(at));
+    return building(at) || (next !== null && building(at + next[0].length));
+  };
+  const places = [...t.matchAll(OUTDOORS)].filter((o) => !namesBuilding(o.index + o[0].length));
+  const qualifies = (m: RegExpExecArray) => {
+    const end = m.index + m[0].length;
+    return (
+      QUALIFIERS.test(m[0]) &&
+      places.some(
+        (o) =>
+          o.index >= end &&
+          /^\W*(?:(?:the|a|an|of|its|their)\W+)?(?:[a-z'-]+\W+)?$/.test(t.slice(end, o.index)),
+      )
     );
-  const inside = [...t.matchAll(INDOORS)].find((m) => !nearOutdoor(m.index + m[0].length));
-  const outside = outdoors[0];
+  };
+  const inside = indoors.find((m) => !qualifies(m));
+  const outside = places[0];
   if (inside && outside) return inside.index < outside.index;
   if (inside) return true;
   if (outside) return false;
@@ -396,6 +429,30 @@ export interface AnimalWords {
   word: string;
 }
 
+/** A gender rideo's identity line gives ("<age> <gender>"). */
+const IDENTITY_GENDER = /^(?:male|female|non-?binary|man|woman|boy|girl)$/;
+/** An age rideo's identity line gives: "8", "72", "30s", "early 30s", "mid-40s", "6 years old". */
+const IDENTITY_AGE = /^(?:(?:early|mid|late)[- ]?)?\d{1,3}(?:'?s)?(?:[- ](?:years?|yrs?)(?:[- ]old)?)?$/;
+
+/**
+ * The age and gender a cast member's description opens with as rideo writes them: its identity line,
+ * "Name: <age> <gender>, <ethnicity>, <build>; <marks>; wearing …" (rideo's compactIdentity), whose
+ * first item is the age and the gender ("45 male", "early 30s female", "8 girl", "6", "male"). Null
+ * when the description does not open with the member's name, a colon and such an item.
+ */
+export function identityOf(name: string, description: string): { age: string; gender: string } | null {
+  const own = plainText(name).trim();
+  const t = plainText(description).trimStart();
+  if (!own || !t.startsWith(own)) return null;
+  const head = /^\s*:\s*([^,;.!?\n]*)/.exec(t.slice(own.length));
+  if (!head) return null;
+  const words = head[1].trim().split(/\s+/).filter(Boolean);
+  const gender = IDENTITY_GENDER.test(words.at(-1) ?? '') ? words.pop()! : '';
+  const age = words.join(' ');
+  if (age ? !IDENTITY_AGE.test(age) : !gender) return null;
+  return { age, gender };
+}
+
 /**
  * The animal a cast member is by its own words, or null for a person (the actor kind of a member
  * without a kind hint, before what the shots say: who rides and holds what). The words read are the
@@ -404,7 +461,11 @@ export interface AnimalWords {
  * only when named before any person and before any word that makes it something the member has, does,
  * wears or is with: "A white duck" and "Pip: 3 male, small; golden fur. A golden retriever puppy." are
  * animals; "A farmer with a goat", "Mira: 8 girl, slim; a small bird tattoo …", "A girl in a rabbit
- * costume", "wearing a fox-fur hat" and "Deep in love with birds" are not.
+ * costume", "wearing a fox-fur hat" and "Deep in love with birds" are not. An identity line that
+ * gives a gender (identityOf: "Tom: 45 male, stocky; bull neck, broken nose") is a person's: an animal
+ * word in it is a feature ("bull neck", "doe eyes", "crow's feet", "a parrot on his shoulder"), and
+ * neither it nor the name ("Wolf: 40 male, tall.") makes the member an animal; only the sentence after
+ * it (rideo's summary: "Quackers: 2 female, small; white feathers. A curious white duck.") still can.
  */
 export function animalOf(name: string, description: string): AnimalWords | null {
   const own = plainText(name).trim();
@@ -417,6 +478,10 @@ export function animalOf(name: string, description: string): AnimalWords | null 
     const first = plainText(sentences[0]);
     if (first.startsWith(own) && /^\s*:/.test(first.slice(own.length)))
       sentences[0] = first.slice(own.length).replace(/^\s*:\s*/, '');
+  }
+  if (identityOf(name, description)?.gender) {
+    const next = sentences[1] ? sentenceKind(sentences[1]) : null;
+    return next && next !== 'person' ? next : null;
   }
   for (const sentence of sentences) {
     const k = sentenceKind(sentence);
@@ -448,9 +513,24 @@ export function readKindHint(hint: string): KindHint {
   return { type: 'unknown', hint: hint.trim() };
 }
 
-/** A person's kind from a cast member's words (age, child or elder words, gender), adult when they say none. */
+/**
+ * The words humanKindOf and the other reading rules read of a cast member: its name, its description,
+ * and the age and gender of rideo's identity line (identityOf) as rideo's identity fields.
+ */
+export function castWords(
+  name: string,
+  description: string,
+): { name: string; summary: string; identity: { age: string; gender: string } | undefined } {
+  return { name, summary: description, identity: identityOf(name, description) ?? undefined };
+}
+
+/**
+ * A person's kind from a cast member's words (an age, child or elder words, a gender: rideo's identity
+ * line gives both, "Bo: 6 male" a child, "Tom: 72 male" an elder, "Ana: early 30s female" a woman, by
+ * humanKindOf's thresholds), adult when they say none.
+ */
 export function personKind(name: string, description: string): ActorKind {
-  return humanKindOf({ name, summary: description, identity: undefined });
+  return humanKindOf(castWords(name, description));
 }
 
 export const isPersonKind = (kind: ActorKind): boolean => HUMANOID_KINDS.includes(kind);
