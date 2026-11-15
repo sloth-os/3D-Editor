@@ -28,7 +28,7 @@ import { PLAIN } from './helpers';
  *   panel, nothing kept: the next open stages the scene again)
  * - offline: the desk loads from its service worker, stages and exports with no network at all
  * - on its own: the explanation, the editor link and the sample scene; the phone layout, also at
- *   360 px with a host name of 40 characters (Done and Close in the frame, Close works)
+ *   360 px with the longest host and scene names (Done and Close in the frame, Close works)
  */
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -897,36 +897,25 @@ test.describe('the embeddable desk', () => {
     await expect(frame.locator('[data-testid="shot-list"]:visible')).toHaveCount(1);
   });
 
-  test('on a phone of 360 px, with a host name of 40 characters: Done and Close stay in the frame', async ({
+  test('on a phone of 360 px, with the longest host and scene names: Done and Close stay in the frame', async ({
     page,
   }) => {
     test.setTimeout(180_000);
     await page.setViewportSize({ width: 360, height: 740 });
     await openHost(page);
     await waitFor(page, 'ready');
-    // the longest host name the contract allows; three modes, so Follow shows too
+    // the longest names the contract allows: the host's (40 characters, on Send) and the scene's
+    // (200); three modes, so Follow shows too
     const hostName = 'Storyboard Studio Online for Film Crews!';
     expect(hostName).toHaveLength(40);
-    await send(page, {
-      type: 'open',
-      scene: smallBrief('clp_phonehostname01'),
-      state: null,
-      options: { ...OPTIONS, hostName },
-    });
+    const scene = smallBrief('clp_phonehostname01');
+    scene.name = 'The long walk up the windy hill, kites in hand, '.repeat(5).slice(0, 199) + '!';
+    expect(scene.name).toHaveLength(200);
+    await send(page, { type: 'open', scene, state: null, options: { ...OPTIONS, hostName } });
     await waitFor(page, 'opened', 1, 120_000);
     await waitFor(page, 'state');
     const frame = await deskFrame(page);
     await expect(frame.getByTestId('desk-state-sent')).toBeVisible();
-    // Send says just "Send" here; the host's name stays in its title and accessible name
-    await expect(frame.getByTestId('desk-send-label')).toHaveText(`Send to ${hostName}`);
-    expect(await frame.getByTestId('desk-send-label').evaluate((e) => (e as HTMLElement).innerText)).toBe(
-      'Send',
-    );
-    await expect(frame.getByTestId('desk-send')).toHaveAttribute('aria-label', `Send to ${hostName}`);
-    await expect(frame.getByTestId('desk-send')).toHaveAttribute(
-      'title',
-      new RegExp(`send them to ${hostName}`),
-    );
     // Follow, Send, Done and Close on the header's line, inside the frame, each the element at its centre
     const header = (await frame.getByTestId('desk-header').boundingBox())!;
     const inFrame = await frame.evaluate(
@@ -949,6 +938,22 @@ test.describe('the embeddable desk', () => {
       expect(box.bottom, id).toBeLessThanOrEqual(header.y + header.height);
       expect(box.top, `${id} is the element at its centre`).toBe(true);
     }
+    // Send says just "Send" here; the host's name stays in its title and accessible name
+    await expect(frame.getByTestId('desk-send-label')).toHaveText(`Send to ${hostName}`);
+    expect(await frame.getByTestId('desk-send-label').evaluate((e) => (e as HTMLElement).innerText)).toBe(
+      'Send',
+    );
+    await expect(frame.getByTestId('desk-send')).toHaveAttribute('aria-label', `Send to ${hostName}`);
+    await expect(frame.getByTestId('desk-send')).toHaveAttribute(
+      'title',
+      new RegExp(`send them to ${hostName}`),
+    );
+    // the scene's name is cut short in what the actions leave of the header (its tooltip has it all)
+    await expect(frame.getByTestId('desk-scene-name')).toHaveAttribute('title', scene.name);
+    const name = await frame
+      .getByTestId('desk-scene-name')
+      .evaluate((e) => ({ full: e.scrollWidth, shown: e.clientWidth }));
+    expect(name.full).toBeGreaterThan(name.shown);
     // Close works from there
     await frame.getByTestId('desk-close').click();
     const [close] = await waitFor(page, 'close');

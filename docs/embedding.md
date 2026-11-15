@@ -831,8 +831,8 @@ Where the contract leaves room, the desk takes the most robust reading:
   refuses; Close while a long brief stages (the staging stopped, nothing of it kept); Send of a
   shot made longer; Follow and Send of one mode, the viewport's keys only over the viewport, a
   portrait brief over the export's size, and the wake lock with and without `screen-wake-lock`;
-  read-only; offline; a phone's 390 × 844, and 360 px with a host name of 40 characters (Done and
-  Close in the frame); and the page on its own. Every message the desk sends is checked against
+  read-only; offline; a phone's 390 × 844, and 360 px with the longest host and scene names (Done
+  and Close in the frame); and the page on its own. Every message the desk sends is checked against
   the schemas. Run it with
   `cd e2e && npx playwright test tests/desk-embed.spec.ts --trace off` after `npm run build`.
 - **Storage partitioning.** The desk's specs (`e2e/tests/desk-*.spec.ts`) run in the `desk`
