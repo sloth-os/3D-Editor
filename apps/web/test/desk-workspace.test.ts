@@ -21,6 +21,7 @@ import {
   type WorkspaceOptions,
 } from '../src/embed/workspace';
 import { localIndex } from '../src/project/local-index';
+import { ProjectSession } from '../src/project/session';
 import { lastCheck } from '../src/ui/director/state';
 
 /*
@@ -32,7 +33,8 @@ import { lastCheck } from '../src/ui/director/state';
  * the probe (memory, a notice, no hang), one desk per host and scene (a second waits for the
  * scene's lock), the checks stamped with the revision they checked (and the full check after staging
  * and Update shots), the brief's changes and Update shots as one undo step, a Close while it stages
- * (the staging stopped, nothing of it kept); and with the real controller: no state sent on its own
+ * (the staging stopped, nothing of it kept) or clears the copy it replaces (nothing of the host's
+ * state written into the copy); and with the real controller: no state sent on its own
  * after one it could not read, Close while the scene stages (its worker stopped, a later open taken).
  */
 
@@ -565,6 +567,45 @@ describe('the desk workspace', () => {
       source: 'brief',
       plan: 'stage',
     });
+  });
+
+  it('ends an open cancelled while it clears the copy it replaces: nothing of the state is written into the copy', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    edit(first, 'local_only', 'yes');
+    first.close();
+    // a state of another staging: the open replaces the local copy with it
+    const elsewhere = await stateOf(origin());
+    const elsewhereLineage = (await decodeDeskState(elsewhere, EXAMPLE().id)).lineage;
+    // the old copy's deletion held until the Close
+    const deleteLocal = ProjectSession.deleteLocal.bind(ProjectSession);
+    let begun!: () => void;
+    const deleting = new Promise<void>((r) => (begun = r));
+    let go!: () => void;
+    const gate = new Promise<void>((r) => (go = r));
+    vi.spyOn(ProjectSession, 'deleteLocal').mockImplementation(async (id) => {
+      begun();
+      await gate;
+      return deleteLocal(id);
+    });
+    const ws = workspace();
+    const opening = ws.open({ hostOrigin: host, brief: EXAMPLE(), state: elsewhere });
+    await deleting;
+    // Close while the copy it replaces is cleared
+    ws.cancelOpen();
+    go();
+    expect(await settledWithin(opening)).toBe('AbortError');
+    expect(ws.session).toBeNull();
+    vi.restoreAllMocks();
+    // the copy holds nothing of the state (nor of the old staging): the next open stages the brief
+    const again = workspace();
+    expect(await again.open({ hostOrigin: host, brief: EXAMPLE(), state: null })).toMatchObject({
+      source: 'brief',
+      plan: 'stage',
+    });
+    expect(readLineage(again.session!.doc)).not.toBe(elsewhereLineage);
+    expect(again.session!.doc.map('meta').get('local_only')).toBeUndefined();
   });
 
   it('stamps a background check with the revision it checked, and shows the blocking line after staging and Update shots', async () => {
