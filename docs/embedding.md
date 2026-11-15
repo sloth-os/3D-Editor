@@ -279,14 +279,17 @@ dev and preview servers read the same two and send the same headers.
 | `DESK_EMBED_ORIGINS` | `*`            | Comma-separated origins that may embed the desk, its `frame-ancestors`: `*` (any site), origins such as `https://studio.example.com`, `https://*.example.com` or `http://localhost:5173`, `'self'` (the desk's own origin) or `'none'` |
 | `DESK_EMBED_COEP`    | `require-corp` | `Cross-Origin-Embedder-Policy` of the desk page and the built files: `require-corp`, `credentialless` or `off` (none sent)                                                                                                             |
 
-An origin is `http` or `https`, a host name (its first label may be `*`), an IPv4 address or a
-bracketed IPv6 address, and an optional port (a number or `*`), with no path; trailing slashes are
-dropped and host names lowercased. `*` admits every site (other entries are then redundant), and
-`'none'` cannot be combined with origins. The server checks both variables when it starts and
-stops for a value it cannot use, with `Invalid configuration: DESK_EMBED_ORIGINS: …` or
-`Invalid configuration: DESK_EMBED_COEP: …`. `credentialless` serves cross-origin isolated hosts as
-well as `require-corp`; `off` is for a proxy in front of the server that sets the header itself (a
-cross-origin isolated host cannot embed a desk without one).
+An origin is `http` or `https`, a host name (its first label may be `*`) or an IPv4 address, and an
+optional port (a number up to 65535, or `*`), with no path, query or user name. The server writes
+each as the browser writes origins: trailing slashes dropped, lowercased, an international name in
+punycode, a default port (`:443`, `:80`) dropped. No IPv6 address: Content Security Policy has no
+way to name one, and browsers drop such a source from `frame-ancestors`, so give that host a name.
+`*` admits every site (other entries are then redundant), and `'none'` cannot be combined with
+origins. The server checks both variables when it starts and stops for a value it cannot use, with
+the reason, such as `Invalid configuration: DESK_EMBED_ORIGINS: 'https://a.example/x' has a path, …`
+or `Invalid configuration: DESK_EMBED_COEP: …`. `credentialless` serves cross-origin isolated hosts
+as well as `require-corp`; `off` is for a proxy in front of the server that sets the header itself
+(a cross-origin isolated host cannot embed a desk without one).
 
 ### Static hosts
 

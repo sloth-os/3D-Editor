@@ -5,8 +5,9 @@
  * Cross-Origin-Resource-Policy: cross-origin, so that hosts that are cross-origin isolated (COOP
  * same-origin + COEP require-corp) can frame it. The built files under assets/ carry the same COEP
  * and CORP: the desk's workers start from them, and a dedicated worker of a document with a COEP
- * needs a compatible one on its script. Pure (no imports): the server (static.ts) and the web
- * app's Vite dev and preview servers (apps/web/vite.config.ts) use it alike.
+ * needs a compatible one on its script. Pure (no imports): the server (static.ts), the web app's
+ * Vite dev and preview servers (apps/web/vite.config.ts) and its service worker
+ * (apps/web/src/pwa/sw.ts) use it alike, so that they agree on the desk's paths.
  */
 
 export const DESK_EMBED_COEP_VALUES = ['require-corp', 'credentialless', 'off'] as const;
@@ -21,8 +22,11 @@ export interface DeskEmbedSettings {
 
 export const DEFAULT_DESK_EMBED: DeskEmbedSettings = { coep: 'require-corp', frameAncestors: ['*'] };
 
-/** URL paths of the desk page: the built desk.html and its clean URL. */
-export const DESK_PAGE_PATHS: readonly string[] = ['/desk.html', '/desk', '/desk/'];
+/**
+ * URL paths of the desk page: the built desk.html and its clean URL, nothing else (`/desk/` and
+ * `/desk.html/` are the editor's, as any other path).
+ */
+export const DESK_PAGE_PATHS: readonly string[] = ['/desk.html', '/desk'];
 
 export function isDeskPagePath(pathname: string): boolean {
   return DESK_PAGE_PATHS.includes(pathname);
@@ -38,16 +42,62 @@ export function parseDeskEmbedCoep(value: string | undefined): DeskEmbedCoep {
   );
 }
 
-// scheme://host[:port]: a host name (its first label may be the wildcard *), an IPv4 address or a
-// bracketed IPv6 address; a port number or *. Nothing else (no path, no spaces, no ; or quotes): the
-// value goes into a header, and a source list must not end the directive.
-const ORIGIN_SOURCE =
-  /^https?:\/\/(?:(?:\*\.)?[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*|\[[0-9a-f:.]+\])(?::(?:\d{1,5}|\*))?$/;
+// A host as a CSP host-source can name it (letters, digits and hyphens in dot-separated labels, an
+// optional final dot; an IPv4 address is such a name): it goes into the header, so nothing that could
+// end the directive or the header (no spaces, ; or quotes) gets through.
+const CSP_HOST = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.?$/;
+
+/**
+ * One origin of DESK_EMBED_ORIGINS as a frame-ancestors source: `scheme://host[:port]` as the
+ * browser writes the origin (URL-parsed: lowercased, international names in punycode, a default
+ * port dropped), or with CSP's wildcards, `*.` before the host and `*` as the port. Whatever no
+ * framing page's origin can match is refused with the reason, so that a typo stops the server at
+ * startup rather than leaving a source that frames nothing: a value that is no URL, a scheme other
+ * than http(s), a path, query, fragment or user name, and IPv6 addresses, which CSP's host-source
+ * cannot express (browsers drop such a source).
+ */
+function originSource(raw: string): string {
+  const refused = (why: string) => new Error(`Invalid configuration: DESK_EMBED_ORIGINS: '${raw}' ${why}`);
+  if (/\s/.test(raw) || [...raw].some((c) => c < ' ' || c === '\x7f'))
+    throw refused('has spaces or control characters in it');
+  const value = raw.toLowerCase().replace(/\/+$/, '');
+  const scheme = /^(https?):\/\//.exec(value)?.[1];
+  if (!scheme)
+    throw refused(
+      "is not an origin: expected *, 'self', 'none' or http(s) origins such as https://app.example.com",
+    );
+  let rest = value.slice(`${scheme}://`.length);
+  if (rest.startsWith('['))
+    throw refused(
+      'has a bracketed (IPv6) address, which browsers ignore in frame-ancestors: use a host name for it',
+    );
+  const anySubdomain = rest.startsWith('*.');
+  if (anySubdomain) rest = rest.slice(2);
+  const anyPort = rest.endsWith(':*');
+  if (anyPort) rest = rest.slice(0, -2);
+  let url: URL;
+  try {
+    url = new URL(`${scheme}://${rest}`);
+  } catch {
+    throw refused('is not an origin: expected scheme://host[:port] with a valid host and a port up to 65535');
+  }
+  if (url.username || url.password)
+    throw refused('has a user name or password: an origin is scheme://host[:port]');
+  if (url.pathname !== '/' || url.search || url.hash || /[?#]/.test(rest))
+    throw refused('has a path, query or fragment: an origin is scheme://host[:port]');
+  if (anyPort && url.port) throw refused('has two ports');
+  if (!CSP_HOST.test(url.hostname))
+    throw refused('is not an origin: its host is not a host name or an IPv4 address');
+  if (anySubdomain && /^[\d.]+$/.test(url.hostname)) throw refused('puts *. before an IP address');
+  const port = anyPort ? ':*' : url.port ? `:${url.port}` : '';
+  return `${scheme}://${anySubdomain ? '*.' : ''}${url.hostname}${port}`;
+}
 
 /**
  * DESK_EMBED_ORIGINS: comma-separated origins that may frame the desk, e.g.
  * `https://rideo.example.com, https://*.example.org` (unset or `*`: any site; `'self'`: the
- * desk's own origin; `'none'`: no site). Trailing slashes are dropped and host names lowercased.
+ * desk's own origin; `'none'`: no site). Trailing slashes are dropped, host names lowercased and a
+ * default port dropped; a value that cannot be an origin throws (originSource).
  */
 export function parseDeskEmbedOrigins(value: string | undefined): string[] {
   const items = (value ?? '')
@@ -62,17 +112,7 @@ export function parseDeskEmbedOrigins(value: string | undefined): string[] {
     if (lower === '*') source = '*';
     else if (lower === "'self'" || lower === 'self') source = "'self'";
     else if (lower === "'none'" || lower === 'none') source = "'none'";
-    else {
-      source = lower.replace(/\/+$/, '');
-      if (!ORIGIN_SOURCE.test(source)) {
-        throw new Error(
-          `Invalid configuration: DESK_EMBED_ORIGINS: expected *, 'self', 'none' or http(s) origins such as https://app.example.com, got '${raw}'`,
-        );
-      }
-      const port = /:(\d+)$/.exec(source);
-      if (port && Number(port[1]) > 65535)
-        throw new Error(`Invalid configuration: DESK_EMBED_ORIGINS: bad port in '${raw}'`);
-    }
+    else source = originSource(raw);
     if (!out.includes(source)) out.push(source);
   }
   if (out.includes("'none'") && out.length > 1)

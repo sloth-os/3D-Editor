@@ -93,6 +93,17 @@ describe('the desk page', () => {
     expect(page.headers.get('content-security-policy')).toBe('frame-ancestors *');
   });
 
+  it('is at /desk.html and /desk only: /desk/ and /desk.html/ are the editor, as in the service worker', async () => {
+    const s = await serve();
+    for (const p of ['/desk/', '/desk.html/', '/desk/?x=1']) {
+      const res = await get(s, p);
+      expect(res.status, p).toBe(200);
+      expect(await res.text(), p).toContain('3D Editor');
+      expect(res.headers.get('cross-origin-embedder-policy'), p).toBeNull();
+      expect(res.headers.get('content-security-policy'), p).toBeNull();
+    }
+  });
+
   it('is never the editor: /desk without a desk build is not found', async () => {
     const dir = await makeTempDir('3d-editor-nodesk-public-');
     try {

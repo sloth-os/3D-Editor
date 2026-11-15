@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../src/config';
 import {
   DEFAULT_DESK_EMBED,
+  DESK_PAGE_PATHS,
   deskAssetHeaders,
   deskEmbedSettings,
   deskHeadersFor,
@@ -40,15 +41,22 @@ describe('DESK_EMBED_ORIGINS', () => {
       parseDeskEmbedOrigins('https://rideo.example.com, http://localhost:5173/,https://*.example.org'),
     ).toEqual(['https://rideo.example.com', 'http://localhost:5173', 'https://*.example.org']);
     expect(parseDeskEmbedOrigins('HTTPS://Rideo.Example.com')).toEqual(['https://rideo.example.com']);
-    expect(parseDeskEmbedOrigins('https://a.example:*, http://127.0.0.1:8080, http://[::1]:3000')).toEqual([
-      'https://a.example:*',
-      'http://127.0.0.1:8080',
-      'http://[::1]:3000',
-    ]);
+    expect(
+      parseDeskEmbedOrigins('https://a.example:*, http://127.0.0.1:8080, https://*.b.example:*'),
+    ).toEqual(['https://a.example:*', 'http://127.0.0.1:8080', 'https://*.b.example:*']);
     expect(parseDeskEmbedOrigins('self, https://a.example')).toEqual(["'self'", 'https://a.example']);
     expect(parseDeskEmbedOrigins("'none'")).toEqual(["'none'"]);
     expect(parseDeskEmbedOrigins('https://a.example, *')).toEqual(['*']);
     expect(parseDeskEmbedOrigins('https://a.example, https://a.example')).toEqual(['https://a.example']);
+  });
+
+  it('writes each origin as the browser does: a default port dropped, a host in punycode', () => {
+    expect(
+      parseDeskEmbedOrigins('https://a.example:443, http://b.example:80, https://c.example:8443'),
+    ).toEqual(['https://a.example', 'http://b.example', 'https://c.example:8443']);
+    expect(parseDeskEmbedOrigins('https://bücher.example')).toEqual(['https://xn--bcher-kva.example']);
+    expect(parseDeskEmbedOrigins('http://0x7f.0.0.1:8080')).toEqual(['http://127.0.0.1:8080']);
+    expect(parseDeskEmbedOrigins('https://a.example, https://a.example:443/')).toEqual(['https://a.example']);
   });
 
   it('refuses what would not be an origin in the header', () => {
@@ -65,6 +73,38 @@ describe('DESK_EMBED_ORIGINS', () => {
     ])
       expect(() => parseDeskEmbedOrigins(bad), bad).toThrow(/DESK_EMBED_ORIGINS/);
     expect(() => parseDeskEmbedOrigins("'none', https://a.example")).toThrow(/'none' cannot be combined/);
+  });
+
+  it('refuses, with the reason, values no framing page can match', () => {
+    const refusal = (value: string) => {
+      try {
+        parseDeskEmbedOrigins(value);
+      } catch (err) {
+        return (err as Error).message;
+      }
+      return null;
+    };
+    // hosts the URL parser refuses: no page has such an origin
+    for (const bad of ['http://1.2.3.4.5.6', 'http://999.999.999.999', 'https://a.example:*:*'])
+      expect(refusal(bad), bad).toMatch(/^Invalid configuration: DESK_EMBED_ORIGINS: '.+' is not an origin/);
+    // CSP has no IPv6 sources: browsers drop them from frame-ancestors, valid or not
+    for (const bad of [
+      'http://[::1]:3000',
+      'https://[:::::]',
+      'https://[1.2.3.4]',
+      'https://[10.0.0.5]:8443',
+    ])
+      expect(refusal(bad), bad).toMatch(
+        /bracketed \(IPv6\) address, which browsers ignore in frame-ancestors/,
+      );
+    expect(refusal('https://user:pw@a.example')).toMatch(/has a user name or password/);
+    for (const bad of ['https://a.example?x=1', 'https://a.example#top', 'https://a.example/desk.html'])
+      expect(refusal(bad), bad).toMatch(/has a path, query or fragment/);
+    for (const bad of ['https://a_b.example', 'https://a..example', 'https://*.*.example'])
+      expect(refusal(bad), bad).toMatch(/its host is not a host name or an IPv4 address/);
+    expect(refusal('https://*.10.0.0.1')).toMatch(/puts \*\. before an IP address/);
+    expect(refusal('https://a.example:8443:*')).toMatch(/has two ports/);
+    expect(refusal('https://a.exa\nmple')).toMatch(/has spaces or control characters/);
   });
 });
 
@@ -101,10 +141,11 @@ describe('the headers', () => {
       expect(deskHeadersFor(f, DEFAULT_DESK_EMBED), f).toEqual({});
   });
 
-  it('knows the URL paths of the desk page', () => {
-    for (const p of ['/desk.html', '/desk', '/desk/']) expect(isDeskPagePath(p)).toBe(true);
-    for (const p of ['/', '/index.html', '/desks', '/desk.htm', '/x/desk'])
-      expect(isDeskPagePath(p)).toBe(false);
+  it('knows the URL paths of the desk page: desk.html and /desk, nothing else', () => {
+    expect(DESK_PAGE_PATHS).toEqual(['/desk.html', '/desk']);
+    for (const p of ['/desk.html', '/desk']) expect(isDeskPagePath(p)).toBe(true);
+    for (const p of ['/', '/index.html', '/desks', '/desk.htm', '/x/desk', '/desk/', '/desk.html/'])
+      expect(isDeskPagePath(p), p).toBe(false);
   });
 });
 
@@ -127,6 +168,9 @@ describe('the configuration', () => {
     expect(() => load({ DESK_EMBED_COEP: 'yes' })).toThrow(/Invalid configuration: DESK_EMBED_COEP/);
     expect(() => load({ DESK_EMBED_ORIGINS: 'https://a.example/x' })).toThrow(
       /Invalid configuration: DESK_EMBED_ORIGINS/,
+    );
+    expect(() => load({ DESK_EMBED_ORIGINS: 'https://a.example, https://[10.0.0.5]:8443' })).toThrow(
+      /Invalid configuration: DESK_EMBED_ORIGINS: 'https:\/\/\[10\.0\.0\.5\]:8443' has a bracketed/,
     );
   });
 });
