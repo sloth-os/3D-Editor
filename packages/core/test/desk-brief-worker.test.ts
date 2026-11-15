@@ -11,7 +11,10 @@ import { describe, expect, it } from 'vitest';
  * (esbuild, platform browser: a Node built-in imported anywhere in the graph fails the build) and runs
  * it in a realm with only what a worker has: Node's globals (process, Buffer, require …) and the
  * page's (window, document, localStorage …) are not defined there, so a read of one, at module load
- * or later, throws as it would in the worker (a guarded `typeof process` check reads nothing).
+ * or later, throws as it would in the worker (a guarded `typeof process` check reads nothing). The
+ * worker's own modules (stage.worker.ts, staging-engine.ts, state.ts, protocol.ts) and the libraries
+ * they add are not in this graph: apps/web/test/desk-stage-worker-safety.test.ts bundles the worker's
+ * entry in the same realm.
  */
 
 const CORE = fileURLToPath(new URL('..', import.meta.url));
