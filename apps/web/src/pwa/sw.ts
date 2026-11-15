@@ -94,10 +94,15 @@ registerRoute(
 
 self.addEventListener('message', (event) => {
   if ((event.data as { type?: unknown } | null)?.type !== 'SKIP_WAITING') return;
+  const sender = event.source instanceof Client ? event.source.id : undefined;
   event.waitUntil(
     skipWaitingUnlessDeskOpen(
       async () =>
-        (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).map((c) => c.url),
+        (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).map((c) => ({
+          id: c.id,
+          url: c.url,
+        })),
+      sender,
       () => self.skipWaiting(),
     ),
   );

@@ -134,20 +134,39 @@ describe('worker scripts', () => {
 });
 
 describe("a new version and the editor's Update", () => {
-  const editor = `${ORIGIN}/?project=abc`;
+  const editor = { id: 'editor', url: `${ORIGIN}/?project=abc` };
+  const windows =
+    (...list: { id: string; url: string }[]) =>
+    async () =>
+      list;
 
   it('takes over when no desk page is open', async () => {
     const skipWaiting = vi.fn(async () => undefined);
-    expect(await skipWaitingUnlessDeskOpen(async () => [editor, `${ORIGIN}/desk/`], skipWaiting)).toBe(true);
+    const other = { id: 'other', url: `${ORIGIN}/desk/` };
+    expect(await skipWaitingUnlessDeskOpen(windows(editor, other), 'editor', skipWaiting)).toBe(true);
     expect(skipWaiting).toHaveBeenCalledOnce();
   });
 
   it('waits while a desk page is open in the partition it serves (the sample, a host on its site)', async () => {
-    for (const desk of [`${ORIGIN}/desk.html`, `${ORIGIN}/desk?scene=1`]) {
+    for (const url of [`${ORIGIN}/desk.html`, `${ORIGIN}/desk?scene=1`]) {
       const skipWaiting = vi.fn(async () => undefined);
-      expect(await skipWaitingUnlessDeskOpen(async () => [editor, desk], skipWaiting), desk).toBe(false);
+      const desk = { id: 'desk', url };
+      expect(await skipWaitingUnlessDeskOpen(windows(editor, desk), 'editor', skipWaiting), url).toBe(false);
       expect(skipWaiting).not.toHaveBeenCalled();
     }
-    expect(deskPageOpen([editor])).toBe(false);
+    expect(deskPageOpen([editor.url])).toBe(false);
+  });
+
+  it('the window that asks is no desk: the editor an older version answered at a desk path updates', async () => {
+    // an older service worker answered /desk.html with the editor, whose Update asks from there
+    const there = { id: 'there', url: `${ORIGIN}/desk.html` };
+    const skipWaiting = vi.fn(async () => undefined);
+    expect(await skipWaitingUnlessDeskOpen(windows(editor, there), 'there', skipWaiting)).toBe(true);
+    expect(skipWaiting).toHaveBeenCalledOnce();
+    // another window at a desk path still holds it
+    const desk = { id: 'desk', url: `${ORIGIN}/desk` };
+    const held = vi.fn(async () => undefined);
+    expect(await skipWaitingUnlessDeskOpen(windows(editor, there, desk), 'there', held)).toBe(false);
+    expect(held).not.toHaveBeenCalled();
   });
 });

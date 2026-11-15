@@ -105,17 +105,26 @@ export function deskPageOpen(clientUrls: readonly string[]): boolean {
   return clientUrls.some((url) => isDeskPagePath(new URL(url).pathname));
 }
 
+/** A window client of the service worker: its id and URL. */
+export interface WindowInfo {
+  id: string;
+  url: string;
+}
+
 /**
  * The SKIP_WAITING message (the editor's Update, pwa/register.ts): this waiting version takes over
  * at once unless a desk page is open among the windows it would take over. Then it waits as
  * versions do, until every page of the active one is closed (or Update is pressed again once the
- * desk is closed).
+ * desk is closed). The window that asks (`senderId`) is never a desk, which has no Update: at a
+ * desk path it is the editor that an older service worker answered there, which may update.
  */
 export async function skipWaitingUnlessDeskOpen(
-  windowUrls: () => Promise<readonly string[]>,
+  windows: () => Promise<readonly WindowInfo[]>,
+  senderId: string | undefined,
   skipWaiting: () => Promise<void>,
 ): Promise<boolean> {
-  if (deskPageOpen(await windowUrls())) return false;
+  const others = (await windows()).filter((w) => w.id !== senderId);
+  if (deskPageOpen(others.map((w) => w.url))) return false;
   await skipWaiting();
   return true;
 }

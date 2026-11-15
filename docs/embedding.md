@@ -641,9 +641,10 @@ that build's service worker until the new one takes over, and the old one answer
 `/desk` with the editor, which it knew instead. This happens only in the editor's own partition:
 the desk opened on its own, and a host on the same site as the desk, whose frame then gets the
 editor without the desk's headers (a cross-origin isolated host refuses it and gives up waiting for
-`hello`). To end it, open the editor in that browser and press Update, or close all its tabs and
-windows, then load the desk again. A host on another site never had the old service worker in its
-partition.
+`hello`). To end it, press the editor's Update in that browser (also in the editor shown at
+`/desk.html`, which is no desk) with no other page at a desk address open, or close all of the
+editor's tabs and windows; then load the desk again. A host on another site never had the old
+service worker in its partition.
 
 ### Opened on its own: the sample
 
