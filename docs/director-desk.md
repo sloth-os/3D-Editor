@@ -406,16 +406,17 @@ undo step, and runs in a web worker as well as on the server:
   sheds, tents, caravans and other shelters are buildings: "inside the river boat", "inside the
   garden shed"), or when "inside" or "indoors" opens a clause after outdoor words, on its own or of
   a room or a building ("a cabin in the woods, inside by the fire", not "the garden, inside the
-  gate"); a deck (a boat's or a house's) is outdoors, unless "below deck", but a deck of cards, a
-  tape or cassette deck and a deck chair are not; its ground from the first ground word they name
-  (grass, sand, snow, ice, wood, carpet, dirt, stone), else a wooden floor inside and plain ground
-  outside; the sun from the time of day (below). Open water that the set or a location names (a
-  puddle, pond, pool, fountain, stream, brook, creek, canal, river, lake, lagoon, loch, reservoir,
-  bay, harbour, sea or ocean; not after "no" or "without") is a water landmark of its size (a pond 5
-  × 4 m, a lake 20 × 10 m, a river a strip 30 m long and 6 m wide, the sea one 80 × 30 m) on the
-  side its clause gives it (on the left, on the right, in front, behind), behind the cast when it
-  gives none, and 1.5 m clear of the cast and the standing props, so nobody starts out on it. The
-  set is at least 12 × 10 m and grows to hold everything with a 2 m margin (at most 200 m).
+  gate"); a deck (a boat's or a house's) is outdoors, unless "below deck", but a deck of cards (of
+  old playing cards too), a tape, cassette, DJ or skateboard deck and a deck chair are not; its
+  ground from the first ground word they name (grass, sand, snow, ice, wood, carpet, dirt, stone),
+  else a wooden floor inside and plain ground outside; the sun from the time of day (below). Open
+  water that the set or a location names (a puddle, pond, pool, fountain, stream, brook, creek,
+  canal, river, lake, lagoon, loch, reservoir, bay, harbour, sea or ocean; not after "no" or
+  "without") is a water landmark of its size (a pond 5 × 4 m, a lake 20 × 10 m, a river a strip 30 m
+  long and 6 m wide, the sea one 80 × 30 m) on the side its clause gives it (on the left, on the
+  right, in front, behind), behind the cast when it gives none, and 1.5 m clear of the cast and the
+  standing props, so nobody starts out on it. The set is at least 12 × 10 m and grows to hold
+  everything with a 2 m margin (at most 200 m).
 - **Cameras**: the brief's framing, else the one its description's first sentence (else its
   action's) names ("close-up", "wide shot", "over the shoulder" …), else `medium`; the brief's
   `move`, else the one its movement words amount to (`dolly_in` a `push_in`, `tracking` a

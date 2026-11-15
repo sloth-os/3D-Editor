@@ -358,15 +358,23 @@ describe('a set without `interior`', () => {
     },
   );
 
-  // a deck is a boat's or a house's (outdoors), not a deck of cards, a tape deck or a deck chair
+  // a deck is a boat's or a house's (outdoors), not a deck of (old playing) cards, a tape, DJ or
+  // skateboard deck or a deck chair; the deck of a ship where cards are dealt is still the ship's
   it.each([
     ['A deck of cards lies on the kitchen table.', true],
+    ['A deck of old playing cards lies on the kitchen table.', true],
+    ['A deck of worn old playing cards in the bedroom.', true],
     ['A tape deck plays in the bedroom.', true],
     ['A cassette deck hums in the living room.', true],
+    ['DJ decks spin in the bedroom.', true],
+    ["The DJ's decks glow in the living room.", true],
+    ['A skateboard deck leans on the bedroom wall.', true],
+    ['A skate deck leans on the bedroom wall.', true],
     ['A deck chair in the living room.', true],
     ["The ship's deck at dawn, a cabin below.", false],
     ['On deck, the crew hauls the sail.', false],
     ['The deck of the ferry, a deck of cards on the bench.', false],
+    ['On the deck of the ship where cards are dealt.', false],
   ])('%s', (words, interior) => {
     expect(interiorFromWords(words)).toBe(interior);
   });

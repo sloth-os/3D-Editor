@@ -58,11 +58,12 @@ const INDOORS =
   /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|cafe|caf|restaurant|(?<!sand |candy |chocolate |crow)bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat(?=\s*(?:$|[,.;:!?)]|(?:in|on|at|of|with|where|above|below|near|by|and|that|which)\b))|cabin interior|staircase|stairwell|elevator|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/g;
 /**
  * Words that say a place is outdoors (they win over a room named as being nearby); a deck too (a
- * boat's or a house's), but not "below deck", nor a deck of cards, a tape or cassette deck or a deck
- * chair.
+ * boat's or a house's), but not "below deck", nor a deck of cards (with up to three words between
+ * "of" and "cards", none a determiner: "a deck of old playing cards", not "the deck of the ship
+ * where cards are dealt"), a tape, cassette, DJ or skateboard deck or a deck chair.
  */
 const OUTDOORS =
-  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:[a-z0-9-]+\s+)?cards\b)|car park|parking lot)\b/g;
+  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot |dj |dj's |skateboard |skate )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:(?!(?:the|an?|this|that|these|those|his|her|their|its|our|my|your)\s)[a-z0-9-]+\s+){0,3}cards\b)|car park|parking lot)\b/g;
 
 /**
  * Indoor words that may say where or whose an outdoor place is rather than name a room ("deep inside
