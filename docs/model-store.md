@@ -188,10 +188,12 @@ other providers' thumbnails come from the server, which proxies and caches them.
   when the cache opens, and beyond 16 MiB or 4000 thumbnails the least recently used go first (the
   170 built-in thumbnails take 1.3 MB). The bounds are the database's, whichever tabs wrote it:
   each write reads its totals again before dropping any. The last 400 shown also stay in the
-  page's memory. Where IndexedDB cannot be used (storage blocked, a sandboxed frame), does not
+  page's memory. Where IndexedDB cannot be used (the browser blocks the site's storage), does not
   answer within 3 s (opening the database or reading a thumbnail), or another tab upgrades or
   deletes the database (this one lets it), they are kept for the page only; under the development
-  server (`vite dev`) every page load is a build of its own.
+  server (`vite dev`) every page load is a build of its own. A desk framed with a `sandbox`
+  without `allow-same-origin` is not such a case: it never connects there
+  ([embedding](embedding.md#the-iframe)).
 - **On the card**, the category's icon stands in, with a light sweep while the thumbnail is made
   (none with reduced motion). A thumbnail that cannot be made shows a warning badge with the reason
   in its tooltip; one whose worker crashed is made again when the card comes near the view again. A
