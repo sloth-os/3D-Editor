@@ -13,10 +13,10 @@ import { cacheNames, clientsClaim } from 'workbox-core';
 import {
   DESK_NETWORK_TIMEOUT_MS,
   DESK_PAGE,
+  answerSkipWaiting,
   deskPageAnswer,
   isDeskPageRequest,
   refreshedDeskCopy,
-  skipWaitingUnlessDeskOpen,
   withWorkerCoep,
 } from './sw-desk';
 
@@ -29,7 +29,8 @@ import {
  * - the built files: from the precache (worker scripts with a COEP, sw-desk.ts withWorkerCoep);
  * - the editor's pages: index.html from the precache, but never for the server's own paths;
  * - a new version waits until the pages of the old one are closed, or takes over when the editor's
- *   Update asks, unless a desk page is open (sw-desk.ts skipWaitingUnlessDeskOpen).
+ *   Update asks, unless a desk page is open: then it tells the editor, which says why
+ *   (sw-desk.ts answerSkipWaiting).
  */
 
 declare const self: ServiceWorkerGlobalScope & { __WB_MANIFEST: (PrecacheEntry | string)[] };
@@ -94,15 +95,15 @@ registerRoute(
 
 self.addEventListener('message', (event) => {
   if ((event.data as { type?: unknown } | null)?.type !== 'SKIP_WAITING') return;
-  const sender = event.source instanceof Client ? event.source.id : undefined;
   event.waitUntil(
-    skipWaitingUnlessDeskOpen(
+    answerSkipWaiting(
+      // every window of this partition: a waiting version controls none of them
       async () =>
         (await self.clients.matchAll({ type: 'window', includeUncontrolled: true })).map((c) => ({
           id: c.id,
           url: c.url,
         })),
-      sender,
+      event.source instanceof Client ? event.source : undefined,
       () => self.skipWaiting(),
     ),
   );

@@ -100,6 +100,12 @@ export function withWorkerCoep(response: Response, destination: string): Respons
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
+/**
+ * The type of the message the service worker sends the window whose Update (SKIP_WAITING) a desk
+ * page keeps waiting (answerSkipWaiting): the editor says why nothing happened (pwa/register.ts).
+ */
+export const UPDATE_WAITS_FOR_DESK = 'UPDATE_WAITS_FOR_DESK';
+
 /** Whether one of these window clients (their URLs) is a desk page. */
 export function deskPageOpen(clientUrls: readonly string[]): boolean {
   return clientUrls.some((url) => isDeskPagePath(new URL(url).pathname));
@@ -127,4 +133,26 @@ export async function skipWaitingUnlessDeskOpen(
   if (deskPageOpen(others.map((w) => w.url))) return false;
   await skipWaiting();
   return true;
+}
+
+/** The window that sent the service worker a message (its Client): its id, and a way to answer. */
+export interface MessageSender {
+  id: string;
+  postMessage(message: unknown): void;
+}
+
+/**
+ * The SKIP_WAITING message as sw.ts handles it: skipWaitingUnlessDeskOpen, and when a desk page
+ * keeps this version waiting, `{ type: UPDATE_WAITS_FOR_DESK }` back to the window that asked, so
+ * that the editor says why its Update did nothing (pwa/update-waits.ts) instead of seeming to ignore
+ * it. When the version takes over, the editor reloads under it and needs no answer.
+ */
+export async function answerSkipWaiting(
+  windows: () => Promise<readonly WindowInfo[]>,
+  sender: MessageSender | undefined,
+  skipWaiting: () => Promise<void>,
+): Promise<boolean> {
+  const took = await skipWaitingUnlessDeskOpen(windows, sender?.id, skipWaiting);
+  if (!took) sender?.postMessage({ type: UPDATE_WAITS_FOR_DESK });
+  return took;
 }

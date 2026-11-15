@@ -434,5 +434,12 @@ projects together have a limit too). Changes that browsers send are held against
 
 The service worker precaches the whole application, so after the first visit the editor starts
 without a network connection. It can be installed as an app (desktop and mobile) and registers
-file handlers for `.glb`, `.gltf`, `.obj`, `.stl` and `.ply`. When a new version is deployed the
-top bar offers to reload.
+file handlers for `.glb`, `.gltf`, `.obj`, `.stl` and `.ply`. When a new version is deployed it
+installs in the background and waits, and the top bar offers **Update available — reload**: the
+new version takes over and the page reloads (left alone, it takes over once every page of the old
+one is closed). While a page of the director's desk is open in the same browser storage partition
+(the desk opened on its own at `/desk.html`, or embedded by a host on the same site), Update waits
+too, so that the files of a running desk never change under it, and the editor says
+"A director's desk is open in this browser; close it to update": close the desk, then press Update
+again. A desk embedded by a host on another site has a service worker of its own in that site's
+partition and holds nothing back ([embedding](embedding.md#offline)).

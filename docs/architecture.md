@@ -954,8 +954,8 @@ routing, the desk's rules in `sw-desk.ts`) precaches `desk.html` and answers it 
 with any query) with the precached copy and the server's current headers when the server answers
 within 4 s, else with the headers it was last served with, so a browser never freezes the
 deployment's settings; a worker script it serves without a COEP gets `require-corp`, and a new
-version refuses the editor's Update while a desk page is open. The build drops the web app
-manifest's link from `desk.html`.
+version refuses the editor's Update while a desk page is open and tells the editor, which says
+why (`update-waits.ts`). The build drops the web app manifest's link from `desk.html`.
 
 ## Server
 

@@ -1,5 +1,13 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import {
+  appendFileSync,
+  copyFileSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { createServer as createNetServer, type AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -21,6 +29,9 @@ import { PLAIN } from './helpers';
  * - the server's frame-ancestors reach a browser whose service worker holds the desk: a host taken
  *   off DESK_EMBED_ORIGINS can no longer frame it, online at once and offline after, and framing
  *   works again once the host is listed again
+ * - a new version of the app waits while a desk page is open in the partition: a SKIP_WAITING from
+ *   a window that is no desk (the editor's Update) is refused and answered, the editor says why,
+ *   and once the desk is closed Update applies it (docs/embedding.md "Offline")
  */
 
 const here = fileURLToPath(new URL('.', import.meta.url));
@@ -127,6 +138,24 @@ async function remountRefused(page: Page, deskOrigin: string): Promise<void> {
 // ---------------------------------------------------------------- a server of the spec's own
 
 const SERVER_MAIN = resolve(root, 'apps/server/dist/main.js');
+const DIST = resolve(root, 'apps/web/dist');
+
+/**
+ * A public directory with the built app (links to apps/web/dist) and a copy of its service worker,
+ * which `newVersion` changes as a deployment of a new version would.
+ */
+function publicDirWithOwnServiceWorker() {
+  const dir = mkdtempSync(resolve(tmpdir(), 'e2e-desk-update-'));
+  for (const entry of readdirSync(DIST)) {
+    if (entry === 'sw.js') copyFileSync(resolve(DIST, entry), resolve(dir, entry));
+    else symlinkSync(resolve(DIST, entry), resolve(dir, entry));
+  }
+  return {
+    dir,
+    newVersion: () => appendFileSync(resolve(dir, 'sw.js'), `\n// e2e: a new version ${Date.now()}\n`),
+    remove: () => rmSync(dir, { recursive: true, force: true }),
+  };
+}
 
 async function freePort(): Promise<number> {
   const s = createNetServer();
@@ -281,6 +310,90 @@ test.describe('the desk under storage partitioning', () => {
       await waitFor(page, 'ready', before + 2);
     } finally {
       await server.stop();
+    }
+  });
+
+  test("a new version waits while a desk page is open in the partition, and the editor's Update says why", async () => {
+    test.setTimeout(240_000);
+    const app = publicDirWithOwnServiceWorker();
+    const port = await freePort();
+    const base = `http://127.0.0.1:${port}`;
+    const server = await startServer(port, { PUBLIC_DIR: app.dir });
+    try {
+      // the editor, controlled by the service worker
+      const editor = await context.newPage();
+      await editor.goto(`${base}/`);
+      await editor.waitForFunction(async () => !!(await navigator.serviceWorker.ready).active, null, {
+        timeout: 60_000,
+      });
+      await editor.reload();
+      await editor.waitForFunction(() => !!navigator.serviceWorker.controller, null, { timeout: 60_000 });
+      // the desk opened on its own: a desk page in the same partition
+      const desk = await context.newPage();
+      await desk.goto(`${base}/desk.html`);
+      await expect(desk.getByTestId('desk-standalone')).toBeVisible();
+      // a window that is neither (a server path the service worker leaves to the network)
+      const other = await context.newPage();
+      await other.goto(`${base}/healthz`);
+      /** Whether a version waits, and whether the version that was active first still is. */
+      const versions = () =>
+        other.evaluate(async () => {
+          const reg = (await navigator.serviceWorker.getRegistration())!;
+          return { waiting: !!reg.waiting, firstActive: reg.active === (window as any).__e2eFirstActive };
+        });
+
+      // a new version is deployed: it installs and waits (registration.waiting can still read
+      // null right after the worker installed)
+      app.newVersion();
+      await other.evaluate(async () => {
+        const reg = (await navigator.serviceWorker.getRegistration())!;
+        (window as any).__e2eFirstActive = reg.active;
+        await reg.update();
+      });
+      await other.waitForFunction(
+        async () => !!(await navigator.serviceWorker.getRegistration())?.waiting,
+        null,
+        { timeout: 60_000 },
+      );
+
+      // SKIP_WAITING from a window that is no desk: refused while the desk is open, and answered
+      const answer = await other.evaluate(
+        () =>
+          new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('SKIP_WAITING got no answer in 15 s')), 15_000);
+            navigator.serviceWorker.addEventListener('message', (e) => {
+              clearTimeout(timer);
+              resolve(e.data);
+            });
+            navigator.serviceWorker.startMessages();
+            void navigator.serviceWorker
+              .getRegistration()
+              .then((reg) => reg!.waiting!.postMessage({ type: 'SKIP_WAITING' }));
+          }),
+      );
+      expect(answer).toEqual({ type: 'UPDATE_WAITS_FOR_DESK' });
+      expect(await versions()).toEqual({ waiting: true, firstActive: true });
+
+      // the editor's Update: refused too, and the editor says why
+      const update = editor.getByRole('button', { name: 'Update available — reload' });
+      await update.click();
+      await expect(
+        editor
+          .getByTestId('toast')
+          .filter({ hasText: "A director's desk is open in this browser; close it to update" }),
+      ).toBeVisible();
+      expect(await versions()).toEqual({ waiting: true, firstActive: true });
+
+      // the desk closed, Update applies the new version: the editor reloads under it
+      await desk.close();
+      const reloaded = editor.waitForEvent('load', { timeout: 30_000 });
+      await update.click();
+      await reloaded;
+      await expect.poll(versions, { timeout: 30_000 }).toEqual({ waiting: false, firstActive: false });
+      await expect(update).toHaveCount(0);
+    } finally {
+      await server.stop();
+      app.remove();
     }
   });
 });

@@ -650,9 +650,10 @@ A new version of the app installs in the background and waits until every page t
 is closed, then takes over at the next load, so a session in a host is never reloaded under the
 person. The editor's **Update** makes a waiting version take over at once; while a desk page is
 open in the same browser partition (the sample, or a host on the same site as the desk), the
-version refuses and keeps waiting, so the files of a running desk never change under it: close
-the desk, then press Update again. Without the service worker (the first visit under a host site,
-development, a browser that refuses one) the desk works while the network does.
+version refuses and keeps waiting, so the files of a running desk never change under it, and it
+answers the editor, which says "A director's desk is open in this browser; close it to update":
+close the desk, then press Update again. Without the service worker (the first visit under a host
+site, development, a browser that refuses one) the desk works while the network does.
 
 Upgrading from a build without the desk: a browser that ran an earlier build of the editor keeps
 that build's service worker until the new one takes over, and the old one answers `/desk.html` and
