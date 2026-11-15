@@ -1,5 +1,5 @@
 import type { SceneDoc } from '../../doc/scene-doc';
-import type { ShotData } from '../../doc/types';
+import type { ObjectData, ShotData } from '../../doc/types';
 import { DeskScene } from '../layout';
 import { DESK_PROPS } from '../props';
 import { flyerKind } from '../rideo/rules';
@@ -16,20 +16,27 @@ import {
   type BriefRecord,
   type BriefRecordShot,
 } from './record';
-import { hostShots, parseBrief, stagedBy } from './stage';
+import { hostShots, parseBrief, stagedActors, stagedBy } from './stage';
 import type { BriefChanges, BriefShot, SceneBrief } from './schema';
 
 export { briefFrames } from './record';
 
 /*
- * How a brief differs from the one a scene was staged from (the contract's BriefChanges): the shots
- * the brief adds, those it no longer has, those whose duration changed (or whose frame count, when
- * the frame rate changed: only the shots whose frame count does change) and those whose cast changed;
- * the cast members it adds and removes; and, beyond the contract's lists (`other`), whatever else an
- * update acts on: the frame rate and size, the set, the props, the shots' camera plans, words and
- * numbering, the cast's words. briefChanges is null exactly when updateFromBrief would change nothing
- * (it acts on this same diff, update.ts), so a desk that offers Update shots on a non-null value
- * offers it whenever the update does something. The desk never drops the staging silently.
+ * How a brief differs from the one a scene was staged from (the contract's BriefChanges), as far as
+ * an update acts on it: the shots the brief adds; the staged shots it no longer has; those whose frame
+ * count changed (a new duration, or a new frame rate: only the shots whose frame count does change)
+ * and that the desk does not already give that length; those whose cast changed; the cast members it
+ * adds that a shot casts, and those it no longer has whose actor is staged; and, beyond the contract's
+ * lists (`other`), whatever else an update acts on: the frame rate and size, the set, the props, the
+ * shots' camera plans, the words and numbering of the shots the desk has, the names, kinds and heights
+ * of the cast members it has actors of. A shot removed in the desk counts only for what stages it
+ * again (its length, cast or camera plan): its words and number are not acted on.
+ *
+ * briefChanges is null exactly when updateFromBrief would change nothing of the staging (it acts on
+ * this same diff, update.ts): such an update gives only the warnings every update of the brief
+ * repeats (how the desk reads the brief, a shot whose length was changed in the desk, a cast member
+ * kept as the kind staged), so a desk that offers Update shots on a non-null value offers it whenever
+ * the update does something. The desk never drops the staging silently.
  *
  * A lens or a move the host gives back as the desk staged it (a host that copies the shot results
  * into its shots, then sends the brief again) agrees with the staging: no change.
@@ -51,7 +58,10 @@ export interface ShotDiff {
   added: boolean;
   /** Its frame count changed (its duration at the brief's frame rate): the desk shot takes the new length. */
   frames: boolean;
-  /** Its duration or its frame count changed (the contract's `retimed`). */
+  /**
+   * Its frame count changed and the desk shot does not have that length already (one removed in the
+   * desk is staged again with it): the contract's `retimed`.
+   */
   retimed: boolean;
   recast: boolean;
   /** Its camera plan changed (framing, movement, lens, move, layout, continuity; see the module comment). */
@@ -184,12 +194,13 @@ export function diffBrief(
       });
       continue;
     }
-    const frames = o.frames !== briefFrames(s.durationSec, b.fps);
+    const wanted = briefFrames(s.durationSec, b.fps);
+    const frames = o.frames !== wanted;
     const d = desk.get(s.id);
     shots.set(s.id, {
       added: false,
       frames,
-      retimed: frames || o.durationSec !== s.durationSec,
+      retimed: frames && (!d || d.frame_end - d.frame_start + 1 !== wanted),
       recast: !sameSet(o.castIds, shotCast(s)),
       replanned: !planAgrees(o, s, () => (d ? stagedCamera((scene ??= new DeskScene(doc)), d) : null)),
       reworded: o.text !== shotTextDigest(s),
@@ -199,15 +210,21 @@ export function diffBrief(
   const now = new Set(b.shots.map((s) => s.id));
   const castBefore = new Map((staged?.cast ?? []).map((c) => [c.id, c]));
   const castNow = new Set(b.cast.map((c) => c.id));
+  // the actors staged now: an update renames, warns of and removes only those
+  const actors = staged ? stagedActors(doc, b.id) : new Map<string, ObjectData>();
   const list = (f: (d: ShotDiff) => boolean) => b.shots.filter((s) => f(shots.get(s.id)!)).map((s) => s.id);
   const changes: BriefChanges = {
     added: list((d) => d.added),
-    removed: [...before.keys()].filter((id) => !now.has(id)),
+    // a shot removed in the desk that the brief drops leaves nothing to remove
+    removed: [...before.keys()].filter((id) => !now.has(id) && desk.has(id)),
     retimed: list((d) => !d.added && d.retimed),
     recast: list((d) => !d.added && d.recast),
     cast: {
-      added: b.cast.filter((c) => !castBefore.has(c.id)).map((c) => c.id),
-      removed: [...castBefore.keys()].filter((id) => !castNow.has(id)),
+      // a member in no shot is not staged; one whose actor was removed in the desk has nothing to remove
+      added: b.cast
+        .filter((c) => !castBefore.has(c.id) && (!staged || p.order.includes(c.id)))
+        .map((c) => c.id),
+      removed: [...castBefore.keys()].filter((id) => !castNow.has(id) && actors.has(id)),
     },
   };
   if (!staged)
@@ -227,15 +244,17 @@ export function diffBrief(
   const resized = staged.width !== b.width || staged.height !== b.height;
   const set = staged.set !== setDigest(p.set);
   // the cast: a new name, or a kind or height other than the actor staged (words that change neither
-  // leave the actor as it is)
+  // leave the actor as it is), of the members with an actor in the desk
   const castWords = new Set<string>();
   let renamed = 0;
   let rekinded = 0;
   let reheighted = 0;
   for (const c of b.cast) {
     const was = castBefore.get(c.id);
-    if (!was || !p.order.includes(c.id) || was.digest === castDigest(c)) continue;
-    const name = was.name !== c.name;
+    const actor = actors.get(c.id);
+    if (!was || !actor || !p.order.includes(c.id) || was.digest === castDigest(c)) continue;
+    // renamed (or, renamed in the desk, kept with a warning) unless the actor has the new name
+    const name = was.name !== c.name && actor.name !== c.name;
     const kind = was.kind !== null && was.kind !== p.cast.get(c.id)?.kind;
     const height = was.heightM !== undefined && was.heightM !== c.heightM;
     renamed += +name;
@@ -247,8 +266,16 @@ export function diffBrief(
   const elementById = new Map(b.elements.map((e) => [e.id, e]));
   const recordElement = new Map(staged.elements.map((e) => [e.id, e]));
   const planned = new Map(p.blockingProps.filter((x) => x.elementId).map((x) => [x.elementId!, x]));
-  const shotsBefore = staged.shots.map((s) => ({ id: s.id, castIds: s.castIds }));
-  const shotsAfter = b.shots.map((s) => ({ id: s.id, castIds: shotCast(s) }));
+  // the holders' runs of shots over the shots the desk has, before and after the update (one removed
+  // in the desk counts once the update stages it again: its length, cast or camera plan changed)
+  const staysOrStaged = (id: string, d: ShotDiff) =>
+    desk.has(id) || d.added || d.frames || d.recast || d.replanned;
+  const shotsBefore = staged.shots
+    .filter((s) => desk.has(s.id))
+    .map((s) => ({ id: s.id, castIds: s.castIds }));
+  const shotsAfter = b.shots
+    .filter((s) => staysOrStaged(s.id, shots.get(s.id)!))
+    .map((s) => ({ id: s.id, castIds: shotCast(s) }));
   const restage = new Set<string>();
   let propWords = 0;
   for (const [eid, x] of planned) {
@@ -257,7 +284,8 @@ export function diffBrief(
     const holder = p.holders.get(eid) ?? null;
     const flies = holder ? flyerKind(`${x.label} ${e.name}`) : null;
     const runsAfter = holderRuns(shotsAfter, holder);
-    const touched = runsAfter.flat().some((id) => shots.get(id)!.frames);
+    // a flight over a shot the update gives a new length or stages
+    const touched = runsAfter.flat().some((id) => shots.get(id)!.added || shots.get(id)!.retimed);
     const element = !was || was.digest !== elementDigest(e) || was.holder !== holder;
     if (element) propWords++;
     if (
@@ -272,7 +300,10 @@ export function diffBrief(
       (eid) => !planned.has(eid),
     ),
   );
-  const kept = b.shots.filter((s) => !shots.get(s.id)!.added).map((s) => shots.get(s.id)!);
+  const keptIds = b.shots.filter((s) => !shots.get(s.id)!.added).map((s) => s.id);
+  const kept = keptIds.map((id) => shots.get(id)!);
+  // the words and number of a shot removed in the desk are not acted on (it stays removed)
+  const inDesk = kept.filter((d, i) => desk.has(keptIds[i]));
   const other: string[] = [];
   if (fps) other.push(`the frame rate (${staged.fps} to ${b.fps} fps)`);
   if (resized) other.push(`the frame size (${staged.width}×${staged.height} to ${b.width}×${b.height})`);
@@ -280,9 +311,9 @@ export function diffBrief(
   if (propWords || removedProps.size) other.push('the props');
   const replanned = kept.filter((d) => d.replanned).length;
   if (replanned) other.push(`${plural(replanned, 'shot')} with a new camera plan`);
-  const reworded = kept.filter((d) => d.reworded).length;
+  const reworded = inDesk.filter((d) => d.reworded).length;
   if (reworded) other.push(`${plural(reworded, 'shot')} with new words`);
-  const renumbered = kept.filter((d) => d.renumbered).length;
+  const renumbered = inDesk.filter((d) => d.renumbered).length;
   if (renumbered && !changes.added.length && !changes.removed.length)
     other.push(`${plural(renumbered, 'shot')} renumbered`);
   if (renamed) other.push(`${plural(renamed, 'cast member')} renamed`);

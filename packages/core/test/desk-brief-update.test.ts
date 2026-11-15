@@ -207,6 +207,79 @@ describe('updateFromBrief keeps what was done in the desk to shots the brief did
     );
   });
 
+  it('keeps the cut order the desk gave the shots, and puts a new shot next to its brief neighbour', () => {
+    const doc = staged();
+    run(doc, 'desk.shot_move', { shot: deskShot(doc, SHOT_B).id, index: 0 });
+    const cut = () => getShots(doc).map((s) => s.external?.shot);
+    expect(cut()).toEqual([SHOT_B, SHOT_A]);
+    // the brief as staged: nothing changes, nothing is said
+    expect(briefChanges(doc, openScene())).toBeNull();
+    const same = updateFromBrief(doc, openScene());
+    expect(cut()).toEqual([SHOT_B, SHOT_A]);
+    expect(same.warnings).toEqual([]);
+    // C comes after B in the brief: in the cut right after B, in time after B's frames
+    const r = updateFromBrief(doc, withC());
+    expect(cut()).toEqual([SHOT_B, SHOT_C, SHOT_A]);
+    expect(ranges(doc)).toEqual([
+      [SHOT_B, 73, 132],
+      [SHOT_C, 133, 180],
+      [SHOT_A, 1, 72],
+    ]);
+    expect(r.warnings.join('\n')).not.toMatch(/orders some shots differently/);
+  });
+
+  it('puts a new shot between its brief neighbours in the cut, without a reorder warning, after a shot lengthened over the next', () => {
+    const doc = staged();
+    run(doc, 'desk.shot_update', { shot: deskShot(doc, SHOT_A).id, frame_end: 96 });
+    const next = withC();
+    // the brief puts C between A and B
+    next.shots = [next.shots[0], { ...next.shots[2], index: 1 }, { ...next.shots[1], index: 2 }];
+    const r = updateFromBrief(doc, next);
+    // in time after B (which A's frames overlap), in the cut between A and B as the brief has it
+    expect(ranges(doc)).toEqual([
+      [SHOT_A, 1, 96],
+      [SHOT_C, 133, 180],
+      [SHOT_B, 73, 132],
+    ]);
+    expect(r.warnings.join('\n')).not.toMatch(/orders some shots differently/);
+  });
+
+  it('warns when the brief reorders the shots the desk keeps, and keeps the desk’s order', () => {
+    const doc = staged();
+    const next = openScene();
+    next.shots = [
+      { ...next.shots[1], index: 0 },
+      { ...next.shots[0], index: 1 },
+    ];
+    const r = updateFromBrief(doc, next);
+    expect(getShots(doc).map((s) => s.external?.shot)).toEqual([SHOT_A, SHOT_B]);
+    expect(r.warnings).toContain(
+      'the brief orders some shots differently from the desk: the desk keeps its cut order (stage the brief in a new project to follow the new order)',
+    );
+    // said once: the same brief again changes nothing and says nothing of the order
+    expect(updateFromBrief(doc, next).warnings.join('\n')).not.toMatch(/orders some shots differently/);
+  });
+
+  it('keeps a name the desk gave an actor when the brief renames the cast member, with a warning', () => {
+    const doc = staged();
+    const mira = actorOf(doc, MIRA).id;
+    doc.rename('objects', mira, 'Mira (hero)');
+    const next = openScene();
+    next.cast[0].name = 'Mirabel';
+    const r = updateFromBrief(doc, next);
+    expect(doc.getObject(mira)!.name).toBe('Mira (hero)');
+    expect(r.warnings).toContain(
+      'Mira (hero) keeps the name it was given in the desk; the brief renamed Mira to Mirabel',
+    );
+    // an actor the desk did not rename takes the brief's new name
+    const other = staged();
+    const pip = actorOf(other, PIP).id;
+    const renamed = openScene();
+    renamed.cast[1].name = 'Pippin';
+    updateFromBrief(other, renamed);
+    expect(other.getObject(pip)!.name).toBe('Pippin');
+  });
+
   it('changes nothing when the brief is the one staged, whatever was done by hand', () => {
     const doc = staged();
     run(doc, 'desk.shot_update', { shot: deskShot(doc, SHOT_A).id, frame_end: 48 });

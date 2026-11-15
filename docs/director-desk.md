@@ -414,14 +414,19 @@ morning light come from its right and the evening light from its left.
 
 `briefRecord(doc)` says what a project was staged from (the host's scene id and the brief's hash).
 The record lives in the document (the scene settings' `brief`), so it travels with the desk state a
-host stores. `briefChanges(doc, brief)` lists how a later brief differs from the one staged, as the
-contract's `BriefChanges` (shots added, removed, retimed and recast; cast added and removed), and in
-`other` (the desk's own, left out when empty) what else an update acts on: the frame rate and size,
-the set, the props, shots with a new camera plan or new words, cast members renamed or of another
-kind or height. It is null exactly when an update would change nothing of the staging and warn of
-nothing, so a desk that offers the update on a non-null value offers it whenever it does something.
-A lens and move the host gives back as the desk staged them (copied from the shot results) are no
-change, and a new frame rate lists as retimed only the shots whose frame count changes.
+host stores. `briefChanges(doc, brief)` lists how a later brief differs from the one staged, as far
+as an update acts on it: as the contract's `BriefChanges` (shots added; staged shots removed; shots
+retimed, whose frame count changed, by a new duration or a new frame rate, to a length the desk shot
+does not have already; shots recast; cast members added that a shot casts, and removed ones whose
+actor is staged), and in `other` (the desk's own, left out when empty) what else an update acts on:
+the frame rate and size, the set, the props, shots with a new camera plan, shots of the desk with
+new words or numbers, cast members with an actor renamed or of another kind or height. A shot
+removed in the desk counts only when the brief changes its length, cast or camera plan (an update
+stages it again). It is null exactly when an update would change nothing of the staging; such an
+update gives only the warnings every update of the brief repeats (how the desk reads the brief, a
+shot whose length was changed in the desk, a cast member kept as the kind staged), so a desk that
+offers the update on a non-null value offers it whenever it does something. A lens and move the host
+gives back as the desk staged them (copied from the shot results) are no change.
 
 `shotResults(doc, {shots?})` (`desk.shot_results`, and `desk_shot_results` over MCP) is what the
 desk tells a host about each staged shot besides its files, in brief order: its frames and duration,
@@ -448,8 +453,11 @@ and no other shot's keys are cut:
   free frames and the shots that overlap its end, or shrinks by its own frames only, its camera's
   move fitted to its new length;
 - a new shot comes after the brief's shot before it (first when it leads: the scene's and the rigid
-  body world's frame ranges then start with it), its camera solved and fitted to its plan, the cast
-  not in it hidden; a rider that a shot it stages, or whose words or cast change, puts on a mount is
+  body world's frame ranges then start with it), in time and in the cut (in the shot list right
+  after that shot, or right before the brief's shot after it when it leads), its camera solved and
+  fitted to its plan, the cast not in it hidden; the scene's frame range grows to hold a shot the
+  update puts or lengthens past its end (a range shortened in the desk stays so for the shots it
+  left out); a rider that a shot it stages, or whose words or cast change, puts on a mount is
   not seated by an update: it stands beside the mount, with a warning (`desk.actor_mount` seats it,
   and staging the brief in a new project mounts it as staging does);
 - a recast shot shows its new cast and hides the rest, and is solved again, as is a shot whose
@@ -457,8 +465,8 @@ and no other shot's keys are cut:
   size changed;
 - a camera set by hand in the desk is never solved again: the update keeps it and warns;
 - cast members the brief drops go; new ones stand on a free spot of the front row, shown in their
-  shots; one the brief renames is renamed (unless the desk renamed it), and one whose kind or height
-  the brief changes stays the actor staged, with a warning;
+  shots; one the brief renames is renamed (one the desk renamed keeps the desk's name, with a
+  warning), and one whose kind or height the brief changes stays the actor staged, with a warning;
 - props whose element went go and new ones are placed; a held prop whose holder or holder's shots
   changed is held (or flown) again; the set is built again when its plan changed;
 - notes the desk did not edit follow the brief's words, and the desk's own shot names (`Shot 3`)
@@ -469,9 +477,10 @@ curve keeps the values it had on both sides of the edit, so an actor a later sho
 in the shot before it), F-curve modifier ranges (one wholly inside cut frames goes, as does a shot),
 the shots, the scene's and the rigid body world's frame ranges, rigid body start frames, tether
 flights, the frames actors spend in water and those bodies float from; a driver that reads `frame`
-is left as it is, with a warning. An update does not reorder the shots the desk keeps (it warns when
-the brief does): stage the brief in a new project to follow a new order. It refuses a project not
-staged from a brief, or staged from another scene.
+is left as it is, with a warning. An update keeps the cut order (the shot list's) of the shots the
+desk keeps, also an order the person gave them in the desk (`desk.shot_move`), and warns when the
+brief now orders them otherwise than it did and the desk does not: stage the brief in a new project
+to follow a new order. It refuses a project not staged from a brief, or staged from another scene.
 
 ### SceneBlocking v1
 
@@ -737,12 +746,13 @@ What it gives, measured in three runs on a 4-core machine shared with other work
 - **Briefs**: the kinds of the cast, who rides whom, who holds what and where the water lies are
   read from English words only, without following pronouns across sentences; a brief places nobody,
   so the cast starts on the planned sides or in a row and moves only as it is staged afterwards
-  (`desk.actor_move` …). An update keeps hand edits of unchanged shots but does not reorder shots,
-  and a recast or replanned shot's camera is solved again unless it was set by hand. Staging a brief
-  took 0.1–0.4 s for 2 shots and 2 cast members, 1.3 s for 20 shots and 6, 8 s for 60 and 12, and
-  34 s for 200 and 12 (a 4-core machine shared with other work); `shotResults` and an update each
-  took about 40 % of that. Most of it is the camera solve and the checks, which measure every actor
-  of the scene in every shot: stage long scenes in a worker and show progress.
+  (`desk.actor_move` …). An update keeps hand edits of unchanged shots and the desk's cut order but
+  does not follow a new order of the brief, and a recast or replanned shot's camera is solved again
+  unless it was set by hand. Staging a brief took 0.1–0.4 s for 2 shots and 2 cast members, 1.3 s
+  for 20 shots and 6, 8 s for 60 and 12, and 34 s for 200 and 12 (a 4-core machine shared with other
+  work); `shotResults` and an update each took about 40 % of that. Most of it is the camera solve
+  and the checks, which measure every actor of the scene in every shot: stage long scenes in a
+  worker and show progress.
 - **SceneBlocking import**: the kind of each character and who rides whom are read from English
   text only; hand-made keys on imported actors and props are replaced on re-import (user objects,
   shots, physics and materials are kept), and the re-import's warnings name the actors, props,

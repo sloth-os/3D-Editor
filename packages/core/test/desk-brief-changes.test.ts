@@ -1,6 +1,9 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { SceneDoc } from '../src/doc/scene-doc';
+import { createEditorState, type OperatorContext } from '../src/operators/context';
+import { createOperatorRegistry } from '../src/operators';
+import { getShots } from '../src/desk/shots';
 import { BRIEF_RECORD_KEY } from '../src/desk/brief/record';
 import {
   briefChanges,
@@ -15,10 +18,13 @@ import {
  * briefChanges reports whatever an update acts on (desk/brief changes.ts): besides the contract's
  * lists, `other` names the frame size, the set, the props, the shots' camera plans and words and the
  * cast's names, kinds and heights. It is null exactly when updateFromBrief changes nothing of the
- * staging and has nothing to warn of, so a desk that offers Update shots on a non-null value offers
- * it whenever the update does something. A brief that gives back the lens and move the desk staged
- * (a host copying the shot results into its shots) changes nothing; a new frame rate retimes only the
- * shots whose frame count changes.
+ * staging: such an update gives only the warnings every update of the brief repeats (a length
+ * changed in the desk, a cast member kept as the kind staged, a member in no shot), so a desk that
+ * offers Update shots on a non-null value offers it whenever the update does something. What the
+ * desk did stays out of it: a shot removed in the desk counts only for what stages it again, an
+ * actor deleted in the desk is not renamed, a length or cut order or scene range given in the desk
+ * stays. A brief that gives back the lens and move the desk staged (a host copying the shot results
+ * into its shots) changes nothing; a new frame rate retimes only the shots whose frame count changes.
  */
 
 const FIXTURES = new URL('./fixtures/desk-embed/', import.meta.url);
@@ -27,6 +33,7 @@ const openScene = (): SceneBrief =>
 
 const SHOT_A = 'sht_0123456789aaaa';
 const SHOT_B = 'sht_0123456789bbbb';
+const PIP = 'chr_0123456789pipd';
 
 function staged(brief: SceneBrief = openScene()): SceneDoc {
   const doc = SceneDoc.create({ empty: true });
@@ -47,8 +54,32 @@ function staging(doc: SceneDoc): string {
 
 const NOTHING_LISTED = { added: [], removed: [], retimed: [], recast: [], cast: { added: [], removed: [] } };
 
-/** Warnings an update gives whatever it changes (a shot lengthened by hand) left out. */
-const warningsOf = (w: readonly string[]) => w.filter((x) => !/frames long in the desk/.test(x));
+/**
+ * The warnings every update of a brief repeats, whatever it changes: a length changed in the desk,
+ * a cast member kept as the kind staged, a member in no shot.
+ */
+const REPEATED = /frames long in the desk|stays the \w+ staged before|is in no shot: not staged/;
+
+/** The warnings of an update that every update of the brief does not repeat. */
+const warningsOf = (w: readonly string[]) => w.filter((x) => !REPEATED.test(x));
+
+function run(doc: SceneDoc, id: string, params: Record<string, unknown>): void {
+  const ctx: OperatorContext = {
+    doc,
+    state: createEditorState(),
+    origin: doc.origin,
+    source: 'api',
+    report: () => {},
+  };
+  const r = createOperatorRegistry().run(ctx, id, params);
+  expect(r.ok, r.error).toBe(true);
+}
+
+const deskShot = (doc: SceneDoc, host: string) => getShots(doc).find((s) => s.external?.shot === host)!;
+const actorOf = (doc: SceneDoc, castId: string) =>
+  doc
+    .listObjects()
+    .find((o) => o.custom_props?.desk_role === 'actor' && o.custom_props?.desk_character_id === castId)!;
 
 describe('briefChanges reports whatever an update acts on', () => {
   const cases: [string, (b: SceneBrief) => void, string[]][] = [
@@ -109,8 +140,8 @@ describe('briefChanges reports whatever an update acts on', () => {
       const before = staging(doc);
       const r = updateFromBrief(doc, next);
       expect(r.changes).toEqual(changes);
-      // it changed the staging, or it says what it kept
-      expect(staging(doc) !== before || warningsOf(r.warnings).length > 0).toBe(true);
+      // it changed the staging, or it says what it kept (the first time: later updates repeat it)
+      expect(staging(doc) !== before || r.warnings.length > 0).toBe(true);
       expect(briefChanges(doc, next)).toBeNull();
     });
 
@@ -138,6 +169,94 @@ describe('briefChanges reports whatever an update acts on', () => {
       expect(warningsOf(r.warnings)).toEqual([]);
       expect(staging(doc)).toBe(before);
     });
+
+  // what the desk did, then what the brief changes: nothing the update acts on
+  const quietAfterDesk: [string, (doc: SceneDoc) => void, (b: SceneBrief) => void][] = [
+    [
+      'new words of a shot removed in the desk',
+      (doc) => run(doc, 'desk.shot_remove', { shots: [deskShot(doc, SHOT_B).id] }),
+      (b) => void (b.shots[1].description = 'Close-up: Mira squints up at the kite.'),
+    ],
+    [
+      'a new number of a shot removed in the desk',
+      (doc) => run(doc, 'desk.shot_remove', { shots: [deskShot(doc, SHOT_B).id] }),
+      (b) => void (b.shots[1].index = 5),
+    ],
+    [
+      'a shot removed in the desk that the brief drops',
+      (doc) => run(doc, 'desk.shot_remove', { shots: [deskShot(doc, SHOT_B).id] }),
+      (b) => void b.shots.splice(1, 1),
+    ],
+    [
+      'a new length the desk gave the shot already',
+      (doc) => run(doc, 'desk.shot_update', { shot: deskShot(doc, SHOT_A).id, frame_end: 48 }),
+      (b) => void (b.shots[0].durationSec = 2),
+    ],
+    ['a new duration of the same frame count', () => {}, (b) => void (b.shots[0].durationSec = 3.01)],
+    [
+      'a new name of a cast member whose actor was deleted in the desk',
+      (doc) => run(doc, 'object.delete', { objects: [actorOf(doc, PIP).id] }),
+      (b) => void (b.cast[1].name = 'Pippin'),
+    ],
+    [
+      'a new cast member in no shot',
+      () => {},
+      (b) =>
+        void b.cast.push({
+          id: 'chr_lena',
+          name: 'Lena',
+          description: 'A girl of 9.',
+          kind: null,
+          heightM: null,
+        }),
+    ],
+    [
+      'the brief as staged, with the scene’s range shortened in the desk',
+      (doc) => doc.updateScene({ frame_end: 60 }),
+      () => {},
+    ],
+    [
+      'the brief as staged, with the cut order changed in the desk',
+      (doc) => run(doc, 'desk.shot_move', { shot: deskShot(doc, SHOT_B).id, index: 0 }),
+      () => {},
+    ],
+  ];
+  for (const [what, desk, edit] of quietAfterDesk)
+    it(`is null for ${what}, and the update changes nothing`, () => {
+      const doc = staged();
+      desk(doc);
+      const next = openScene();
+      edit(next);
+      expect(briefChanges(doc, next)).toBeNull();
+      const before = staging(doc);
+      const r = updateFromBrief(doc, next);
+      expect(r.changes).toBeNull();
+      expect(r.solved).toEqual([]);
+      expect(warningsOf(r.warnings)).toEqual([]);
+      expect(staging(doc)).toBe(before);
+    });
+
+  it('a warning of what an update keeps comes again with the brief, while briefChanges is null', () => {
+    const doc = staged();
+    const next = openScene();
+    next.cast[0].kind = 'dog';
+    const kept = 'Mira now reads as a dog but stays the child staged before';
+    expect(updateFromBrief(doc, next).warnings.join('\n')).toContain(kept);
+    expect(briefChanges(doc, next)).toBeNull();
+    const before = staging(doc);
+    expect(updateFromBrief(doc, next).warnings.join('\n')).toContain(kept);
+    expect(staging(doc)).toBe(before);
+  });
+
+  it('lists a shot removed in the desk as retimed when the brief gives it a new length: the update stages it again', () => {
+    const doc = staged();
+    run(doc, 'desk.shot_remove', { shots: [deskShot(doc, SHOT_B).id] });
+    const next = openScene();
+    next.shots[1].durationSec = 3;
+    expect(briefChanges(doc, next)).toEqual({ ...NOTHING_LISTED, retimed: [SHOT_B] });
+    updateFromBrief(doc, next);
+    expect(deskShot(doc, SHOT_B)).toMatchObject({ frame_start: 73, frame_end: 144 });
+  });
 
   it('is null for a brief that gives back the lens and move the desk staged, and the update solves nothing', () => {
     const doc = staged();

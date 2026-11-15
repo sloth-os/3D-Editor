@@ -73,8 +73,11 @@ import {
  *   then over new frames before the next shot; it shrinks by its frames no other shot covers; its
  *   camera's move is fitted to its new length. A shot whose length was changed in the desk and whose
  *   frame count the brief did not change keeps the desk's length (with a warning);
- * - a new shot is put after the brief's shot before it (before the first shot when it leads), its
- *   camera solved from its framing and fitted to its planned layout, the cast not in it hidden;
+ * - a new shot is put after the brief's shot before it (before the first shot when it leads), in
+ *   time and in the cut (the list: right after that shot, or right before the brief's shot after it
+ *   when it leads), its camera solved from its framing and fitted to its planned layout, the cast
+ *   not in it hidden; the scene's frame range grows to hold a shot the update puts or lengthens past
+ *   its end (one the desk left past it stays so);
  * - a shot removed in the desk stays removed unless the brief changes its length, cast or camera
  *   plan: then it is staged again like a new one (with a warning);
  * - a shot whose cast changed shows its new cast and hides the rest (in the frames it alone covers),
@@ -85,8 +88,8 @@ import {
  * - a camera set by hand in the desk is never solved again: the update keeps it and warns;
  * - cast members the brief no longer stages go; new ones stand on a free mark, shown in their shots
  *   (an actor removed in the desk is staged again only for a shot the update stages or recasts); a
- *   member the brief renames is renamed (unless the desk renamed it); one whose kind or height the
- *   brief changes stays the actor staged, with a warning;
+ *   member the brief renames is renamed, unless the desk renamed it (it keeps the desk's name, with a
+ *   warning); one whose kind or height the brief changes stays the actor staged, with a warning;
  * - props whose element went go, new ones are placed, and a held prop whose holder or holder's shots
  *   changed is held (or flown) again; the set is rebuilt when its plan changed;
  * - notes the desk did not edit follow the brief's words; shot names that are the desk's own
@@ -95,8 +98,11 @@ import {
  *   someone rides is staged with the rider beside the mount, with a warning (desk.actor_mount seats
  *   them; staging the brief in a new project mounts them as staging does).
  *
- * The brief's order of the shots the desk keeps is not changed by an update (a warning says so when
- * the brief reorders them): stage the brief in a new project to follow a new order.
+ * The cut order (the shot list's) of the shots the desk keeps is the desk's: an update does not
+ * change it, also when the person reordered the shots in the desk (desk.shot_move), and warns when
+ * the brief now orders them otherwise than it did and the desk does not: stage the brief in a new
+ * project to follow a new order. A brief that changes nothing the update acts on (briefChanges null)
+ * leaves the staging as it is (changes.ts).
  */
 
 /** Whether object `id` animates as the desk last staged it (its recorded motion digest). */
@@ -242,6 +248,9 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
     if (s.camera) staged.set(s.camera, asStaged(doc, s.camera));
   for (const o of [...actors.values(), ...props.values()]) staged.set(o.id, asStaged(doc, o.id));
   const deskBefore = hostShots(doc, sceneId);
+  // the shots past the scene's last frame (a range the person shortened in the desk stays so)
+  const sceneEnd = doc.getScene().frame_end;
+  const pastEnd = new Set(getShots(doc).flatMap((s) => (s.frame_end > sceneEnd ? [s.id] : [])));
   // the shots this update stages: new ones, and those removed in the desk that the brief changed; the
   // others removed in the desk stay removed (kept in the record)
   const place = new Set<string>();
@@ -318,9 +327,15 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
   for (const [cid, o] of actors) {
     const c = castById.get(cid)!;
     if (created.has(cid)) continue;
-    // a name the brief changed (one changed in the desk stays)
+    // a name the brief changed: the actor takes it, unless the desk renamed it (its name stays)
     const was = recordCast.get(cid);
-    if (was && was.name !== c.name && o.name !== c.name) doc.rename('objects', o.id, c.name);
+    if (was && was.name !== c.name && o.name !== c.name) {
+      if (o.name === was.name) doc.rename('objects', o.id, c.name);
+      else
+        warnings.push(
+          `${o.name} keeps the name it was given in the desk; the brief renamed ${was.name} to ${c.name}`,
+        );
+    }
     const kind = o.custom_props?.[DESK_PROPS.kind];
     const now = plan.cast.get(cid)!.kind;
     if (typeof kind === 'string' && kind !== now)
@@ -353,6 +368,10 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
     const prev = brief.shots
       .slice(0, i)
       .reverse()
+      .map((p) => desk.get(p.id))
+      .find((x): x is ShotData => !!x);
+    const following = brief.shots
+      .slice(i + 1)
       .map((p) => desk.get(p.id))
       .find((x): x is ShotData => !!x);
     const spans = getShots(doc).map(shotSpan);
@@ -395,7 +414,12 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
       pre_roll: 0,
       external: { source: 'host', project: null, clip: sceneId, shot: s.id, index: s.index },
     };
-    setShots(doc, [...getShots(doc), shot]);
+    // in the cut next to its brief neighbours: right after the brief's shot before it, else right
+    // before the brief's shot after it (the desk's own order of the others stays)
+    const list = getShots(doc);
+    const neighbour = list.findIndex((x) => x.id === (prev ?? following)?.id);
+    const at = neighbour < 0 ? list.length : prev ? neighbour + 1 : neighbour;
+    setShots(doc, [...list.slice(0, at), shot, ...list.slice(at)]);
     for (const [cid, o] of actors)
       if (!created.has(cid)) keyVisible(doc, o.id, start, end, shotCast(s).includes(cid));
     solve.add(id);
@@ -475,22 +499,35 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
         `${next.name} is ${length} frames long in the desk and ${wanted} in the brief: kept as edited in the desk`,
       );
   }
-  // the cut in time order; the brief's order of the shots kept is the desk's
-  const ordered = [...byId.values()].sort(
-    (a, b) => a.frame_start - b.frame_start || a.id.localeCompare(b.id),
+  // the cut order is the desk's: the shots it kept stay where it has them (also an order the person
+  // gave them in the desk), the new ones went in next to their brief neighbours
+  const ordered = [...byId.values()];
+  // (written only when something changed: an update that changes nothing writes nothing)
+  if (JSON.stringify(ordered) !== JSON.stringify(shotsNow)) setShots(doc, ordered);
+  // a brief that now orders the shots the desk kept otherwise than it did, which the desk does not follow
+  const kept = new Set(
+    brief.shots.filter((s) => deskBefore.has(s.id) && recordShot.has(s.id)).map((s) => s.id),
   );
-  setShots(doc, ordered);
-  const deskOrder = ordered
-    .filter((s) => s.external?.source === 'host' && s.external.clip === sceneId && s.external.shot)
-    .map((s) => s.external!.shot!);
-  const briefOrder = brief.shots.map((s) => s.id).filter((id) => deskOrder.includes(id));
-  if (deskOrder.join('\u0000') !== briefOrder.join('\u0000'))
+  const order = (ids: readonly string[]) => [...new Set(ids.filter((id) => kept.has(id)))].join('\u0000');
+  const briefOrder = order(brief.shots.map((s) => s.id));
+  const deskOrder = order(
+    ordered.flatMap((s) =>
+      s.external?.source === 'host' && s.external.clip === sceneId && s.external.shot
+        ? [s.external.shot]
+        : [],
+    ),
+  );
+  if (briefOrder !== order(record.shots.map((s) => s.id)) && briefOrder !== deskOrder)
     warnings.push(
       'the brief orders some shots differently from the desk: the desk keeps its cut order (stage the brief in a new project to follow the new order)',
     );
-  const last = ordered.reduce((m, s) => Math.max(m, s.frame_end), -Infinity);
-  if (Number.isFinite(last) && last > doc.getScene().frame_end) doc.updateScene({ frame_end: last });
-  if (!doc.getScene().camera && ordered[0]?.camera) doc.updateScene({ camera: ordered[0].camera });
+  // the scene's range grows to hold a shot the update put or lengthened past its end; a shot the desk
+  // left past it (a range shortened by hand) does not make it grow
+  const end = doc.getScene().frame_end;
+  const grown = ordered.filter((s) => s.frame_end > end && !pastEnd.has(s.id));
+  if (grown.length) doc.updateScene({ frame_end: Math.max(...grown.map((s) => s.frame_end)) });
+  if ((place.size || gone.length) && !doc.getScene().camera && ordered[0]?.camera)
+    doc.updateScene({ camera: ordered[0].camera });
 
   // ------------------------------------------------------------ new cast members: shown in their shots only
   const cut = cutOf(doc, brief, actorCast);
@@ -547,15 +584,16 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
       stageHeld(doc, made.root, made.baseScale, p, flies, actors.get(p.heldBy) ?? null, cut, warnings);
   }
   // an insert shot frames its props: subjects of new or replanned inserts may name props made just now
-  setShots(
-    doc,
-    getShots(doc).map((x) => {
-      const host = x.external?.source === 'host' && x.external.clip === sceneId ? x.external.shot : null;
-      const s = host ? brief.shots.find((b) => b.id === host) : undefined;
-      if (!s || !solve.has(x.id)) return x;
-      return { ...x, subjects: subjectsOf(s, x.framing ?? 'medium', actorId, props) };
-    }),
-  );
+  if (solve.size)
+    setShots(
+      doc,
+      getShots(doc).map((x) => {
+        const host = x.external?.source === 'host' && x.external.clip === sceneId ? x.external.shot : null;
+        const s = host ? brief.shots.find((b) => b.id === host) : undefined;
+        if (!s || !solve.has(x.id)) return x;
+        return { ...x, subjects: subjectsOf(s, x.framing ?? 'medium', actorId, props) };
+      }),
+    );
 
   // ------------------------------------------------------------ riders the update does not seat
   const desk = hostShots(doc, sceneId);
