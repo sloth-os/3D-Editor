@@ -62,19 +62,36 @@ function changedBrief(): SceneBrief {
   return b;
 }
 
-/** Web Locks as one browser partition has them: one holder per name, the others wait in turn. */
+/**
+ * Web Locks as one browser partition has them: one holder per name, the others wait in turn; a
+ * request with both `ifAvailable` and `signal` is refused, as Chromium refuses it (NotSupportedError).
+ */
 class FakeLocks implements SceneLocks {
   /** The names asked for, in order. */
   readonly names: string[] = [];
+  /** Held before a request that does not wait is answered (the test opens it). */
+  gate: Promise<void> | null = null;
   private readonly held = new Set<string>();
   private readonly waiting = new Map<string, (() => void)[]>();
+
+  /** Whether another request for `name` would wait. */
+  isHeld(name: string): boolean {
+    return this.held.has(name);
+  }
 
   async request(
     name: string,
     options: { ifAvailable?: boolean; signal?: AbortSignal },
     callback: (lock: unknown) => Promise<void> | void,
   ): Promise<unknown> {
+    if (options.ifAvailable && options.signal)
+      throw new DOMException(
+        "The 'signal' and 'ifAvailable' options cannot be used together.",
+        'NotSupportedError',
+      );
+    if (options.signal?.aborted) throw new DOMException('The lock request was aborted', 'AbortError');
     this.names.push(name);
+    if (options.ifAvailable && this.gate) await this.gate;
     if (this.held.has(name)) {
       if (options.ifAvailable) return callback(null);
       await new Promise<void>((resolve, reject) => {
@@ -120,6 +137,46 @@ const bytes = (s: { data: ArrayBuffer }) => new Uint8Array(s.data);
 const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 const edit = (ws: DeskWorkspace, key: string, value: unknown) =>
   ws.session!.doc.transact(() => ws.session!.doc.map('meta').set(key, value));
+
+/**
+ * Holds every gzipped state's unpacking (DecompressionStream) until `go()`; `started` settles once
+ * one began. Undone by vi.unstubAllGlobals.
+ */
+function holdUnpacking() {
+  let begin!: () => void;
+  const started = new Promise<void>((r) => (begin = r));
+  let go!: () => void;
+  const gate = new Promise<void>((r) => (go = r));
+  const Real = DecompressionStream;
+  class Held {
+    readonly readable: ReadableStream<Uint8Array>;
+    readonly writable: WritableStream<BufferSource>;
+    constructor(format: CompressionFormat) {
+      const ds = new Real(format);
+      this.writable = ds.writable;
+      this.readable = ds.readable.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          async start() {
+            begin();
+            await gate;
+          },
+        }),
+      );
+    }
+  }
+  vi.stubGlobal('DecompressionStream', Held);
+  return { started, go };
+}
+
+/** What an open came to within `ms`: 'opened', the name of its error, or 'still opening'. */
+const settledWithin = (p: Promise<unknown>, ms = 1000) =>
+  Promise.race([
+    p.then(
+      () => 'opened',
+      (e: Error) => e.name,
+    ),
+    new Promise<string>((r) => setTimeout(() => r('still opening'), ms)),
+  ]);
 
 /** Opens `brief` for `host` in a new workspace, then closes it; its state. */
 async function stateOf(host: string, brief = EXAMPLE()) {
@@ -357,6 +414,24 @@ describe('the desk workspace', () => {
     expect(hostShots(ws)).toEqual([SHOT_A, SHOT_B]);
   });
 
+  it('waits once for a project database that never answers: it does not ask it again for the copy', async () => {
+    const realOpen = indexedDB.open.bind(indexedDB);
+    const asked: string[] = [];
+    vi.spyOn(indexedDB, 'open').mockImplementation((name: string, version?: number) => {
+      if (!name.startsWith('3d-editor-project-desk-')) return realOpen(name, version);
+      asked.push(name);
+      return {} as IDBOpenDBRequest;
+    });
+    const ws = workspace({ storageTimeoutMs: 300 });
+    const t0 = performance.now();
+    const r = await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: null });
+    const ms = performance.now() - t0;
+    expect(r).toMatchObject({ source: 'brief', persistent: false });
+    // one timeout (the session's database), not a second one reading the same database for the copy
+    expect(asked).toHaveLength(1);
+    expect(ms).toBeGreaterThanOrEqual(300);
+  });
+
   it('keeps the scene in memory, with its local copy read, when storage refuses writes', async () => {
     const host = origin();
     const first = workspace();
@@ -409,6 +484,53 @@ describe('the desk workspace', () => {
     await new Promise((r) => setTimeout(r, 20));
     third.close();
     await expect(waiting).rejects.toThrow(/abort/i);
+  });
+
+  it('ends an open cancelled while its state unpacks: it never waits for the other desk, and that desk keeps its scene', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    edit(first, 'work', 'kept');
+    // a gzipped state of another staging: opened, it would replace the first desk's copy
+    const elsewhere = await stateOf(origin());
+    expect(bytes(elsewhere)[9]).toBe(1);
+    const lockName = `${SCENE_LOCK_PREFIX}${deskProjectId(host, EXAMPLE().id)}`;
+    const asked = locks.names.filter((n) => n === lockName).length;
+    const unpacking = holdUnpacking();
+    const work: (WorkProgress | null)[] = [];
+    const second = workspace({}, (w) => work.push(w));
+    const opening = second.open({ hostOrigin: host, brief: EXAMPLE(), state: elsewhere });
+    await unpacking.started;
+    // Close while the state unpacks
+    second.cancelOpen();
+    unpacking.go();
+    expect(await settledWithin(opening)).toBe('AbortError');
+    // it asked for no lock of the scene and did not wait for the first desk
+    expect(locks.names.filter((n) => n === lockName).length).toBe(asked);
+    expect(work.some((w) => w?.label === OTHER_DESK_WAIT)).toBe(false);
+    expect(second.session).toBeNull();
+    expect(first.session!.doc.map('meta').get('work')).toBe('kept');
+  });
+
+  it("ends an open cancelled while it asks for the scene's lock, and lets go of the lock it got", async () => {
+    const host = origin();
+    const lockName = `${SCENE_LOCK_PREFIX}${deskProjectId(host, EXAMPLE().id)}`;
+    let go!: () => void;
+    locks.gate = new Promise<void>((r) => (go = r));
+    try {
+      const ws = workspace();
+      const opening = ws.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+      await vi.waitFor(() => expect(locks.names.at(-1)).toBe(lockName));
+      // Close while the request that does not wait is answered
+      ws.cancelOpen();
+      go();
+      expect(await settledWithin(opening)).toBe('AbortError');
+      expect(ws.session).toBeNull();
+      await vi.waitFor(() => expect(locks.isHeld(lockName)).toBe(false));
+    } finally {
+      locks.gate = null;
+      go();
+    }
   });
 
   it('stamps a background check with the revision it checked, and shows the blocking line after staging and Update shots', async () => {
@@ -618,6 +740,29 @@ describe('the desk workspace with the controller', () => {
     await vi.waitFor(() => expect(ofType('opened')).toHaveLength(1), { timeout: 10_000 });
     expect(ofType('opened')[0]).toMatchObject({ sceneId: 'clp_fedcba9876543210' });
     expect(ofType('error')).toEqual([]);
+    expect(first.session).not.toBeNull();
+    c.dispose();
+  }, 20_000);
+
+  it('ends an open that Close cancelled while the state unpacked, though another desk has the scene', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    const state = await stateOf(origin());
+    const unpacking = holdUnpacking();
+    const ws = workspace();
+    const { c, sent, ofType } = await controllerWith(ws, { hostOrigin: host });
+    c.message({ type: 'open', scene: EXAMPLE(), state });
+    await unpacking.started;
+    await c.close();
+    unpacking.go();
+    vi.unstubAllGlobals();
+    // the host opens another scene: it opens now, while the first desk keeps its own
+    c.message({ type: 'open', scene: { ...EXAMPLE(), id: 'clp_fedcba9876543211' }, state: null });
+    await vi.waitFor(() => expect(ofType('opened')).toHaveLength(1), { timeout: 10_000 });
+    await vi.waitFor(() => expect(ofType('state')).toHaveLength(1));
+    expect(sent.map((m) => m.type)).toEqual(['ready', 'close', 'opened', 'state']);
+    expect(ofType('opened')[0]).toMatchObject({ sceneId: 'clp_fedcba9876543211' });
     expect(first.session).not.toBeNull();
     c.dispose();
   }, 20_000);

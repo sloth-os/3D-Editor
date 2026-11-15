@@ -518,6 +518,45 @@ test.describe('the embeddable desk', () => {
     await expectValidMessages(page);
   });
 
+  test('a second desk on a scene another tab of the browser has open: its Close ends the wait', async ({
+    page,
+    context,
+  }) => {
+    test.setTimeout(240_000);
+    const scene = smallBrief('clp_twodesks000001');
+    await openHost(page);
+    await waitFor(page, 'ready');
+    await send(page, { type: 'open', scene, state: null, options: OPTIONS });
+    await waitFor(page, 'opened', 1, 120_000);
+    // another tab of the same host in this browser opens the same scene: its desk waits for the first
+    const second = await context.newPage();
+    await openHost(second);
+    await waitFor(second, 'ready');
+    await send(second, { type: 'open', scene, state: null, options: OPTIONS });
+    const frame = await deskFrame(second);
+    await expect(frame.getByTestId('desk-work')).toContainText('open in another tab', { timeout: 60_000 });
+    // the person presses the desk's Close: the wait ends, close goes, and nothing after it
+    await frame.getByTestId('desk-work-close').click();
+    const [close] = await waitFor(second, 'close');
+    expect(close).toEqual({ type: 'close', reason: 'cancel' });
+    await expect(frame.getByTestId('desk-work')).toHaveCount(0);
+    await expect(frame.getByTestId('desk-closed')).toBeVisible();
+    // the host opens another scene in that frame: it opens at once, and the first tab keeps its own
+    await send(second, {
+      type: 'open',
+      scene: smallBrief('clp_twodesks000002'),
+      state: null,
+      options: OPTIONS,
+    });
+    await waitFor(second, 'state', 1, 120_000);
+    expect((await portMessages(second)).map((m) => m.type)).toEqual(['ready', 'close', 'opened', 'state']);
+    expect((await ofType(second, 'opened'))[0]).toMatchObject({ sceneId: 'clp_twodesks000002' });
+    await expect((await deskFrame(page)).getByTestId('desk-app')).toHaveAttribute('data-status', 'open');
+    expect((await portMessages(page)).map((m) => m.type)).not.toContain('close');
+    await expectValidMessages(second);
+    await second.close();
+  });
+
   test('a shot made longer in the desk: Send warns, the clip goes with its issue', async ({ page }) => {
     test.setTimeout(240_000);
     await openHost(page);

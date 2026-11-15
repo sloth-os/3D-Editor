@@ -249,6 +249,61 @@ describe("the desk's header", () => {
     );
   });
 
+  it('offers Close over the work while the scene opens (another desk has it): Close ends the open', async () => {
+    const cancelOpen = vi.fn();
+    const sent: string[] = [];
+    const ws: SceneWorkspace = {
+      // another desk of this browser has the scene: the open waits
+      open: () => new Promise(() => {}),
+      encodeState: async () => ({
+        state: { format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(4) },
+        shots: 2,
+      }),
+      onEdit: () => () => {},
+      snapshot: () => new Uint8Array([1]),
+      stagedShots: () => [],
+      lengthMismatches: () => [],
+      changes: () => null,
+      updateFromBrief: async () => null,
+      results: async () => [],
+      projectId: null,
+      cancelOpen,
+    };
+    const c = new DeskController({
+      send: (m) => (sent.push(m.type), true),
+      workspace: ws,
+      exportSupport: async () => ({ available: true, reason: null }),
+      deskVersion: '1.0.0',
+      log: () => {},
+    });
+    await c.connected('https://host.example');
+    c.message({ type: 'open', scene: brief, state: null } as never);
+    await vi.waitFor(() => expect(c.status.value).toBe('opening'));
+    const { DeskApp } = await import('../src/embed/DeskApp');
+    const { OTHER_DESK_WAIT } = await import('../src/embed/workspace');
+    const v = render(
+      h(DeskApp, { c, work: { label: OTHER_DESK_WAIT, startedAt: Date.now() }, lengthChecks: () => [] }),
+    );
+    expect(v.getByTestId('desk-work').textContent).toContain('open in another tab');
+    fireEvent.click(v.getByTestId('desk-work-close'));
+    await vi.waitFor(() => expect(c.status.value).toBe('closed'));
+    expect(cancelOpen).toHaveBeenCalledTimes(1);
+    expect(sent).toEqual(['ready', 'close']);
+    // once the scene is open, the work of an update offers no Close (the header has it)
+    cleanup();
+    const open = await openDesk({ hostName: 'rideo' });
+    const { DeskApp: App } = await import('../src/embed/DeskApp');
+    const u = render(
+      h(App, {
+        c: open,
+        work: { label: 'Updating 2 shots from the brief…', startedAt: 0 },
+        lengthChecks: () => [],
+      }),
+    );
+    expect(u.getByTestId('desk-work')).toBeTruthy();
+    expect(u.queryByTestId('desk-work-close')).toBeNull();
+  });
+
   it("turns Send off for a brief over the export's size and says why", async () => {
     const c = await openDesk({ hostName: 'rideo' }, { ...brief, width: 2160, height: 3840 } as SceneBrief);
     const v = await header(c);

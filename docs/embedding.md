@@ -398,7 +398,8 @@ and no telemetry, for the page's life. Where the browser blocks storage it keeps
 (the host's state is the copy that counts) and nothing fails. Where storage works at first but fails
 as a scene opens (its database does not open, does not answer within 10 s, or refuses a write) it
 keeps that scene in memory too and says so: it reads the local copy where it can but writes nothing,
-and opening never hangs on storage. It registers the service worker itself, starts
+and opening never hangs on storage (a database that did not answer is not asked again for the copy,
+so the open waits 10 s at most for it). It registers the service worker itself, starts
 its staging worker with the page, and posts `hello` at the page's `load` event. After the page has
 loaded it sends nothing to any server, and its own files come from the service worker's cache (on
 the first visit under a host site the service worker fetches them once, in the background, as it
@@ -434,9 +435,10 @@ the same scene of the same host (another tab, window or frame under the same hos
 it, saying "This scene is open in another tab or window of this browser. The desk opens it here as
 soon as it is closed there.", and opens the scene once the first lets go of it: when that desk's
 page goes away or opens another scene (after Done or Close a desk keeps its scene, as the person
-may go back to it). It never clears the database under the first. A Close ends the wait. Browsers
-without Web Locks (Safari before 15.4) do not let desks wait for each other, so there a second desk
-on the scene can still replace the copy under the first.
+may go back to it). It never clears the database under the first. A Close ends the wait: the
+notice offers **Close** as the header does. Browsers without Web Locks (Safari before 15.4) do not
+let desks wait for each other, so there a second desk on the scene can still replace the copy
+under the first.
 
 ### The desk state
 
@@ -511,9 +513,11 @@ is where the scene starts); the page stays responsive and shows the work. Then c
 first `state`, so the host's copy is current from the start (`opened` alone after a state the desk
 did not read). A brief that validates but cannot be staged is answered with `error` `invalid_scene`
 without an `id`; it does not count as the connection's `open`, and the host may send another.
-**Close** while the scene opens cancels the open: `close` goes at once and nothing after it (no
-`opened`, no `state`); the desk lets go of the scene and takes a later `open`, as it does after a
-Close before any `open`.
+**Close** while the scene opens cancels the open, at any moment of it (while the host's state
+unpacks, while the desk waits for another desk, while it stages; the work it shows offers
+**Close**): `close` goes at once and nothing after it (no `opened`, no `state`). An open cancelled
+before the local copy is read changes nothing of it. The desk lets go of the scene and takes a
+later `open`, as it does after a Close before any `open`.
 
 The shot list shows the staging's checks at once (their issues), and once the scene is open,
 whatever it opened from, the desk runs the full checks in the background (each shot's blocking
@@ -769,7 +773,8 @@ Where the contract leaves room, the desk takes the most robust reading:
   scene, presses Done, or the host sends `save`, so that a browser that cannot read the host's
   state never replaces it just by opening the scene.
 - **A scene open in another desk of the browser.** `opened` comes once that desk lets go of the
-  scene (the desk shows why it waits), not as soon as the scene is staged; a Close ends the wait.
+  scene (the desk shows why it waits, with Close), not as soon as the scene is staged; a Close
+  ends the wait.
 - **Requests before `ready`** wait until `ready` is out, then are handled in order.
 - **Lists.** The contract bounds no list: `export.shots: []` names no shot (every shot of the brief,
   as when it is missing), `export.modes: []` asks for the open's, and a repeated mode counts once,

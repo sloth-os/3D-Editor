@@ -45,10 +45,13 @@ import { StagingClient } from './staging';
  *   storage it lives in memory only (the host's state is the authoritative copy anyway). Storage
  *   that fails after the probe (its database does not open, does not answer within
  *   STORAGE_TIMEOUT_MS, or refuses a write) is left for memory too, with the local copy read but
- *   never written, and the person is told (OpenOutcome.notice): opening never hangs on it.
+ *   never written (not asked again of a database that did not answer: one timeout at most), and
+ *   the person is told (OpenOutcome.notice): opening never hangs on it.
  * - One desk per host and scene in this browser: the desk holds a Web Lock named after the project
  *   while the scene is open, and a second desk (another tab or frame) waits for it with a notice,
- *   so it never throws away the database under the first one.
+ *   so it never throws away the database under the first one. A Close at any moment of an open
+ *   (while the state unpacks, while it asks for the lock or waits for it, while storage opens) ends
+ *   it before anything of the local copy changes.
  * - Opening follows the merge rule (state.ts restorePlan): a host state from the same staging as the
  *   local copy is merged into it, any other readable state replaces it; without a state the local
  *   copy is used, else the brief is staged (in the staging worker). A state that does not read
@@ -165,8 +168,24 @@ function browserLocks(): SceneLocks | null {
   return n?.locks ? (n.locks as SceneLocks) : null;
 }
 
+/** Throws the open's cancellation (an AbortError) once Close cancelled it. */
+function stopIfCancelled(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  throw signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The open was cancelled.', 'AbortError');
+}
+
 /** How long the scene's database may take to open (or clear) before the desk keeps it in memory. */
 export const STORAGE_TIMEOUT_MS = 10_000;
+
+/** Storage that did not answer within the storage timeout (asked again, it would not answer either). */
+class StorageTimeout extends Error {
+  constructor(ms: number) {
+    super(`it did not answer within ${Math.max(1, Math.round(ms / 1000))} s`);
+    this.name = 'StorageTimeout';
+  }
+}
 
 /** The scene's Web Lock is named this followed by its local id (deskProjectId). */
 export const SCENE_LOCK_PREFIX = '3d-editor-desk:';
@@ -239,8 +258,8 @@ export class DeskWorkspace {
   private notice: string | null = null;
   /** Lets go of the scene's lock. */
   private release: (() => void) | null = null;
-  /** A wait for another desk's lock (aborted when this desk closes). */
-  private waiting: AbortController | null = null;
+  /** The open in progress, from its start (cancelOpen and close abort it: Close while it opens). */
+  private opening: AbortController | null = null;
   private readonly locks: SceneLocks | null;
   private readonly storageTimeoutMs: number;
 
@@ -271,7 +290,7 @@ export class DeskWorkspace {
       let over = false;
       const timer = setTimeout(() => {
         over = true;
-        reject(new Error(`it did not answer within ${Math.max(1, Math.round(ms / 1000))} s`));
+        reject(new StorageTimeout(ms));
       }, ms);
       p.then(
         (v) => {
@@ -310,13 +329,16 @@ export class DeskWorkspace {
     return { session, persistent: false };
   }
 
-  /** Opens the scene's session: in IndexedDB where it works, else in memory. */
+  /**
+   * Opens the scene's session: in IndexedDB where it works, else in memory. A database that did not
+   * answer is not asked again for the local copy: the open waits one storage timeout at most.
+   */
   private async openStored(id: string): Promise<Stored> {
     if (!(await this.storage())) return { session: await this.openSession(id, false), persistent: false };
     try {
       return { session: await this.openPersistent(id), persistent: true };
     } catch (err) {
-      return this.inMemory(id, err, true);
+      return this.inMemory(id, err, !(err instanceof StorageTimeout));
     }
   }
 
@@ -335,9 +357,12 @@ export class DeskWorkspace {
 
   /**
    * Holds the scene's lock while it is open here (one desk per host and scene in this browser):
-   * waits, saying so, while another desk holds it. Resolves with what lets go of it.
+   * waits, saying so, while another desk holds it. Resolves with what lets go of it. The open's
+   * `signal` ends it at any moment (AbortError): checked before each request and passed to the one
+   * that waits (Web Locks refuse a signal on a request that does not wait, NotSupportedError, so
+   * that one is checked as soon as it answers, and a lock it got is let go).
    */
-  private async lockScene(id: string): Promise<() => void> {
+  private async lockScene(id: string, signal: AbortSignal): Promise<() => void> {
     const locks = this.locks;
     if (!locks) return () => {};
     const name = `${SCENE_LOCK_PREFIX}${id}`;
@@ -352,20 +377,20 @@ export class DeskWorkspace {
           })
           .catch(reject);
       });
-    try {
-      if (await take({ ifAvailable: true })) return release;
-    } catch {
-      // locks that do not work here (an opaque origin): as without them
-      return () => {};
+    stopIfCancelled(signal);
+    // null: locks that do not work here (an opaque origin): as without them
+    const got = await take({ ifAvailable: true }).catch(() => null);
+    if (signal.aborted) {
+      if (got) release();
+      stopIfCancelled(signal);
     }
-    const waiting = new AbortController();
-    this.waiting = waiting;
+    if (got === null) return () => {};
+    if (got) return release;
     this.onWork({ label: OTHER_DESK_WAIT, startedAt: Date.now() });
     try {
-      await take({ signal: waiting.signal });
+      await take({ signal });
       return release;
     } finally {
-      if (this.waiting === waiting) this.waiting = null;
       this.onWork(null);
     }
   }
@@ -411,8 +436,27 @@ export class DeskWorkspace {
     this.release = null;
   }
 
-  /** Opens the scene of `brief` for `hostOrigin` (see the module comment). */
+  /**
+   * Opens the scene of `brief` for `hostOrigin` (see the module comment). cancelOpen (a Close) ends
+   * it with an AbortError at any moment until the local copy is read: while the state unpacks,
+   * while it asks for the scene's lock or waits for another desk, and while storage opens; nothing
+   * of the copy is changed then.
+   */
   async open(o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null }): Promise<OpenOutcome> {
+    const cancel = new AbortController();
+    this.opening?.abort();
+    this.opening = cancel;
+    try {
+      return await this.openScene(o, cancel.signal);
+    } finally {
+      if (this.opening === cancel) this.opening = null;
+    }
+  }
+
+  private async openScene(
+    o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null },
+    signal: AbortSignal,
+  ): Promise<OpenOutcome> {
     const { brief } = o;
     this.letGo();
     this.brief = brief;
@@ -427,11 +471,13 @@ export class DeskWorkspace {
           err instanceof StateUnreadable ? err.message : `the desk state does not read (${String(err)})`;
       }
     }
+    stopIfCancelled(signal);
     // one desk per host and scene in this browser: another one waits until this one lets go
-    const release = await this.lockScene(id);
+    const release = await this.lockScene(id, signal);
     this.notice = null;
     let s: ProjectSession | null = null;
     try {
+      stopIfCancelled(signal);
       this.onWork({ label: 'Opening the scene…', startedAt: Date.now() });
       let stored: Stored;
       try {
@@ -440,6 +486,8 @@ export class DeskWorkspace {
         this.onWork(null);
       }
       s = stored.session;
+      // the last moment a Close ends the open with nothing of the local copy changed
+      stopIfCancelled(signal);
       const plan = restorePlan(decoded && { lineage: decoded.lineage }, {
         staged: this.stagedHere(s, brief.id),
         lineage: readLineage(s.doc),
@@ -634,14 +682,17 @@ export class DeskWorkspace {
     return this.session?.id ?? null;
   }
 
-  /** Ends a wait for another desk's lock (the open rejects); the open scene, if any, stays. */
+  /**
+   * Ends the open in progress (it rejects with an AbortError: see open), a wait for another desk's
+   * lock too; an open scene stays.
+   */
   cancelOpen(): void {
-    this.waiting?.abort();
+    this.opening?.abort();
   }
 
-  /** Lets go of the scene and its lock (a wait for another desk's lock ends). */
+  /** Lets go of the scene and its lock (an open in progress ends, a wait for another desk too). */
   close(): void {
-    this.waiting?.abort();
+    this.opening?.abort();
     this.letGo();
     this.staging.dispose();
   }

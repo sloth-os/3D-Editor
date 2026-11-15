@@ -444,7 +444,11 @@ function DeskEditor({ s }: { s: ProjectSession }) {
   );
 }
 
-function WorkOverlay({ work }: { work: WorkProgress | null }) {
+/**
+ * What the desk is busy with, over the desk (and its header). While the scene opens (staging, a
+ * wait for another desk of this browser) it offers Close, as the header would: it cancels the open.
+ */
+function WorkOverlay({ work, onClose }: { work: WorkProgress | null; onClose: (() => void) | null }) {
   useTick(!!work, 500);
   if (!work) return null;
   const secs = Math.round((Date.now() - work.startedAt) / 1000);
@@ -458,6 +462,18 @@ function WorkOverlay({ work }: { work: WorkProgress | null }) {
         <div class="desk-work-time">
           {secs} s · the page stays responsive: the work runs in the background
         </div>
+        {onClose && (
+          <div class="desk-modal-actions">
+            <button
+              class="btn"
+              data-testid="desk-work-close"
+              title="Stop opening the scene and close the desk"
+              onClick={onClose}
+            >
+              Close
+            </button>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -506,7 +522,7 @@ export function DeskApp(p: DeskAppProps) {
           </div>
         </div>
       )}
-      <WorkOverlay work={p.work} />
+      <WorkOverlay work={p.work} onClose={status === 'opening' ? () => void c.close() : null} />
       <PopupMenuHost />
       <Toasts />
     </div>
