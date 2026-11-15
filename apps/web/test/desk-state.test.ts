@@ -405,7 +405,7 @@ describe('the desk state', () => {
             sample();
           }
         }
-        static [Symbol.hasInstance](v: unknown) {
+        static override [Symbol.hasInstance](v: unknown) {
           return v instanceof RealU8;
         }
       }
