@@ -14,9 +14,14 @@ import type { RideoBlockingPose, RideoCharacterInput, RideoMovement, RideoShotIn
 
 // ---------------------------------------------------------------- text
 
+/** Text with accents folded and apostrophes made plain, in its own case. */
+export function foldText(text: string): string {
+  return text.normalize('NFKD').replace(/\p{M}/gu, '').replace(/[‘’ʼ]/g, "'");
+}
+
 /** Lower-case text with accents folded and apostrophes made plain. */
 export function plainText(text: string): string {
-  return text.normalize('NFKD').replace(/\p{M}/gu, '').replace(/[‘’ʼ]/g, "'").toLowerCase();
+  return foldText(text).toLowerCase();
 }
 
 /** The text of a character: its name, summary and identity (rideo's identity fields, or one string). */
@@ -32,14 +37,141 @@ export function characterText(c: Pick<RideoCharacterInput, 'name' | 'summary' | 
   return plainText([c.name, c.summary ?? '', identity].join('. '));
 }
 
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+export const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** Sentences of a text (split at . ! ? ; and line breaks). */
-const sentences = (text: string): string[] =>
-  text
-    .split(/[.!?;\n]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+/** Titles before a name: a period after one never ends a sentence ("Dr. Okafor", "St. Ives"). */
+const TITLES = new Set([
+  'dr',
+  'mr',
+  'mrs',
+  'ms',
+  'mx',
+  'st',
+  'prof',
+  'rev',
+  'fr',
+  'capt',
+  'col',
+  'gen',
+  'lt',
+  'sgt',
+  'cpl',
+  'maj',
+  'adm',
+  'cmdr',
+  'det',
+  'insp',
+  'supt',
+  'sen',
+  'gov',
+  'hon',
+  'pres',
+  'mt',
+  'mme',
+  'mlle',
+]);
+
+/**
+ * Abbreviations: a period after one ends a sentence only when a capital comes next ("approx. 160 cm",
+ * "e.g. a scar", but "scars, tattoos etc. A retired boxer.").
+ */
+const ABBREVIATIONS = new Set([
+  'approx',
+  'appr',
+  'ca',
+  'cf',
+  'eg',
+  'ie',
+  'etc',
+  'esp',
+  'incl',
+  'no',
+  'nos',
+  'nr',
+  'vs',
+  'viz',
+  'al',
+  'jr',
+  'sr',
+  'ft',
+  'in',
+  'lb',
+  'lbs',
+  'oz',
+  'cm',
+  'mm',
+  'km',
+  'kg',
+  'yrs',
+  'yr',
+  'yo',
+  'mos',
+  'mo',
+  'wks',
+  'wk',
+  'hrs',
+  'hr',
+  'min',
+  'max',
+  'avg',
+  'est',
+  'dept',
+  'ave',
+  'rd',
+]);
+
+/**
+ * Whether the period at `at` (its marks end at `next`) ends a sentence: not after a title, an initial
+ * ("J.", "U.S.") or an abbreviation that no capital follows. A period inside a number ("1.85 m") is
+ * never seen here: no space follows it.
+ */
+function periodEnds(text: string, at: number, next: number): boolean {
+  const word = /(\p{L}+(?:\.\p{L}+)*|\p{N}+(?:[.,]\p{N}+)*)$/u.exec(
+    text.slice(Math.max(0, at - 40), at),
+  )?.[1];
+  // after a number ("aged 45. A boxer."), or after other marks: an end
+  if (!word || /^\p{N}/u.test(word)) return true;
+  const parts = word.split('.');
+  if (parts.every((p) => p.length === 1 && p !== p.toLowerCase())) return false;
+  const w = parts.join('').toLowerCase();
+  if (TITLES.has(w)) return false;
+  if (ABBREVIATIONS.has(w) || parts.length > 1 || word.length === 1)
+    return /^\s+["“'‘(]*\p{Lu}/u.test(text.slice(next));
+  return true;
+}
+
+/**
+ * Where the first sentence of `text` ends: `end`, where its end mark starts (the text's length when it
+ * has none), and `next`, where the text after it starts. A sentence ends at a line break, at ".", "!",
+ * "?" or "…" followed by a space or the end of the text (closing quotes or brackets between), and
+ * with `semicolons` at ";"; a period inside a number, after a title ("Dr.", "Mrs.", "St."), an initial
+ * or an abbreviation ("approx.", "e.g.") does not end it, unless a capital follows the abbreviation.
+ */
+export function sentenceBreak(text: string, semicolons = false): { end: number; next: number } {
+  const re = semicolons ? /[.!?…]+["”'’)\]]*(?=\s|$)|[\n;]/g : /[.!?…]+["”'’)\]]*(?=\s|$)|\n/g;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const next = m.index + m[0].length;
+    if (/^\.+["”'’)\]]*$/.test(m[0]) && !periodEnds(text, m.index, next)) continue;
+    return { end: m.index, next };
+  }
+  return { end: text.length, next: text.length };
+}
+
+/** The sentences of a text, trimmed, without their end marks (see sentenceBreak). */
+export function sentencesOf(text: string, semicolons = false): string[] {
+  const out: string[] = [];
+  let rest = text;
+  while (rest.trim()) {
+    const b = sentenceBreak(rest, semicolons);
+    const s = rest.slice(0, b.end).trim();
+    if (s) out.push(s);
+    rest = rest.slice(b.next);
+  }
+  return out;
+}
+
+/** Sentences of a text (split at . ! ? ; and line breaks as sentenceBreak reads them). */
+const sentences = (text: string): string[] => sentencesOf(text, true);
 
 // ---------------------------------------------------------------- actor kinds
 
@@ -133,8 +265,8 @@ export function actsAsPerson(c: Pick<RideoCharacterInput, 'name' | 'summary' | '
   return false;
 }
 
-/** Ages written out ("an eight-year-old girl"). */
-const AGE_WORDS: Readonly<Record<string, number>> = {
+/** Numbers written out ("an eight-year-old girl", "forty-five", "thirty"). */
+const NUMBER_WORDS: Readonly<Record<string, number>> = {
   one: 1,
   two: 2,
   three: 3,
@@ -147,22 +279,122 @@ const AGE_WORDS: Readonly<Record<string, number>> = {
   ten: 10,
   eleven: 11,
   twelve: 12,
+  thirteen: 13,
+  fourteen: 14,
+  fifteen: 15,
+  sixteen: 16,
+  seventeen: 17,
+  eighteen: 18,
+  nineteen: 19,
+  twenty: 20,
+  thirty: 30,
+  forty: 40,
+  fifty: 50,
+  sixty: 60,
+  seventy: 70,
+  eighty: 80,
+  ninety: 90,
 };
 
+/** Decades written out ("in her twenties", "late sixties"). */
+const DECADE_WORDS: Readonly<Record<string, number>> = {
+  twenties: 20,
+  thirties: 30,
+  forties: 40,
+  fifties: 50,
+  sixties: 60,
+  seventies: 70,
+  eighties: 80,
+  nineties: 90,
+};
+
+/** Where in a decade "early", "mid" and "late" put an age ("late 60s": 68), and "-something" (35). */
+const DECADE_PART: Readonly<Record<string, number>> = { early: 2, mid: 5, late: 8, something: 5 };
+
+/** Units of a baby's age, in years ("18 months": 1). */
+const SMALL_UNITS: readonly (readonly [RegExp, number])[] = [
+  [/^months?$|^mos?$/, 12],
+  [/^weeks?$|^wks?$/, 52],
+  [/^days?$/, 365],
+];
+
 /**
- * A person's kind from its words: its age (identity.age, else "<n>-year-old"), else what its own
- * words call it (toddler, child, elder), else its gender (identity.gender, else its words), else adult.
+ * The age a text gives, in years, or null: a number ("45", "about 30", "30-ish", "45 years old"), a
+ * decade ("30s", "early 30s", "mid-forties", "late sixties": early, mid and late put it 2, 5 and 8
+ * years in), a number written out ("forty-five", "thirty-something") or a baby's months, weeks or
+ * days ("18 months": 1). Teens ("teenage", "late teens") and words such as "elderly" or "young" are
+ * not read as an age: what they say is read from the words (humanKindOf).
+ */
+export function ageOf(text: string): number | null {
+  const words = plainText(text)
+    .replace(/(\d)\s*'?s\b/g, '$1 decade')
+    .replace(/(\w)-?ish\b/g, '$1')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const part = words.map((w) => DECADE_PART[w]).find((v) => v !== undefined) ?? 0;
+  for (const [i, w] of words.entries()) {
+    let n: number | null = null;
+    let decade = false;
+    if (/^\d{1,3}$/.test(w)) {
+      n = Number(w);
+      decade = words[i + 1] === 'decade' || words[i + 1] === 'something';
+    } else if (DECADE_WORDS[w] !== undefined) {
+      n = DECADE_WORDS[w];
+      decade = true;
+    } else if (NUMBER_WORDS[w] !== undefined) {
+      n = NUMBER_WORDS[w];
+      const unit = NUMBER_WORDS[words[i + 1]];
+      // "forty-five", "thirty-something"
+      if (n >= 20 && unit !== undefined && unit < 10) n += unit;
+      else if (n >= 20 && words[i + 1] === 'something') decade = true;
+    }
+    if (n === null) continue;
+    const small = SMALL_UNITS.find(([re]) => words.slice(i + 1, i + 3).some((x) => re.test(x)));
+    if (small) return Math.floor(n / small[1]);
+    return decade ? n + part : n;
+  }
+  return null;
+}
+
+/** Words an age may have besides its number ("about 30", "early 30s", "45 years old"). */
+const AGE_FILLER =
+  /^(?:decade|early|mid|late|something|about|around|roughly|nearly|almost|just|over|under|past|approx|approximately|circa|ca|c|aged?|in|his|her|their|years?|yrs?|y|o|old|months?|mos?|weeks?|wks?|days?|and|a|half)$/;
+
+/** Whether a text is an age and nothing else ("8", "early 30s", "thirty", "6 years old"; not "two dogs"). */
+export function isAgeText(text: string): boolean {
+  const words = plainText(text)
+    .replace(/(\d)\s*'?s\b/g, '$1 decade')
+    .replace(/(\w)-?ish\b/g, '$1')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  return (
+    ageOf(text) !== null &&
+    words.every(
+      (w) =>
+        /^\d{1,3}$/.test(w) ||
+        NUMBER_WORDS[w] !== undefined ||
+        DECADE_WORDS[w] !== undefined ||
+        AGE_FILLER.test(w),
+    )
+  );
+}
+
+/**
+ * A person's kind from its words: its age (identity.age, else "<n>-year-old"; ageOf reads numbers,
+ * decades and ages written out), else what its own words call it (toddler, child, elder), else its
+ * gender (identity.gender, else its words), else adult.
  */
 export function humanKindOf(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'identity'>): ActorKind {
   const own = ownTexts(c);
   const fields = c.identity && typeof c.identity === 'object' ? c.identity : null;
   const ageField = typeof fields?.age === 'string' ? fields.age : '';
-  const ageMatch =
-    /(\d{1,3})/.exec(ageField) ??
-    own.map((t) => /\b(\d{1,3}|[a-z]+)[- ]?(?:years?|yrs?)[- ]?old\b/.exec(t)).find(Boolean) ??
-    null;
-  const said = ageMatch?.[1] ?? '';
-  const age = /^\d+$/.test(said) ? Number(said) : (AGE_WORDS[said] ?? null);
+  let age = ageOf(ageField);
+  for (const t of own) {
+    if (age !== null) break;
+    // "an eight-year-old", "a forty-five-year-old"
+    const said = /\b(\d{1,3}|[a-z]+(?:-[a-z]+)?)[- ]?(?:years?|yrs?)[- ]?old\b/.exec(t);
+    if (said) age = ageOf(said[1]);
+  }
   if (age !== null) {
     if (age <= 3) return 'toddler';
     if (age <= 12) return 'child';

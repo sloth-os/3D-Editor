@@ -13,10 +13,12 @@ import {
   RIDEO_POSE_HEIGHT,
   RideoImportInputSchema,
   RideoSceneBlockingSchema,
+  ageOf,
   editorPose,
   flyerKind,
   humanKindOf,
   inferActorKind,
+  isAgeText,
   isRideoId,
   modelFor,
   moveOfMovement,
@@ -26,6 +28,7 @@ import {
   rideoPose,
   ridersByText,
   ridingDenied,
+  sentencesOf,
   speciesOf,
 } from '../src/desk/rideo';
 import { HIDDEN_SCALE, hideSpans, replaceKeys, setKey, truncateMotion } from '../src/desk/rideo/keys';
@@ -193,6 +196,45 @@ describe('rideo reading rules', () => {
     expect(kindOf('Dad', 'A father who plays with his kids.')).toBe('man');
     expect(kindOf('Alex')).toBe('adult');
     expect(humanKindOf({ name: 'Jo', summary: 'An eight-year-old.' })).toBe('child');
+  });
+
+  it('reads ages written out, decades and a baby’s months by the same thresholds', () => {
+    expect(kindOf('Gus', '', { age: 'late sixties', gender: 'male' })).toBe('elder');
+    expect(kindOf('Gus', '', { age: 'late 60s', gender: 'male' })).toBe('elder');
+    expect(kindOf('Ned', '', { age: 'early 60s', gender: 'male' })).toBe('man');
+    expect(kindOf('Dee', '', { age: 'early twenties', gender: 'female' })).toBe('woman');
+    expect(kindOf('Bo', '', { age: 'six' })).toBe('child');
+    expect(kindOf('Kit', '', { age: '18 months' })).toBe('toddler');
+    // a forty-five-year-old is not a five-year-old
+    expect(humanKindOf({ name: 'Jo', summary: 'A forty-five-year-old.' })).toBe('adult');
+    expect(['thirty-something', 'mid-40s', '30-ish', 'about 30', 'seventy-two'].map(ageOf)).toEqual([
+      35, 45, 30, 30, 72,
+    ]);
+    // teens and words like "elderly" are read from the words, not as an age
+    expect(
+      ['teenage', 'late teens', 'elderly', 'two dogs and a cat'].map((t) => [ageOf(t), isAgeText(t)]),
+    ).toEqual([
+      [null, false],
+      [null, false],
+      [null, false],
+      [2, false],
+    ]);
+  });
+
+  it('ends a sentence where it ends, not after a title, an initial, a number or an abbreviation', () => {
+    // the words about a titled name are one sentence: its rider, its species
+    const okafor = { id: 'chr_okafor0000001', name: 'Dr. Okafor' };
+    const pepper = { id: PEPPER, name: 'Pepper', kind: 'pony' as const };
+    expect(ridersByText('Dr. Okafor rides Pepper to the clinic.', [okafor], [pepper])).toEqual([
+      { rider: okafor.id, mount: PEPPER },
+    ]);
+    expect(speciesOf({ name: 'Whiskers', summary: 'Mr. Whiskers is a tabby cat.' })).toBe('cat');
+    expect(sentencesOf('Dr. Okafor: 52 female, 1.85 m tall, approx. 90 kg; e.g. a scar. A surgeon.')).toEqual(
+      ['Dr. Okafor: 52 female, 1.85 m tall, approx. 90 kg; e.g. a scar', 'A surgeon'],
+    );
+    expect(
+      sentencesOf('Scars, tattoos etc. A boxer! Wears a U.S. Army jacket; aged 45. Kind.', true),
+    ).toEqual(['Scars, tattoos etc', 'A boxer', 'Wears a U.S. Army jacket', 'aged 45', 'Kind']);
   });
 
   it('makes quadrupeds of the animals rideo keeps as mounts and pets, and people of the others', () => {

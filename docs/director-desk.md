@@ -361,16 +361,24 @@ undo step, and runs in a web worker as well as on the server:
   that opens with rideo's identity line, `Name: <age> <gender>, <build>; <marks>; wearing …`, gives
   the person's age and gender (`Bo: 6 male` a child, `Tom: 72 male` an elder,
   `Ana: early 30s female` a woman; 3 and under a toddler, 12 and under a child, 65 and over an
-  elder); one that gives a gender is a person's whatever animal words follow in it ("bull neck",
-  "doe eyes", "a parrot on his shoulder") or the name says ("Wolf"), unless the sentence after it
-  names the animal ("A curious white duck."). An animal the desk has no figure for stands in as the
-  built kind nearest its size, with a warning: birds and small animals as a `cat`, foxes and wolves
-  as a `dog`, goats as a `sheep`, big cats as a `bear`, big grazers as a `cow`, camels and zebras as
-  a `horse`. `heightM` sets its height (an animal's is the top of its figure, as in
-  [SceneBlocking v1](#sceneblocking-v1): its withers come out lower). Each stands where the first
-  shot that plans it puts it (left −1.2 m, centre 0, right +1.2 m, a second one on a side 1.2 m
-  behind the first, facing as planned for a front camera), the others in a row at the front, and is
-  hidden in the shots that do not cast it.
+  elder). The line runs to its first sentence end: a period inside a number (`1.85 m`), after a
+  title (`Dr.`, `Mrs.`, `St.`) or an initial, or after an abbreviation no capital follows
+  (`approx. 160 cm`, `e.g. a scar`) does not end it. An age may be written out: `early twenties`,
+  `30-ish`, `thirty-something`, `18 months` (a toddler); early, mid and late put an age 2, 5 and 8
+  years into its decade, so `late sixties` or `late 60s` is an elder (teens, and words such as
+  "elderly", are not read as an age but as age words). A line whose first item ends with a gender
+  word (male, female, man, woman, boy, girl, non-binary) is a person's whatever its age says and
+  whatever animal words follow in it ("bull neck", "doe eyes", "a parrot on his shoulder") or the
+  name says ("Wolf"), unless the sentence after it names the animal ("A curious white duck."). An
+  animal word that says what a member has or resembles is not what it is: a possessive ("crow's
+  feet") or one before "-like" ("a crow-like old woman"), as before "tattoo", "costume" or "ears".
+  An animal the desk has no figure for stands in as the built kind nearest its size, with a warning:
+  birds and small animals as a `cat`, foxes and wolves as a `dog`, goats as a `sheep`, big cats as a
+  `bear`, big grazers as a `cow`, camels and zebras as a `horse`. `heightM` sets its height (an
+  animal's is the top of its figure, as in [SceneBlocking v1](#sceneblocking-v1): its withers come
+  out lower). Each stands where the first shot that plans it puts it (left −1.2 m, centre 0, right
+  +1.2 m, a second one on a side 1.2 m behind the first, facing as planned for a front camera), the
+  others in a row at the front, and is hidden in the shots that do not cast it.
 - **Props**: an element of kind `prop` is the built-in model its name names (else a 0.4 m cube in
   the colour a colour word of its name or first sentence gives), one of kind `other` only when its
   name names a built-in model (a style is not staged, with a warning), and `location` elements are
@@ -382,16 +390,19 @@ undo step, and runs in a web worker as well as on the server:
   name a room before any outdoor place ("inside", "flat", "bar", "cafe", "factory" or "museum" with
   an outdoor place right after it says where that place is, as in "deep inside the forest" or "the
   cafe terrace", but a room's name always names a room, and an outdoor word that names a building is
-  not the place: "the kitchen of the lake house", "inside the park's cafe"); its ground from the
-  first ground word they name (grass, sand, snow, ice, wood, carpet, dirt, stone), else a wooden
-  floor inside and plain ground outside; the sun from the time of day (below). Open water that the
-  set or a location names (a puddle, pond, pool, fountain, stream, brook, creek, canal, river, lake,
-  lagoon, loch, reservoir, bay, harbour, sea or ocean; not after "no" or "without") is a water
-  landmark of its size (a pond 5 × 4 m, a lake 20 × 10 m, a river a strip 30 m long and 6 m wide,
-  the sea one 80 × 30 m) on the side its clause gives it (on the left, on the right, in front,
-  behind), behind the cast when it gives none, and 1.5 m clear of the cast and the standing props,
-  so nobody starts out on it. The set is at least 12 × 10 m and grows to hold everything with a 2 m
-  margin (at most 200 m).
+  not the place: "the kitchen of the lake house", "inside the park's cafe"; boats, ships, yachts,
+  sheds, tents, caravans and other shelters are buildings: "inside the river boat", "inside the
+  garden shed"), or when "inside" or "indoors" opens a clause after outdoor words, on its own or of
+  a room or a building ("a cabin in the woods, inside by the fire", not "the garden, inside the
+  gate"); a deck is outdoors, unless "below deck"; its ground from the first ground word they name
+  (grass, sand, snow, ice, wood, carpet, dirt, stone), else a wooden floor inside and plain ground
+  outside; the sun from the time of day (below). Open water that the set or a location names (a
+  puddle, pond, pool, fountain, stream, brook, creek, canal, river, lake, lagoon, loch, reservoir,
+  bay, harbour, sea or ocean; not after "no" or "without") is a water landmark of its size (a pond 5
+  × 4 m, a lake 20 × 10 m, a river a strip 30 m long and 6 m wide, the sea one 80 × 30 m) on the
+  side its clause gives it (on the left, on the right, in front, behind), behind the cast when it
+  gives none, and 1.5 m clear of the cast and the standing props, so nobody starts out on it. The
+  set is at least 12 × 10 m and grows to hold everything with a 2 m margin (at most 200 m).
 - **Cameras**: the brief's framing, else the one its description's first sentence (else its
   action's) names ("close-up", "wide shot", "over the shoulder" …), else `medium`; the brief's
   `move`, else the one its movement words amount to (`dolly_in` a `push_in`, `tracking` a

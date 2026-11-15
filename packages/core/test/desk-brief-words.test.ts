@@ -116,6 +116,45 @@ describe('a cast member without a kind hint', () => {
     // as when the brief's kind says "person"
     expect(kindOf(name, description, 'person')).toMatchObject({ kind, warnings: [] });
   });
+
+  // the identity line runs to its first real sentence end: a period after a title, inside a number
+  // or after an abbreviation does not end it, so what follows is not read as rideo's summary; a gender
+  // word in its first item is a person's whatever the age says, and a worded age is read as an age
+  it.each([
+    ['Dr. Okafor', 'Dr. Okafor: 52 female; doe eyes.', 'woman'],
+    ['Mr. Lee', 'Mr. Lee: 70 male, stooped; bull neck. A retired boxer.', 'elder'],
+    ['Tom', 'Tom: 45 male, 1.85 m tall; bull neck, broken nose.', 'man'],
+    ['Ann', 'Ann: 30 female, approx. 160 cm; doe eyes.', 'woman'],
+    ['Okafor', 'Okafor: 52 female; doe eyes.', 'woman'],
+    ['Dr. Okafor', 'Dr. Okafor: 52 female, tall; owl eyes; wearing a white coat. A surgeon.', 'woman'],
+    ['Mrs. Hay', 'Mrs. Hay: 40 female; e.g. a fox-red scarf, a crow tattoo. A vet.', 'woman'],
+    ['Dee2', 'Dee2: early twenties female; doe eyes.', 'woman'],
+    ['Ivy', 'Ivy: 30-ish female; cat-eye glasses.', 'woman'],
+    ['Jo', 'Jo: tall, thin; crow’s feet.', 'adult'],
+    ['Gwen', 'Gwen: 70 female. A crow-like old woman.', 'elder'],
+  ])('%s (%s) is a person: its identity line ends where its sentence does', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
+  });
+
+  // worded ages by humanKindOf's thresholds (late sixties: 68, an elder)
+  it.each([
+    ['Gus', 'Gus: late sixties male; walrus moustache.', 'elder'],
+    ['Ida', 'Ida: seventy-two female; bird-like hands.', 'elder'],
+    ['Lea', 'Lea: thirty-something female; doe eyes.', 'woman'],
+    ['Bo', 'Bo: six male, small; wearing shorts.', 'child'],
+    ['Kit', 'Kit: eighteen months female; wearing a bonnet.', 'toddler'],
+    ['Al', 'Al: late 60s male; bull neck.', 'elder'],
+  ])('%s (%s) is staged by its worded age', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
+  });
+
+  it('still reads the animal its summary names after a period inside the identity line or the summary', () => {
+    expect(kindOf('Bella', 'Bella: 4 female, 1.6 m; chestnut coat. Dr. Hay’s gentle mare.')).toMatchObject({
+      kind: 'horse',
+      warnings: [],
+    });
+    expect(kindOf('Quackers', 'Quackers: 2 female, approx. 30 cm; white feathers. A duck.').kind).toBe('cat');
+  });
 });
 
 describe('a set without `interior`', () => {
@@ -161,5 +200,38 @@ describe('a set without `interior`', () => {
   it('reads an outdoor word that names a building as neither indoors nor outdoors', () => {
     expect(interiorFromWords('A lake house at dusk.')).toBeNull();
     expect(interiorFromWords('The lake at dusk.')).toBe(false);
+  });
+
+  // boats, ships, sheds, tents, caravans and other shelters are buildings: "inside the river boat" is
+  // inside the boat, not deep inside the river
+  it.each([
+    'Inside the river boat.',
+    'Inside the garden shed.',
+    'Inside the mountain tent.',
+    'Inside the beach caravan.',
+    'Inside the harbour ship, below deck.',
+    'Inside the lake yacht.',
+    'Inside the sea ferry.',
+  ])('%s is an interior', (words) => {
+    expect(interiorFromWords(words)).toBe(true);
+  });
+
+  it.each(['On the deck of the river boat.', 'The river by the boat shed.', 'A tent pitched in the meadow.'])(
+    '%s is outdoors',
+    (words) => {
+      expect(interiorFromWords(words)).toBe(false);
+    },
+  );
+
+  // "inside" or "indoors" opening a clause says where the scene is, of itself or of a room or a
+  // building, whatever outdoor words came before
+  it.each([
+    ['A cabin in the woods, inside by the fire.', true],
+    ['The farmyard, inside the barn.', true],
+    ['The campsite; indoors, a storm rages.', true],
+    ['The garden, inside the gate.', false],
+    ['Deep inside the forest, a mossy clearing.', false],
+  ])('%s', (words, interior) => {
+    expect(interiorFromWords(words)).toBe(interior);
   });
 });

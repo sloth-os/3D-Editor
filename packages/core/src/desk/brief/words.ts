@@ -2,7 +2,16 @@ import type { DeskFraming, DeskMove } from '../../doc/types';
 import { DESK_MOVES } from '../../doc/types';
 import { BUILT_KINDS, type ActorKind } from '../characters';
 import { HUMANOID_KINDS } from '../characters/types';
-import { humanKindOf, plainText, speciesOf } from '../rideo/rules';
+import {
+  escapeRe,
+  foldText,
+  humanKindOf,
+  isAgeText,
+  plainText,
+  sentenceBreak,
+  sentencesOf,
+  speciesOf,
+} from '../rideo/rules';
 import { RIDEO_MOVEMENTS, type RideoMovement } from '../rideo/schema';
 import type { TimeOfDay } from './schema';
 
@@ -47,9 +56,12 @@ export function sunOf(time: TimeOfDay | null): { azimuthDeg: number; elevationDe
  */
 const INDOORS =
   /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|cafe|caf|restaurant|(?<!sand |candy |chocolate |crow)bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat(?=\s*(?:$|[,.;:!?)]|(?:in|on|at|of|with|where|above|below|near|by|and|that|which)\b))|cabin interior|staircase|stairwell|elevator|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/g;
-/** Words that say a place is outdoors (they win over a room named as being nearby). */
+/**
+ * Words that say a place is outdoors (they win over a room named as being nearby); a deck too (a
+ * boat's or a house's), but not "below deck".
+ */
 const OUTDOORS =
-  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|car park|parking lot)\b/g;
+  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under )decks?|car park|parking lot)\b/g;
 
 /**
  * Indoor words that may say where or whose an outdoor place is rather than name a room ("deep inside
@@ -59,20 +71,27 @@ const OUTDOORS =
 const QUALIFIERS = /^(?:inside|flat|bar|cafe|caf|factory|museum)$/;
 
 /**
- * Buildings an outdoor word before them says which of ("the lake house", "the beach house", "the
- * mountain lodge", "the forest hotel"): the outdoor word then names the building, not the place.
+ * Buildings, and the shelters people are inside of as they are of a building (boats, sheds, tents,
+ * caravans …), that an outdoor word before them says which of ("the lake house", "the mountain lodge",
+ * "the river boat", "the garden shed", "the mountain tent"): the outdoor word then names the building,
+ * not the place.
  */
 const BUILDING =
-  /^[\s-]+(?:house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace)s?\b/;
+  /^[\s-]+(?:house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace|barn|shed|shack|stable|greenhouse|lighthouse|windmill|mill|boat|houseboat|ship|yacht|barge|ferry|steamer|tent|caravan|trailer|camper|motorhome|yurt|tipi|teepee|wigwam|igloo|bothy)s?\b/;
+
+/** What comes before "inside" or "indoors" that opens a clause ("a cabin in the woods, inside by the fire"). */
+const CLAUSE_OPENING = /(?:[,;:–—]|\s-)\s*(?:(?:and|but|then)\s+)?$/;
 
 /**
  * Whether a place is an interior by its words: "indoors", "inside" or a room's name make it one unless
- * outdoor words come first ("a meadow behind the house's kitchen"); null when the words say neither.
+ * outdoor words come first ("a meadow behind the house's kitchen"), or "inside" or "indoors" opens a
+ * clause after them ("a cabin in the woods, inside by the fire"); null when the words say neither.
  * "inside", "flat", "bar", "cafe", "factory" or "museum" with an outdoor place right after it says
  * where or whose that place is ("deep inside the forest", "the cafe terrace", "the factory yard"),
  * nothing of a room; a room's name always names one ("the kitchen of the farm"). An outdoor word that
- * names a building ("the lake house", "the forest hotel") or owns a room or building ("the park's
- * cafe") says which building, not that the place is outdoors.
+ * names a building or a shelter ("the lake house", "the forest hotel", "the river boat", "the garden
+ * shed", "the mountain tent") or owns a room or building ("the park's cafe") says which building, not
+ * that the place is outdoors.
  */
 export function interiorFromWords(text: string): boolean | null {
   const t = plainText(text);
@@ -99,8 +118,27 @@ export function interiorFromWords(text: string): boolean | null {
       )
     );
   };
+  // "inside" or "indoors" opening a clause says where the scene is, whatever outdoor words came
+  // before: on its own ("inside by the fire") or of a room or a building ("inside the barn"), not of
+  // anything else ("inside the gate")
+  const insideClause = (m: RegExpExecArray) => {
+    if (!/^(?:inside|indoors?)$/.test(m[0]) || qualifies(m) || !CLAUSE_OPENING.test(t.slice(0, m.index)))
+      return false;
+    const end = m.index + m[0].length;
+    const object =
+      /^\s+(?:the|an?|his|her|their|its|our|my|your|this|that)\s+(?:[a-z'-]+\s+){0,2}[a-z'-]+/.exec(
+        t.slice(end),
+      );
+    if (!object) return true;
+    const objectEnd = end + object[0].length;
+    return (
+      indoors.some((x) => x.index > end && x.index < objectEnd) ||
+      (t.slice(end, objectEnd).match(/[a-z'-]+/g) ?? []).some((w) => BUILDING.test(` ${w}`))
+    );
+  };
   const inside = indoors.find((m) => !qualifies(m));
   const outside = places[0];
+  if (indoors.some(insideClause)) return true;
   if (inside && outside) return inside.index < outside.index;
   if (inside) return true;
   if (outside) return false;
@@ -391,11 +429,20 @@ const MODIFIED =
 const TOY_BEFORE =
   /\b(?:teddy|toy|rocking|stuffed|plush|hobby|cuddly|wooden|paper|cardboard|origami|inflatable|plastic|china|porcelain)\s+$/;
 
-/** `text` with the words a modifier makes something else (see MODIFIED, TOY_BEFORE) blanked, same length. */
+/**
+ * Words after which the word before is not what the member is: a possessive names whose something
+ * is ("crow's feet", "the farmer's duck"), "-like" what it resembles ("a crow-like old woman").
+ */
+const OWNED_OR_LIKE = /^(?:'s\b|-like\b)/;
+
+/** `text` with the words a modifier makes something else (see MODIFIED, OWNED_OR_LIKE, TOY_BEFORE) blanked, same length. */
 function blankModifiers(text: string): string {
-  return text.replace(/[a-z]+/g, (w, at: number) =>
-    MODIFIED.test(text.slice(at + w.length)) || TOY_BEFORE.test(text.slice(0, at)) ? ' '.repeat(w.length) : w,
-  );
+  return text.replace(/[a-z]+/g, (w, at: number) => {
+    const after = text.slice(at + w.length);
+    return MODIFIED.test(after) || OWNED_OR_LIKE.test(after) || TOY_BEFORE.test(text.slice(0, at))
+      ? ' '.repeat(w.length)
+      : w;
+  });
 }
 
 /**
@@ -429,58 +476,72 @@ export interface AnimalWords {
   word: string;
 }
 
-/** A gender rideo's identity line gives ("<age> <gender>"). */
+/** A gender rideo's identity line gives ("<age> <gender>"): a person's word, whatever its age says. */
 const IDENTITY_GENDER = /^(?:male|female|non-?binary|man|woman|boy|girl)$/;
-/** An age rideo's identity line gives: "8", "72", "30s", "early 30s", "mid-40s", "6 years old". */
-const IDENTITY_AGE = /^(?:(?:early|mid|late)[- ]?)?\d{1,3}(?:'?s)?(?:[- ](?:years?|yrs?)(?:[- ]old)?)?$/;
 
 /**
- * The age and gender a cast member's description opens with as rideo writes them: its identity line,
- * "Name: <age> <gender>, <ethnicity>, <build>; <marks>; wearing …" (rideo's compactIdentity), whose
- * first item is the age and the gender ("45 male", "early 30s female", "8 girl", "6", "male"). Null
- * when the description does not open with the member's name, a colon and such an item.
+ * The line a cast member's description opens with after the member's name and a colon, as rideo
+ * writes its identity line ("Name: <age> <gender>, <ethnicity>, <build>; <marks>; wearing …." —
+ * rideo's compactIdentity, followed by its summary), and the text after it (accents folded, case
+ * kept). The line runs to its first sentence end (rideo/rules.ts sentenceBreak): a period inside a
+ * number ("1.85 m"), after a title ("Dr.", "Mr.", "Mrs.", "Ms.", "St.") or an initial, or after an
+ * abbreviation no capital follows ("approx. 160 cm", "e.g. a scar") does not end it, so whatever
+ * follows such a period is still the line, not the summary. Null when the description does not open
+ * with the name and a colon.
+ */
+export function identityLine(name: string, description: string): { line: string; rest: string } | null {
+  const own = foldText(name).trim().split(/\s+/).filter(Boolean);
+  if (!own.length) return null;
+  const text = foldText(description);
+  const opening = new RegExp(`^\\s*${own.map(escapeRe).join('\\s+')}\\s*:`, 'i').exec(text);
+  if (!opening) return null;
+  const after = text.slice(opening[0].length);
+  const end = sentenceBreak(after);
+  return { line: after.slice(0, end.end).trim(), rest: after.slice(end.next).trim() };
+}
+
+/**
+ * The age and gender a cast member's description opens with as rideo writes them: the first item of
+ * its identity line (identityLine), "<age> <gender>" ("45 male", "early 30s female", "8 girl", "6",
+ * "male", "early twenties female", "30-ish female"). A gender word last in it (male, female, man,
+ * woman, boy, girl, non-binary) makes it a person's line whatever the age says; without one, the item
+ * must be an age alone ("8", "thirty", "6 years old"). Null otherwise.
  */
 export function identityOf(name: string, description: string): { age: string; gender: string } | null {
-  const own = plainText(name).trim();
-  const t = plainText(description).trimStart();
-  if (!own || !t.startsWith(own)) return null;
-  const head = /^\s*:\s*([^,;.!?\n]*)/.exec(t.slice(own.length));
-  if (!head) return null;
-  const words = head[1].trim().split(/\s+/).filter(Boolean);
+  const id = identityLine(name, description);
+  if (!id) return null;
+  const words = plainText(id.line.split(/[,;]/)[0]).trim().split(/\s+/).filter(Boolean);
   const gender = IDENTITY_GENDER.test(words.at(-1) ?? '') ? words.pop()! : '';
   const age = words.join(' ');
-  if (age ? !IDENTITY_AGE.test(age) : !gender) return null;
+  if (!gender && !isAgeText(age)) return null;
   return { age, gender };
 }
 
 /**
  * The animal a cast member is by its own words, or null for a person (the actor kind of a member
  * without a kind hint, before what the shots say: who rides and holds what). The words read are the
- * description's first sentence (after rideo's "Name:" opening its identity line) and, when that says
- * neither a person nor an animal, the next sentence; then the name ("Duck"). In each, an animal counts
- * only when named before any person and before any word that makes it something the member has, does,
- * wears or is with: "A white duck" and "Pip: 3 male, small; golden fur. A golden retriever puppy." are
- * animals; "A farmer with a goat", "Mira: 8 girl, slim; a small bird tattoo …", "A girl in a rabbit
- * costume", "wearing a fox-fur hat" and "Deep in love with birds" are not. An identity line that
- * gives a gender (identityOf: "Tom: 45 male, stocky; bull neck, broken nose") is a person's: an animal
- * word in it is a feature ("bull neck", "doe eyes", "crow's feet", "a parrot on his shoulder"), and
- * neither it nor the name ("Wolf: 40 male, tall.") makes the member an animal; only the sentence after
- * it (rideo's summary: "Quackers: 2 female, small; white feathers. A curious white duck.") still can.
+ * description's first sentence (after rideo's "Name:" its identity line: identityLine) and, when that
+ * says neither a person nor an animal, the next sentence; then the name ("Duck"). Sentences end as
+ * rideo/rules.ts sentencesOf reads them: not at a period inside a number, after a title or an
+ * abbreviation. In each, an animal counts only when named before any person and before any word that
+ * makes it something the member has, does, wears, is with or resembles: "A white duck" and "Pip: 3
+ * male, small; golden fur. A golden retriever puppy." are animals; "A farmer with a goat", "Mira: 8
+ * girl, slim; a small bird tattoo …", "A girl in a rabbit costume", "wearing a fox-fur hat", "Jo:
+ * tall, thin; crow's feet.", "A crow-like old woman" and "Deep in love with birds" are not. An identity
+ * line that gives a gender (identityOf: "Tom: 45 male, stocky; bull neck, broken nose", "Dee: early
+ * twenties female; doe eyes") is a person's: an animal word in it is a feature ("bull neck", "doe
+ * eyes", "a parrot on his shoulder"), and neither it nor the name ("Wolf: 40 male, tall.") makes the
+ * member an animal; only the sentence after it (rideo's summary: "Quackers: 2 female, small; white
+ * feathers. A curious white duck.") still can.
  */
 export function animalOf(name: string, description: string): AnimalWords | null {
   const own = plainText(name).trim();
-  const sentences = description
-    .split(/[.!?\n]+/)
-    .map((x) => x.trim())
+  const id = identityLine(name, description);
+  const sentences = (id ? [id.line, ...sentencesOf(id.rest)] : sentencesOf(description))
     .filter(Boolean)
     .slice(0, 2);
-  if (sentences.length && own) {
-    const first = plainText(sentences[0]);
-    if (first.startsWith(own) && /^\s*:/.test(first.slice(own.length)))
-      sentences[0] = first.slice(own.length).replace(/^\s*:\s*/, '');
-  }
-  if (identityOf(name, description)?.gender) {
-    const next = sentences[1] ? sentenceKind(sentences[1]) : null;
+  if (id && identityOf(name, description)?.gender) {
+    const next = id.rest ? sentenceKind(sentencesOf(id.rest)[0] ?? '') : null;
     return next && next !== 'person' ? next : null;
   }
   for (const sentence of sentences) {
