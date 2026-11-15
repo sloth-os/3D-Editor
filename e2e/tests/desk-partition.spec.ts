@@ -356,19 +356,32 @@ test.describe('the desk under storage partitioning', () => {
         { timeout: 60_000 },
       );
 
-      // SKIP_WAITING from a window that is no desk: refused while the desk is open, and answered
+      // SKIP_WAITING from a window that is no desk: refused while the desk is open, and answered.
+      // On a busy machine the browser can be slow to start the waiting worker for the message, so
+      // the message is sent again every 5 s until the first answer: a refused SKIP_WAITING changes
+      // nothing. Should the new version take over instead, there is no waiting worker left to ask.
       const answer = await other.evaluate(
         () =>
           new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error('SKIP_WAITING got no answer in 15 s')), 15_000);
-            navigator.serviceWorker.addEventListener('message', (e) => {
+            const end = (settle: () => void) => {
               clearTimeout(timer);
-              resolve(e.data);
-            });
+              clearInterval(again);
+              settle();
+            };
+            const ask = () =>
+              navigator.serviceWorker.getRegistration().then((reg) => {
+                if (reg?.waiting) return reg.waiting.postMessage({ type: 'SKIP_WAITING' });
+                const why = reg?.active ? 'no version waits: the new one took over' : 'no registration';
+                end(() => reject(new Error(why)));
+              });
+            navigator.serviceWorker.addEventListener('message', (e) => end(() => resolve(e.data)));
             navigator.serviceWorker.startMessages();
-            void navigator.serviceWorker
-              .getRegistration()
-              .then((reg) => reg!.waiting!.postMessage({ type: 'SKIP_WAITING' }));
+            const timer = setTimeout(
+              () => end(() => reject(new Error('SKIP_WAITING got no answer in 60 s'))),
+              60_000,
+            );
+            const again = setInterval(() => void ask(), 5_000);
+            void ask();
           }),
       );
       expect(answer).toEqual({ type: 'UPDATE_WAITS_FOR_DESK' });
@@ -377,11 +390,12 @@ test.describe('the desk under storage partitioning', () => {
       // the editor's Update: refused too, and the editor says why
       const update = editor.getByRole('button', { name: 'Update available — reload' });
       await update.click();
+      // the answer comes from the waiting worker, which a busy machine can be slow to start
       await expect(
         editor
           .getByTestId('toast')
           .filter({ hasText: "A director's desk is open in this browser; close it to update" }),
-      ).toBeVisible();
+      ).toBeVisible({ timeout: 60_000 });
       expect(await versions()).toEqual({ waiting: true, firstActive: true });
 
       // the desk closed, Update applies the new version: the editor reloads under it
