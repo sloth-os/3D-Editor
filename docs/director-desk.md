@@ -362,9 +362,9 @@ undo step, and runs in a web worker as well as on the server:
   the person's age and gender (`Bo: 6 male` a child, `Tom: 72 male` an elder,
   `Ana: early 30s female` a woman; 3 and under a toddler, 12 and under a child, 65 and over an
   elder). The line runs to its first sentence end (see [Briefs](#limits-and-known-gaps) for where
-  a sentence ends): a period inside a number (`1.85 m`), after a personal title (`Dr.`, `Mrs.`),
-  after another title or an initial unless a capitalised sentence opener follows (`St. Ives`,
-  `J. Smith`), or after an abbreviation no capital follows (`approx. 160 cm`, `e.g. a scar`) does
+  a sentence ends): a period inside a number (`1.85 m`), after a title (`Dr.`, `Mrs.`, `St.`) or
+  an initial unless a capitalised sentence opener follows (`Dr. Okafor`, `St. Ives`, `J. Smith`),
+  or after an abbreviation no capital follows (`approx. 160 cm`, `e.g. a scar`) does
   not end it. An age may be written out: `early twenties`, `30-ish`, `thirty-something`,
   `18 months` (a toddler); early, mid and late put an age 2, 5 and 8 years into its decade, so
   `late sixties` or `late 60s` is an elder (teens, and words such as "elderly", are not read as an
@@ -786,11 +786,10 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   grabs the kite." gives the kite to nobody). Sentences are split in the text's own case, at ".",
   "!", "?", ";" or a line break, but not at a period inside a number, after an abbreviation no
   capital follows (`approx.`, `e.g.`; "in", "no", "max" and a few more only beside a number, as in
-  `6 ft 2 in.` or `No. 5`), after a personal title (`Dr.`, `Mr.`, `Mrs.`, `Ms.`, `Mx.`: what
-  follows is the name, so "Dr. An arrives." is one sentence), or after another title written with
-  a capital or an initial (`St. Ives`, `J. A. Smith`) unless the next word opens a sentence and is
-  written with a capital ("He", "The", "Then"), so "Exit at Gate C. Pip barks." and "Tom runs
-  along Elm St. in the rain." stay one sentence. A brief places nobody, so the cast starts on the
+  `6 ft 2 in.` or `No. 5`), or after a title written with a capital or an initial (`Dr. Okafor`,
+  `St. Ives`, `J. A. Smith`) unless the next word opens a sentence and is written with a capital
+  ("He", "The", "Then"), so "Exit at Gate C. Pip barks." and "Tom runs along Elm St. in the rain."
+  stay one sentence, but "Dr. An arrives." is two. A brief places nobody, so the cast starts on the
   planned sides or in a row and moves only as it is staged afterwards (`desk.actor_move` …). An
   update keeps hand edits of unchanged shots and the desk's cut order but does not follow a new
   order of the brief, and a recast or replanned shot's camera is solved again unless it was set by

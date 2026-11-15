@@ -316,30 +316,24 @@ describe('rideo reading rules', () => {
     expect(moveOfMovement('pan', 'The camera pans down Elm St. as Mira runs left.')).toBe('pan_left');
   });
 
-  // after a personal title (Dr., Mr., Mrs., Ms., Mx.; not St., which may be a street) the word written
-  // with a capital is the person's name, even one that may open a sentence ("Dr. An", "Mr. Soon")
-  it("reads the word after a personal title as the person's name", () => {
+  // any title ends its sentence before a capitalised word that opens one, "Dr." and "Ms." too: they
+  // may be a street ("Ocean Dr.") or capitals that spell one ("MS", "the DR")
+  it('ends a sentence after a street, an illness or a country spelled like a title', () => {
     expect(
-      ['Dr. An arrives.', 'Mr. Soon waves.', 'She has an M.S. The work was hard.'].map((t) =>
-        sentencesOf(t, true),
-      ),
+      [
+        'Mira skates down Ocean Dr. He grabs the kite.',
+        'Ruth has MS. She walks with a cane.',
+        'Tom drives to the DR. He swims.',
+      ].map((t) => sentencesOf(t, true)),
     ).toEqual([
-      ['Dr. An arrives'],
-      ['Mr. Soon waves'],
-      // initials that spell a title are initials
-      ['She has an M.S', 'The work was hard'],
+      ['Mira skates down Ocean Dr', 'He grabs the kite'],
+      ['Ruth has MS', 'She walks with a cane'],
+      ['Tom drives to the DR', 'He swims'],
     ]);
-    const tom = { id: 'tom', name: 'Tom' };
-    const an = { id: 'an', name: 'Dr. An' };
-    const soon = { id: 'soon', name: 'Mr. Soon' };
+    // "He" is not followed back to Mira: the kite goes to nobody
+    const mira = { id: 'mira', name: 'Mira' };
     const kite = { id: 'kite', name: 'Kite' };
-    const pepper = { id: PEPPER, name: 'Pepper', kind: 'pony' as const };
-    expect(holdersByText('Dr. An grabs the kite.', [an, tom], [kite])).toEqual([
-      { holder: 'an', prop: 'kite' },
-    ]);
-    expect(ridersByText('Mr. Soon rides Pepper.', [soon, tom], [pepper])).toEqual([
-      { rider: 'soon', mount: PEPPER },
-    ]);
+    expect(holdersByText('Mira skates down Ocean Dr. He grabs the kite.', [mira], [kite])).toEqual([]);
   });
 
   // shot texts are split in their own case before they are lowered: lowered, "walks in. he" and
