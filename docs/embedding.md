@@ -418,15 +418,14 @@ export's progress with **Cancel**. They keep one line at every width, Done and C
 frame whatever the host's name (it may have 40 characters): where the header is narrow the scene's
 name, the notes and the host's name in Send are cut short, and on a phone Follow has no label, Send
 says just "Send" (the host's name in its tooltip) and Close is its icon. It has no top-bar menus,
-workspaces, project list, presence,
-share or update button, Console, Diagnostics, UV editor, Dope Sheet or Properties editor; the
-viewport's menus grey out what it hides (Import…). The desk ignores their keys: Ctrl/Cmd+S and
-Ctrl/Cmd+O do nothing at all (not the browser's Save Page or Open File either, also on a keyboard
-layout without Latin letters, where the browser takes the keys of S and O for them), and the others
-keep what the browser does with them (F3 finds in the page). Which panels are open, and
-their sizes, it keeps under its own keys of the browser's storage (`3d-editor:desk:panel:*`,
-`3d-editor:desk:size:*`), never the editor's. When the scene opens the desk looks through the first
-shot's camera.
+workspaces, project list, presence, share or update button, Console, Diagnostics, UV editor, Dope
+Sheet or Properties editor; the viewport's menus grey out what it hides (Import…). The desk ignores
+their keys: Ctrl/Cmd+S and Ctrl/Cmd+O do nothing at all (not the browser's Save Page or Open File
+either, also on a keyboard layout without Latin letters, where the browser takes the keys of S and O
+for them), and the others keep what the browser does with them (F3 finds in the page). Which panels
+are open, and their sizes, it keeps under its own keys of the browser's storage
+(`3d-editor:desk:panel:*`, `3d-editor:desk:size:*`), never the editor's. When the scene opens the
+desk looks through the first shot's camera.
 
 ### Projects per host and scene
 
