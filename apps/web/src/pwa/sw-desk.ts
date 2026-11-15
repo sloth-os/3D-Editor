@@ -102,7 +102,7 @@ export function withWorkerCoep(response: Response, destination: string): Respons
 
 /**
  * The type of the message the service worker sends the window whose Update (SKIP_WAITING) a desk
- * page keeps waiting (answerSkipWaiting): the editor says why nothing happened (pwa/register.ts).
+ * page keeps waiting (answerSkipWaiting): the editor says why nothing happened (pwa/update-waits.ts).
  */
 export const UPDATE_WAITS_FOR_DESK = 'UPDATE_WAITS_FOR_DESK';
 

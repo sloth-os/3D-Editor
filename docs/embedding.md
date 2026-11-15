@@ -826,7 +826,9 @@ Where the contract leaves room, the desk takes the most robust reading:
   framed desk sees none of its origin's first-party storage), that the desk registers its service
   worker in a cross-site host's partition and loads, stages and exports there offline, and that a
   change of `DESK_EMBED_ORIGINS` reaches a browser whose service worker holds the desk, online at
-  once and offline after. Run it the same way, after `npm run build`.
+  once and offline after, and that a new version of the app waits while a desk page is open in the
+  partition (the editor's Update says why) and takes over once the desk is closed. Run it the same
+  way, after `npm run build`.
 
 A host should check, besides its own logic, that it:
 
