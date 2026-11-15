@@ -29,7 +29,13 @@ import {
   serverExportReason,
   type ExportSettings,
 } from '../src/ui/dialogs/ExportVideoDialog';
-import { browserJob, clearBrowserJob, type BrowserJob } from '../src/ui/dialogs/browser-export-job';
+import {
+  browserJob,
+  cancelBrowserJob,
+  clearBrowserJob,
+  startBrowserJob,
+  type BrowserJob,
+} from '../src/ui/dialogs/browser-export-job';
 import {
   BrowserExportError,
   type BrowserExportFile,
@@ -53,6 +59,8 @@ const browser = vi.hoisted(() => ({
   start: null as null | ((req: unknown, hooks: unknown) => Promise<unknown>),
   zipped: [] as unknown[],
   released: [] as string[],
+  /** A release that takes a while (deleting an export's directory on disk). */
+  releaseWait: null as Promise<void> | null,
 }));
 vi.mock('../src/export', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../src/export')>();
@@ -66,6 +74,7 @@ vi.mock('../src/export', async (importOriginal) => {
     },
     releaseBrowserExport: async (r: { id: string } | string) => {
       browser.released.push(typeof r === 'string' ? r : r.id);
+      if (browser.releaseWait) await browser.releaseWait;
     },
   };
 });
@@ -425,7 +434,10 @@ describe('export files and status texts', () => {
     expect(browserPreviewFile(files)?.name).toBe('sequence.mp4');
     expect(browserPreviewFile(files.filter((x) => x.kind !== 'sequence'))?.name).toBe('shot-01-wide.mp4');
     const j = (over: Partial<BrowserJob>): BrowserJob => ({
+      id: 1,
       project: 'p',
+      projectName: 'P',
+      shotNames: {},
       label: null,
       status: 'running',
       progress: null,
@@ -519,6 +531,7 @@ describe('Export Video window', () => {
     browser.start = null;
     browser.zipped = [];
     browser.released = [];
+    browser.releaseWait = null;
     browserJob.value = null;
     URL.createObjectURL = vi.fn(() => `blob:test/${++urls}`);
     URL.revokeObjectURL = vi.fn();
@@ -862,10 +875,232 @@ describe('Export Video window', () => {
     expect(byTestId(container, 'export-video-settings')).not.toBeNull();
   });
 
-  it('closes on Escape (the export goes on on the server)', async () => {
-    await open();
+  it('closes on Escape, and an export on the server goes on and is followed again', async () => {
+    const { container } = await open();
+    await waitFor(() => expect(byTestId(container, 'export-video-settings')).not.toBeNull());
+    fireEvent.click(byTestId(container, 'export-video-where-server')!);
+    statusAnswers = [job({ status: 'running' })];
+    fireEvent.click(byTestId(container, 'export-video-start')!);
+    await waitFor(() => expect(byTestId(container, 'export-video-cancel')).not.toBeNull());
     expect(dialog.value).toBe('export-video');
     fireEvent.keyDown(document.body, { key: 'Escape' });
     expect(dialog.value).toBeNull();
+    // nothing was cancelled; the window opened again follows the export
+    expect(deleted).toEqual([]);
+    cleanup();
+    const again = await open();
+    await waitFor(() => expect(byTestId(again.container, 'export-video-cancel')).not.toBeNull());
+    expect(byTestId(again.container, 'export-video-job')!.getAttribute('data-where')).toBeNull();
+  });
+
+  /** An export on this device that runs until it is cancelled (its hooks kept). */
+  const endless = () => {
+    const runs: { req: BrowserExportRequest; hooks: BrowserExportHooks }[] = [];
+    browser.start = (req, h) => {
+      const hooks = h as BrowserExportHooks;
+      runs.push({ req: req as BrowserExportRequest, hooks });
+      return new Promise((_resolve, reject) =>
+        hooks.signal!.addEventListener('abort', () =>
+          reject(new BrowserExportError('The export was cancelled', 'CANCELLED')),
+        ),
+      );
+    };
+    return runs;
+  };
+
+  it('closes during an export on this device, which goes on and is followed again', async () => {
+    const runs = endless();
+    const first = await open();
+    await waitFor(() =>
+      expect((byTestId(first.container, 'export-video-start') as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(byTestId(first.container, 'export-video-start')!);
+    await waitFor(() => expect(runs).toHaveLength(1));
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    expect(dialog.value).toBeNull();
+    expect(runs[0].hooks.signal!.aborted).toBe(false);
+    cleanup();
+    const again = await open();
+    await waitFor(() =>
+      expect(byTestId(again.container, 'export-video-job')!.getAttribute('data-status')).toBe('running'),
+    );
+    await act(() => runs[0].hooks.onProgress!({ phase: 'render', done: 9, total: 72, shot: CLOSE }));
+    expect(byTestId(again.container, 'export-video-status')!.textContent).toMatch(
+      /^Rendering frame 10 of 72 · shot Close/,
+    );
+    fireEvent.click(byTestId(again.container, 'export-video-cancel')!);
+    expect(runs[0].hooks.signal!.aborted).toBe(true);
+    await waitFor(() =>
+      expect(byTestId(again.container, 'export-video-status')!.textContent).toMatch(/^Cancelled/),
+    );
+  });
+
+  it('starts one export on this device at a time: a double press starts one, a second start is refused', async () => {
+    const runs = endless();
+    const { container } = await open();
+    await waitFor(() =>
+      expect((byTestId(container, 'export-video-start') as HTMLButtonElement).disabled).toBe(false),
+    );
+    const button = byTestId(container, 'export-video-start')!;
+    // two presses before the window renders again
+    fireEvent.click(button);
+    fireEvent.click(button);
+    await waitFor(() => expect(byTestId(container, 'export-video-cancel')).not.toBeNull());
+    await act(() => new Promise((r) => setTimeout(r, 20)));
+    expect(runs).toHaveLength(1);
+    expect(byTestId(container, 'export-video-error')).toBeNull();
+    expect(byTestId(container, 'export-video-job')!.getAttribute('data-status')).toBe('running');
+    // a start from code while it runs is refused, naming the export
+    await expect(startBrowserJob(sessionSignal.value!, { shots: 'all' }, null)).rejects.toThrow(
+      'An export of Kite Day is running on this device: wait for it, or cancel it first.',
+    );
+    expect(runs).toHaveLength(1);
+    fireEvent.click(byTestId(container, 'export-video-cancel')!);
+    await waitFor(() => expect(byTestId(container, 'export-video-new')).not.toBeNull());
+  });
+
+  it("refuses a second start while the previous export's files are deleted, and releases them once", async () => {
+    // a finished export whose files take a while to delete (its directory on disk)
+    let finish!: (r: BrowserExportResult) => void;
+    browser.start = () => new Promise((resolve) => (finish = resolve));
+    const session = sessionSignal.value!;
+    const first = startBrowserJob(session, { shots: 'all' }, null);
+    await waitFor(() => expect(typeof finish).toBe('function'));
+    finish(browserResult());
+    await first;
+    expect(browserJob.value?.status).toBe('done');
+    const oldUrls = Object.values(browserJob.value!.urls);
+    let deleted!: () => void;
+    browser.releaseWait = new Promise<void>((r) => (deleted = r));
+    const runs = endless();
+    // two starts while the files are deleted: the second is refused at once
+    const a = startBrowserJob(session, { shots: 'all' }, null);
+    await expect(startBrowserJob(session, { shots: 'all' }, null)).rejects.toThrow(
+      /^An export of Kite Day is running on this device/,
+    );
+    expect(browserJob.value?.status).toBe('running');
+    deleted();
+    await waitFor(() => expect(runs).toHaveLength(1));
+    expect(browser.released).toEqual(['local-1']);
+    expect(
+      vi
+        .mocked(URL.revokeObjectURL)
+        .mock.calls.map(([u]) => u)
+        .sort(),
+    ).toEqual([...oldUrls].sort());
+    // the snapshot was taken when the export was asked for, not after the delete
+    expect(runs[0].req.update).toBeInstanceOf(Uint8Array);
+    cancelBrowserJob();
+    await a;
+    expect(browserJob.value?.status).toBe('cancelled');
+  });
+
+  it("revokes the previous export's object URLs when a new export starts", async () => {
+    let finish!: (r: BrowserExportResult) => void;
+    browser.start = () => new Promise((resolve) => (finish = resolve));
+    const { container } = await open();
+    await waitFor(() =>
+      expect((byTestId(container, 'export-video-start') as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(byTestId(container, 'export-video-start')!);
+    await waitFor(() => expect(typeof finish).toBe('function'));
+    await act(async () => finish(browserResult()));
+    await waitFor(() => expect(byTestId(container, 'export-video-files')).not.toBeNull());
+    const urls = Object.values(browserJob.value!.urls);
+    expect(urls).toHaveLength(browserResult().files.length);
+    expect(URL.revokeObjectURL).not.toHaveBeenCalled();
+    endless();
+    fireEvent.click(byTestId(container, 'export-video-new')!);
+    fireEvent.click(byTestId(container, 'export-video-start')!);
+    await waitFor(() => expect(browser.released).toEqual(['local-1']));
+    expect(
+      vi
+        .mocked(URL.revokeObjectURL)
+        .mock.calls.map(([u]) => u)
+        .sort(),
+    ).toEqual([...urls].sort());
+  });
+
+  it('shows why an export on this device failed', async () => {
+    browser.start = async () => {
+      throw new BrowserExportError(
+        'The export was not started: it needs about 3.1 GB of memory with one render worker, more than the 2.0 GB a render may use in this tab',
+        'OUT_OF_MEMORY',
+      );
+    };
+    const { container } = await open();
+    await waitFor(() =>
+      expect((byTestId(container, 'export-video-start') as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(byTestId(container, 'export-video-start')!);
+    await waitFor(() =>
+      expect(byTestId(container, 'export-video-job')!.getAttribute('data-status')).toBe('failed'),
+    );
+    const status = byTestId(container, 'export-video-status')!;
+    expect(status.className).toBe('error-text');
+    expect(status.textContent).toMatch(
+      /^Failed: The export was not started: it needs about 3\.1 GB of memory/,
+    );
+    expect(byTestId(container, 'export-video-new')).not.toBeNull();
+  });
+
+  it("shows another project's running export in this project's window, with its progress and Cancel", async () => {
+    const runs = endless();
+    const first = await open();
+    await waitFor(() =>
+      expect((byTestId(first.container, 'export-video-start') as HTMLButtonElement).disabled).toBe(false),
+    );
+    fireEvent.click(byTestId(first.container, 'export-video-start')!);
+    await waitFor(() => expect(runs).toHaveLength(1));
+    fireEvent.keyDown(document.body, { key: 'Escape' });
+    cleanup();
+    // another project opens in the tab (no reload: the export goes on)
+    const other = projectDoc(false);
+    sessionSignal.value = {
+      ...fakeSession(other),
+      id: 'proj-2',
+      title: { value: 'Other' },
+    } as unknown as ProjectSession;
+    const second = await open();
+    await waitFor(() => expect(byTestId(second.container, 'export-video-job')).not.toBeNull());
+    expect(byTestId(second.container, 'export-video-start')).toBeNull();
+    expect(byTestId(second.container, 'export-video-other-project')!.textContent).toBe(
+      'This export is of Kite Day: this tab runs one export on this device at a time.',
+    );
+    // its shots are named as in its project
+    await act(() => runs[0].hooks.onProgress!({ phase: 'render', done: 3, total: 72, shot: WIDE }));
+    expect(byTestId(second.container, 'export-video-status')!.textContent).toMatch(
+      /^Rendering frame 4 of 72 · shot Wide/,
+    );
+    fireEvent.click(byTestId(second.container, 'export-video-cancel')!);
+    expect(runs[0].hooks.signal!.aborted).toBe(true);
+    await waitFor(() =>
+      expect(byTestId(second.container, 'export-video-status')!.textContent).toMatch(/^Cancelled/),
+    );
+    // the export it followed stays shown until New Export
+    expect(byTestId(second.container, 'export-video-other-project')).not.toBeNull();
+    fireEvent.click(byTestId(second.container, 'export-video-new')!);
+    expect(byTestId(second.container, 'export-video-settings')).not.toBeNull();
+  });
+
+  it("says in the Quality buttons' tooltip how the export that would run encodes", async () => {
+    const { container } = await open();
+    await waitFor(() => expect(byTestId(container, 'export-video-settings')).not.toBeNull());
+    const title = () => byTestId(container, 'export-video-quality')!.getAttribute('title');
+    // this device: a bit rate (1920×1080 at 24 fps, standard), no CRF
+    expect(title()).toBe(
+      '2 samples, shadows and ambient occlusion; this device encodes H.264 at 3.7 Mbit/s (0.09 bits per pixel and frame at 1280×720)',
+    );
+    fireEvent.click(byTestId(container, 'export-video-codec-vp9')!);
+    expect(title()).toMatch(
+      /; this device encodes VP9 at quantizer 33 \(where the browser has no VP9 encoder, H\.264 at /,
+    );
+    fireEvent.click(byTestId(container, 'export-video-where-server')!);
+    expect(title()).toBe('2 samples, shadows and ambient occlusion; the server encodes VP9 at CRF 33');
+    fireEvent.click(byTestId(container, 'export-video-codec-h264')!);
+    fireEvent.click(byTestId(container, 'export-video-quality-high')!);
+    expect(title()).toBe(
+      '4 samples up to 1280×720 (else 2), shadows and ambient occlusion; the server encodes H.264 at CRF 18 (x264 preset slow)',
+    );
   });
 });

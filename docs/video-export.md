@@ -65,7 +65,10 @@ the tab is hidden, and the export asks for it again each time the tab is shown).
 lists the files as download links with a preview of the sequence, and **Download all (.zip)** saves
 them as one ZIP archive (stored: the videos and PNGs are compressed already). The files stay until
 the next export on this device, or until the tab closes (a later export deletes the files of closed
-tabs). An export goes on when the window is closed, as long as the tab stays open.
+tabs). An export goes on when the window is closed, as long as the tab stays open. A tab runs one
+export on this device at a time, whichever project it exports: the export is registered as Export
+is pressed (a second press starts nothing), and while it runs every project's window shows it, with
+its progress and Cancel, instead of offering Export.
 
 **Requirements**: a secure page (HTTPS, or `localhost`; browsers offer WebCodecs and the Origin
 Private File System only there), Web Workers, and a WebCodecs `VideoEncoder` that encodes H.264 at
