@@ -23,7 +23,6 @@ import {
   runDeskExport,
   shotExportParams,
   shotResultOf,
-  wakeLockAllowed,
   type DeskExportProgress,
   type DeskExportRequest,
   type ExportEngine,
@@ -477,29 +476,6 @@ describe("the Send check's lengths on a staged scene", () => {
     expect(lengthChecks(doc, EXAMPLE())).toEqual([
       { shotId: a, name: shots[0].name, frames: 84, briefFrames: 72, byBrief: false },
     ]);
-  });
-});
-
-describe('the wake lock', () => {
-  it("is asked for only where the permissions policy allows 'screen-wake-lock'", () => {
-    const policy = (allowed: boolean) => ({
-      allowsFeature: (f: string) => (f === 'screen-wake-lock' ? allowed : true),
-    });
-    expect(wakeLockAllowed({ permissionsPolicy: policy(false) })).toBe(false);
-    expect(wakeLockAllowed({ permissionsPolicy: policy(true) })).toBe(true);
-    // the older name of the same interface
-    expect(wakeLockAllowed({ featurePolicy: policy(false) })).toBe(false);
-    // where the browser cannot tell, the request decides
-    expect(wakeLockAllowed({})).toBe(true);
-    expect(
-      wakeLockAllowed({
-        permissionsPolicy: {
-          allowsFeature: () => {
-            throw new Error('unknown feature');
-          },
-        },
-      }),
-    ).toBe(true);
   });
 });
 

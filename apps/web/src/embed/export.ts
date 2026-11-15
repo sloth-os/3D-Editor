@@ -296,25 +296,6 @@ export function lengthChecks(doc: SceneDoc, brief: SceneBrief): LengthCheck[] {
   return out;
 }
 
-// ---------------------------------------------------------------- the screen's wake lock
-
-/**
- * Whether this document may keep the screen on (the permissions policy's 'screen-wake-lock'): a
- * framed desk may only where its iframe's `allow` names it. True where the browser cannot tell (the
- * request is then refused if it may not).
- */
-export function wakeLockAllowed(doc: unknown = globalThis.document): boolean {
-  type Policy = { allowsFeature?: (feature: string) => boolean };
-  const d = doc as { permissionsPolicy?: Policy; featurePolicy?: Policy } | undefined;
-  const policy = d?.permissionsPolicy ?? d?.featurePolicy;
-  if (!policy || typeof policy.allowsFeature !== 'function') return true;
-  try {
-    return policy.allowsFeature('screen-wake-lock') !== false;
-  } catch {
-    return true;
-  }
-}
-
 // ---------------------------------------------------------------- the export
 
 /** The engine the desk's export runs on (tests give a fake one). */
