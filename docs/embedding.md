@@ -409,12 +409,15 @@ Inside the frame the desk is the editor's Director workspace, focused: the viewp
 through the shot cameras, the shot list and inspector with each shot's issues, the sequence strip,
 the timeline and playback, the staging tools and the Asset Browser with the built-in models, under
 a compact header: the scene's name, where it was opened from and whether the host has its latest
-state, the brief's changes with **Update shots**, **Send to …** (the host's name), **Done** and
-**Close**, and an export's progress with **Cancel**. It has no top-bar menus, workspaces, project
-list, presence, share or update button, Console, Diagnostics, UV editor, Dope Sheet or Properties
-editor; the viewport's menus grey out what it hides (Import…). The desk ignores their keys:
-Ctrl/Cmd+S and Ctrl/Cmd+O do nothing at all (not the browser's Save Page or Open File either), and
-the others keep what the browser does with them (F3 finds in the page). Which panels are open, and
+state, the brief's changes with **Update shots**, **Follow** (the reference clip **Send** renders,
+when the host takes more than one), **Send to …** (the host's name), **Done** and **Close**, and an
+export's progress with **Cancel**. On a phone they keep one line: Follow without its label, the
+scene's name and the notes cut short. It has no top-bar menus, workspaces, project list, presence,
+share or update button, Console, Diagnostics, UV editor, Dope Sheet or Properties editor; the
+viewport's menus grey out what it hides (Import…). The desk ignores their keys: Ctrl/Cmd+S and
+Ctrl/Cmd+O do nothing at all (not the browser's Save Page or Open File either, also on a keyboard
+layout without Latin letters, where the browser takes the keys of S and O for them), and the others
+keep what the browser does with them (F3 finds in the page). Which panels are open, and
 their sizes, it keeps under its own keys of the browser's storage (`3d-editor:desk:panel:*`,
 `3d-editor:desk:size:*`), never the editor's. When the scene opens the desk looks through the first
 shot's camera.

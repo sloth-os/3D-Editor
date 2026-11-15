@@ -760,11 +760,16 @@ test.describe('the embeddable desk', () => {
     await page.setViewportSize({ width: 390, height: 844 });
     await openHost(page);
     await waitFor(page, 'ready');
+    // three modes: Follow shows
     await send(page, { type: 'open', scene: smallBrief(), state: null, options: OPTIONS });
     await waitFor(page, 'opened', 1, 120_000);
+    await waitFor(page, 'state');
     const frame = await deskFrame(page);
+    // the header's note says where the state went (the longest the header gets)
+    await expect(frame.getByTestId('desk-state-sent')).toBeVisible();
     for (const id of [
       'desk-scene-name',
+      'desk-mode',
       'desk-send',
       'desk-done',
       'desk-close',
@@ -773,10 +778,14 @@ test.describe('the embeddable desk', () => {
     ])
       await expect(frame.getByTestId(id)).toBeVisible();
     await expect(frame.getByTestId('director-panel')).toBeHidden();
-    for (const id of ['desk-send', 'desk-done', 'desk-close']) {
+    // Follow, Send, Done and Close on one line within the width
+    const header = (await frame.getByTestId('desk-header').boundingBox())!;
+    for (const id of ['desk-mode', 'desk-send', 'desk-done', 'desk-close']) {
       const box = (await frame.getByTestId(id).boundingBox())!;
       expect(box.x + box.width).toBeLessThanOrEqual(390);
+      expect(box.y + box.height).toBeLessThanOrEqual(header.y + header.height);
     }
+    await expect(frame.getByTestId('desk-mode')).toHaveValue('camera');
     expect(await frame.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
     await frame.getByTestId('bottom-tab-shots').click();
     await expect(frame.locator('[data-testid="shot-list"]:visible')).toHaveCount(1);

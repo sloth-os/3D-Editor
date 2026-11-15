@@ -307,6 +307,33 @@ describe('the keys the desk ignores', () => {
     expect(messages()).toEqual([]);
   });
 
+  it('keeps them by the key pressed on a layout without Latin letters, and only there', () => {
+    desk(false);
+    off = installKeymap({ ignore: DESK_IGNORED_KEYS });
+    // with Alt (AltGr is Ctrl+Alt) or Shift they are other keys
+    expect(press({ key: 'ы', code: 'KeyS', ctrlKey: true, altKey: true })).toBe(false);
+    expect(press({ key: 'Ы', code: 'KeyS', ctrlKey: true, shiftKey: true })).toBe(false);
+    // a Latin layout names the shortcut by its letter: Dvorak's O key types r (Ctrl+R reloads) and
+    // its S key types o (Ctrl+O, kept)
+    expect(press({ key: 'r', code: 'KeyO', ctrlKey: true })).toBe(false);
+    expect(press({ key: 'o', code: 'KeyS', ctrlKey: true })).toBe(true);
+    // Russian: Ctrl/Cmd and the S or O key type ы and щ; the browser takes them as Ctrl+S, Ctrl+O
+    for (const k of [
+      { key: 'ы', code: 'KeyS', ctrlKey: true },
+      { key: 'ы', code: 'KeyS', metaKey: true },
+      { key: 'щ', code: 'KeyO', ctrlKey: true },
+      { key: 'щ', code: 'KeyO', metaKey: true },
+      // Greek
+      { key: 'σ', code: 'KeyS', ctrlKey: true },
+    ]) {
+      expect(press(k)).toBe(true);
+      expect(press(k, input)).toBe(true);
+    }
+    // the same keys without Ctrl/Cmd are typing
+    expect(press({ key: 'ы', code: 'KeyS' }, input)).toBe(false);
+    expect(messages()).toEqual([]);
+  });
+
   it('leaves the browser its own keys the desk ignores (find, developer tools)', () => {
     desk(false);
     off = installKeymap({ ignore: DESK_IGNORED_KEYS });
@@ -334,6 +361,7 @@ describe('the keys the desk ignores', () => {
     off = installKeymap();
     expect(press(ctrlS, input)).toBe(false);
     expect(press(ctrlO, input)).toBe(false);
+    expect(press({ key: 'ы', code: 'KeyS', ctrlKey: true }, input)).toBe(false);
   });
 });
 

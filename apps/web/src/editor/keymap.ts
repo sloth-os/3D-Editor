@@ -199,9 +199,21 @@ export const TYPING_PAUSE_MS = 1500;
  * Keys of the editor whose browser default acts on the page itself: Save Page As (Ctrl/Cmd+S) and
  * the file chooser whose file the tab opens in place of the page (Ctrl/Cmd+O). A page that ignores
  * them (the embeddable desk: it has no Save or Open) still keeps them from the browser, wherever the
- * focus is.
+ * focus is, and on a layout without Latin letters too (keptCombo()).
  */
 export const KEPT_FROM_BROWSER: ReadonlySet<string> = new Set(['Ctrl+S', 'Ctrl+O']);
+
+/**
+ * The combination a key press is to the browser's own shortcuts (combo() names it by the letter the
+ * layout types). A layout whose key types no Latin letter (Cyrillic, Greek, Hebrew, ...) leaves the
+ * browser the key's letter on a US keyboard: Ctrl+Ы is Ctrl+S to it, so it saves the page. A key
+ * that types a Latin letter is that letter's shortcut (Dvorak's Ctrl+R on the O key reloads).
+ */
+function keptCombo(e: KeyboardEvent): string {
+  const letter = /^Key([A-Z])$/.exec(e.code);
+  if (!letter || !(e.ctrlKey || e.metaKey) || e.altKey || /^[a-z]$/i.test(e.key)) return combo(e);
+  return ['Ctrl', ...(e.shiftKey ? ['Shift'] : []), letter[1]].join('+');
+}
 
 /**
  * Installs the window-level keymap. `ignore`: key combinations (as combo() names them, e.g.
@@ -216,7 +228,7 @@ export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () =
   const onKept = (e: KeyboardEvent) => {
     // a keydown without a key (browsers' autofill sends some to the field it fills) is none of them
     if (typeof e.key !== 'string' || typeof e.code !== 'string') return;
-    if (kept.includes(combo(e))) e.preventDefault();
+    if (kept.includes(keptCombo(e))) e.preventDefault();
   };
   // The field keys are being typed into, while the typing goes on. When it is taken away under the
   // person's fingers (an agent made another object active, ran another operation, removed what it

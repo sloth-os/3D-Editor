@@ -20,9 +20,10 @@ import './desk.css';
  * the viewport through the shot cameras, the shot list and inspector with each shot's issues, the
  * sequence strip, the timeline and playback, the staging tools and the Asset Browser — under a
  * compact header: the scene's name, where it came from and whether the host has its latest state,
- * the brief's changes with Update shots, Send to <host>, Done and Close, and an export's progress
- * with Cancel. No menus, workspaces, project list, presence, share, update button, Console,
- * Diagnostics, UV, Dope Sheet or Properties.
+ * the brief's changes with Update shots, Follow (the reference clip Send renders, when the host
+ * takes more than one), Send to <host>, Done and Close, and an export's progress with Cancel; on a
+ * phone they keep one line (Follow without its label, the notes cut short). No menus, workspaces,
+ * project list, presence, share, update button, Console, Diagnostics, UV, Dope Sheet or Properties.
  *
  * The viewport's keys (X and Delete, G/R/S, …) act only while the pointer or the focus is in the
  * viewport: the header, the banners and the Director column say so on pointer and focus as the
@@ -336,14 +337,15 @@ function DeskHeader(p: { c: DeskController; lengthChecks: () => LengthCheck[] })
       <div class="desk-actions">
         {open && options.modes.length > 1 && (
           <label
-            class="desk-mode hide-narrow"
+            class="desk-mode"
             title={`The reference clip Send renders for each shot (${options.hostName} takes ${options.modes
               .map((m) => MODE_LABEL[m])
               .join(', ')})`}
           >
-            <span>Follow</span>
+            <span class="hide-narrow">Follow</span>
             <select
               value={mode}
+              aria-label="Follow"
               data-testid="desk-mode"
               onChange={(e) => (c.mode.value = (e.currentTarget as HTMLSelectElement).value as Mode)}
             >

@@ -226,7 +226,8 @@
   align-items: center;
 }
 
-/* phones (the editor's phone layout starts at 760 px): the header keeps its buttons on one line */
+/* phones (the editor's phone layout starts at 760 px): the header keeps its buttons and Follow on
+   one line, the scene's name and notes cut short to make room */
 @media (max-width: 760px) {
   .hide-narrow {
     display: none !important;
@@ -234,6 +235,15 @@
   .desk-header {
     padding: 2px 6px;
     gap: 4px;
+  }
+  .desk-title .desk-pill {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .desk-mode {
+    margin-right: 0;
   }
   .desk-actions .btn {
     padding-left: 6px;
