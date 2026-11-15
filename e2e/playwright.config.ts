@@ -14,6 +14,44 @@ export const WEBDAV = { url: `http://127.0.0.1:${PORTS.webdav}`, username: 'edit
 
 const common = { PUBLIC_DIR: publicDir, LOG_LEVEL: 'warn', HOST: '127.0.0.1' };
 
+/** Software WebGL in headless Chromium. */
+const GL_ARGS = [
+  '--use-gl=angle',
+  '--use-angle=swiftshader',
+  '--enable-unsafe-swiftshader',
+  '--ignore-gpu-blocklist',
+];
+const VIEWPORT = { width: 1400, height: 860 };
+
+/**
+ * The features Playwright 1.63 turns off in Chromium by default (its chromiumSwitches.ts), one of
+ * them third-party storage partitioning, which every browser applies in use: a framed page's
+ * storage, service worker and caches are kept per top-level site. The desk's specs need it as in
+ * production, so their project drops this default switch and passes the same list without
+ * ThirdPartyStoragePartitioning (desk-partition.spec.ts fails if partitioning is off, e.g. once a
+ * Playwright upgrade changes this list).
+ */
+const PLAYWRIGHT_DISABLED_FEATURES = [
+  'AvoidUnnecessaryBeforeUnloadCheckSync',
+  'DestroyProfileOnBrowserClose',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'HttpsUpgrades',
+  'LensOverlay',
+  'MediaRouter',
+  'PaintHolding',
+  'ThirdPartyStoragePartitioning',
+  'BlockOriginHeaderModificationOnRedirect',
+  'Translate',
+  'AutoDeElevate',
+  'OptimizationHints',
+  'msForceBrowserSignIn',
+  'msEdgeUpdateLaunchServicesPreferredVersion',
+];
+const disableFeatures = (features: string[]) => `--disable-features=${features.join(',')}`;
+/** The desk's specs (desk-*.spec.ts): their own project, with storage partitioning on. */
+const DESK_SPECS = /[\\/]desk-[^\\/]*\.spec\.ts$/;
+
 /**
  * Real end-to-end setup: the production builds of the web app and server, a real WebDAV
  * server, and real Chromium (WebGL via SwiftShader in headless mode).
@@ -32,18 +70,32 @@ export default defineConfig({
   use: {
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
-    viewport: { width: 1400, height: 860 },
-    launchOptions: {
-      args: [
-        '--use-gl=angle',
-        '--use-angle=swiftshader',
-        '--enable-unsafe-swiftshader',
-        '--ignore-gpu-blocklist',
-      ],
-    },
+    viewport: VIEWPORT,
+    launchOptions: { args: GL_ARGS },
   },
   projects: [
-    { name: 'chromium', use: { ...devices['Desktop Chrome'], viewport: { width: 1400, height: 860 } } },
+    {
+      name: 'chromium',
+      testIgnore: DESK_SPECS,
+      use: { ...devices['Desktop Chrome'], viewport: VIEWPORT },
+    },
+    {
+      name: 'desk',
+      testMatch: DESK_SPECS,
+      use: {
+        ...devices['Desktop Chrome'],
+        viewport: VIEWPORT,
+        launchOptions: {
+          ignoreDefaultArgs: [disableFeatures(PLAYWRIGHT_DISABLED_FEATURES)],
+          args: [
+            ...GL_ARGS,
+            disableFeatures(
+              PLAYWRIGHT_DISABLED_FEATURES.filter((f) => f !== 'ThirdPartyStoragePartitioning'),
+            ),
+          ],
+        },
+      },
+    },
   ],
   webServer: [
     {

@@ -1,9 +1,11 @@
 /*
- * The desk's service worker (the PWA's, scope '/', which precaches desk.html and everything it
- * loads: docs/embedding.md, "Offline"). The desk registers it itself and never reloads for it: a new
- * version waits until every page it serves is closed and takes over at the next load, so a session
- * in a host is never cut short. (The editor's registration, pwa/register.ts, reloads once the person
- * asks for the update; the desk has no such button.)
+ * The desk's service worker: the web app's (src/pwa/sw.ts, scope '/'), which precaches desk.html
+ * and every file it loads (docs/embedding.md, "Offline"). The desk registers it itself and never
+ * reloads for it. A new version installs in the background and waits until every page the old one
+ * serves is closed, then takes over at the next load, so a session in a host is never cut short:
+ * the editor's Update (pwa/register.ts), which makes a waiting version take over at once, is refused
+ * while a desk page is open in the same browser partition (the sample, or a host on the desk's own
+ * site), so the files of a running desk never change under it.
  */
 
 /** Registers the service worker; resolves with whether this page is (or will be) served offline. */

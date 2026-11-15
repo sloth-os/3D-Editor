@@ -154,3 +154,41 @@ export function deskHeadersFor(relativePath: string, settings: DeskEmbedSettings
   if (rel.startsWith('assets/')) return deskAssetHeaders(settings);
   return {};
 }
+
+/**
+ * URL path prefixes of what the Vite dev server serves in place of the built assets/: the source
+ * modules, Vite's own client and pre-bundled dependencies, and the workers started from them.
+ */
+export const VITE_DEV_MODULE_PREFIXES: readonly string[] = [
+  '/src/',
+  '/@vite/',
+  '/@fs/',
+  '/@id/',
+  '/node_modules/',
+  '/@react-refresh',
+  '/@prefresh/',
+];
+
+/**
+ * What the web app's Vite dev (`dev`) and preview servers do with a request path, as the server
+ * does with its files: the page headers on the desk page (/desk served as /desk.html), the asset
+ * headers on the built files under /assets/ (in dev also on the modules and workers it serves in
+ * their place), the editor's index.html at /desk/ and /desk.html/ as at any path that is no desk
+ * page, and no desk headers on anything else: never on the editor's pages, the service worker or
+ * the manifest.
+ */
+export function viteDeskRoute(
+  pathname: string,
+  dev: boolean,
+  settings: DeskEmbedSettings,
+): { headers: Record<string, string>; rewrite?: string } {
+  if (isDeskPagePath(pathname))
+    return {
+      headers: deskPageHeaders(settings),
+      rewrite: pathname === '/desk.html' ? undefined : '/desk.html',
+    };
+  if (isDeskPagePath(pathname.replace(/\/+$/, ''))) return { headers: {}, rewrite: '/index.html' };
+  const module = dev && VITE_DEV_MODULE_PREFIXES.some((prefix) => pathname.startsWith(prefix));
+  if (module || pathname.startsWith('/assets/')) return { headers: deskAssetHeaders(settings) };
+  return { headers: {} };
+}

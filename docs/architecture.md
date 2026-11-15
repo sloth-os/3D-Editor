@@ -945,11 +945,17 @@ telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested o
   out, a slider drag writes no live value, a dropped model file is refused unread; the editor
   refuses nothing there), and the keys of the chrome it hides, which its keymap ignores.
 
-The server and the Vite dev and preview servers share `apps/server/src/desk-embed.ts` (no
-imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the page's COEP, CORP and CSP
-`frame-ancestors` and the built files' COEP and CORP, and `/desk` maps to `desk.html`, never to
-the editor's `index.html`. The PWA's service worker precaches `desk.html` and serves it (also at
-`/desk`, with any query) from its cache; the build drops the web app manifest's link from it.
+The server, the Vite dev and preview servers and the PWA's service worker share
+`apps/server/src/desk-embed.ts` (no imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the
+page's COEP, CORP and CSP `frame-ancestors` and the built files' COEP and CORP, and `/desk` maps
+to `desk.html`, never to the editor's `index.html` (`/desk/` and `/desk.html/` are the editor's,
+as any other path). The PWA's service worker (`apps/web/src/pwa/sw.ts`: Workbox's precaching and
+routing, the desk's rules in `sw-desk.ts`) precaches `desk.html` and answers it (also at `/desk`,
+with any query) with the precached copy and the server's current headers when the server answers
+within 4 s, else with the headers it was last served with, so a browser never freezes the
+deployment's settings; a worker script it serves without a COEP gets `require-corp`, and a new
+version refuses the editor's Update while a desk page is open. The build drops the web app
+manifest's link from `desk.html`.
 
 ## Server
 

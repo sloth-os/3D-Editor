@@ -264,10 +264,15 @@ origin; each host's scenes stay apart ([projects](#projects-per-host-and-scene))
   origins).
 - Never `X-Frame-Options`: it cannot name the hosts, and `frame-ancestors` replaces it. The server
   never sends it.
-- The service worker keeps the responses it precached, headers included. After `DESK_EMBED_COEP` or
-  `DESK_EMBED_ORIGINS` changed on a deployment, a browser that has the desk's service worker keeps
-  getting the old headers from it until the next build of the app (a new `sw.js`) replaces its
-  cache. Set them before the first deployment, or deploy a new build with the change.
+- The desk's service worker answers `/desk.html` and `/desk` with the headers the server sends
+  now whenever the server answers within 4 s ([offline](#offline)), so a change of
+  `DESK_EMBED_ORIGINS` or `DESK_EMBED_COEP` reaches every browser that is online at its next load of
+  the desk (a host taken off the list can no longer frame it there), with no new build. The service
+  worker keeps those headers for its offline copy of the page: offline, the desk loads with the
+  headers it was last served with. A worker script it serves without a COEP gets `require-corp`,
+  which every page accepts for its workers, so a desk whose COEP was turned on after its files were
+  cached still starts its workers. Browsers keep the built files a year (`immutable`), each with the
+  headers it came with, so set `DESK_EMBED_COEP` before the first deployment where you can.
 
 ### Configuration
 
@@ -371,9 +376,14 @@ desk at the other is a cross-site frame, as in production.
 
 `npm run dev` serves the editor at `http://localhost:5173/` and the desk at
 `http://localhost:5173/desk.html` (also `/desk`), with the headers of `DESK_EMBED_COEP` and
-`DESK_EMBED_ORIGINS` on the page and on every script, style and worker it loads (requests to the
-proxied `/api`, `/dav`, `/otlp`, `/mcp` and `/sync` are left alone). `npm run preview` does the same
-for the build. In development the desk registers no service worker: it works online only.
+`DESK_EMBED_ORIGINS` chosen by path as the server chooses them by file (`viteDeskRoute` in
+`apps/server/src/desk-embed.ts`): the page's on the desk page, the built files' on the modules and
+workers it loads (`/src/`, `/@vite/`, `/@fs/`, `/@id/`, `/node_modules/`), none on the editor's
+pages, the proxied `/api`, `/dav`, `/otlp`, `/mcp` and `/sync`, or anything else. `npm run preview`
+does the same for the build, the built files' headers on `/assets/` only, so never on `index.html`,
+`sw.js` or the manifest, whoever asks for them. Both serve the editor at `/desk/` and
+`/desk.html/`, as the server does. In development the desk registers no service worker: it works
+online only.
 
 ## What the desk does
 
@@ -609,12 +619,31 @@ not offered. Send, Done and Close work as usual.
 
 `ready.capabilities.offline` is `true`: once loaded, the desk stages, edits, exports and keeps its
 copy without a network, and talks to nobody but its host. The page loads offline once the service
-worker has it: the web app's service worker (`sw.js`, scope `/`) precaches `desk.html` and every
-file it loads, the desk registers it itself, and it serves `/desk.html` and `/desk` (with any query)
-from its cache, never the editor's `index.html`. A new version of the app waits until every page it
-serves is closed and takes over at the next load, so a session in a host is never reloaded under
-the person. Without the service worker (the first visit under a host site, development, a browser
-that refuses one) the desk works while the network does.
+worker has it: the web app's service worker (`sw.js`, scope `/`, built from
+`apps/web/src/pwa/sw.ts`) precaches `desk.html` and every file it loads, the desk registers it
+itself, and it answers `/desk.html` and `/desk` (with any query), never with the editor's
+`index.html`. It answers with its precached copy of the page, the version whose files it serves,
+and with the server's current [headers](#headers) when the server answers within 4 s; offline, or
+when the server does not answer in time, with the headers the page was last served with (a 5xx
+counts as no answer; a redirect or another error from the server is passed on). `/desk/` and
+`/desk.html/` are the editor's, as on the server.
+
+A new version of the app installs in the background and waits until every page the old one serves
+is closed, then takes over at the next load, so a session in a host is never reloaded under the
+person. The editor's **Update** makes a waiting version take over at once; while a desk page is
+open in the same browser partition (the sample, or a host on the same site as the desk), the
+version refuses and keeps waiting, so the files of a running desk never change under it: close
+the desk, then press Update again. Without the service worker (the first visit under a host site,
+development, a browser that refuses one) the desk works while the network does.
+
+Upgrading from a build without the desk: a browser that ran an earlier build of the editor keeps
+that build's service worker until the new one takes over, and the old one answers `/desk.html` and
+`/desk` with the editor, which it knew instead. This happens only in the editor's own partition:
+the desk opened on its own, and a host on the same site as the desk, whose frame then gets the
+editor without the desk's headers (a cross-origin isolated host refuses it and gives up waiting for
+`hello`). To end it, open the editor in that browser and press Update, or close all its tabs and
+windows, then load the desk again. A host on another site never had the old service worker in its
+partition.
 
 ### Opened on its own: the sample
 
@@ -765,6 +794,13 @@ Where the contract leaves room, the desk takes the most robust reading:
   `screen-wake-lock`; read-only; offline; a phone's 390 × 844; and the page on its own. Every
   message the desk sends is checked against the schemas. Run it with
   `cd e2e && npx playwright test tests/desk-embed.spec.ts --trace off` after `npm run build`.
+- **Storage partitioning.** The desk's specs (`e2e/tests/desk-*.spec.ts`) run in the `desk`
+  Playwright project, with Chromium's third-party storage partitioning on as browsers ship it
+  (Playwright turns it off by default). `e2e/tests/desk-partition.spec.ts` checks that it is on (the
+  framed desk sees none of its origin's first-party storage), that the desk registers its service
+  worker in a cross-site host's partition and loads, stages and exports there offline, and that a
+  change of `DESK_EMBED_ORIGINS` reaches a browser whose service worker holds the desk, online at
+  once and offline after. Run it the same way, after `npm run build`.
 
 A host should check, besides its own logic, that it:
 

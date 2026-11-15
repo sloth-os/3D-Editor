@@ -3,44 +3,36 @@ import preact from '@preact/preset-vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { deskEmbedSettings, deskHeadersFor, isDeskPagePath } from '../server/src/desk-embed';
+import { deskEmbedSettings, viteDeskRoute } from '../server/src/desk-embed.ts';
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
   version: string;
 };
 const serverTarget = process.env.EDITOR_SERVER_URL ?? 'http://127.0.0.1:8080';
-/** Paths the dev server passes to the editor server. */
-const PROXIED = ['/api', '/dav', '/otlp', '/mcp', '/sync'];
-const NAVIGATIONS = new Set(['document', 'iframe', 'frame', 'embed', 'object']);
 
 /**
  * The embeddable desk's headers on the dev and preview servers, as the editor server sends them
- * (apps/server/src/desk-embed.ts, from DESK_EMBED_COEP and DESK_EMBED_ORIGINS): desk.html, also at
- * /desk, with COEP, CORP and CSP frame-ancestors; the scripts and other subresources (the dev
- * server's modules and workers, the preview's assets) with COEP and CORP; the editor's own pages
- * with none of them.
+ * (apps/server/src/desk-embed.ts viteDeskRoute, from DESK_EMBED_COEP and DESK_EMBED_ORIGINS), chosen
+ * by path as the server chooses them by file: desk.html, also at /desk, with COEP, CORP and CSP
+ * frame-ancestors; the built files under /assets/ (in dev also its modules and workers) with COEP
+ * and CORP; the editor's pages, the service worker and the rest with none of them, whoever asks
+ * (the service worker's precache fetches index.html like a script, not as a page).
  */
 function deskEmbedHeaders(): Plugin {
   const settings = deskEmbedSettings(process.env);
-  const page = deskHeadersFor('desk.html', settings);
-  const asset = deskHeadersFor('assets/', settings);
-  const middleware: Connect.NextHandleFunction = (req, res, next) => {
-    const url = new URL(req.url ?? '/', 'http://localhost');
-    if (isDeskPagePath(url.pathname)) {
-      for (const [k, v] of Object.entries(page)) res.setHeader(k, v);
-      if (url.pathname !== '/desk.html') req.url = `/desk.html${url.search}`;
-    } else if (
-      !NAVIGATIONS.has(String(req.headers['sec-fetch-dest'] ?? '')) &&
-      !PROXIED.some((p) => url.pathname === p || url.pathname.startsWith(`${p}/`))
-    ) {
-      for (const [k, v] of Object.entries(asset)) res.setHeader(k, v);
-    }
-    next();
-  };
+  const middleware =
+    (dev: boolean): Connect.NextHandleFunction =>
+    (req, res, next) => {
+      const url = new URL(req.url ?? '/', 'http://localhost');
+      const route = viteDeskRoute(url.pathname, dev, settings);
+      for (const [k, v] of Object.entries(route.headers)) res.setHeader(k, v);
+      if (route.rewrite) req.url = `${route.rewrite}${url.search}`;
+      next();
+    };
   return {
     name: 'desk-embed-headers',
-    configureServer: (server) => void server.middlewares.use(middleware),
-    configurePreviewServer: (server) => void server.middlewares.use(middleware),
+    configureServer: (server) => void server.middlewares.use(middleware(true)),
+    configurePreviewServer: (server) => void server.middlewares.use(middleware(false)),
   };
 }
 
@@ -68,6 +60,11 @@ export default defineConfig({
     VitePWA({
       registerType: 'prompt',
       injectRegister: false,
+      // our own service worker (src/pwa/sw.ts, built with the precache list of the build): the
+      // desk page needs routes a generated one cannot express (docs/embedding.md, "Offline")
+      strategies: 'injectManifest',
+      srcDir: 'src/pwa',
+      filename: 'sw.ts',
       includeAssets: ['favicon.svg', 'icons/*.png', 'icons/*.svg'],
       manifest: {
         id: '/',
@@ -101,26 +98,11 @@ export default defineConfig({
           },
         ],
       },
-      workbox: {
+      injectManifest: {
         globPatterns: ['**/*.{js,css,html,svg,png,woff2,webmanifest}'],
         maximumFileSizeToCacheInBytes: 8 * 1024 * 1024,
-        navigateFallback: '/index.html',
-        // the desk (desk.html, also at /desk, with any query) comes from the precache; were it
-        // missing there, from the network, never as the editor's index.html
-        ignoreURLParametersMatching: [/.*/],
-        navigateFallbackDenylist: [
-          /^\/desk(\.html)?\/?(\?|$)/,
-          /^\/api\//,
-          /^\/sync\//,
-          /^\/mcp/,
-          /^\/dav\//,
-          /^\/otlp\//,
-          /^\/metrics/,
-          /^\/healthz/,
-          /^\/readyz/,
-        ],
-        cleanupOutdatedCaches: true,
-        clientsClaim: true,
+        // one classic script: the editor and the desk register it with type 'classic'
+        rollupFormat: 'iife',
       },
       devOptions: { enabled: false },
     }),

@@ -35,6 +35,9 @@
     "fake-indexeddb": "6.2.7",
     "happy-dom": "21.0.4",
     "vite": "8.3.5",
-    "vite-plugin-pwa": "2.0.0"
+    "vite-plugin-pwa": "2.0.0",
+    "workbox-core": "7.4.1",
+    "workbox-precaching": "7.4.1",
+    "workbox-routing": "7.4.1"
   }
 }

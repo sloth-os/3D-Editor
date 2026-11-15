@@ -10,6 +10,7 @@ import {
   isDeskPagePath,
   parseDeskEmbedCoep,
   parseDeskEmbedOrigins,
+  viteDeskRoute,
 } from '../../src/desk-embed';
 
 /*
@@ -146,6 +147,58 @@ describe('the headers', () => {
     for (const p of ['/desk.html', '/desk']) expect(isDeskPagePath(p)).toBe(true);
     for (const p of ['/', '/index.html', '/desks', '/desk.htm', '/x/desk', '/desk/', '/desk.html/'])
       expect(isDeskPagePath(p), p).toBe(false);
+  });
+});
+
+describe("the web app's Vite servers (vite.config.ts)", () => {
+  const page = deskPageHeaders(DEFAULT_DESK_EMBED);
+  const asset = deskAssetHeaders(DEFAULT_DESK_EMBED);
+
+  it('give the desk page its headers at /desk.html and /desk (served as desk.html)', () => {
+    for (const dev of [true, false]) {
+      expect(viteDeskRoute('/desk.html', dev, DEFAULT_DESK_EMBED)).toEqual({
+        headers: page,
+        rewrite: undefined,
+      });
+      expect(viteDeskRoute('/desk', dev, DEFAULT_DESK_EMBED)).toEqual({
+        headers: page,
+        rewrite: '/desk.html',
+      });
+    }
+  });
+
+  it('give the asset headers only to the built files (in dev, to its modules), as the server does', () => {
+    for (const dev of [true, false])
+      expect(viteDeskRoute('/assets/desk-1a2b.js', dev, DEFAULT_DESK_EMBED).headers).toEqual(asset);
+    for (const p of [
+      '/src/embed/stage.worker.ts',
+      '/@vite/client',
+      '/@fs/home/x/packages/core/src/index.ts',
+      '/node_modules/.vite/deps/preact.js',
+    ]) {
+      expect(viteDeskRoute(p, true, DEFAULT_DESK_EMBED).headers, p).toEqual(asset);
+      expect(viteDeskRoute(p, false, DEFAULT_DESK_EMBED).headers, p).toEqual({});
+    }
+  });
+
+  it("never give desk headers to the editor's pages, the service worker or the manifest", () => {
+    for (const dev of [true, false])
+      for (const p of [
+        '/',
+        '/index.html',
+        '/sw.js',
+        '/manifest.webmanifest',
+        '/favicon.svg',
+        '/api/config',
+        '/x',
+      ])
+        expect(viteDeskRoute(p, dev, DEFAULT_DESK_EMBED), `${p} dev=${dev}`).toEqual({ headers: {} });
+  });
+
+  it('serve the editor at /desk/ and /desk.html/, as the server and the service worker do', () => {
+    for (const dev of [true, false])
+      for (const p of ['/desk/', '/desk.html/'])
+        expect(viteDeskRoute(p, dev, DEFAULT_DESK_EMBED), p).toEqual({ headers: {}, rewrite: '/index.html' });
   });
 });
 
