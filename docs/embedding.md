@@ -167,7 +167,7 @@ type OpenOptions = {
 type BriefChanges = {
   added: Id[];               // shots in the brief, not staged
   removed: Id[];             // shots staged, no longer in the brief
-  retimed: Id[];             // shots whose duration changed
+  retimed: Id[];             // shots whose frame count changed (a new duration or a new frame rate)
   recast: Id[];              // shots whose cast changed
   cast: { added: Id[]; removed: Id[] };
 };
@@ -522,7 +522,9 @@ later `open`, as it does after a Close before any `open`.
 The shot list shows the staging's checks at once (their issues), and once the scene is open,
 whatever it opened from, the desk runs the full checks in the background (each shot's blocking
 line and layout too), as it does again after **Update shots**. A check is of the scene as it was
-when the check was asked for: an edit made while it runs shows it as out of date.
+when the check was asked for: an edit made while it runs shows it as out of date. The staging
+worker does one thing at a time; the person's requests (an export's shot results, Update shots) go
+ahead of a check still waiting, though a check already running ends first.
 
 ### A later brief: changes and Update shots
 

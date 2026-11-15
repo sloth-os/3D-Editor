@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import * as Y from 'yjs';
 import { describe, expect, it, vi } from 'vitest';
 import { SceneDoc, briefRecord, getShots, type SceneBrief } from '@3d-editor/core';
-import { checkSummary, runStaging } from '../src/embed/staging-engine';
+import { checkSummary, runStaging, type StagingRequest } from '../src/embed/staging-engine';
 import { StagingClient, StagingError, type StagingWorkerFactory } from '../src/embed/staging';
 import { readLineage } from '../src/embed/state';
 
@@ -148,6 +148,51 @@ describe('the staging client', () => {
     };
     return { factory, made };
   }
+
+  it("runs the person's requests (results, an update) ahead of a background check still waiting", async () => {
+    // a worker that answers each request only when the test says so
+    const posted: { id: number; request: StagingRequest }[] = [];
+    let w: { onmessage: ((e: MessageEvent) => void) | null } | null = null;
+    const factory: StagingWorkerFactory = () => {
+      const worker = {
+        onmessage: null as ((e: MessageEvent) => void) | null,
+        onerror: null as ((e: ErrorEvent) => void) | null,
+        terminate: vi.fn(),
+        postMessage: (m: { id: number; request: StagingRequest }) => void posted.push(m),
+      };
+      w = worker;
+      return worker;
+    };
+    const answer = (i: number) =>
+      w!.onmessage!({ data: { id: posted[i].id, reply: runStaging(posted[i].request) } } as MessageEvent);
+    const kinds = () => posted.map((p) => p.request.kind);
+    const client = new StagingClient(factory);
+    const update = Y.encodeStateAsUpdate(staged().doc.ydoc);
+    // a background check runs and another waits behind it; then an export asks for the results
+    const first = client.check(update, { background: true });
+    const second = client.check(update, { background: true });
+    const results = client.results(update);
+    await vi.waitFor(() => expect(kinds()).toEqual(['check']));
+    answer(0);
+    await first;
+    // the results go next, ahead of the check that waits (it is not dropped: it runs after them)
+    await vi.waitFor(() => expect(kinds()).toEqual(['check', 'results']));
+    answer(1);
+    expect((await results).results.map((r) => r.shotId)).toEqual([SHOT_A, SHOT_B]);
+    await vi.waitFor(() => expect(kinds()).toEqual(['check', 'results', 'check']));
+    answer(2);
+    expect((await second).check.summary).toMatch(/^2 shots checked/);
+    // the person's own requests keep their order among themselves
+    const u = client.update(update, changedBrief());
+    const c = client.check(update);
+    await vi.waitFor(() => expect(kinds().slice(3)).toEqual(['update']));
+    answer(3);
+    await u;
+    await vi.waitFor(() => expect(kinds().slice(3)).toEqual(['update', 'check']));
+    answer(4);
+    await c;
+    client.dispose();
+  });
 
   it('answers requests in order through its worker, and makes a new worker after one dies', async () => {
     const { factory, made } = fakeWorkers();

@@ -3,10 +3,12 @@ import { runStaging, type StagingReply, type StagingRequest, type StagingSummary
 
 /*
  * The page's side of the staging worker (stage.worker.ts): one worker, made when the desk starts
- * (its script loads with the page, so no request goes out later), requests answered in order. Where
- * the browser has no module workers (unit tests), the work runs in process. A request that fails
- * rejects with StagingError (its message and code); a worker that dies is made again for the next
- * request.
+ * (its script loads with the page, so no request goes out later), one request at a time. The
+ * person's requests (staging, Update shots, an export's shot results) run in the order they come,
+ * ahead of the background checks still waiting (a check of a long scene takes seconds; one already
+ * running is not stopped). Where the browser has no module workers (unit tests), the work runs in
+ * process. A request that fails rejects with StagingError (its message and code); a worker that dies
+ * is made again for the next request.
  */
 
 export class StagingError extends Error {
@@ -27,6 +29,15 @@ interface WorkerLike {
 }
 
 export type StagingWorkerFactory = () => WorkerLike | null;
+
+/** A request waiting for the worker. */
+interface Queued {
+  request: StagingRequest;
+  /** A background check: the person's requests go ahead of it. */
+  background: boolean;
+  resolve: (r: StagingReply) => void;
+  reject: (e: unknown) => void;
+}
 
 /** A staging or an update of the staging: the change to apply, its summary, the checks, the time. */
 export type Staged = Extract<StagingReply, { kind: 'stage' | 'update' }> & {
@@ -52,8 +63,9 @@ export class StagingClient {
     number,
     { resolve: (r: StagingReply) => void; reject: (e: Error) => void }
   >();
-  /** Requests run one after another (the worker handles one at a time anyway). */
-  private queue: Promise<unknown> = Promise.resolve();
+  /** Requests waiting, in the order they run (the worker handles one at a time anyway). */
+  private readonly queued: Queued[] = [];
+  private running = false;
 
   constructor(private readonly factory: StagingWorkerFactory = moduleStagingWorker) {}
 
@@ -92,23 +104,43 @@ export class StagingClient {
     this.pending.clear();
   }
 
-  private call(request: StagingRequest): Promise<StagingReply> {
-    const run = async (): Promise<StagingReply> => {
-      const w = this.ensure();
-      if (!w) {
-        // no workers here: in process, after a turn of the event loop so the page can paint first
-        await new Promise((r) => setTimeout(r, 0));
-        return runStaging(request);
-      }
-      const id = ++this.seq;
-      return new Promise<StagingReply>((resolve, reject) => {
-        this.pending.set(id, { resolve, reject });
-        w.postMessage({ id, request });
+  /** Queues a request: a background check last, any other ahead of the background checks waiting. */
+  private call(request: StagingRequest, background = false): Promise<StagingReply> {
+    return new Promise<StagingReply>((resolve, reject) => {
+      const job: Queued = { request, background, resolve, reject };
+      const at = background ? -1 : this.queued.findIndex((q) => q.background);
+      if (at < 0) this.queued.push(job);
+      else this.queued.splice(at, 0, job);
+      this.next();
+    });
+  }
+
+  /** Runs the first request waiting once the worker is free. */
+  private next(): void {
+    if (this.running) return;
+    const job = this.queued.shift();
+    if (!job) return;
+    this.running = true;
+    void this.run(job.request)
+      .then(job.resolve, job.reject)
+      .finally(() => {
+        this.running = false;
+        this.next();
       });
-    };
-    const next = this.queue.then(run, run);
-    this.queue = next.catch(() => undefined);
-    return next;
+  }
+
+  private async run(request: StagingRequest): Promise<StagingReply> {
+    const w = this.ensure();
+    if (!w) {
+      // no workers here: in process, after a turn of the event loop so the page can paint first
+      await new Promise((r) => setTimeout(r, 0));
+      return runStaging(request);
+    }
+    const id = ++this.seq;
+    return new Promise<StagingReply>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      w.postMessage({ id, request });
+    });
   }
 
   /** The reply of a request of `kinds`, or its failure thrown as StagingError. */
@@ -143,10 +175,16 @@ export class StagingClient {
     );
   }
 
-  /** The desk's checks of the document `update` holds. */
-  async check(update: Uint8Array): Promise<{ check: DeskCheckResult; ms: number }> {
+  /**
+   * The desk's checks of the document `update` holds. `background`: a check nobody waits for (the
+   * person's requests go ahead of it while it waits).
+   */
+  async check(
+    update: Uint8Array,
+    opts: { background?: boolean } = {},
+  ): Promise<{ check: DeskCheckResult; ms: number }> {
     return StagingClient.expect<Extract<StagingReply, { kind: 'check' }>>(
-      await this.call({ kind: 'check', update }),
+      await this.call({ kind: 'check', update }, opts.background === true),
       ['check'],
     );
   }

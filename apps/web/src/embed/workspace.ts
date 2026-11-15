@@ -65,7 +65,8 @@ import { StagingClient } from './staging';
  *   (it is where the scene starts); an update from a later brief is one undo step.
  * - Checks shown in the shot list carry the document's revision when they were asked for (an edit
  *   made while the worker checks shows them as out of date); after the scene opens and after
- *   Update shots the full checks (blocking lines, layouts) run in the background.
+ *   Update shots the full checks (blocking lines, layouts) run in the background, behind the
+ *   person's requests to the worker while they wait.
  */
 
 /** The local project id of a host's scene: a digest of the host's origin and the scene id. */
@@ -546,7 +547,8 @@ export class DeskWorkspace {
     const update = Y.encodeStateAsUpdate(s.doc.ydoc);
     const run = (async () => {
       try {
-        const r = await this.staging.check(update);
+        // behind the person's requests (an export's results, Update shots) while it waits
+        const r = await this.staging.check(update, { background: true });
         if (this.session === s) this.keepCheck(s, r.check, revision);
       } catch {
         // the shot list's Check button runs them again

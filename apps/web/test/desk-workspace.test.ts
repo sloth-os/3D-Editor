@@ -560,6 +560,15 @@ describe('the desk workspace', () => {
     expect(getShots(b.doc).every((x) => lined.has(x.id))).toBe(true);
   });
 
+  it("asks for its full checks in the background, behind the person's requests to the worker", async () => {
+    const ws = workspace();
+    const check = vi.spyOn(ws.staging, 'check');
+    await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: null });
+    await ws.backgroundCheck;
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledWith(expect.any(Uint8Array), { background: true });
+  });
+
   it('shows the checks of an update as out of date when the scene changed while the worker ran', async () => {
     const host = origin();
     await stateOf(host);
