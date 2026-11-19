@@ -201,6 +201,11 @@ describe('a cast member without a kind hint', () => {
     ['Kai', 'Kai: 35 male, Pacific Islander, as strong as a big old bull; tattoos.', 'man'],
     ['Bo', 'Bo: 40 male, White, built like a bear; beard.', 'man'],
     ['Mia', 'Mia: 7 female, slim, pony tail; freckles.', 'child'],
+    // an ethnicity written for people, in any case (Kai and Lu are guards: written with a capital,
+    // they were people before the list of ethnicities was closed too)
+    ['Kai', 'Kai: 35 male, Pacific Islander, ox build; tattoos.', 'man'],
+    ['Lu', 'Lu: 30 female, East Asian, bull build; short hair.', 'woman'],
+    ['Lu2', 'Lu2: 30 female, east asian, bull build; short hair.', 'woman'],
   ])('%s (%s) is a person: its animal word is a feature or a likeness', (name, description, kind) => {
     expect(animalOf(name, description)).toBeNull();
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
@@ -247,9 +252,9 @@ describe('a cast member without a kind hint', () => {
     },
   );
 
-  // ... and so does "bear", "bull", "ox" or "gorilla" before a build word after an animal's coat: it
-  // is a person's build only in the line of a people, its ethnicity written with a capital ("Rob: 35
-  // male, White, bear build" above)
+  // ... and so does "bear", "bull", "ox" or "gorilla" before a build word after an animal's coat, breed
+  // or region, or "N/A": it is a person's build only in the line of a people, its ethnicity one written
+  // for people ("Rob: 35 male, White, bear build" above), whatever capital it has
   it.each([
     [
       'Bruno',
@@ -270,12 +275,49 @@ describe('a cast member without a kind hint', () => {
       'cow',
     ],
     ['Koko', 'Koko: 12 female, black, gorilla build; grey hair on her back.', 'gorilla', 'bear'],
-  ])('%s (%s) is an animal (%s): its build word after a coat names it', (name, description, word, kind) => {
-    expect(animalOf(name, description)).toMatchObject({ word, kind });
-    expect(kindOf(name, description).kind).toBe(kind);
-  });
+    [
+      'Bruno7',
+      'Bruno7: 6 male, N/A, hulking bear build; scar over one eye. Steals honey from the campsite.',
+      'bear',
+      'bear',
+    ],
+    [
+      'Kodiak2',
+      'Kodiak2: 8 male, Brown, massive bear build; torn left ear. Fishes for salmon in the river.',
+      'bear',
+      'bear',
+    ],
+    [
+      'Ferdinand4',
+      'Ferdinand4: 5 male, Black Angus, massive bull build; ring through his nose.',
+      'cow',
+      'cow',
+    ],
+    ['Kong3', 'Kong3: 20 male, Silverback, massive gorilla build; scarred chest.', 'gorilla', 'bear'],
+    ['Oxford', 'Oxford: 10 male, Bovine, giant ox frame; long horns.', 'cow', 'cow'],
+    ['Duke', 'Duke: 6 male, Hereford, massive bull build; ring through his nose.', 'cow', 'cow'],
+    ['Babe', 'Babe: 4 male, Blue, giant ox frame; long curved horns.', 'cow', 'cow'],
+    ['Bubba2', 'Bubba2: 4 male, Angus, stocky bull frame; short horns.', 'cow', 'cow'],
+    ['Hercules2', 'Hercules2: 6 male, Highland, powerful ox build; shaggy coat.', 'cow', 'cow'],
+    ['Kodiak2b', 'Kodiak2b: 15 male, Alaskan, enormous bear frame; grey muzzle.', 'bear', 'bear'],
+    ['Ursa', 'Ursa: 9 female, Ursine, hulking bear build; grey muzzle.', 'bear', 'bear'],
+    ['Ebon', 'Ebon: 9 male, American Black, hulking bear build; torn ear.', 'bear', 'bear'],
+    ['Bram', 'Bram: 9 male, Dark brown, hulking bear build; torn ear.', 'bear', 'bear'],
+    ['Jet', 'Jet: 9 male, Jet black, massive bull build; ring through his nose.', 'cow', 'cow'],
+    ['Cinna', 'Cinna: 9 female, Cinnamon, hulking bear build; torn ear.', 'bear', 'bear'],
+    ['Charlie', 'Charlie: 9 male, Charolais, massive bull build; ring through his nose.', 'cow', 'cow'],
+  ])(
+    '%s (%s) is an animal (%s): its build word after a coat, a breed or a region names it',
+    (name, description, word, kind) => {
+      expect(animalOf(name, description)).toMatchObject({ word, kind });
+      expect(kindOf(name, description).kind).toBe(kind);
+    },
+  );
 
-  it('keeps a bull whose build names it the mount the shot says it is', () => {
+  it.each([
+    'Tornado: 7 male, black, massive bull build; ring through his nose. Has never been ridden for eight seconds.',
+    'Tornado: 7 male, Brahman, massive bull build; ring through his nose.',
+  ])('keeps a bull whose build names it the mount the shot says it is: %s', (tornado) => {
     const brief = {
       id: 'scene',
       name: 'Scene',
@@ -291,14 +333,7 @@ describe('a cast member without a kind hint', () => {
           kind: null,
           heightM: null,
         },
-        {
-          id: 'tornado',
-          name: 'Tornado',
-          description:
-            'Tornado: 7 male, black, massive bull build; ring through his nose. Has never been ridden for eight seconds.',
-          kind: null,
-          heightM: null,
-        },
+        { id: 'tornado', name: 'Tornado', description: tornado, kind: null, heightM: null },
       ],
       elements: [],
       shots: [

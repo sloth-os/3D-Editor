@@ -374,9 +374,12 @@ undo step, and runs in a web worker as well as on the server:
   (`Pip: 3 male, golden retriever, small`, `Kit: kitten female`, `Rex: young male, beagle`): then
   it is that animal. An animal word there is a feature of a person instead before a body part or a
   look ("bull neck", "doe eyes", "horse face", "pony tail"), as "bear", "bull", "ox" or "gorilla"
-  before a build word when the line's ethnicity is written with a capital ("White, bear build",
-  "Black, ox frame"; after a coat, "brown, hulking bear build" is a bear, and "sturdy pony build" is
-  a pony), and after "as a" or "like a" ("strong as an ox", "as strong as a big old bull", "built
+  before a build word when the line's ethnicity is one written for people ("White, bear build",
+  "Black, ox frame": "White" or "Black" with a capital, "Asian", "East Asian", "Latina", "Pacific
+  Islander", "Samoan", "Mixed race" and the like, one of these before "American", or two joined by
+  "and" or a hyphen; after a coat, a breed or a region, "brown, hulking bear build" and "Brown,
+  massive bear build" are a bear and "Hereford, massive bull build" a bull, and "sturdy pony build"
+  is a pony), and after "as a" or "like a" ("strong as an ox", "as strong as a big old bull", "built
   like a bear"); before another animal word the later is the animal ("cattle dog" is a dog), unless
   it is the young, the sex or a breed word ("Shetland pony mare", "bear cub"), or the first is a
   breed of dog: the first breed of a cross names it ("golden retriever-poodle mix" is a retriever,

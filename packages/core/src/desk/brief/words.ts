@@ -481,14 +481,33 @@ const FIGURATIVE = /^(?:bear|bull|ox|gorilla|ape)$/;
 const BUILD_NOUNS = /^(?:build|frame|physique|body|shape|size|type|[a-z]*sized)$/;
 
 /**
+ * One ethnicity an LLM writes for people in rideo's identity line, as a regular expression's source
+ * (HUMAN_ETHNICITY): "White", "Black", "Asian", "East Asian", "Hispanic", "Latina", "Caucasian",
+ * "Middle Eastern", "Pacific Islander", "Samoan", "Mixed race", "Korean", "Irish" …, one of these
+ * before "American" ("Korean American", "Mexican-American"), "White British" or "Black British".
+ */
+const ETHNICITY = String.raw`(?:(?:white|black|asian|(?:(?:south[\s-]?)?east|south|central)[\s-]asian|hispanic|latin[aeox]|caucasian|african|afro[\s-]?caribbean|caribbean|middle[\s-]eastern|north[\s-]african|arab|native[\s-]american|indigenous|first[\s-]nations|pacific[\s-]islander|polynesian|samoan|maori|native[\s-]hawaiian|mixed(?:[\s-]race)?|biracial|multiracial|indian|pakistani|chinese|japanese|korean|vietnamese|filipin[ao]|thai|mexican|jewish|persian|mediterranean|european|scandinavian|irish|italian|greek)(?:[\s-]american)?|(?:white|black)[\s-]british)`;
+
+/**
+ * The ethnicity items of rideo's identity line (the item after the age and gender, whole) that name
+ * a people, after which a FIGURATIVE build is a person's (identityAnimal's `people`), in any case:
+ * one ethnicity (ETHNICITY), or such ethnicities joined by "and" or a hyphen ("Black and Asian",
+ * "Chinese-Filipino"). Anything else names no people: "N/A", "unknown", a coat ("Brown", "Jet
+ * black"), a breed ("Black Angus", "Hereford") or a region ("Alaskan", "Highland"); identityAnimal
+ * also reads "white" and "black" in lower case as a coat ("black and white").
+ */
+const HUMAN_ETHNICITY = new RegExp(String.raw`^${ETHNICITY}(?:(?:\s+and\s+|\s*-\s*)${ETHNICITY})*$`, 'i');
+
+/**
  * The words an item of rideo's identity line is read by for an animal (sentenceKind: those before
  * any person and any word of NOT_ITSELF) with the animal words that are a person's feature or
  * likeness, or another animal's modifier, blanked, same length: one whose next word (after spaces or
  * a hyphen) is a body part or a look (FEATURE_NOUNS: "bull neck", "doe eyes", "horse face", "chicken
  * legs", "pony tail"), one used for a person's build before a build word in the line of a people
- * (FIGURATIVE before BUILD_NOUNS when `people`, the line's ethnicity item written with a capital:
- * "White, bear build", "Black, ox frame"; not after a coat, "brown, hulking bear build" is a bear,
- * nor "sturdy pony build"), one after "as a(n)" or "like a(n)" with at most two words between
+ * (FIGURATIVE before BUILD_NOUNS when `people`, the line's ethnicity item a people's, HUMAN_ETHNICITY:
+ * "White, bear build", "Black, ox frame"; not after a coat, a breed or a region, "brown, hulking bear
+ * build" and "Brown, massive bear build" are a bear and "Hereford, massive bull build" a bull, nor
+ * "sturdy pony build"), one after "as a(n)" or "like a(n)" with at most two words between
  * ("strong as an ox", "as strong as a big old bull"), and one whose next word is another animal
  * word, not its young, its sex or a breed word (KEEPS_ANIMAL): the later word is the animal
  * ("Australian cattle dog", "bird dog" and "bull terrier" are dogs, but "Shetland pony mare" is a
@@ -594,14 +613,14 @@ export function identityOf(name: string, description: string): { age: string; ge
  * but for the animal words that are a person's feature or likeness or another animal's modifier
  * (blankFeatures) — "Pip: 3 male, golden retriever, small", "Bella: adult female, chestnut mare",
  * "Clover: 7 female, chestnut, sturdy pony build", "Bruno: 6 male, brown, hulking bear build" (a
- * bear: its ethnicity item is a coat, in lower case), "Cub: 2 male, bear cub", "Blue: 3 male,
+ * bear: its ethnicity item is a coat, not a people's), "Cub: 2 male, bear cub", "Blue: 3 male,
  * Australian cattle dog" (a dog). The words read end before a word that makes it something the
  * member has, does or is with ("golden retriever with a white chest"), and in the first item only
  * the age, before the gender, can name it ("Kit: kitten female", "Pip: puppy male"). Null when it
  * names none, or names one only as a feature: before a body part or a look ("Tom: 45 male, stocky,
  * bull neck", "Dee: 25 female, Latina, petite, doe eyes", "Ken: 40 male, Asian, horse face"), as a
- * build in the line of a people, its ethnicity item (the item after the age and gender) written
- * with a capital ("Rob: 35 male, White, bear build"), after "as a(n)" ("strong as an ox") or "like"
+ * build in the line of a people, its ethnicity item (the item after the age and gender) a people's
+ * (HUMAN_ETHNICITY: "Rob: 35 male, White, bear build"), after "as a(n)" ("strong as an ox") or "like"
  * ("built like a bear"), before a hyphened "-ed" word ("bull-necked") or as a figure of speech ("a
  * bear of a man"); the marks after the ";" ("bull neck", "doe eyes") are never read here.
  */
@@ -610,8 +629,10 @@ function identityAnimal(line: string): AnimalWords | null {
   // "<age> <gender>": the gender is no animal's head ("puppy male")
   const age = first.trim().split(/\s+/);
   if (IDENTITY_GENDER.test(plainText(age.at(-1) ?? ''))) age.pop();
-  // an ethnicity written with a capital names a people ("White", "Samoan"), not a coat ("brown")
-  const people = /^\p{Lu}/u.test(others[0]?.trim() ?? '');
+  // an ethnicity of people ("White", "Samoan": HUMAN_ETHNICITY), not a coat ("brown", "Brown", "black
+  // and white"), a breed ("Hereford") or a region ("Alaskan")
+  const ethnicity = others[0]?.trim() ?? '';
+  const people = HUMAN_ETHNICITY.test(ethnicity) && !/\b(?:white|black)\b/.test(ethnicity);
   for (const item of [age.join(' '), ...others]) {
     const k = sentenceKind(item, { people });
     if (k && k !== 'person') return k;
