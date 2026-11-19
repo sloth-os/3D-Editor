@@ -518,8 +518,9 @@ const HUMAN_ETHNICITY = new RegExp(String.raw`^${ETHNICITY}(?:(?:\s+and\s+|\s*-\
  * "White, bear build", "Black, ox frame"; not after a coat, a breed or a region, "brown, hulking bear
  * build" and "Brown, massive bear build" are a bear and "Hereford, massive bull build" a bull, nor
  * "sturdy pony build"), one after "as a(n)" or "like a(n)" with at most two words between
- * ("strong as an ox", "as strong as a big old bull"), and one whose next word is another animal
- * word, not its young, its sex or a breed word (KEEPS_ANIMAL): the later word is the animal
+ * ("strong as an ox", "as strong as a big old bull", and "fierce as a tiger" or "sleek as an
+ * otter", whose article MODIFIED blanked before an -er word), and one whose next word is another
+ * animal word, not its young, its sex or a breed word (KEEPS_ANIMAL): the later word is the animal
  * ("Australian cattle dog", "bird dog" and "bull terrier" are dogs, but "Shetland pony mare" is a
  * pony and "bear cub" a bear), unless it names a dog and is not a young one (isDogWord): a breed of
  * dog names the dog, the first breed of a cross as in a sentence ("golden retriever-poodle mix" is
@@ -533,7 +534,7 @@ function blankFeatures(head: string, people: boolean): string {
     const feature =
       FEATURE_NOUNS.test(next) ||
       (people && FIGURATIVE.test(w) && BUILD_NOUNS.test(next)) ||
-      /\b(?:as|like)\s+an?\s+(?:[a-z-]+\s+){0,2}$/.test(head.slice(0, at)) ||
+      /\b(?:as|like)\s+(?:an?|\s{1,2})\s+(?:[a-z-]+\s+){0,2}$/.test(head.slice(0, at)) ||
       (isAnimalWord(next) && !KEEPS_ANIMAL.test(next) && !(isDogWord(w) && !KEEPS_ANIMAL.test(w)));
     return feature ? ' '.repeat(w.length) : w;
   });

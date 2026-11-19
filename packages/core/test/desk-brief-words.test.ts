@@ -206,6 +206,13 @@ describe('a cast member without a kind hint', () => {
     ['Kai', 'Kai: 35 male, Pacific Islander, ox build; tattoos.', 'man'],
     ['Lu', 'Lu: 30 female, East Asian, bull build; short hair.', 'woman'],
     ['Lu2', 'Lu2: 30 female, east asian, bull build; short hair.', 'woman'],
+    // a likeness of an animal word ending in -er or -or, whose article blankModifiers blanks
+    ['X', 'X: 30 female, White, fierce as a tiger; freckles. A teacher.', 'woman'],
+    ['Lea', 'Lea: 28 female, White, lithe as a panther; freckles.', 'woman'],
+    ['Ben', 'Ben: 40 male, White, busy as a beaver; freckles.', 'man'],
+    ['Ray', 'Ray: 50 male, White, proud as a rooster; moustache.', 'man'],
+    ['Oda', 'Oda: 25 female, White, sleek as an otter; freckles.', 'woman'],
+    ['Ted', 'Ted: 60 male, White, tenacious as a terrier; scar.', 'man'],
   ])('%s (%s) is a person: its animal word is a feature or a likeness', (name, description, kind) => {
     expect(animalOf(name, description)).toBeNull();
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
