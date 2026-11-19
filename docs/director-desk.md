@@ -373,20 +373,19 @@ undo step, and runs in a web worker as well as on the server:
   animal as what the member is before its first `;`, as its age, ethnicity or build
   (`Pip: 3 male, golden retriever, small`, `Kit: kitten female`, `Rex: young male, beagle`): then
   it is that animal. An animal word there is a feature of a person instead before a body part or a
-  look ("bull neck", "doe eyes", "horse face", "pony tail"), as "bear", "bull", "ox" or "gorilla"
-  before a build word in the line of a person: its ethnicity is one of a closed list written for
-  people ("White" or "Black" with a capital, "Asian", "East Asian", "Latina", "Pacific Islander",
-  "Samoan", "Mixed race", "Korean", "Irish" and others, one of these before "American", or two
-  joined by "and" or a hyphen) and its marks or clothes are a person's (a beard, tattoos, glasses, a
-  shaved head, a hairstyle, or a shirt, jeans, a dress and other clothes: "White, bear build;
-  beard", "Black, ox frame; wearing a grey hoodie"). Otherwise the build word names the animal:
-  after a coat, a breed or a region ("brown, hulking bear build", "Brown, massive bear build" and
-  "Hereford, massive bull build"), with an animal's marks only ("Black, muscular bull build; long
-  curved horns" is a bull, as is "Indian, massive bull build; hump and dewlap"), and "sturdy pony
-  build" is a pony. It is a feature after "as a" or "like a" too ("strong as an ox", "as strong as a
-  big old bull", "thick-necked as a bull", "built like a bear"), but not "as" after a verb that
-  gives a role ("worked as a plough horse", "retired as a race horse" and "adopted as a kitten" are
-  the animal);
+  look ("bull neck", "doe eyes", "horse face", "pony tail"), or after "as a" or "like a" ("strong as
+  an ox", "as strong as a big old bull", "thick-necked as a bull", "built like a bear"), but not
+  "as" after a word that gives a role: a past participle, after a hyphen too ("retired as a race
+  horse", "adopted as a kitten", "hand-reared as a foal", "bottle-fed as a lamb"), unless it says
+  what the member has or is like ("thick-necked", "quick-witted"), a form of work, use, breed,
+  train, serve, act, double or live ("worked as a plough horse", "doubles as a gun dog"), or "home",
+  "life", "up", "out", "years" or "family" after one ("brought home as a puppy", "began life as a
+  race horse"); an animal named only in a likeness is not one ("Babe: 4 male, blue, strong as an ox"
+  is a person unless the sentence after the line names the ox). "Bear", "bull", "ox" or "gorilla"
+  before a build word names the animal whatever the ethnicity and marks say ("brown, hulking bear
+  build", "Hereford, massive bull build", "White, bear build; beard"), as "sturdy pony build" names
+  a pony: a person's clothes make such a member a person, an animal that acts as a person ("White,
+  bear build; wearing a flannel shirt"), and rideo's line gives a person's outfit;
   before another animal word the later is the animal ("cattle dog" is a dog), unless it is the
   young, the sex or a breed word ("Shetland pony mare", "bear cub"), or the first is a breed of dog:
   the first breed of a cross names it ("golden retriever-poodle mix" is a retriever, not a small

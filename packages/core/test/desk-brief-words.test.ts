@@ -10,9 +10,9 @@ import type { SceneBrief } from '../src/desk/brief';
  * gender, build; marks; wearing …") is the animal its own words name only when they name it before
  * any person and not as something the member has, does or wears; an identity line that gives a
  * gender is a person's unless an item before its first ";" names an animal as what the member is
- * ("golden retriever", "sturdy pony build", "brown, hulking bear build"; not "bull neck" or "White,
- * bear build"), whatever animal words follow in its marks, and its age and gender make the person a
- * child, an elder, a woman or a man; a set without `interior` is one only when a room is named, not
+ * ("golden retriever", "sturdy pony build", "hulking bear build"; not "bull neck" or "strong as an
+ * ox"), whatever animal words follow in its marks, and its age and gender make the person a child,
+ * an elder, a woman or a man; a set without `interior` is one only when a room is named, not
  * an outdoor place that "inside", "flat", "bar", "cafe", "factory" or "museum" qualifies, and an
  * outdoor word naming a building ("the lake house") is not the place.
  */
@@ -185,29 +185,21 @@ describe('a cast member without a kind hint', () => {
   });
 
   // an animal word in an item before the ";" is a feature of a person, whichever item it is in: before
-  // a body part or a look ("bull neck", "pony tail"), as a build ("bear build", "gorilla build"), or
-  // likened ("strong as an ox", "as strong as a big old bull", "built like a bear")
+  // a body part or a look ("bull neck", "pony tail") or likened ("strong as an ox", "as strong as a
+  // big old bull", "built like a bear")
   it.each([
     ['Tom', 'Tom: 45 male, stocky, bull neck; broken nose.', 'man'],
     ['Dee', 'Dee: 25 female, Latina, petite, doe eyes. A shy librarian.', 'woman'],
     ['Ken', 'Ken: 40 male, Asian, horse face; scar.', 'man'],
-    ['Rob', 'Rob: 35 male, White, bear build; beard.', 'man'],
     ['Tim', 'Tim: 30 male, slim, chicken legs; freckles.', 'man'],
     ['Ned', 'Ned: 50 male, bull-neck; scar.', 'man'],
     ['Al', 'Al: 40 male, strong as an ox; scar.', 'man'],
     ['Gus', 'Gus: 70 male, as strong as a young bull; scar.', 'elder'],
-    ['Gil', 'Gil: 40 male, White, gorilla build; beard.', 'man'],
-    ['Abe', 'Abe: 45 male, Black, ox build; shaved head.', 'man'],
     ['Kai', 'Kai: 35 male, Pacific Islander, as strong as a big old bull; tattoos.', 'man'],
     // Bo and Mia are guards, persons without these rules too: "like" ends the words read (NOT_ITSELF)
     // and "pony" before "tail" is a modifier (MODIFIED)
     ['Bo', 'Bo: 40 male, White, built like a bear; beard.', 'man'],
     ['Mia', 'Mia: 7 female, slim, pony tail; freckles.', 'child'],
-    // an ethnicity written for people, in any case (Kai and Lu are guards: written with a capital,
-    // they were people before the list of ethnicities was closed too)
-    ['Kai', 'Kai: 35 male, Pacific Islander, ox build; tattoos.', 'man'],
-    ['Lu', 'Lu: 30 female, East Asian, bull build; short hair.', 'woman'],
-    ['Lu2', 'Lu2: 30 female, east asian, bull build; short hair.', 'woman'],
     // a likeness of an animal word ending in -er or -or, whose article blankModifiers blanks
     ['X', 'X: 30 female, White, fierce as a tiger; freckles. A teacher.', 'woman'],
     ['Lea', 'Lea: 28 female, White, lithe as a panther; freckles.', 'woman'],
@@ -215,11 +207,11 @@ describe('a cast member without a kind hint', () => {
     ['Ray', 'Ray: 50 male, White, proud as a rooster; moustache.', 'man'],
     ['Oda', 'Oda: 25 female, White, sleek as an otter; freckles.', 'woman'],
     ['Ted', 'Ted: 60 male, White, tenacious as a terrier; scar.', 'man'],
-    // a person's clothes make the line a people's as a beard does; an -ed word after a hyphen is no
-    // verb that gives a role
-    ['Hank', 'Hank: 50 male, White, bear build; scar on chin; wearing a flannel shirt and jeans.', 'man'],
-    ['Moe', 'Moe: 40 male, Black, bull build; wearing a grey hoodie.', 'man'],
+    // an -ed word after a hyphen that says what the member has or is like is no verb that gives a role
     ['Thor', 'Thor: 40 male, White, thick-necked as a bull; beard.', 'man'],
+    ['Wes', 'Wes: 35 male, White, wide-eyed as a deer; freckles.', 'man'],
+    ['Max', 'Max: 45 male, White, broad-shouldered as an ox; beard.', 'man'],
+    ['Ivy', 'Ivy: 30 female, White, quick-witted as a fox; freckles.', 'woman'],
   ])('%s (%s) is a person: its animal word is a feature or a likeness', (name, description, kind) => {
     expect(animalOf(name, description)).toBeNull();
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
@@ -259,6 +251,29 @@ describe('a cast member without a kind hint', () => {
     ],
     ['Hobbes', 'Hobbes: 8 male, ginger, adopted as a kitten; torn ear.', 'cat'],
     ['Juniper', 'Juniper: 3 female, chestnut, bought as a foal; white sock.', 'horse'],
+    ['Duchess', 'Duchess: 14 female, bay, proven as a brood mare, deep-bodied; white sock.', 'horse'],
+    ['Bubbles', 'Bubbles: 3 female, grey, spoilt as a kitten, fluffy; blue eyes.', 'cat'],
+    ['Scout2', 'Scout2: 4 female, liver and white, doubles as a gun dog, athletic; freckled muzzle.', 'dog'],
+    ['Bonzo', 'Bonzo: 3 male, black, lives as a farm dog, scruffy; one white paw.', 'dog'],
+    // ... and so does one after a hyphen ("hand-reared", "bottle-fed", "farm-born")
+    [
+      'Star',
+      'Star: 6 female, grey, hand-reared as a foal; white star. Nuzzles everyone for treats.',
+      'horse',
+    ],
+    ['Larry', 'Larry: 1 male, white, bottle-fed as a lamb; black face. Follows Mary to school.', 'sheep'],
+    ['Ruby3', 'Ruby3: 4 female, chestnut, hand-raised as a calf; white face.', 'cow'],
+    ['Ozzy', 'Ozzy: 2 male, black, bottle-fed as a piglet; floppy ears.', 'pig'],
+    ['Sable', 'Sable: 5 female, bay, home-bred as a foal; white sock.', 'horse'],
+    ['Daisy2', 'Daisy2: 3 female, red, farm-born as a calf; white face.', 'cow'],
+    // ... and "home", "life", "up", "out", "years" or "family" after such a word
+    ['Rosie', 'Rosie: 5 female, golden, brought home as a puppy, medium; feathered ears.', 'small_dog'],
+    [
+      'Champ',
+      'Champ: 10 male, bay, began life as a race horse; narrow white blaze. Now pulls the milk cart.',
+      'horse',
+    ],
+    ['Patch', 'Patch: 2 male, black, grew up as a farm dog; one white paw.', 'dog'],
   ])('%s (%s) is the animal its role names', (name, description, kind) => {
     expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
   });
@@ -304,10 +319,8 @@ describe('a cast member without a kind hint', () => {
     },
   );
 
-  // ... and so does "bear", "bull", "ox" or "gorilla" before a build word after an animal's coat, breed
-  // or region, or "N/A": it is a person's build only in the line of a people, its ethnicity one written
-  // for people in any case but "white" and "black" in lower case, which are coats, and its marks or
-  // clothes a person's ("Rob: 35 male, White, bear build; beard" above)
+  // ... and so does "bear", "bull", "ox" or "gorilla" before a build word, after an animal's coat,
+  // breed or region, or "N/A"
   it.each([
     [
       'Bruno',
@@ -367,8 +380,10 @@ describe('a cast member without a kind hint', () => {
     },
   );
 
-  // ... and after an ethnicity written for people too when the line has no person's marks or clothes:
-  // "White" and "Black" are coats, and "Indian" or "African" where a bull or a gorilla comes from
+  // ... and after an ethnicity written for people too, whatever the marks: "White" and "Black" are
+  // coats, "Indian" or "African" where a bull or a gorilla comes from, and hair, eyes, a nose, freckles,
+  // piercings, tattoos, a belt or a necklace an animal's as well as a person's (so "Rob: 35 male, White,
+  // bear build; beard" is a bear: rideo's identity line gives a person's clothes, below)
   it.each([
     [
       'Diablo',
@@ -406,13 +421,55 @@ describe('a cast member without a kind hint', () => {
       'gorilla',
       'bear',
     ],
+    ['Ferdinand2', 'Ferdinand2: 5 male, Black, massive bull build; piercing dark eyes.', 'cow', 'cow'],
+    ['Diablo2', 'Diablo2: 6 male, Black, muscular bull build; curly hair between his horns.', 'cow', 'cow'],
+    [
+      'Brahma2',
+      'Brahma2: 8 male, Indian, massive bull build; painted horns; wearing a marigold necklace and brass bells.',
+      'cow',
+      'cow',
+    ],
+    [
+      'Domino2',
+      'Domino2: 5 male, Black, heavy bull build; broad white belt around his middle.',
+      'cow',
+      'cow',
+    ],
+    ['Charlie2', 'Charlie2: 6 male, White, massive bull build; freckled pink nose.', 'cow', 'cow'],
+    ['Samson', 'Samson: 9 male, Black, massive bull frame; short horns, pierced nose.', 'cow', 'cow'],
+    ['Monty', 'Monty: 12 male, Black and White, heavy ox build; tattoo in his left ear.', 'cow', 'cow'],
+    ['Chianina', 'Chianina: 9 male, Italian, giant ox build; short hair, black nose.', 'cow', 'cow'],
+    ['Baloo', 'Baloo: 20 male, Indian, shaggy sloth bear build; long hair on his chest.', 'bear', 'bear'],
+    [
+      'Ursula',
+      'Ursula: 22 female, Black, old bear build; balding patches on her flanks; wearing a faded circus collar.',
+      'bear',
+      'bear',
+    ],
+    ['Kong', 'Kong: 18 male, Black, massive gorilla frame; thinning hair on his crown.', 'gorilla', 'bear'],
+    ['Rob', 'Rob: 35 male, White, bear build; beard.', 'bear', 'bear'],
   ])(
-    '%s (%s) is an animal (%s): its build word names it without a person’s marks or clothes',
+    '%s (%s) is an animal (%s): its build word names it after an ethnicity too, whatever its marks',
     (name, description, word, kind) => {
       expect(animalOf(name, description)).toMatchObject({ word, kind });
       expect(kindOf(name, description).kind).toBe(kind);
     },
   );
+
+  // ... and a person's clothes make such a member a person, one that acts as a person (castKinds)
+  it.each([
+    ['Hank', 'Hank: 50 male, White, bear build; scar on chin; wearing a flannel shirt and jeans.', 'bear'],
+    ['Moe', 'Moe: 40 male, Black, bull build; wearing a grey hoodie.', 'cow'],
+    ['Gil', 'Gil: 40 male, White, gorilla build; beard; wearing a leather vest.', 'gorilla'],
+    ['Kai', 'Kai: 35 male, Pacific Islander, ox build; tattoos; wearing a rugby jersey.', 'cow'],
+  ])('%s (%s) is a person: its clothes make the %s its build names a person', (name, description, word) => {
+    expect(animalOf(name, description)).toMatchObject({ word });
+    expect(kindOf(name, description)).toMatchObject({
+      kind: 'man',
+      reason: `a ${word} that acts as a person`,
+      warnings: [],
+    });
+  });
 
   it.each([
     'Tornado: 7 male, black, massive bull build; ring through his nose. Has never been ridden for eight seconds.',
