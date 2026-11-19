@@ -57,14 +57,25 @@ export function sunOf(time: TimeOfDay | null): { azimuthDeg: number; elevationDe
 const INDOORS =
   /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|cafe|caf|restaurant|(?<!sand |candy |chocolate |crow)bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat(?=\s*(?:$|[,.;:!?)]|(?:in|on|at|of|with|where|above|below|near|by|and|that|which)\b))|cabin interior|staircase|stairwell|elevator|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/g;
 /**
+ * Buildings, and the shelters people are inside of as they are of a building (boats, ships, sheds,
+ * tents, caravans …), as a regular expression's source: BUILDING's words, and the words that end a
+ * deck of cards (OUTDOORS).
+ */
+const BUILDING_WORDS =
+  'house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace|barn|shed|shack|stable|greenhouse|lighthouse|windmill|mill|boat|houseboat|riverboat|ship|yacht|barge|ferry|steamer|trawler|liner|tent|caravan|trailer|camper|motorhome|yurt|tipi|teepee|wigwam|igloo|bothy';
+
+/**
  * Words that say a place is outdoors (they win over a room named as being nearby); a deck too (a
  * boat's or a house's), but not "below deck", nor a deck of cards (after "of" a determiner or none,
- * then up to three words before "cards", none a determiner, a preposition or a word that opens a
- * clause: "a deck of old playing cards", "the deck of his cards", not "the deck of the ship where
- * cards are dealt"), a tape, cassette, DJ or skateboard deck or a deck chair.
+ * then up to three words before "cards", none a determiner, a preposition, a word that opens a
+ * clause or a building or a vessel of BUILDING_WORDS: "a deck of old playing cards", "the deck of
+ * his cards", not "the deck of the ship where cards are dealt" nor "on the deck of the ship cards
+ * are dealt"), a tape, cassette, DJ or skateboard deck or a deck chair.
  */
-const OUTDOORS =
-  /\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot |dj |dj's |skateboard |skate )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:(?:the|an?|this|that|these|those|his|her|their|its|our|my|your)\s+)?(?:(?!(?:the|an?|this|that|these|those|his|her|their|its|our|my|your|where|which|who|whose|when|while|as|if|so|and|or|but|with|without|on|in|at|from|by|for|to|of|is|are|was|were)\s)[a-z0-9-]+\s+){0,3}cards\b)|car park|parking lot)\b/g;
+const OUTDOORS = new RegExp(
+  String.raw`\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot |dj |dj's |skateboard |skate )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:(?:the|an?|this|that|these|those|his|her|their|its|our|my|your)\s+)?(?:(?!(?:the|an?|this|that|these|those|his|her|their|its|our|my|your|where|which|who|whose|when|while|as|if|so|and|or|but|with|without|on|in|at|from|by|for|to|of|is|are|was|were|(?:${BUILDING_WORDS})s?)\s)[a-z0-9-]+\s+){0,3}cards\b)|car park|parking lot)\b`,
+  'g',
+);
 
 /**
  * Indoor words that may say where or whose an outdoor place is rather than name a room ("deep inside
@@ -79,8 +90,7 @@ const QUALIFIERS = /^(?:inside|flat|bar|cafe|caf|factory|museum)$/;
  * "the river boat", "the garden shed", "the mountain tent"): the outdoor word then names the building,
  * not the place.
  */
-const BUILDING =
-  /^[\s-]+(?:house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace|barn|shed|shack|stable|greenhouse|lighthouse|windmill|mill|boat|houseboat|ship|yacht|barge|ferry|steamer|tent|caravan|trailer|camper|motorhome|yurt|tipi|teepee|wigwam|igloo|bothy)s?\b/;
+const BUILDING = new RegExp(String.raw`^[\s-]+(?:${BUILDING_WORDS})s?\b`);
 
 /** What comes before "inside" or "indoors" that opens a clause ("a cabin in the woods, inside by the fire"). */
 const CLAUSE_OPENING = /(?:[,;:–—]|\s-)\s*(?:(?:and|but|then)\s+)?$/;
