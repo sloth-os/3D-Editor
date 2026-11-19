@@ -199,6 +199,8 @@ describe('a cast member without a kind hint', () => {
     ['Gil', 'Gil: 40 male, White, gorilla build; beard.', 'man'],
     ['Abe', 'Abe: 45 male, Black, ox build; shaved head.', 'man'],
     ['Kai', 'Kai: 35 male, Pacific Islander, as strong as a big old bull; tattoos.', 'man'],
+    // Bo and Mia are guards, persons without these rules too: "like" ends the words read (NOT_ITSELF)
+    // and "pony" before "tail" is a modifier (MODIFIED)
     ['Bo', 'Bo: 40 male, White, built like a bear; beard.', 'man'],
     ['Mia', 'Mia: 7 female, slim, pony tail; freckles.', 'child'],
     // an ethnicity written for people, in any case (Kai and Lu are guards: written with a capital,

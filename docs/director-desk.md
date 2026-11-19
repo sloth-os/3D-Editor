@@ -363,7 +363,7 @@ undo step, and runs in a web worker as well as on the server:
   `Ana: early 30s female` a woman; 3 and under a toddler, 12 and under a child, 65 and over an
   elder). The line runs to its first sentence end (see [Briefs](#limits-and-known-gaps) for where
   a sentence ends): a period inside a number (`1.85 m`), after a title (`Dr.`, `Mrs.`, `St.`) or
-  an initial unless a capitalised sentence opener follows (`Dr. Okafor`, `St. Ives`, `J. Smith`),
+  an initial (`Dr. Okafor`, `St. Ives`, `J. Smith`) unless a capitalised sentence opener follows,
   or after an abbreviation no capital follows (`approx. 160 cm`, `e.g. a scar`) does
   not end it. An age may be written out: `early twenties`, `30-ish`, `thirty-something`,
   `18 months` (a toddler); early, mid and late put an age 2, 5 and 8 years into its decade, so

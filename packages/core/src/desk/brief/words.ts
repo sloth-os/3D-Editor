@@ -482,7 +482,7 @@ const FEATURE_NOUNS =
   /^(?:neck|eyes?|face|nose|legs?|arms?|shoulders?|chest|jaw|jowls|lips|mouth|teeth|ears?|hands?|feet|foot|toes|hair|head|brows?|lashes|cheeks|chin|belly|gut|back|hips|thighs|skin|grin|smile|gaze|stare|glare|walk|gait|stance|posture|tail)$/;
 
 /** Animal words used for a person's build ("a bear build", "an ox frame"). */
-const FIGURATIVE = /^(?:bear|bull|ox|gorilla|ape)$/;
+const FIGURATIVE = /^(?:bear|bull|ox|gorilla)$/;
 
 /**
  * Words for a build, after which a FIGURATIVE word is a person's build in the identity line of a
@@ -587,11 +587,11 @@ const IDENTITY_GENDER = /^(?:male|female|non-?binary|man|woman|boy|girl)$/;
  * writes its identity line ("Name: <age> <gender>, <ethnicity>, <build>; <marks>; wearing …." —
  * rideo's compactIdentity, followed by its summary), and the text after it (accents folded, case
  * kept). The line runs to its first sentence end (rideo/rules.ts sentenceBreak): a period inside a
- * number ("1.85 m"), after a title ("Dr.", "Mr.", "Mrs.", "Ms.", "St.") or an initial unless a
- * capitalised word that opens a sentence follows ("Dr. Okafor", "St. Ives", "J. Smith"), or after an
- * abbreviation no capital follows ("approx. 160 cm", "e.g. a scar") does not end it, so whatever
- * follows such a period is still the line, not the summary. Null when the description does not open
- * with the name and a colon.
+ * number ("1.85 m"), after a title ("Dr.", "Mr.", "Mrs.", "Ms.", "St.") or an initial
+ * ("Dr. Okafor", "St. Ives", "J. Smith") unless a capitalised word that opens a sentence follows,
+ * or after an abbreviation no capital follows ("approx. 160 cm", "e.g. a scar") does not end it, so
+ * whatever follows such a period is still the line, not the summary. Null when the description does
+ * not open with the name and a colon.
  */
 export function identityLine(name: string, description: string): { line: string; rest: string } | null {
   const own = foldText(name).trim().split(/\s+/).filter(Boolean);
