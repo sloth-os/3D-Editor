@@ -218,6 +218,26 @@ describe('a cast member without a kind hint', () => {
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
   });
 
+  // a role is no likeness: an animal word after "as" that follows a verb giving the member a role
+  // (worked, used, bred, trained as one) names what the member is
+  it.each([
+    [
+      'Bess',
+      'Bess: 9 female, chestnut, worked as a plough horse; white blaze. Retired to the meadow.',
+      'horse',
+    ],
+    ['Jenny', 'Jenny: 12 female, grey, used as a pack mule; long ears.', 'donkey'],
+    ['Buddy', 'Buddy: 7 male, golden, works as a therapy dog; grey muzzle.', 'dog'],
+    ['Nell2', 'Nell2: 6 female, black and white, bred as a working dog; one blue eye.', 'dog'],
+    [
+      'Moss5',
+      'Moss5: 4 male, black and white, trained as a sheepdog; one blue eye. Never lets a lamb stray.',
+      'dog',
+    ],
+  ])('%s (%s) is the animal its role names', (name, description, kind) => {
+    expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
+  });
+
   // ... but an animal word before another word names what the member is: a species in the build item
   // ("sturdy pony build", "lean collie build", "heavy cow build") or before its type, its sex, its
   // age or a size ("golden retriever type", "tabby tom", "pony yearling", "mare sixteen hands")

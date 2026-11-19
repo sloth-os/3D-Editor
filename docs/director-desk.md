@@ -380,14 +380,15 @@ undo step, and runs in a web worker as well as on the server:
   "and" or a hyphen; after a coat, a breed or a region, "brown, hulking bear build" and "Brown,
   massive bear build" are a bear and "Hereford, massive bull build" a bull, and "sturdy pony build"
   is a pony), and after "as a" or "like a" ("strong as an ox", "as strong as a big old bull", "built
-  like a bear"); before another animal word the later is the animal ("cattle dog" is a dog), unless
-  it is the young, the sex or a breed word ("Shetland pony mare", "bear cub"), or the first is a
-  breed of dog: the first breed of a cross names it ("golden retriever-poodle mix" is a retriever,
-  not a small dog). In the first item only the age can name the animal (`puppy male`). Animal words
-  among its marks ("bull neck", "doe eyes", "a parrot on his shoulder") or in the name ("Wolf") do
-  not make a person an animal, unless the sentence after the line names the animal ("A curious white
-  duck."). An animal word that says what a member has or resembles is not what it is: a possessive
-  ("crow's feet"), one before "-like" ("a crow-like old woman") or before a hyphened "-ed" word
+  like a bear"; not "as" after a verb that gives a role: "worked as a plough horse" is a horse);
+  before another animal word the later is the animal ("cattle dog" is a dog), unless it is the
+  young, the sex or a breed word ("Shetland pony mare", "bear cub"), or the first is a breed of dog:
+  the first breed of a cross names it ("golden retriever-poodle mix" is a retriever, not a small
+  dog). In the first item only the age can name the animal (`puppy male`). Animal words among its
+  marks ("bull neck", "doe eyes", "a parrot on his shoulder") or in the name ("Wolf") do not make a
+  person an animal, unless the sentence after the line names the animal ("A curious white duck.").
+  An animal word that says what a member has or resembles is not what it is: a possessive ("crow's
+  feet"), one before "-like" ("a crow-like old woman") or before a hyphened "-ed" word
   ("bull-necked", "doe-eyed"), "a bear of a man", as before "tattoo", "costume" or "ears".
   An animal the desk has no figure for stands in as the built kind nearest its size, with a warning:
   birds and small animals as a `cat`, foxes and wolves as a `dog`, goats as a `sheep`, big cats as a
