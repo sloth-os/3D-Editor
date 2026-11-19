@@ -212,6 +212,28 @@ describe('a cast member without a kind hint', () => {
     ['Wes', 'Wes: 35 male, White, wide-eyed as a deer; freckles.', 'man'],
     ['Max', 'Max: 45 male, White, broad-shouldered as an ox; beard.', 'man'],
     ['Ivy', 'Ivy: 30 female, White, quick-witted as a fox; freckles.', 'woman'],
+    ['Ezra', 'Ezra: 72 male, White, grey-bearded as an old goat; rheumy eyes.', 'elder'],
+    ['Vera', 'Vera: 45 female, White, sharp-featured as a fox; thin lips.', 'woman'],
+    ['Mort', 'Mort: 55 male, White, heavy-jowled as a basset hound; sad eyes.', 'man'],
+    ['Ellie', 'Ellie: 13 female, White, knock-kneed as a newborn foal; braces.', 'woman'],
+    // "bear", "bull", "ox" or "gorilla" before a build word is a person's build when the outfit names
+    // a garment only a person wears, next to an animal's gear too (a collar, a harness)
+    ['Hank', 'Hank: 50 male, White, bear build; scar on chin; wearing a flannel shirt and jeans.', 'man'],
+    ['Moe', 'Moe: 40 male, Black, bull build; wearing a grey hoodie.', 'man'],
+    ['Gil', 'Gil: 40 male, White, gorilla build; beard; wearing a leather vest.', 'man'],
+    ['Kai', 'Kai: 35 male, Pacific Islander, ox build; tattoos; wearing a rugby jersey.', 'man'],
+    [
+      'Brennan',
+      'Brennan: 58 male, Irish, bear build; grey stubble; wearing a black cassock and a white clerical collar.',
+      'man',
+    ],
+    ['Chad', 'Chad: 21 male, White, bull build; wearing a pink polo shirt with a popped collar.', 'man'],
+    [
+      'Ty',
+      'Ty: 26 male, White, bull build; sunburned neck; wearing a climbing harness over a grey t-shirt.',
+      'man',
+    ],
+    ['Joe', 'Joe: 37 male, White, bear build; full beard; wearing a horseshoe belt buckle and jeans.', 'man'],
   ])('%s (%s) is a person: its animal word is a feature or a likeness', (name, description, kind) => {
     expect(animalOf(name, description)).toBeNull();
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
@@ -274,6 +296,21 @@ describe('a cast member without a kind hint', () => {
       'horse',
     ],
     ['Patch', 'Patch: 2 male, black, grew up as a farm dog; one white paw.', 'dog'],
+    ['Rex2', 'Rex2: 9 male, sable, started out as a farm dog; grey muzzle.', 'dog'],
+    ['Major', 'Major: 16 male, grey, spent years as a pack horse; dappled rump.', 'horse'],
+    ['Tilly', 'Tilly: 3 female, grey, joined the family as a kitten; white bib.', 'cat'],
+    ['Biscuit', 'Biscuit: 4 male, cream, given away as a puppy; one floppy ear.', 'small_dog'],
+    ['Shamrock', 'Shamrock: 9 male, grey, came over as a foal; dappled rump.', 'horse'],
+    // ... and so do the irregular past participles, "began" and "begun" by themselves, and the forms
+    // of run, compete, perform and volunteer
+    ['Domino', 'Domino: 15 male, black, driven as a carriage horse; feathered feet.', 'horse'],
+    ['Flash', 'Flash: 5 male, bay, stolen as a foal; white star.', 'horse'],
+    ['Smudge', 'Smudge: 5 female, grey, left as a kitten on the church steps; white socks.', 'cat'],
+    ['Dancer', 'Dancer: 11 female, bay, began as a race horse; white sock.', 'horse'],
+    ['Scout', 'Scout: 4 male, grey and white, runs as a sled dog; one blue eye.', 'dog'],
+    ['Sugar', 'Sugar: 7 female, palomino, competes as a show pony; plaited mane.', 'pony'],
+    ['Pegasus', 'Pegasus: 12 male, white, performing as a circus horse; long flowing mane.', 'horse'],
+    ['Biscuit2', 'Biscuit2: 7 male, golden, volunteers as a therapy dog; grey muzzle.', 'dog'],
   ])('%s (%s) is the animal its role names', (name, description, kind) => {
     expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
   });
@@ -383,7 +420,8 @@ describe('a cast member without a kind hint', () => {
   // ... and after an ethnicity written for people too, whatever the marks: "White" and "Black" are
   // coats, "Indian" or "African" where a bull or a gorilla comes from, and hair, eyes, a nose, freckles,
   // piercings, tattoos, a belt or a necklace an animal's as well as a person's (so "Rob: 35 male, White,
-  // bear build; beard" is a bear: rideo's identity line gives a person's clothes, below)
+  // bear build; beard" is a bear); only a garment in the outfit makes the build a person's (above), not
+  // an animal's gear or adornments ("wearing a faded circus collar", "a marigold necklace and bells")
   it.each([
     [
       'Diablo',
@@ -455,21 +493,6 @@ describe('a cast member without a kind hint', () => {
       expect(kindOf(name, description).kind).toBe(kind);
     },
   );
-
-  // ... and a person's clothes make such a member a person, one that acts as a person (castKinds)
-  it.each([
-    ['Hank', 'Hank: 50 male, White, bear build; scar on chin; wearing a flannel shirt and jeans.', 'bear'],
-    ['Moe', 'Moe: 40 male, Black, bull build; wearing a grey hoodie.', 'cow'],
-    ['Gil', 'Gil: 40 male, White, gorilla build; beard; wearing a leather vest.', 'gorilla'],
-    ['Kai', 'Kai: 35 male, Pacific Islander, ox build; tattoos; wearing a rugby jersey.', 'cow'],
-  ])('%s (%s) is a person: its clothes make the %s its build names a person', (name, description, word) => {
-    expect(animalOf(name, description)).toMatchObject({ word });
-    expect(kindOf(name, description)).toMatchObject({
-      kind: 'man',
-      reason: `a ${word} that acts as a person`,
-      warnings: [],
-    });
-  });
 
   it.each([
     'Tornado: 7 male, black, massive bull build; ring through his nose. Has never been ridden for eight seconds.',

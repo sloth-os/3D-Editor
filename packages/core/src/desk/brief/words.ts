@@ -482,39 +482,62 @@ const isDogWord = (w: string): boolean =>
 const FEATURE_NOUNS =
   /^(?:neck|eyes?|face|nose|legs?|arms?|shoulders?|chest|jaw|jowls|lips|mouth|teeth|ears?|hands?|feet|foot|toes|hair|head|brows?|lashes|cheeks|chin|belly|gut|back|hips|thighs|skin|grin|smile|gaze|stare|glare|walk|gait|stance|posture|tail)$/;
 
+/** Animal words used for a person's build ("a bear build", "an ox frame"). */
+const FIGURATIVE = /^(?:bear|bull|ox|gorilla)$/;
+
+/**
+ * Words for a build, after which a FIGURATIVE word is a person's build when the member is dressed
+ * as a person ("bear build", "ox frame", "gorilla-sized"; see blankFeatures).
+ */
+const BUILD_NOUNS = /^(?:build|frame|physique|body|shape|size|type|[a-z]*sized)$/;
+
+/**
+ * Garments only a person wears, read in the outfit of rideo's identity line (after "wearing";
+ * identityAnimal): a shirt, a top, a suit, a dress, trousers, jeans, shorts, a jersey, a sweater, a
+ * jacket, a coat, a vest, a cassock, a kurta, a uniform, a hat, shoes and others ("wearing a black
+ * cassock and a white clerical collar", "wearing a climbing harness over a grey t-shirt"). An
+ * animal's gear and adornments are none ("a red collar", "a leather harness", "brass bells", "a
+ * marigold necklace", "a saddle blanket").
+ */
+const GARMENT =
+  /\b(?:shirts?|t-?shirts?|tees?|polos?|blouses?|tops?|suits?|tuxedos?|dress(?:es)?|skirts?|trousers|pants|jeans|shorts|slacks|chinos|leggings|tights|hoodies?|sweaters?|jumpers?|jerseys?|cardigans?|sweatshirts?|vests?|waistcoats?|blazers?|jackets?|coats?|peacoats?|overcoats?|raincoats?|parkas?|anoraks?|cassocks?|robes?|gowns?|kurtas?|saris?|sarongs?|kimonos?|tunics?|kilts?|overalls|dungarees|aprons?|uniforms?|jumpsuits?|tracksuits?|pyjamas|pajamas|ponchos?|shawls?|cloaks?|capes?|scrubs|hats?|caps?|beanies?|berets?|helmets?|boots|shoes|trainers|sneakers|sandals|loafers|heels|gloves|scarf|scarves|ties?|belts?)\b/i;
+
 /**
  * Stems of the hyphened "-ed" words that say what a member has or is like (a body part, a look or a
- * nature: "thick-necked", "broad-shouldered", "wide-eyed", "cold-blooded", "quick-witted",
- * "good-natured"), as a regular expression's source: before "as a(n)" such a word makes a likeness
- * (LIKENESS), where any other hyphened "-ed" word is a past participle that gives a role
- * ("hand-reared", "bottle-fed", "home-bred").
+ * nature: "thick-necked", "broad-shouldered", "wide-eyed", "grey-bearded", "cold-blooded",
+ * "quick-witted", "good-natured"), as a regular expression's source: before "as a(n)" such a word
+ * makes a likeness (LIKENESS), where any other hyphened "-ed" word is a past participle that gives a
+ * role ("hand-reared", "bottle-fed", "home-bred").
  */
 const HAS_ED =
-  'neck|shoulder|chest|legg|ey|ear|foot|head|heart|hair|skinn|bon|bodi|lipp|jaw|back|nos|fac|to|arm|hand|brow|cheek|chinn|hipp|thigh|belli|blood|witt|sight|tongu|skull|limb|mouth|voic|tooth|waist|muscl|temper|natur|manner|will|mind|spirit|fram|fist|tail|lash|lidd|throat|colou?r';
+  'neck|shoulder|chest|legg|ey|ear|foot|head|heart|hair|beard|jowl|skinn|bon|bodi|lipp|jaw|back|nos|fac|featur|to|arm|hand|finger|kne|brow|cheek|chinn|hipp|thigh|belli|blood|witt|sight|tongu|skull|limb|mouth|voic|tooth|waist|muscl|temper|natur|humou?r|manner|behav|will|mind|spirit|fram|fist|tail|lash|lidd|throat|colou?r';
 
 /**
  * Words before "as" that give the member a role (LIKENESS), as a regular expression's source: past
  * participles that do not end in "-ed" (bred, kept, bought, sold, born, brought, caught, found, got,
- * given, held, known, taken, won, shown, proven, spoilt), began and begun, and forms of work, use,
- * breed, train, serve, act, double and live ("works", "using", "doubles", "lives").
+ * given, held, known, taken, won, shown, proven, spoilt, driven, ridden, stolen, chosen, taught,
+ * lost, left, sent, drawn, thrown, broken, cast, hidden, beaten), began and begun, and forms of
+ * work, use, breed, train, serve, act, double, live, run, compete, perform and volunteer ("works",
+ * "using", "doubles", "competes").
  */
 const ROLE_WORDS =
-  'work(?:s|ing)?|use|uses|using|breed(?:s|ing)?|bred|train(?:s|ing)?|serves?|serving|act(?:s|ing)?|doubles?|doubling|lives?|living|kept|bought|sold|born|brought|caught|found|got|given|held|known|taken|won|shown|proven|spoilt|began|begun';
+  'work(?:s|ing)?|use|uses|using|breed(?:s|ing)?|bred|train(?:s|ing)?|serves?|serving|act(?:s|ing)?|doubles?|doubling|lives?|living|run|runs|running|competes?|competing|performs?|performing|volunteers?|volunteering|kept|bought|sold|born|brought|caught|found|got|given|held|known|taken|won|shown|proven|spoilt|driven|ridden|stolen|chosen|taught|lost|left|sent|drawn|thrown|broken|cast|hidden|beaten|began|begun';
 
 /**
  * An animal word's likeness in an item of rideo's identity line, read on the words before it
- * (blankFeatures): "as a(n)" or "like a(n)" with at most two words between ("strong as an ox", "as
- * strong as a big old bull", "fierce as a tiger" or "sleek as an otter", whose article MODIFIED
- * blanked before an -er word, "built like a bear"), but not "as" after a word that gives the member
- * a role: a word ending in "-ed" ("retired", "adopted"), one after a hyphen too ("hand-reared",
- * "bottle-fed") unless it says what the member has or is like (HAS_ED: "thick-necked as a bull" is a
- * likeness), a word of ROLE_WORDS ("bred", "farm-born", "works", "doubles"), or "home", "life",
- * "up", "out", "years" or "family" after such a word ("brought home as a puppy", "began life as a
- * race horse", "grew up as a farm dog"): "worked as a plough horse", "retired as a race horse" and
- * "hand-reared as a foal" are the animal.
+ * (blankFeatures): "as a(n)" with at most two words between ("strong as an ox", "as strong as a big
+ * old bull", "fierce as a tiger" or "sleek as an otter", whose article MODIFIED blanked before an
+ * -er word; after "like" no word is read at all, NOT_ITSELF: "built like a bear"), but not "as"
+ * after a word that gives the member a role: a word ending in "-ed" ("retired", "adopted"), one
+ * after a hyphen too ("hand-reared", "bottle-fed") unless it says what the member has or is like
+ * (HAS_ED: "thick-necked as a bull" is a likeness), a word of ROLE_WORDS ("bred", "farm-born",
+ * "works", "driven"), or "home", "life", "up", "out", "away", "over", "years" or "family" ("brought
+ * home as a puppy", "began life as a race horse", "grew up as a farm dog", "given away as a puppy"):
+ * "worked as a plough horse", "retired as a race horse" and "hand-reared as a foal" are the animal.
+ * Another word between the role word and "as" makes a likeness ("used mainly as a pack horse").
  */
 const LIKENESS = new RegExp(
-  String.raw`\b(?:(?<!(?:(?:^|[^a-z-])(?:[a-z]+ed|home|life|up|out|years|family)|(?:^|[^a-z])(?:${ROLE_WORDS})|-(?!(?:${HAS_ED})ed\b)[a-z]+ed)\s+)as|like)\s+(?:an?|\s{1,2})\s+(?:[a-z-]+\s+){0,2}$`,
+  String.raw`\b(?<!(?:(?:^|[^a-z-])(?:[a-z]+ed|home|life|up|out|away|over|years|family)|(?:^|[^a-z])(?:${ROLE_WORDS})|-(?!(?:${HAS_ED})ed\b)[a-z]+ed)\s+)as(?:\s+an?\s+|\s{3,})(?:[a-z-]+\s+){0,2}$`,
 );
 
 /**
@@ -522,24 +545,27 @@ const LIKENESS = new RegExp(
  * any person and any word of NOT_ITSELF) with the animal words that are a person's feature or
  * likeness, or another animal's modifier, blanked, same length: one whose next word (after spaces or
  * a hyphen) is a body part or a look (FEATURE_NOUNS: "bull neck", "doe eyes", "horse face", "chicken
- * legs", "pony tail"), a likeness (LIKENESS: "strong as an ox", "fierce as a tiger", "built like a
- * bear"; not a role, "retired as a race horse"), and one whose next word is another animal word,
- * not its young, its sex or a breed word (KEEPS_ANIMAL): the later word is the animal ("Australian
- * cattle dog", "bird dog" and "bull terrier" are dogs, but "Shetland pony mare" is a pony and "bear
- * cub" a bear), unless it names a dog and is not a young one (isDogWord): a breed of dog names the
- * dog, the first breed of a cross as in a sentence ("golden retriever-poodle mix" is a retriever,
- * "Labrador poodle mix" a Labrador; "puppy-dog eyes" stay a feature). Any other animal word is read
- * as in a sentence ("sturdy pony build", "golden retriever type", "donkey jack", and "bear build" or
- * "ox frame" whatever the line's ethnicity and marks: a person's clothes make such a member a
- * person, castKinds).
+ * legs", "pony tail"), a likeness (LIKENESS: "strong as an ox", "fierce as a tiger"; not a role,
+ * "retired as a race horse"), one used for a person's build before a build word when the member is
+ * `dressed` as a person (FIGURATIVE before BUILD_NOUNS, the line's outfit naming a person's garment,
+ * GARMENT: "White, bear build; wearing a flannel shirt"; not otherwise, whatever the ethnicity and
+ * marks say: "brown, hulking bear build", "White, bear build; beard" and "Black, old bear build;
+ * wearing a faded circus collar" are bears), and one whose next word is another animal word, not its
+ * young, its sex or a breed word (KEEPS_ANIMAL): the later word is the animal ("Australian cattle
+ * dog", "bird dog" and "bull terrier" are dogs, but "Shetland pony mare" is a pony and "bear cub" a
+ * bear), unless it names a dog and is not a young one (isDogWord): a breed of dog names the dog, the
+ * first breed of a cross as in a sentence ("golden retriever-poodle mix" is a retriever, "Labrador
+ * poodle mix" a Labrador; "puppy-dog eyes" stay a feature). Any other animal word is read as in a
+ * sentence ("sturdy pony build", "golden retriever type", "donkey jack").
  */
-function blankFeatures(head: string): string {
+function blankFeatures(head: string, dressed: boolean): string {
   return head.replace(/[a-z]+/g, (w, at: number) => {
     if (!isAnimalWord(w)) return w;
     const next = /^[\s-]+([a-z]+)/.exec(head.slice(at + w.length))?.[1] ?? '';
     const feature =
       FEATURE_NOUNS.test(next) ||
       LIKENESS.test(head.slice(0, at)) ||
+      (dressed && FIGURATIVE.test(w) && BUILD_NOUNS.test(next)) ||
       (isAnimalWord(next) && !KEEPS_ANIMAL.test(next) && !(isDogWord(w) && !KEEPS_ANIMAL.test(w)));
     return feature ? ' '.repeat(w.length) : w;
   });
@@ -551,14 +577,14 @@ function blankFeatures(head: string): string {
  * something the member has, does or wears; 'person' when a person is named first; null when it says
  * neither. In an `item` of rideo's identity line an animal word that is a person's feature or
  * likeness, or another animal's modifier, does not count (blankFeatures: "bull neck", "strong as an
- * ox", "cattle dog").
+ * ox", "cattle dog", and "bear build" when the member is dressed as a person, `item.dressed`).
  */
-function sentenceKind(sentence: string, item = false): AnimalWords | 'person' | null {
+function sentenceKind(sentence: string, item?: { dressed: boolean }): AnimalWords | 'person' | null {
   const t = blankModifiers(plainText(sentence));
   const person = PERSON_NOUN.exec(t);
   const breaker = NOT_ITSELF.exec(t);
   const before = t.slice(0, Math.min(person?.index ?? t.length, breaker?.index ?? t.length));
-  const head = item ? blankFeatures(before) : before;
+  const head = item ? blankFeatures(before, item.dressed) : before;
   let stand: { at: number; kind: ActorKind; word: string } | null = null;
   for (const [re, kind] of STAND_INS) {
     const m = re.exec(head);
@@ -629,23 +655,30 @@ export function identityOf(name: string, description: string): { age: string; ge
  * but for the animal words that are a person's feature or likeness or another animal's modifier
  * (blankFeatures) — "Pip: 3 male, golden retriever, small", "Bella: adult female, chestnut mare",
  * "Clover: 7 female, chestnut, sturdy pony build", "Bruno: 6 male, brown, hulking bear build" (a
- * bear, as "Rob: 35 male, White, bear build" is: a person's clothes make such a member a person,
- * castKinds), "Cub: 2 male, bear cub", "Blue: 3 male, Australian cattle dog" (a dog). The words read
+ * bear, as "Rob: 35 male, White, bear build; beard" is), "Cub: 2 male, bear cub", "Blue: 3 male,
+ * Australian cattle dog" (a dog). The words read
  * end before a word that makes it something the member has, does or is with ("golden retriever with
  * a white chest"), and in the first item only the age, before the gender, can name it ("Kit: kitten
  * female", "Pip: puppy male"). Null when it names none, or names one only as a feature: before a
  * body part or a look ("Tom: 45 male, stocky, bull neck", "Dee: 25 female, Latina, petite, doe
  * eyes", "Ken: 40 male, Asian, horse face"), after "as a(n)" ("strong as an ox") or "like" ("built
- * like a bear"), before a hyphened "-ed" word ("bull-necked") or as a figure of speech ("a bear of a
- * man"); the marks after the ";" ("bull neck", "doe eyes") are never read here as what the member is.
+ * like a bear"), before a hyphened "-ed" word ("bull-necked"), as a figure of speech ("a bear of a
+ * man") or as the build of a member whose outfit (after "wearing") names a garment only a person
+ * wears (GARMENT: "Hank: 50 male, White, bear build; wearing a flannel shirt", "Brennan: 58 male,
+ * Irish, bear build; wearing a black cassock and a white clerical collar"); the marks after the ";"
+ * ("bull neck", "doe eyes") are never read here as what the member is.
  */
 function identityAnimal(line: string): AnimalWords | null {
   const [first, ...others] = line.split(';')[0].split(',');
   // "<age> <gender>": the gender is no animal's head ("puppy male")
   const age = first.trim().split(/\s+/);
   if (IDENTITY_GENDER.test(plainText(age.at(-1) ?? ''))) age.pop();
+  // dressed as a person: a garment in the outfit ("wearing a flannel shirt"), next to an animal's
+  // gear too ("wearing a cassock and a clerical collar"); an animal's gear alone is no garment
+  const outfit = /\bwearing\b(.*)/i.exec(line.split(';').slice(1).join(';'))?.[1] ?? '';
+  const dressed = GARMENT.test(outfit);
   for (const item of [age.join(' '), ...others]) {
-    const k = sentenceKind(item, true);
+    const k = sentenceKind(item, { dressed });
     if (k && k !== 'person') return k;
   }
   return null;
