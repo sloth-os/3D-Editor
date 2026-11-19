@@ -215,6 +215,11 @@ describe('a cast member without a kind hint', () => {
     ['Ray', 'Ray: 50 male, White, proud as a rooster; moustache.', 'man'],
     ['Oda', 'Oda: 25 female, White, sleek as an otter; freckles.', 'woman'],
     ['Ted', 'Ted: 60 male, White, tenacious as a terrier; scar.', 'man'],
+    // a person's clothes make the line a people's as a beard does; an -ed word after a hyphen is no
+    // verb that gives a role
+    ['Hank', 'Hank: 50 male, White, bear build; scar on chin; wearing a flannel shirt and jeans.', 'man'],
+    ['Moe', 'Moe: 40 male, Black, bull build; wearing a grey hoodie.', 'man'],
+    ['Thor', 'Thor: 40 male, White, thick-necked as a bull; beard.', 'man'],
   ])('%s (%s) is a person: its animal word is a feature or a likeness', (name, description, kind) => {
     expect(animalOf(name, description)).toBeNull();
     expect(kindOf(name, description)).toMatchObject({ kind, reason: 'a person', warnings: [] });
@@ -236,6 +241,24 @@ describe('a cast member without a kind hint', () => {
       'Moss5: 4 male, black and white, trained as a sheepdog; one blue eye. Never lets a lamb stray.',
       'dog',
     ],
+    // any past participle gives a role, not only those of work and training
+    [
+      'Thunder',
+      'Thunder: 12 male, bay, retired as a race horse; white blaze. Grazes in the paddock.',
+      'horse',
+    ],
+    [
+      'Ranger',
+      'Ranger: 9 male, sable, registered as a service dog; calm eyes. Guides his blind owner.',
+      'dog',
+    ],
+    [
+      'Goldie',
+      'Goldie: 3 female, golden, registered as a retriever; feathered tail. Fetches the ducks.',
+      'dog',
+    ],
+    ['Hobbes', 'Hobbes: 8 male, ginger, adopted as a kitten; torn ear.', 'cat'],
+    ['Juniper', 'Juniper: 3 female, chestnut, bought as a foal; white sock.', 'horse'],
   ])('%s (%s) is the animal its role names', (name, description, kind) => {
     expect(kindOf(name, description)).toMatchObject({ kind, warnings: [] });
   });
@@ -283,7 +306,8 @@ describe('a cast member without a kind hint', () => {
 
   // ... and so does "bear", "bull", "ox" or "gorilla" before a build word after an animal's coat, breed
   // or region, or "N/A": it is a person's build only in the line of a people, its ethnicity one written
-  // for people ("Rob: 35 male, White, bear build" above), whatever capital it has
+  // for people in any case but "white" and "black" in lower case, which are coats, and its marks or
+  // clothes a person's ("Rob: 35 male, White, bear build; beard" above)
   it.each([
     [
       'Bruno',
@@ -343,9 +367,57 @@ describe('a cast member without a kind hint', () => {
     },
   );
 
+  // ... and after an ethnicity written for people too when the line has no person's marks or clothes:
+  // "White" and "Black" are coats, and "Indian" or "African" where a bull or a gorilla comes from
+  it.each([
+    [
+      'Diablo',
+      'Diablo: 6 male, Black, muscular bull build; long curved horns. Charges anything red.',
+      'cow',
+      'cow',
+    ],
+    [
+      'Nanuk',
+      'Nanuk: 9 male, White, massive polar bear build; black nose. Hunts seals on the ice.',
+      'bear',
+      'bear',
+    ],
+    [
+      'Koko2',
+      'Koko2: 30 female, Black, stocky gorilla build; gentle eyes. Signs to her keeper.',
+      'gorilla',
+      'bear',
+    ],
+    [
+      'Domino',
+      'Domino: 5 male, Black and White, heavy bull build; ear tag. Grazes by the fence.',
+      'cow',
+      'cow',
+    ],
+    [
+      'Brahma',
+      'Brahma: 8 male, Indian, massive bull build; hump and dewlap. Wanders the village lanes.',
+      'cow',
+      'cow',
+    ],
+    [
+      'Kumbuka',
+      'Kumbuka: 25 male, African, huge gorilla build; silver back. Guards his family in the enclosure.',
+      'gorilla',
+      'bear',
+    ],
+  ])(
+    '%s (%s) is an animal (%s): its build word names it without a person’s marks or clothes',
+    (name, description, word, kind) => {
+      expect(animalOf(name, description)).toMatchObject({ word, kind });
+      expect(kindOf(name, description).kind).toBe(kind);
+    },
+  );
+
   it.each([
     'Tornado: 7 male, black, massive bull build; ring through his nose. Has never been ridden for eight seconds.',
     'Tornado: 7 male, Brahman, massive bull build; ring through his nose.',
+    'Tornado: 7 male, Black, massive bull build; ring through his nose.',
   ])('keeps a bull whose build names it the mount the shot says it is: %s', (tornado) => {
     const brief = {
       id: 'scene',
@@ -551,20 +623,28 @@ describe('a set without `interior`', () => {
     expect(interiorFromWords(words)).toBe(true);
   });
 
-  it.each(['On the deck of the river boat.', 'The river by the boat shed.', 'A tent pitched in the meadow.'])(
-    '%s is outdoors',
-    (words) => {
-      expect(interiorFromWords(words)).toBe(false);
-    },
-  );
+  // ... but an ocean liner or a sea trawler is no building the sea names: the ocean or the sea is
+  // still the place
+  it.each([
+    'On the deck of the river boat.',
+    'The river by the boat shed.',
+    'A tent pitched in the meadow.',
+    'Passengers crowd the rail of the ocean liner while the band plays in the lounge.',
+    'The sea trawler heads out at dawn; the skipper climbs from the galley kitchen to the rail.',
+  ])('%s is outdoors', (words) => {
+    expect(interiorFromWords(words)).toBe(false);
+  });
 
   // a deck is a boat's or a house's (outdoors), not a deck of (old playing, his) cards, a tape, DJ
   // or skateboard deck or a deck chair; the deck of a ship where cards are dealt is still the ship's,
-  // and so is the deck of a ship, a riverboat, a yacht or a river boat before "cards"
+  // and so is the deck of a ship, a riverboat, a yacht, a river boat, a schooner, a galleon or a
+  // treehouse before "cards"
   it.each([
     ['A deck of cards lies on the kitchen table.', true],
     ['A deck of old playing cards lies on the kitchen table.', true],
     ['A deck of worn old playing cards in the bedroom.', true],
+    ['A deck of his old cards lies on the kitchen table.', true],
+    ['A worn deck of Bicycle playing cards on the kitchen table.', true],
     ['The deck of his cards lies on the kitchen table.', true],
     ['Grandpa shuffles the deck of his cards in the kitchen.', true],
     ['She deals from a deck of the cards in the living room.', true],
@@ -587,6 +667,9 @@ describe('a set without `interior`', () => {
     ['A poker game on the deck of the yacht cards dealt beside the galley kitchen.', false],
     ['On the deck of the ship cards are dealt to the sailors.', false],
     ['The deck of the river boat cards scattered everywhere.', false],
+    ['Sailors on the deck of the galleon play cards while the cook works in the kitchen below.', false],
+    ['On the deck of the schooner cards are dealt to the sailors near the dining room.', false],
+    ['Kids on the deck of the treehouse play cards while Mum cooks in the kitchen.', false],
   ])('%s', (words, interior) => {
     expect(interiorFromWords(words)).toBe(interior);
   });

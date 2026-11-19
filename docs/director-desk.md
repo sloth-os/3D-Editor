@@ -374,13 +374,19 @@ undo step, and runs in a web worker as well as on the server:
   (`Pip: 3 male, golden retriever, small`, `Kit: kitten female`, `Rex: young male, beagle`): then
   it is that animal. An animal word there is a feature of a person instead before a body part or a
   look ("bull neck", "doe eyes", "horse face", "pony tail"), as "bear", "bull", "ox" or "gorilla"
-  before a build word when the line's ethnicity is one written for people ("White, bear build",
-  "Black, ox frame": "White" or "Black" with a capital, "Asian", "East Asian", "Latina", "Pacific
-  Islander", "Samoan", "Mixed race" and the like, one of these before "American", or two joined by
-  "and" or a hyphen; after a coat, a breed or a region, "brown, hulking bear build" and "Brown,
-  massive bear build" are a bear and "Hereford, massive bull build" a bull, and "sturdy pony build"
-  is a pony), and after "as a" or "like a" ("strong as an ox", "as strong as a big old bull", "built
-  like a bear"; not "as" after a verb that gives a role: "worked as a plough horse" is a horse);
+  before a build word in the line of a person: its ethnicity is one of a closed list written for
+  people ("White" or "Black" with a capital, "Asian", "East Asian", "Latina", "Pacific Islander",
+  "Samoan", "Mixed race", "Korean", "Irish" and others, one of these before "American", or two
+  joined by "and" or a hyphen) and its marks or clothes are a person's (a beard, tattoos, glasses, a
+  shaved head, a hairstyle, or a shirt, jeans, a dress and other clothes: "White, bear build;
+  beard", "Black, ox frame; wearing a grey hoodie"). Otherwise the build word names the animal:
+  after a coat, a breed or a region ("brown, hulking bear build", "Brown, massive bear build" and
+  "Hereford, massive bull build"), with an animal's marks only ("Black, muscular bull build; long
+  curved horns" is a bull, as is "Indian, massive bull build; hump and dewlap"), and "sturdy pony
+  build" is a pony. It is a feature after "as a" or "like a" too ("strong as an ox", "as strong as a
+  big old bull", "thick-necked as a bull", "built like a bear"), but not "as" after a verb that
+  gives a role ("worked as a plough horse", "retired as a race horse" and "adopted as a kitten" are
+  the animal);
   before another animal word the later is the animal ("cattle dog" is a dog), unless it is the
   young, the sex or a breed word ("Shetland pony mare", "bear cub"), or the first is a breed of dog:
   the first breed of a cross names it ("golden retriever-poodle mix" is a retriever, not a small
@@ -412,18 +418,20 @@ undo step, and runs in a web worker as well as on the server:
   sheds, tents, caravans and other shelters are buildings: "inside the river boat", "inside the
   garden shed"), or when "inside" or "indoors" opens a clause after outdoor words, on its own or of
   a room or a building ("a cabin in the woods, inside by the fire", not "the garden, inside the
-  gate"); a deck (a boat's or a house's) is outdoors, unless "below deck", but a deck of cards (of
-  old playing cards or of his cards too, not with a boat, a ship or a building between "of" and
-  "cards": "on the deck of the ship cards are dealt" is the ship's), a tape, cassette, DJ or
-  skateboard deck and a deck chair are not; its ground from the first ground word they name (grass,
-  sand, snow, ice, wood, carpet, dirt, stone), else a wooden floor inside and plain ground outside;
-  the sun from the time of day (below). Open water that the set or a location names (a puddle, pond,
-  pool, fountain, stream, brook, creek, canal, river, lake, lagoon, loch, reservoir, bay, harbour,
-  sea or ocean; not after "no" or "without") is a water landmark of its size (a pond 5 × 4 m, a lake
-  20 × 10 m, a river a strip 30 m long and 6 m wide, the sea one 80 × 30 m) on the side its clause
-  gives it (on the left, on the right, in front, behind), behind the cast when it gives none, and
-  1.5 m clear of the cast and the standing props, so nobody starts out on it. The set is at least
-  12 × 10 m and grows to hold everything with a 2 m margin (at most 200 m).
+  gate"); a deck (a boat's or a house's) is outdoors, unless "below deck", but a deck of cards
+  (between "of" and "cards" at most one word of any kind, then up to three that describe cards: "a
+  deck of his cards", "a deck of worn old playing cards", "a deck of Bicycle playing cards"; "on the
+  deck of the ship cards are dealt" and "on the deck of the galleon sailors play cards" are the
+  ship's), a tape, cassette, DJ or skateboard deck and a deck chair are not; its ground from the
+  first ground word they name (grass, sand, snow, ice, wood, carpet, dirt, stone), else a wooden
+  floor inside and plain ground outside; the sun from the time of day (below). Open water that the
+  set or a location names (a puddle, pond, pool, fountain, stream, brook, creek, canal, river, lake,
+  lagoon, loch, reservoir, bay, harbour, sea or ocean; not after "no" or "without") is a water
+  landmark of its size (a pond 5 × 4 m, a lake 20 × 10 m, a river a strip 30 m long and 6 m wide,
+  the sea one 80 × 30 m) on the side its clause gives it (on the left, on the right, in front,
+  behind), behind the cast when it gives none, and 1.5 m clear of the cast and the standing props,
+  so nobody starts out on it. The set is at least 12 × 10 m and grows to hold everything with a 2 m
+  margin (at most 200 m).
 - **Cameras**: the brief's framing, else the one its description's first sentence (else its
   action's) names ("close-up", "wide shot", "over the shoulder" …), else `medium`; the brief's
   `move`, else the one its movement words amount to (`dolly_in` a `push_in`, `tracking` a

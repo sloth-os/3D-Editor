@@ -57,23 +57,23 @@ export function sunOf(time: TimeOfDay | null): { azimuthDeg: number; elevationDe
 const INDOORS =
   /\b(?:indoors?|inside|interior|room|bedroom|kitchen|bathroom|living room|lounge|hallway|hall|corridor|office|classroom|library|studio|attic|cellar|basement|garage|shop|cafe|caf|restaurant|(?<!sand |candy |chocolate |crow)bar|pub|church|chapel|museum|gallery|theatre|theater|cinema|gym|warehouse|factory|hospital|ward|lobby|apartment|flat(?=\s*(?:$|[,.;:!?)]|(?:in|on|at|of|with|where|above|below|near|by|and|that|which)\b))|cabin interior|staircase|stairwell|elevator|dining room|nursery|playroom|workshop|barn interior|tent interior)\b/g;
 /**
- * Buildings, and the shelters people are inside of as they are of a building (boats, ships, sheds,
- * tents, caravans …), as a regular expression's source: BUILDING's words, and the words that end a
- * deck of cards (OUTDOORS).
+ * Words that describe playing cards, as a regular expression's source: those that may stand, up to
+ * three of them, before "cards" in a deck of cards (OUTDOORS: "a deck of worn old playing cards",
+ * "a deck of Bicycle playing cards").
  */
-const BUILDING_WORDS =
-  'house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace|barn|shed|shack|stable|greenhouse|lighthouse|windmill|mill|boat|houseboat|riverboat|ship|yacht|barge|ferry|steamer|trawler|liner|tent|caravan|trailer|camper|motorhome|yurt|tipi|teepee|wigwam|igloo|bothy';
+const CARD_WORDS =
+  'playing|tarot|poker|bridge|trading|flash|old|new|brand|worn|well-worn|fresh|battered|tattered|dog-eared|greasy|grubby|dirty|marked|crisp|sticky|bent|torn|faded|shiny|plastic|paper|cheap|lucky|spare|unopened|blank|antique|vintage';
 
 /**
  * Words that say a place is outdoors (they win over a room named as being nearby); a deck too (a
- * boat's or a house's), but not "below deck", nor a deck of cards (after "of" a determiner or none,
- * then up to three words before "cards", none a determiner, a preposition, a word that opens a
- * clause or a building or a vessel of BUILDING_WORDS: "a deck of old playing cards", "the deck of
- * his cards", not "the deck of the ship where cards are dealt" nor "on the deck of the ship cards
- * are dealt"), a tape, cassette, DJ or skateboard deck or a deck chair.
+ * boat's or a house's), but not "below deck", nor a deck of cards ("of", at most one word of any kind,
+ * then up to three CARD_WORDS and "cards": "a deck of cards", "the deck of his cards", "a deck of
+ * worn old playing cards", "a deck of Bicycle playing cards"; not "on the deck of the ship cards are
+ * dealt" nor "on the deck of the galleon sailors play cards"), a tape, cassette, DJ or skateboard
+ * deck or a deck chair.
  */
 const OUTDOORS = new RegExp(
-  String.raw`\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot |dj |dj's |skateboard |skate )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:(?:the|an?|this|that|these|those|his|her|their|its|our|my|your)\s+)?(?:(?!(?:the|an?|this|that|these|those|his|her|their|its|our|my|your|where|which|who|whose|when|while|as|if|so|and|or|but|with|without|on|in|at|from|by|for|to|of|is|are|was|were|(?:${BUILDING_WORDS})s?)\s)[a-z0-9-]+\s+){0,3}cards\b)|car park|parking lot)\b`,
+  String.raw`\b(?:outdoors?|outside|exterior|open air|meadow|field|park|garden|yard|backyard|street|road|lane|beach|forest|woods?|jungle|desert|mountain|hill|valley|countryside|farm|paddock|pasture|lake|river|sea|ocean|shore|harbou?r|square|playground|courtyard|rooftop|sky|campsite|camp|clearing|orchard|vineyard|savanna|tundra|cliff|canyon|dunes?|terrace|patio|porch|veranda|(?<!below |under |tape |cassette |card |cards |record |mixing |tarot |dj |dj's |skateboard |skate )decks?(?!\s+(?:chairs?|shoes?)\b|\s+of\s+(?:[a-z0-9-]+\s+)?(?:(?:${CARD_WORDS})\s+){0,3}cards\b)|car park|parking lot)\b`,
   'g',
 );
 
@@ -90,7 +90,8 @@ const QUALIFIERS = /^(?:inside|flat|bar|cafe|caf|factory|museum)$/;
  * "the river boat", "the garden shed", "the mountain tent"): the outdoor word then names the building,
  * not the place.
  */
-const BUILDING = new RegExp(String.raw`^[\s-]+(?:${BUILDING_WORDS})s?\b`);
+const BUILDING =
+  /^[\s-]+(?:house|home|cottage|cabin|lodge|hotel|motel|inn|hostel|chalet|villa|hut|bungalow|mansion|manor|castle|palace|barn|shed|shack|stable|greenhouse|lighthouse|windmill|mill|boat|houseboat|riverboat|ship|yacht|barge|ferry|steamer|tent|caravan|trailer|camper|motorhome|yurt|tipi|teepee|wigwam|igloo|bothy)s?\b/;
 
 /** What comes before "inside" or "indoors" that opens a clause ("a cabin in the woods, inside by the fire"). */
 const CLAUSE_OPENING = /(?:[,;:–—]|\s-)\s*(?:(?:and|but|then)\s+)?$/;
@@ -499,14 +500,25 @@ const BUILD_NOUNS = /^(?:build|frame|physique|body|shape|size|type|[a-z]*sized)$
 const ETHNICITY = String.raw`(?:(?:white|black|asian|(?:(?:south[\s-]?)?east|south|central)[\s-]asian|hispanic|latin[aeox]|caucasian|african|afro[\s-]?caribbean|caribbean|middle[\s-]eastern|north[\s-]african|arab|native[\s-]american|indigenous|first[\s-]nations|pacific[\s-]islander|polynesian|samoan|maori|native[\s-]hawaiian|mixed(?:[\s-]race)?|biracial|multiracial|indian|pakistani|chinese|japanese|korean|vietnamese|filipin[ao]|thai|mexican|jewish|persian|mediterranean|european|scandinavian|irish|italian|greek)(?:[\s-]american)?|(?:white|black)[\s-]british)`;
 
 /**
- * The ethnicity items of rideo's identity line (the item after the age and gender, whole) that name
- * a people, after which a FIGURATIVE build is a person's (identityAnimal's `people`), in any case:
- * one ethnicity (ETHNICITY), or such ethnicities joined by "and" or a hyphen ("Black and Asian",
- * "Chinese-Filipino"). Anything else names no people: "N/A", "unknown", a coat ("Brown", "Jet
- * black"), a breed ("Black Angus", "Hereford") or a region ("Alaskan", "Highland"); identityAnimal
- * also reads "white" and "black" in lower case as a coat ("black and white").
+ * The ethnicity items of rideo's identity line (the item after the age and gender, whole) that may
+ * name a people (identityAnimal's `people`), in any case: one ethnicity of the closed list ETHNICITY,
+ * or such ethnicities joined by "and" or a hyphen ("Black and Asian", "Chinese-Filipino"). Anything
+ * else names no people: "N/A", "unknown", a coat ("Brown", "Jet black"), a breed ("Black Angus",
+ * "Hereford") or a region ("Alaskan", "Highland"); identityAnimal also reads "white" and "black" in
+ * lower case as a coat ("black and white").
  */
 const HUMAN_ETHNICITY = new RegExp(String.raw`^${ETHNICITY}(?:(?:\s+and\s+|\s*-\s*)${ETHNICITY})*$`, 'i');
+
+/**
+ * Marks and clothes only a person has, read in rideo's identity line after its first ";" (the
+ * marks, and the clothes after "wearing"): facial hair, tattoos, glasses, freckles, piercings, a
+ * shaved or bald head, a hairstyle, make-up or a garment ("beard", "tattoos", "shaved head", "short
+ * hair", "a flannel shirt and jeans", a coat only after "wearing": "wearing a grey wool coat"). An
+ * animal's tack, collar, bell, ring or coat is none ("a leather harness", "a red collar", "ring
+ * through his nose", "shaggy coat").
+ */
+const PERSON_LOOKS =
+  /\b(?:beard(?:s|ed)?|moustaches?|mustaches?|goatee|stubble|sideburns|tattoo(?:s|ed)?|(?:ta\s+)?moko|glasses|sunglasses|spectacles|goggles|freckle[sd]?|piercings?|pierced|earrings?|necklaces?|bracelets?|make-?up|lipstick|mascara|eyeliner|shaved\s+head|shaven|bald(?:ing)?\s+head|balding|(?:short|long|curly|straight|wavy|cropped|braided|spiky|slicked[\s-]back|shoulder[\s-]length|thinning|receding|messy|neat)\s+hair|hairline|ponytail|braids|plaits|pigtails|dreadlocks|cornrows|(?:crew|buzz)\s+cut|mohawk|afro|shirts?|t-shirts?|blouses?|jackets?|blazers?|vests?|waistcoats?|jerseys?|jeans|trousers|shorts|leggings|tights|skirts?|dress(?:es)?|suits?|ties?|uniforms?|overalls|dungarees|aprons?|hoodies?|sweaters?|jumpers?|cardigans?|overcoats?|raincoats?|parkas?|anoraks?|robes?|gowns?|tunics?|kilts?|saris?|sarongs?|kimonos?|ponchos?|cloaks?|pyjamas|pajamas|swimsuits?|hats?|caps?|beanies?|scarf|scarves|helmets?|belts?|backpacks?|boots|shoes|sneakers|trainers|sandals|heels|gloves|socks|wearing\b[^;]*\bcoats?)\b/i;
 
 /**
  * The words an item of rideo's identity line is read by for an animal (sentenceKind: those before
@@ -514,15 +526,20 @@ const HUMAN_ETHNICITY = new RegExp(String.raw`^${ETHNICITY}(?:(?:\s+and\s+|\s*-\
  * likeness, or another animal's modifier, blanked, same length: one whose next word (after spaces or
  * a hyphen) is a body part or a look (FEATURE_NOUNS: "bull neck", "doe eyes", "horse face", "chicken
  * legs", "pony tail"), one used for a person's build before a build word in the line of a people
- * (FIGURATIVE before BUILD_NOUNS when `people`, the line's ethnicity item a people's, HUMAN_ETHNICITY:
- * "White, bear build", "Black, ox frame"; not after a coat, a breed or a region, "brown, hulking bear
- * build" and "Brown, massive bear build" are a bear and "Hereford, massive bull build" a bull, nor
- * "sturdy pony build"), one after "as a(n)" or "like a(n)" with at most two words between
+ * (FIGURATIVE before BUILD_NOUNS when `people`: the line's ethnicity item a people's,
+ * HUMAN_ETHNICITY, and a person's marks or clothes after its first ";", PERSON_LOOKS: "White, bear
+ * build; beard", "Black, ox frame; shaved head"; not after a coat, a breed or a region, "brown,
+ * hulking bear build" and "Brown, massive bear build" are a bear and "Hereford, massive bull build" a
+ * bull, nor without a person's marks or clothes, "Black, muscular bull build; long curved horns" is a
+ * bull, nor "sturdy pony build"), one after "as a(n)" or "like a(n)" with at most two words between
  * ("strong as an ox", "as strong as a big old bull", and "fierce as a tiger" or "sleek as an
  * otter", whose article MODIFIED blanked before an -er word), but not "as" after a verb that gives
- * the member a role (work, works, worked, working, use, used, breed, bred, train, trained, serve,
- * serves, served, act, acts, acted, raised, kept: "worked as a plough horse" and "trained as a
- * sheepdog" are the animal), and one whose next word is another animal word, not its young, its
+ * the member a role (a past participle: a word ending in "-ed" not after a hyphen, or bred, kept,
+ * bought, sold, born, brought, caught, found, got, given, held, known, taken, won, shown; or work,
+ * works, working, use, uses, using, breed, breeds, breeding, train, trains, training, serve, serves,
+ * serving, act, acts, acting: "worked as a plough horse", "trained as a sheepdog", "retired as a race
+ * horse" and "adopted as a kitten" are the animal, but "thick-necked as a bull" is a likeness), and
+ * one whose next word is another animal word, not its young, its
  * sex or a breed word (KEEPS_ANIMAL): the later word is the animal
  * ("Australian cattle dog", "bird dog" and "bull terrier" are dogs, but "Shetland pony mare" is a
  * pony and "bear cub" a bear), unless it names a dog and is not a young one (isDogWord): a breed of
@@ -537,7 +554,7 @@ function blankFeatures(head: string, people: boolean): string {
     const feature =
       FEATURE_NOUNS.test(next) ||
       (people && FIGURATIVE.test(w) && BUILD_NOUNS.test(next)) ||
-      /\b(?:(?<!\b(?:work(?:s|ed|ing)?|used?|breed|bred|train(?:ed)?|serve[sd]?|act(?:s|ed)?|raised|kept)\s+)as|like)\s+(?:an?|\s{1,2})\s+(?:[a-z-]+\s+){0,2}$/.test(
+      /\b(?:(?<!(?:^|[^a-z-])(?:[a-z]+ed|work(?:s|ing)?|use|uses|using|breed(?:s|ing)?|bred|train(?:s|ing)?|serves?|serving|act(?:s|ing)?|kept|bought|sold|born|brought|caught|found|got|given|held|known|taken|won|shown)\s+)as|like)\s+(?:an?|\s{1,2})\s+(?:[a-z-]+\s+){0,2}$/.test(
         head.slice(0, at),
       ) ||
       (isAnimalWord(next) && !KEEPS_ANIMAL.test(next) && !(isDogWord(w) && !KEEPS_ANIMAL.test(w)));
@@ -636,19 +653,25 @@ export function identityOf(name: string, description: string): { age: string; ge
  * names none, or names one only as a feature: before a body part or a look ("Tom: 45 male, stocky,
  * bull neck", "Dee: 25 female, Latina, petite, doe eyes", "Ken: 40 male, Asian, horse face"), as a
  * build in the line of a people, its ethnicity item (the item after the age and gender) a people's
- * (HUMAN_ETHNICITY: "Rob: 35 male, White, bear build"), after "as a(n)" ("strong as an ox") or "like"
- * ("built like a bear"), before a hyphened "-ed" word ("bull-necked") or as a figure of speech ("a
- * bear of a man"); the marks after the ";" ("bull neck", "doe eyes") are never read here.
+ * (HUMAN_ETHNICITY) and its marks or clothes a person's (PERSON_LOOKS: "Rob: 35 male, White, bear
+ * build; beard"), after "as a(n)" ("strong as an ox") or "like" ("built like a bear"), before a
+ * hyphened "-ed" word ("bull-necked") or as a figure of speech ("a bear of a man"); the marks after
+ * the ";" ("bull neck", "doe eyes") are never read here as what the member is.
  */
 function identityAnimal(line: string): AnimalWords | null {
   const [first, ...others] = line.split(';')[0].split(',');
   // "<age> <gender>": the gender is no animal's head ("puppy male")
   const age = first.trim().split(/\s+/);
   if (IDENTITY_GENDER.test(plainText(age.at(-1) ?? ''))) age.pop();
-  // an ethnicity of people ("White", "Samoan": HUMAN_ETHNICITY), not a coat ("brown", "Brown", "black
-  // and white"), a breed ("Hereford") or a region ("Alaskan")
+  // a people's line: an ethnicity of people ("White", "Samoan": HUMAN_ETHNICITY), not a coat ("brown",
+  // "Brown", "black and white"), a breed ("Hereford") or a region ("Alaskan"), and a person's marks or
+  // clothes (PERSON_LOOKS: "beard", "wearing a flannel shirt"): "Black" is a bull's coat too, and
+  // "Indian" or "African" where a bull or a gorilla comes from
   const ethnicity = others[0]?.trim() ?? '';
-  const people = HUMAN_ETHNICITY.test(ethnicity) && !/\b(?:white|black)\b/.test(ethnicity);
+  const people =
+    HUMAN_ETHNICITY.test(ethnicity) &&
+    !/\b(?:white|black)\b/.test(ethnicity) &&
+    PERSON_LOOKS.test(line.split(';').slice(1).join(';'));
   for (const item of [age.join(' '), ...others]) {
     const k = sentenceKind(item, { people });
     if (k && k !== 'person') return k;
