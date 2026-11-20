@@ -9,7 +9,9 @@ import { OperatorError } from '../../operators/context';
 import { DESK_PROPS } from '../props';
 import { getDeskSettings, getShots } from '../shots';
 import { DESK_SHAPE_PROP, DeskScene, isWater, toRideo, v3len, v3sub } from '../layout';
+import { readBriefRecord } from '../brief/record';
 import { GROUND_COLORS, setUnitRoot } from '../set';
+import { UNIT_ROOT, deriveUnitId } from '../units/ids';
 import { readInstance, unitOf } from '../units/list';
 import { viewTarget } from '../moves';
 import { blueprintFor, posedBones, posesOf, requireBuiltKind } from '../characters/kinds';
@@ -52,9 +54,10 @@ import {
  *   shot's start; a prop's size is its largest extent; a held prop names its holder (heldBy).
  * - The set: its size and interior from the desk settings, its ground's name, the sun's azimuth and
  *   elevation as rideo measures them. A library set (a unit instance with key 'set') is the set's
- *   ground and pieces: its landmarks are not written (with a warning), so that importing the blocking
- *   again keeps the set and adds no copies of its pieces, and its ground's name is the one staging
- *   wrote on its root.
+ *   ground and pieces: its landmarks are not written (with a warning), also once it is made local
+ *   while the brief record says the slot holds a unit, so that importing the blocking again keeps the
+ *   set and adds no copies of its pieces; a linked set's ground name is the one staging wrote on its
+ *   root.
  * Shots are keyed by their source's shot id (external.shot: a host's, or an imported clip's), else by
  * their own id. Their moves are returned beside the blocking (a host keeps them as the shot's camera
  * move): a move the blocking's end does not name (a tracking shot's end reads as a push in) stays the
@@ -99,6 +102,18 @@ function hexOf(c: readonly number[]): string {
       .toString(16)
       .padStart(2, '0');
   return `#${byte(c[0] ?? 0)}${byte(c[1] ?? 0)}${byte(c[2] ?? 0)}`;
+}
+
+/**
+ * The root of the scene's library set: the instance with key 'set', or the root it keeps once made
+ * local (its id derived from the slot) while the brief record says the slot holds a unit, as a slot
+ * made local is still the scene's library set. Null: the set is the words'.
+ */
+function librarySetRoot(doc: SceneDoc): string | null {
+  const linked = setUnitRoot(doc);
+  if (linked) return linked;
+  const local = deriveUnitId('set', UNIT_ROOT);
+  return readBriefRecord(doc)?.setUnit?.staged === 'unit' && doc.getObject(local) ? local : null;
 }
 
 /** rideo's name of a ground colour (the first word of its table that names it), else 'ground'. */
@@ -426,10 +441,14 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   };
   const landmarks: RideoSceneBlocking['set']['landmarks'] = [];
   const landmarkIds = new Set<string>();
-  // a library set's pieces are the set's: a re-import keeps the set
+  // a library set's pieces are the set's, linked or made local: a re-import keeps the set
+  const setRoot = librarySetRoot(doc);
   const inSetUnit = (id: string) => {
     const owner = unitOf(doc, id);
-    return owner !== null && readInstance(doc, owner)?.kind === 'set';
+    if (owner !== null && readInstance(doc, owner)?.kind === 'set') return true;
+    for (let p = scene.objects.get(id)?.parent ?? null; p; p = scene.objects.get(p)?.parent ?? null)
+      if (p === setRoot) return true;
+    return false;
   };
   let setPieces = 0;
   for (const l of objects.filter((x) => prop(x, DESK_PROPS.role) === 'landmark' && isRoot(x, 'landmark'))) {
@@ -473,8 +492,8 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   }
 
   if (setPieces) {
-    const root = setUnitRoot(doc);
-    const name = (root && readInstance(doc, root)?.name) || 'library set';
+    const name =
+      (setRoot && (readInstance(doc, setRoot)?.name ?? doc.getObject(setRoot)?.name)) || 'library set';
     warnings.push(
       `the set is the library's '${name}': its ${setPieces} piece(s) are not written as landmarks (a re-import keeps the set)`,
     );

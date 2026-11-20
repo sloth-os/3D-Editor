@@ -1354,6 +1354,39 @@ describe('the blocking export of a library set', () => {
     expect(count()).toEqual(was);
   });
 
+  it('writes no landmark of a set made local either: the slot is still the library set', () => {
+    const L = library();
+    const b = withPins(openBrief(), { set: L.set });
+    const { doc } = staged(b, source(L.set));
+    makeLocal(doc, listUnits(doc)[0].root);
+    expect(listUnits(doc)).toEqual([]);
+    expect(readBriefRecord(doc)!.setUnit).toMatchObject({ ...L.set.pin, staged: 'unit' });
+    const out = exportRideoBlocking(doc);
+    expect(out.blocking.set.landmarks).toEqual([]);
+    expect(out.blocking.set.ground).toBe('grass');
+    expect(out.warnings).toContain(
+      "the set is the library's 'Meadow': its 1 piece(s) are not written as landmarks (a re-import keeps the set)",
+    );
+    const count = () => ({
+      landmarks: doc.listObjects().filter((o) => prop(o, 'desk_role') === 'landmark').length,
+      grounds: doc.listObjects().filter((o) => prop(o, 'desk_label') === 'ground').length,
+      objects: doc.listObjects().length,
+    });
+    const was = count();
+    doc.transact(() =>
+      importRideoBlocking(
+        docContext(doc),
+        { ...planBrief(b).input, blocking: out.blocking, update: true },
+        solveShotCameras,
+      ),
+    );
+    expect(count()).toEqual(was);
+    // the words' set (its pin not here) is written as it is
+    const words = staged(b).doc;
+    expect(readBriefRecord(words)!.setUnit).toMatchObject({ staged: 'pending', why: 'missing' });
+    expect(exportRideoBlocking(words).blocking.set.landmarks.map((l) => l.label)).toEqual(['pond']);
+  });
+
   it('keeps the pieces of a set published from the scene through a re-import and a new sun', () => {
     const { doc } = staged(openBrief());
     const ex = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });

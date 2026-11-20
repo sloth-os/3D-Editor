@@ -553,8 +553,9 @@ transaction's origin); only when `linked` does the slot's record take the pin (`
 for a set the record's set is the unit's), so that the next brief, which pins it, is no change.
 `stateUnitRows(doc)` is the desk state's `units`. An exported blocking
 (`desk.export_rideo_blocking`) writes no landmark of a library set's pieces (a warning says how
-many) and takes its ground's name from the set's root, so importing it again keeps the set and adds
-no copies.
+many), also once the set is made local (its pieces stay the set's while the record says the slot
+holds the unit), and takes a linked set's ground name from its root, so importing it again keeps
+the set and adds no copies.
 
 ### Updating from a later brief
 
