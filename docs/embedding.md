@@ -485,8 +485,11 @@ desk, and its record says why. The record's state is the row's `staged` and `why
 | —                  | no `units` in `state`    | An open without units, a desk from before units, rows the host cannot read                       | —                                   | unknown                                                            |
 
 A `pending` slot is tried again at every open: when one brings its file, the desk offers Update
-shots. A `refused` slot is tried again only when the brief pins another version or item, so a unit
-the desk cannot use never offers Update shots again and again.
+shots. So it does, once, for a pin whose file the host sent but the desk cannot use (a `refused`
+reason above), so that the refusal reaches the record: Update shots keeps what the slot holds, warns
+why and records the pin `refused`, as `state.units` then says. A `refused` slot is tried again only
+when the brief pins another version or item, so a unit the desk cannot use never offers Update
+shots again and again.
 
 `unavailable` means the host sent matching bytes but the desk could not use them this time, for a
 reason that may pass: the open's unit budget (48 MiB of files and 160 MiB unpacked, counted in slot

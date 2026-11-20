@@ -660,6 +660,14 @@ export function wouldTry(s: SlotUnit): boolean {
   return s.stageable;
 }
 
+/**
+ * Whether an update records slot `s`'s pin refused: its file was sent (or the caller said why it left
+ * it out) and staging cannot use it. resolveUnits looks only at pins it would try, so never at one the
+ * record refuses already: once an update has recorded it, it is not tried again.
+ */
+export const refusesPin = (s: SlotUnit): boolean =>
+  s.action === 'none' && s.pin !== null && s.problem?.staged === 'refused';
+
 /** What staging or an update does in slot `s` (see the module comment). */
 function actionOf(s: SlotUnit): UnitAction {
   if (!s.pin) return s.inst && s.rec?.staged === 'unit' ? 'remove' : 'none';

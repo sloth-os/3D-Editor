@@ -478,18 +478,21 @@ the frame rate and size, the set, the props, shots with a new camera plan, shots
 new words or numbers, cast members with an actor renamed (not one the desk gave the new name
 already) or of another kind or height. A shot removed in the desk counts only when the brief changes
 its length, cast or camera plan (an update stages it again). It is null exactly when an update would
-change nothing of the staging; such an update gives only the warnings every update of the brief
-repeats (how the desk reads the brief, a shot whose length was changed in the desk, a cast member
-kept as the kind staged), so a desk that offers the update on a non-null value offers it whenever it
-does something. A lens and move the host gives back as the desk staged them (copied from the shot
-results) are no change. `briefChanges(doc, brief, {units})` counts the library pins whose unit the
-desk holds ([library units](#library-units); headers are enough): what an update does with them is
-named in `other` only, in the desk's words ("the set from the library", "a new version of the
-library set", "another library set", "the set from the words (no library set)", "1 cast member from
-the library", "2 cast members with a new library figure", "1 cast member back to a mannequin", "1
-prop from the library", "1 prop with a new library version", "1 prop back to the words"); the
-contract's lists never carry a pin. A pin whose unit the desk does not hold, or cannot use, is no
-change.
+change nothing of the staging and refuse no library pin the record does not refuse already; such an
+update gives only the warnings every update of the brief repeats (how the desk reads the brief, a
+shot whose length was changed in the desk, a cast member kept as the kind staged), so a desk that
+offers the update on a non-null value offers it whenever it does something. A lens and move the host
+gives back as the desk staged them (copied from the shot results) are no change.
+`briefChanges(doc, brief, {units})` counts the library pins whose unit the desk holds ([library
+units](#library-units); headers are enough): what an update does with them is named in `other` only,
+in the desk's words ("the set from the library", "a new version of the library set", "another
+library set", "the set from the words (no library set)", "1 cast member from the library", "2 cast
+members with a new library figure", "1 cast member back to a mannequin", "1 prop from the library",
+"1 prop with a new library version", "1 prop back to the words"); the contract's lists never carry a
+pin. A pin whose unit the desk does not hold is no change. One whose unit it holds but cannot use is
+a change until an update has recorded it refused ("a library set that cannot be used", "1 cast
+member with a library figure that cannot be used", "1 prop with a library version that cannot be
+used"): the update keeps what the slot has and warns why, and the pin is not tried again.
 
 `shotResults(doc, {shots?})` (`desk.shot_results`, and `desk_shot_results` over MCP) is what the
 desk tells a host about each staged shot besides its files, in brief order: its frames and duration,
@@ -537,11 +540,13 @@ without pins records nothing more, so it stages, records and reports exactly as 
 
 `pinsWanted(doc, brief)` lists the pins whose slot an update would place, update or replace if the
 unit were held (not those the scene holds, made local, or refused at that version): the files a desk
-keeps for a later Update shots. `adoptPublished(doc, brief, {slot, link, pin, linked, header})`
-makes the scene's published objects an instance of the version the host saved (no id changes; the
-caller chooses the transaction's origin); only when `linked` does the slot's record take the pin
-(`staged` `unit`, and for a set the record's set is the unit's), so that the next brief, which pins
-it, is no change. `stateUnitRows(doc)` is the desk state's `units`. An exported blocking
+keeps for a later Update shots. `pinsRefused(doc, brief, units)` lists, with why, the pins whose
+unit the desk holds but cannot use and that the record does not refuse yet (an Update shots records
+them `refused`). `adoptPublished(doc, brief, {slot, link, pin, linked, header})` makes the scene's
+published objects an instance of the version the host saved (no id changes; the caller chooses the
+transaction's origin); only when `linked` does the slot's record take the pin (`staged` `unit`, and
+for a set the record's set is the unit's), so that the next brief, which pins it, is no change.
+`stateUnitRows(doc)` is the desk state's `units`. An exported blocking
 (`desk.export_rideo_blocking`) writes no landmark of a library set's pieces (a warning says how
 many) and takes its ground's name from the set's root, so importing it again keeps the set and adds
 no copies.

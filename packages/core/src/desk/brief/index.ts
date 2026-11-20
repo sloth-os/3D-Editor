@@ -64,4 +64,10 @@ export {
   type UnitSize,
   type UnitSource,
 } from './units';
-export { adoptPublished, pinsWanted, type AdoptPublishedOptions } from './library';
+export {
+  adoptPublished,
+  pinsRefused,
+  pinsWanted,
+  type AdoptPublishedOptions,
+  type RefusedPin,
+} from './library';

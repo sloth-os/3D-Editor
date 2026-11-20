@@ -18,7 +18,14 @@ import {
 } from './record';
 import { hostShots, parseBrief, stagedActors, stagedBy, stagedCast } from './stage';
 import type { BriefChanges, BriefShot, SceneBrief } from './schema';
-import { planUnitsOf, resolveUnits, type ResolvedUnits, type SlotUnit, type UnitSource } from './units';
+import {
+  planUnitsOf,
+  refusesPin,
+  resolveUnits,
+  type ResolvedUnits,
+  type SlotUnit,
+  type UnitSource,
+} from './units';
 
 export { briefFrames } from './record';
 
@@ -34,10 +41,11 @@ export { briefFrames } from './record';
  * again (its length, cast or camera plan): its words and number are not acted on.
  *
  * briefChanges is null exactly when updateFromBrief would change nothing of the staging (it acts on
- * this same diff, update.ts): such an update gives only the warnings every update of the brief
- * repeats (how the desk reads the brief, a shot whose length was changed in the desk, a cast member
- * kept as the kind staged), so a desk that offers Update shots on a non-null value offers it whenever
- * the update does something. The desk never drops the staging silently.
+ * this same diff, update.ts) and refuse no library pin the record does not refuse already: such an
+ * update gives only the warnings every update of the brief repeats (how the desk reads the brief, a
+ * shot whose length was changed in the desk, a cast member kept as the kind staged), so a desk that
+ * offers Update shots on a non-null value offers it whenever the update does something. The desk
+ * never drops the staging silently.
  *
  * A lens or a move the host gives back as the desk staged it (a host that copies the shot results
  * into its shots, then sends the brief again) agrees with the staging: no change.
@@ -49,8 +57,11 @@ export { briefFrames } from './record';
  * "1 prop from the library", "1 prop with a new library version", "1 prop back to the words"): the
  * contract's lists never carry pin changes. A pin whose unit the desk does not hold (`units`) moves
  * nothing, so it is no change until the unit is here; a pending pin whose unit is now held is one,
- * even when the brief is the one staged (the hash shortcut is not taken then). The kind and height of
- * a member that is (or becomes) a library figure are the figure's: the brief's are no change.
+ * even when the brief is the one staged (the hash shortcut is not taken then). So is a pin whose unit
+ * the desk holds but cannot use, until an update has recorded it refused (it is then not tried again):
+ * "a library set that cannot be used", "1 cast member with a library figure that cannot be used",
+ * "1 prop with a library version that cannot be used". The kind and height of a member that is (or
+ * becomes) a library figure are the figure's: the brief's are no change.
  */
 
 const sameSet = (a: readonly string[], b: readonly string[]) => {
@@ -160,23 +171,29 @@ export function unitWords(units: ResolvedUnits | null): string[] {
             ? 'another library set'
             : 'the set from the words (no library set)',
     );
+  if (set && refusesPin(set)) out.push('a library set that cannot be used');
   const count = (slots: Iterable<SlotUnit>, ...what: SlotUnit['action'][]) =>
     [...slots].filter((s) => what.includes(s.action)).length;
+  const refused = (slots: Iterable<SlotUnit>) => [...slots].filter(refusesPin).length;
   const cast = units.cast.values();
   const castList = [...cast];
   const elements = [...units.elements.values()];
   const n1 = count(castList, 'place');
   const n2 = count(castList, 'update', 'replace');
   const n3 = count(castList, 'remove');
+  const n4 = refused(castList);
   if (n1) out.push(`${plural(n1, 'cast member')} from the library`);
   if (n2) out.push(`${plural(n2, 'cast member')} with a new library figure`);
   if (n3) out.push(`${plural(n3, 'cast member')} back to a mannequin`);
+  if (n4) out.push(`${plural(n4, 'cast member')} with a library figure that cannot be used`);
   const p1 = count(elements, 'place');
   const p2 = count(elements, 'update', 'replace');
   const p3 = count(elements, 'remove');
+  const p4 = refused(elements);
   if (p1) out.push(`${plural(p1, 'prop')} from the library`);
   if (p2) out.push(`${plural(p2, 'prop')} with a new library version`);
   if (p3) out.push(`${plural(p3, 'prop')} back to the words`);
+  if (p4) out.push(`${plural(p4, 'prop')} with a library version that cannot be used`);
   return out;
 }
 
@@ -241,8 +258,9 @@ export function diffBrief(
   const staged = r && r.sceneId === b.id ? r : null;
   const shots = new Map<string, ShotDiff>();
   const none = { restage: new Set<string>(), removed: new Set<string>() };
-  // the brief staged, as it was: nothing differs (unless a library unit the record waits for is here)
-  if (staged && staged.hash === briefHash(b) && !units?.all.some(acts)) {
+  // the brief staged, as it was: nothing differs (unless a library unit the record waits for is
+  // here, to place or to refuse)
+  if (staged && staged.hash === briefHash(b) && !units?.all.some((s) => acts(s) || refusesPin(s))) {
     for (const s of b.shots)
       shots.set(s.id, {
         added: !staged.shots.some((x) => x.id === s.id),
@@ -441,11 +459,11 @@ export const noChanges = (c: BriefChanges): boolean =>
 
 /**
  * How `brief` differs from the brief `doc` was staged from (see the module comment); null when it
- * does not, which is exactly when updateFromBrief (given the same `units`) would change nothing. A
- * document not staged from a brief, or staged from another scene's, differs by every shot and cast
- * member of `brief`. `units`: the library units the desk holds (headers are enough: nothing is
- * decoded); without it a pinned unit counts as not held. Throws an OperatorError (INVALID_PARAMS) for
- * a brief that does not validate.
+ * does not, which is exactly when updateFromBrief (given the same `units`) would change nothing of
+ * the staging and record no new refusal of a library pin. A document not staged from a brief, or
+ * staged from another scene's, differs by every shot and cast member of `brief`. `units`: the library
+ * units the desk holds (headers are enough: nothing is decoded); without it a pinned unit counts as
+ * not held. Throws an OperatorError (INVALID_PARAMS) for a brief that does not validate.
  */
 export function briefChanges(
   doc: SceneDoc,

@@ -9,6 +9,7 @@ import {
   briefChanges,
   briefPins,
   briefWithoutPins,
+  pinsRefused,
   pinsWanted,
   planInfoOf,
   stageBrief,
@@ -219,9 +220,17 @@ function staging(doc: SceneDoc): string {
   });
 }
 
+/** The pins the record refuses, as 'slot ref@version'. */
+const refusals = (doc: SceneDoc) =>
+  stateUnitRows(doc)
+    .filter((x) => x.staged === 'refused')
+    .map((x) => `${x.slot} ${x.ref}@${x.version}`);
+
 /**
  * Updates `doc` to `b` and checks that briefChanges (given the same units) was null exactly when
- * the update changed nothing of the staging. Returns the update's report and the changes.
+ * the update changed nothing of the staging and refused no pin the record did not refuse already
+ * (a pin the desk holds but cannot use is a change once: the update records why). Returns the
+ * update's report and the changes.
  */
 function update(
   doc: SceneDoc,
@@ -231,12 +240,21 @@ function update(
   const o = units ? { units } : {};
   const changes = briefChanges(doc, b, o);
   const before = staging(doc);
+  const refused = new Set(refusals(doc));
   const r = updateFromBrief(doc, b, o);
-  expect(changes === null, `briefChanges ${JSON.stringify(changes)}`).toBe(staging(doc) === before);
+  const acted = staging(doc) !== before || refusals(doc).some((x) => !refused.has(x));
+  expect(changes === null, `briefChanges ${JSON.stringify(changes)}`).toBe(!acted);
   return { r, changes };
 }
 
 const NOTHING_LISTED = { added: [], removed: [], retimed: [], recast: [], cast: { added: [], removed: [] } };
+
+/** briefChanges' words of a pin whose unit the desk holds but cannot use (one slot). */
+const REFUSED_WORDS = {
+  set: 'a library set that cannot be used',
+  figure: '1 cast member with a library figure that cannot be used',
+  prop: '1 prop with a library version that cannot be used',
+} as const;
 
 describe('staging with library units', () => {
   it('places the set, a figure and a prop from their units and records their pins', () => {
@@ -786,16 +804,17 @@ describe('a unit that cannot be used is refused, with its reason', () => {
     const L = library();
     const { doc } = staged(openBrief());
     const mira = actorOf(doc, MIRA).id;
-    // Pip's figure (a dog) pinned on Mira (a child)
+    // Pip's figure (a dog) pinned on Mira (a child): offered once, so that the refusal is recorded
     const dog = withPins(openBrief(), { cast: { [MIRA]: L.pip } });
     const u = update(doc, dog, source(L.pip));
-    expect(u.changes).toBeNull();
+    expect(u.changes).toEqual({ ...NOTHING_LISTED, other: [REFUSED_WORDS.figure] });
     expect(rowsOf(u.r)).toEqual([`cast:${MIRA} words figure_kind`]);
     expect(libraryWarnings(u.r)[0]).toContain('Mira is staged as a child of 1.28 m');
     expect(actorOf(doc, MIRA).id).toBe(mira);
     expect(readInstance(doc, mira)).toBeNull();
     expect(recordCast(doc, MIRA).unit).toMatchObject({ staged: 'refused', why: 'figure_kind' });
     expect(pinsWanted(doc, dog)).toEqual([]);
+    expect(update(doc, dog, source(L.pip)).changes).toBeNull();
     // a taller Mira
     const tall = lib(
       'lib_0123456789mira',
@@ -803,8 +822,138 @@ describe('a unit that cannot be used is refused, with its reason', () => {
       reheadered(L.units.mira, (h) => (h.figure!.heightM = 1.4)),
     );
     const t = update(doc, withPins(openBrief(), { cast: { [MIRA]: tall } }), source(tall));
+    expect(t.changes?.other).toEqual([REFUSED_WORDS.figure]);
     expect(rowsOf(t.r)).toEqual([`cast:${MIRA} words figure_rig`]);
     expect(readInstance(doc, mira)).toBeNull();
+  });
+});
+
+describe('a pin the desk holds but cannot use is a change until an update records it', () => {
+  it('a figure v2 of another height over v1 placed: offered once, recorded refused (figure_rig), v1 stays', () => {
+    const L = library();
+    const b1 = withPins(openBrief(), { cast: { [MIRA]: L.mira } });
+    const { doc } = staged(b1, source(L.mira));
+    const actor = actorOf(doc, MIRA).id;
+    const h1 = Number(prop(actorOf(doc, MIRA), 'desk_height_m'));
+    // v2 of the item, 6 cm taller; the host sends the figure's height as the member's
+    const v2 = lib(
+      L.mira.pin.ref,
+      2,
+      reheadered(L.units.mira, (h) => (h.figure!.heightM = h1 + 0.06)),
+    );
+    const b2 = withPins(openBrief(), { cast: { [MIRA]: v2 } });
+    b2.cast.find((c) => c.id === MIRA)!.heightM = Math.round((h1 + 0.06) * 100) / 100;
+    // the file is kept for the update that records the refusal, which the desk can name now
+    expect(pinsWanted(doc, b2)).toEqual([v2.pin]);
+    expect(pinsRefused(doc, b2, source(v2))).toEqual([
+      {
+        slot: `cast:${MIRA}`,
+        pin: v2.pin,
+        why: 'figure_rig',
+        message: expect.stringContaining('Mira is staged as a child of 1.28 m'),
+      },
+    ]);
+    const u = update(doc, b2, source(v2));
+    expect(u.changes).toEqual({ ...NOTHING_LISTED, other: [REFUSED_WORDS.figure] });
+    expect(rowsOf(u.r)).toEqual([`cast:${MIRA} words figure_rig`]);
+    // the actor stays the v1 figure (the brief's height is not used), with why v2 is not
+    expect(libraryWarnings(u.r)).toEqual([
+      "Mira's library figure 'Mira' is 1.28 m tall: the brief's height 1.34 m is not used",
+      expect.stringMatching(/^Mira's library figure lib_0123456789mira v2 cannot be used \(.+\): v1 stays$/),
+    ]);
+    expect(stateUnitRows(doc)).toEqual([
+      {
+        slot: `cast:${MIRA}`,
+        ...pick(v2),
+        sha256: v2.pin.sha256,
+        staged: 'refused',
+        local: false,
+        why: 'figure_rig',
+      },
+    ]);
+    expect(readInstance(doc, actor)).toMatchObject({ ref: L.mira.pin.ref, version: 1 });
+    // recorded: no change any more, and the file is not wanted
+    expect(briefChanges(doc, b2, { units: source(v2) })).toBeNull();
+    expect(pinsWanted(doc, b2)).toEqual([]);
+    expect(pinsRefused(doc, b2, source(v2))).toEqual([]);
+    expect(update(doc, b2, source(v2)).changes).toBeNull();
+  });
+
+  it.each([
+    ['set', 'too_new'],
+    ['prop', 'unreadable'],
+  ] as const)(
+    'a %s v2 that cannot be used (%s) over v1 placed: offered once, recorded refused',
+    (kind, why) => {
+      const L = library();
+      const v1 = kind === 'set' ? L.set : L.kite;
+      const v2 =
+        kind === 'set'
+          ? lib(
+              v1.pin.ref,
+              2,
+              reheadered(L.units.set, (h) => (h.schemaVersion = SCHEMA_VERSION + 1)),
+            )
+          : lib(v1.pin.ref, 2, new TextEncoder().encode('not a unit'));
+      const pins = (l: Lib) => (kind === 'set' ? { set: l } : { el: { [KITE]: l } });
+      const slot = kind === 'set' ? 'set' : `el:${KITE}`;
+      const { doc } = staged(withPins(openBrief(), pins(v1)), source(v1));
+      const b2 = withPins(openBrief(), pins(v2));
+      const u = update(doc, b2, source(v2));
+      expect(u.changes).toEqual({ ...NOTHING_LISTED, other: [REFUSED_WORDS[kind]] });
+      expect(rowsOf(u.r)).toEqual([`${slot} words ${why}`]);
+      expect(stateUnitRows(doc)).toEqual([
+        expect.objectContaining({ slot, version: 2, staged: 'refused', why }),
+      ]);
+      expect(listUnits(doc).map((i) => [i.key, i.version])).toEqual([[slot, 1]]);
+      expect(update(doc, b2, source(v2)).changes).toBeNull();
+      expect(pinsWanted(doc, b2)).toEqual([]);
+    },
+  );
+
+  it('a pending pin whose file comes and cannot be used: offered although the brief is the one staged', () => {
+    const L = library();
+    const bad = lib(L.kite.pin.ref, 1, new TextEncoder().encode('not a unit'));
+    const b = withPins(openBrief(), { el: { [KITE]: bad } });
+    const { doc } = staged(b, unitSourceOf([]));
+    expect(recordElement(doc, KITE).unit).toMatchObject({ staged: 'pending', why: 'missing' });
+    const u = update(doc, b, source(bad));
+    expect(u.changes).toEqual({ ...NOTHING_LISTED, other: [REFUSED_WORDS.prop] });
+    expect(recordElement(doc, KITE).unit).toMatchObject({ staged: 'refused', why: 'unreadable' });
+    expect(update(doc, b, source(bad)).changes).toBeNull();
+    // and with other changes: said beside them
+    const later = structuredClone(b);
+    later.fps = 30;
+    const { doc: other } = staged(b, unitSourceOf([]));
+    expect(briefChanges(other, later, { units: source(bad) })?.other).toEqual([
+      'the frame rate (24 to 30 fps)',
+      REFUSED_WORDS.prop,
+    ]);
+  });
+
+  it('several members and props: counted, beside what is placed', () => {
+    const L = library();
+    const { doc } = staged(openBrief());
+    const notAUnit = (ref: string) => lib(ref, 1, new TextEncoder().encode(`not a unit: ${ref}`));
+    const b = withPins(openBrief(), {
+      set: L.set,
+      cast: { [MIRA]: notAUnit('lib_0123456789mir1'), [PIP]: notAUnit('lib_0123456789pip1') },
+      el: { [KITE]: notAUnit('lib_0123456789kit1') },
+    });
+    const pinned = briefPins(b).map((p) => p.pin.ref);
+    const held = source(L.set, ...pinned.filter((ref) => ref !== L.set.pin.ref).map((ref) => notAUnit(ref)));
+    const u = update(doc, b, held);
+    expect(u.changes?.other).toEqual([
+      'the set from the library',
+      '2 cast members with a library figure that cannot be used',
+      REFUSED_WORDS.prop,
+    ]);
+    expect(rowsOf(u.r)).toEqual([
+      'set unit',
+      `cast:${MIRA} words unreadable`,
+      `cast:${PIP} words unreadable`,
+      `el:${KITE} words unreadable`,
+    ]);
   });
 });
 

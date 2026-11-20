@@ -11,13 +11,23 @@ import { plannedSun } from './plan';
 import { readBriefRecord, setDigest, writeBriefRecord, type RecordPin } from './record';
 import type { BriefUnitPin, SceneBrief } from './schema';
 import { parseBrief } from './stage';
-import { UNIT_FACTS_PROP, pinKey, planInfoOf, wouldTry } from './units';
+import {
+  UNIT_FACTS_PROP,
+  pinKey,
+  planInfoOf,
+  refusesPin,
+  wouldTry,
+  type UnitRefusal,
+  type UnitSource,
+} from './units';
 
 /*
  * The desk's side of a host's library beyond staging (docs/embedding.md "Library units"):
  *
  * - pinsWanted: the pins of a brief whose unit an Update shots would place, update or replace if it
  *   were held (the desk keeps only those units after an open, for a later update);
+ * - pinsRefused: the pins whose unit the desk holds but staging cannot use, not recorded refused yet
+ *   (an Update shots records them; until then briefChanges counts them as changes);
  * - adoptPublished: once the host has confirmed a publish (unit-ack), the scene's published objects
  *   become an instance of the new version (adoptUnit: no id changes); when the host linked it to the
  *   brief's slot (`linked`, it pins the version in its next brief), the record says the slot holds it,
@@ -40,6 +50,35 @@ export function pinsWanted(doc: SceneDoc, brief: SceneBrief): BriefUnitPin[] {
     if (s.pin && wouldTry(s) && !out.has(pinKey(s.pin)))
       out.set(pinKey(s.pin), { ref: s.pin.ref, version: s.pin.version, sha256: s.pin.sha256 });
   return [...out.values()];
+}
+
+/** A pin whose unit the desk holds but staging cannot use (pinsRefused). */
+export interface RefusedPin {
+  /** The slot's key: 'set', 'cast:<castId>' or 'el:<elementId>'. */
+  slot: string;
+  pin: BriefUnitPin;
+  why: UnitRefusal;
+  message: string;
+}
+
+/**
+ * The pins of `brief` (validated: INVALID_PARAMS otherwise) whose unit `units` holds (or says why it
+ * was left out) but an update of `doc` cannot use, with why: those an Update shots records 'refused'
+ * (briefChanges counts them as changes until it has; the record's pin then refuses them, and they are
+ * listed no more). In slot order; headers are enough (nothing is decoded).
+ */
+export function pinsRefused(doc: SceneDoc, brief: SceneBrief, units: UnitSource): RefusedPin[] {
+  const b = parseBrief(brief);
+  const out: RefusedPin[] = [];
+  for (const s of resolveBriefUnits(doc, b, readBriefRecord(doc), units).all)
+    if (refusesPin(s) && s.problem?.staged === 'refused')
+      out.push({
+        slot: s.key,
+        pin: { ref: s.pin!.ref, version: s.pin!.version, sha256: s.pin!.sha256 },
+        why: s.problem.why,
+        message: s.problem.message,
+      });
+  return out;
 }
 
 /** What adoptPublished links. */
