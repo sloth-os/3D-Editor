@@ -1,7 +1,18 @@
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { MAX_EXPORT_HEIGHT, MAX_EXPORT_WIDTH } from '@3d-editor/core';
+import {
+  CONTAINER_PREFIX_BYTES,
+  MAX_EXPORT_HEIGHT,
+  MAX_EXPORT_WIDTH,
+  MAX_UNIT_HEADER_BYTES,
+  MAX_UNIT_NAME_LENGTH,
+  UNIT_CONTAINER_VERSION,
+  UNIT_FORMAT,
+  UNIT_MAGIC,
+  UNIT_VERSION,
+  readUnitHeader,
+} from '@3d-editor/core';
 import { DEFAULT_DESK_EMBED, deskHeadersFor } from '../../server/src/desk-embed';
 import {
   PROGRESS_INTERVAL_MS,
@@ -36,9 +47,9 @@ import { CONTAINER_VERSION, STATE_MAGIC } from '../src/embed/state';
 /*
  * docs/embedding.md against the code: the messages of each direction, the error codes and modes,
  * the timings and limits, library units' kinds, limits, publish refusals and the reasons a pin
- * waits or is refused, the headers and their defaults, the desk state's container, the fixtures
- * it lists, links that resolve, the docs that link to it, and the Markdown the formatter does not
- * check (*.md is prettier-ignored).
+ * waits or is refused, the unit file's layout, the headers and their defaults, the desk state's
+ * container, the fixtures it lists (the real unit file among them), links that resolve, the docs
+ * that link to it, and the Markdown the formatter does not check (*.md is prettier-ignored).
  */
 
 const ROOT = resolve(__dirname, '../../..');
@@ -279,6 +290,46 @@ describe('docs/embedding.md', () => {
       expect(header).toContain(`\`${key}\``);
   });
 
+  it('describes the unit file as core writes it, and its fixture is one', () => {
+    const text = section(doc, '### The unit file');
+    const rows = tables(text)[0].rows;
+    const cell = (bytes: string) => rows.find((r) => r[0] === bytes)![1];
+    // the prefix's rows, one after the other, end where core's header starts
+    let at = 0;
+    for (const [bytes] of rows.slice(0, -2)) {
+      const [first, last = first] = bytes.split('–').map(Number);
+      expect(first, bytes).toBe(at);
+      at = last + 1;
+    }
+    expect(at).toBe(CONTAINER_PREFIX_BYTES);
+    const magic = /`([^`]+)`/.exec(cell('0–7'))![1].replace('\\r', '\r').replace('\\n', '\n');
+    expect(new TextEncoder().encode(magic)).toEqual(UNIT_MAGIC);
+    expect(cell('8')).toContain(`\`${UNIT_CONTAINER_VERSION}\``);
+    expect(cell('9')).toContain('`0` none, `1` gzip');
+    expect(cell('10–11')).toContain('`0`');
+    expect(cell('12–15')).toContain('unsigned 32-bit, little-endian');
+    expect(cell('12–15')).toContain(`at most ${MAX_UNIT_HEADER_BYTES / 1024} KiB`);
+    const header = cell('header');
+    expect(header).toContain(`\`format\` (\`${UNIT_FORMAT}\`), \`version\` (\`${UNIT_VERSION}\`)`);
+    const kinds = UNIT_KINDS.map((k) => `\`${k}\``);
+    expect(header).toContain(`\`kind\` (${kinds.slice(0, -1).join(', ')} or ${kinds.at(-1)})`);
+    expect(header).toContain(`\`name\` (1–${MAX_UNIT_NAME_LENGTH} characters)`);
+    expect(flat(text)).toContain(`stable for format \`${UNIT_FORMAT}\` version ${UNIT_VERSION}`);
+    // the fixture it names: a real unit file, laid out so, whose header core reads
+    expect(flat(text)).toContain('`units/unit-file-prop.json`');
+    const file = JSON.parse(read('apps/web/test/fixtures/desk-protocol/units/unit-file-prop.json'));
+    const bytes = new Uint8Array(Buffer.from(file.$bytes as string, 'base64'));
+    expect(bytes.subarray(0, 8)).toEqual(UNIT_MAGIC);
+    expect([bytes[8], bytes[10], bytes[11]]).toEqual([UNIT_CONTAINER_VERSION, 0, 0]);
+    expect([0, 1]).toContain(bytes[9]);
+    const length = new DataView(bytes.buffer, bytes.byteOffset).getUint32(12, true);
+    const json = new TextDecoder().decode(
+      bytes.subarray(CONTAINER_PREFIX_BYTES, CONTAINER_PREFIX_BYTES + length),
+    );
+    expect(JSON.parse(json)).toMatchObject({ format: UNIT_FORMAT, version: UNIT_VERSION, kind: 'prop' });
+    expect(readUnitHeader(bytes)).toEqual(JSON.parse(json));
+  });
+
   it("names, under Testing a host, every member of the fake host's window.host and each desk spec", () => {
     const host = read('e2e/fixtures/desk-host/index.html');
     const block = host.slice(host.indexOf('window.host = {'), host.indexOf('window.host.mount();'));
@@ -306,6 +357,13 @@ describe('docs/embedding.md', () => {
     expect(fixtures).toContain(`the ${valid.length} valid messages`);
     for (const f of valid) expect(fixtures).toContain(`\`${f}\``);
     expect(fixtures).toContain(`the ${invalid.length} that must not validate`);
+    // under units/, real unit files (not messages): core keeps a copy of each
+    const units = json(resolve(dir, 'units'));
+    expect(units.length).toBeGreaterThan(0);
+    for (const f of units) {
+      expect(fixtures).toContain(`Under \`units/\`, \`${f}\``);
+      expect(fixtures).toContain(`\`units/${f}\`, which core's unit tests read`);
+    }
     expect(existsSync(resolve(ROOT, 'packages/core/test/fixtures/desk-embed'))).toBe(true);
   });
 

@@ -38,7 +38,8 @@ import {
  * fixtures (test/fixtures/desk-protocol: one valid example of every message, and invalid ones
  * under invalid/; the contract's own copies, an ArrayBuffer written {"$bytes": base64}), the
  * answers to messages that do not validate, and core's copies of the scene fixtures (the staging
- * tests read them) against these.
+ * tests read them) and of the real unit files under units/ (its unit tests read them) against
+ * these.
  */
 
 const DIR = resolve(__dirname, 'fixtures/desk-protocol');
@@ -110,10 +111,18 @@ describe('the contract fixtures', () => {
     const theirs = [
       ...jsonFiles(core).filter((f) => f !== 'staged-golden.json'),
       ...jsonFiles(resolve(core, 'invalid')).map((f) => `invalid/${f}`),
+      ...jsonFiles(resolve(core, 'units')).map((f) => `units/${f}`),
     ];
     expect(theirs.length).toBeGreaterThan(0);
-    for (const f of ['open-units.json', 'open-units-figure-hints.json', 'invalid/open-units-bad-pin.json'])
+    for (const f of [
+      'open-units.json',
+      'open-units-figure-hints.json',
+      'invalid/open-units-bad-pin.json',
+      'units/unit-file-prop.json',
+    ])
       expect(theirs, f).toContain(f);
+    // every real unit file of the contract has its copy in core (its unit tests read them)
+    for (const f of jsonFiles(resolve(DIR, 'units'))) expect(theirs).toContain(`units/${f}`);
     for (const f of theirs) expect(load(core, f), f).toEqual(load(DIR, f));
   });
 });

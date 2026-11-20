@@ -1,3 +1,5 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   MAX_UNIT_BODY_BYTES,
@@ -6,6 +8,7 @@ import {
   MAX_UNIT_HEADER_BYTES,
   MAX_UNIT_META_BYTES,
   MAX_UNIT_RECORDS,
+  UNIT_CONTAINER_VERSION,
   UNIT_FORMAT,
   UNIT_KINDS,
   UNIT_VERSION,
@@ -20,12 +23,20 @@ import {
   type UnitCredit,
   type UnitHeaderInput,
 } from '../src/desk/units';
-import { UNIT_MAGIC, gzipDeterministic, sha256Hex, writeContainer } from '../src/desk/container';
+import {
+  CONTAINER_PREFIX_BYTES,
+  UNIT_MAGIC,
+  gzipDeterministic,
+  sha256Hex,
+  writeContainer,
+} from '../src/desk/container';
 import { SCHEMA_VERSION } from '../src/doc/types';
 
 /*
  * The unit file (desk/units/format.ts): round trips, determinism, blob de-duplication, the header's
- * limits and every refusal with its code. Fixtures are hand-made bodies, independent of staging.
+ * limits and every refusal with its code. Fixtures are hand-made bodies, independent of staging;
+ * the contract's real unit file (fixtures/desk-embed/units, docs/embedding.md "The unit file") is
+ * read as hosts read it.
  */
 
 const enc = new TextEncoder();
@@ -621,5 +632,44 @@ describe('rigDigest', () => {
     expect(UNIT_FORMAT).toBe('3d-editor.desk-unit');
     expect(UNIT_VERSION).toBe(1);
     expect(MAX_UNIT_BYTES).toBe(33554432);
+  });
+});
+
+describe("the contract's unit file (fixtures/desk-embed/units/unit-file-prop.json)", () => {
+  /** A unit file core wrote (the example brief's red kite), as hosts keep it: {"$bytes": base64}. */
+  const file = (): Uint8Array => {
+    const json = readFileSync(resolve(__dirname, 'fixtures/desk-embed/units/unit-file-prop.json'), 'utf8');
+    return new Uint8Array(Buffer.from((JSON.parse(json) as { $bytes: string }).$bytes, 'base64'));
+  };
+
+  it('is laid out as docs/embedding.md says: the prefix, then a JSON header a host reads alone', () => {
+    const bytes = file();
+    expect(bytes.subarray(0, 8)).toEqual(UNIT_MAGIC);
+    expect(bytes[8]).toBe(UNIT_CONTAINER_VERSION);
+    expect([0, 1]).toContain(bytes[9]);
+    expect([bytes[10], bytes[11]]).toEqual([0, 0]);
+    const n = new DataView(bytes.buffer, bytes.byteOffset).getUint32(12, true);
+    expect(n).toBeLessThanOrEqual(MAX_UNIT_HEADER_BYTES);
+    const header = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(
+        bytes.subarray(CONTAINER_PREFIX_BYTES, CONTAINER_PREFIX_BYTES + n),
+      ),
+    );
+    expect(header).toMatchObject({
+      format: UNIT_FORMAT,
+      version: UNIT_VERSION,
+      kind: 'prop',
+      name: 'Red kite',
+    });
+  });
+
+  it('reads and decodes in core: its header and body agree', () => {
+    const bytes = file();
+    const header = readUnitHeader(bytes);
+    expect(header).toMatchObject({ format: UNIT_FORMAT, version: 1, kind: 'prop', name: 'Red kite' });
+    const unit = decodeUnit(bytes);
+    expect(unit.header).toEqual(header);
+    expect(Object.keys(unit.body.blocks.objects!)).toHaveLength(header.counts.objects);
+    expect(unit.body.blocks.objects!['@root']).toMatchObject({ name: 'Red kite' });
   });
 });

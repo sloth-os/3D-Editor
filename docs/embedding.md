@@ -239,15 +239,18 @@ tests. In this repository:
   `unit-publish-bad-sha.json`, `unit-publish-thumbnail-too-large.json`,
   `unit-ack-ok-without-ref.json`, `state-units-bad-staged.json`).
   `apps/web/test/desk-protocol.test.ts` checks the desk's schemas (`apps/web/src/embed/protocol.ts`)
-  against them. The fixtures' unit files are short texts, not units (a desk refuses them as
+  against them. The messages' unit files are short texts, not units (a desk refuses them as
   `unreadable`), with their real SHA-256 values; the pins of `open-units.json` (on the set, a cast
-  member and a prop) and its `units` agree.
+  member and a prop) and its `units` agree. Under `units/`, `unit-file-prop.json` is a real unit
+  file in `{"$bytes": …}` (the example brief's red kite, written by core), laid out as
+  [The unit file](#the-unit-file) says.
 - `packages/core/test/fixtures/desk-embed/`: copies of the briefs (`open.json`,
   `open-with-state.json`, `opened-changed.json`, `open-units.json`, `open-units-figure-hints.json`
-  and five invalid ones) that core's staging tests read; `desk-protocol.test.ts` checks that they
-  are the same files. Next to them is core's own `staged-golden.json`: how the desk staged each of
-  those briefs without pins, and five more (an interior, water, animals, a rider on a mount, a kite
-  in flight), before library units; `desk-brief-golden.test.ts` holds staging to it.
+  and five invalid ones) that core's staging tests read, and of `units/unit-file-prop.json`, which
+  core's unit tests read; `desk-protocol.test.ts` checks that they are the same files. Next to them
+  is core's own `staged-golden.json`: how the desk staged each of those briefs without pins, and
+  five more (an interior, water, animals, a rider on a mount, a kite in flight), before library
+  units; `desk-brief-golden.test.ts` holds staging to it.
 
 ## Library units
 
@@ -364,6 +367,27 @@ type StateUnit = {           // state.units[]: one row per brief slot whose reco
   why?: string;              // pending or refused: the reason (≤ 40)
 };
 ```
+
+### The unit file
+
+A unit file (the `data` of an `open.units` entry or of `unit-publish.unit`) is a container the desk
+writes with core (`packages/core/src/desk/units/format.ts`):
+
+| Bytes  | Content                                                                                                                                         |
+| ------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| 0–7    | the magic `3DUNIT\r\n`                                                                                                                          |
+| 8      | the container version: `1`                                                                                                                      |
+| 9      | the body's compression: `0` none, `1` gzip                                                                                                      |
+| 10–11  | both `0`                                                                                                                                        |
+| 12–15  | the header's length in bytes (unsigned 32-bit, little-endian), at most 64 KiB                                                                   |
+| header | UTF-8 JSON holding at least `format` (`3d-editor.desk-unit`), `version` (`1`), `kind` (`set`, `prop` or `figure`) and `name` (1–120 characters) |
+| body   | the unit itself, gzipped when byte 9 says so                                                                                                    |
+
+This layout is stable for format `3d-editor.desk-unit` version 1, and it is all of a unit file a
+host may read: the prefix and the header, which reads without the body, to check a file before it
+keeps it. The header's other fields (the body's digest and size, counts, bounds, credits, facts of
+its kind) and the body are the desk's own; what a host stores of a unit comes in
+`unit-publish.meta`. The fixture `units/unit-file-prop.json` is such a file ([Fixtures](#fixtures)).
 
 ### The host's part
 
