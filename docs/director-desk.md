@@ -723,6 +723,9 @@ undo step). For a new version of the item a slot holds, the instance is updated 
   and a part deleted in the desk stays deleted;
 - a part only the new version has is added; one it drops goes when it was left as it was and
   nothing outside the instance uses it (keys, drivers, shots, the scene's camera), else it stays;
+- the drivers the unit gave follow the same rules: one left as it was takes the new version or goes
+  with it, one edited in the desk is kept (with a warning when the new version changed it too), one
+  deleted in the desk stays deleted;
 - a new version with the same content changes no part, only the version the instance names.
 
 Another item pinned to the slot replaces the instance: its objects, edits and all, give way to the

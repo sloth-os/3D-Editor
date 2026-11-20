@@ -9,6 +9,7 @@ import {
   UNIT_ROOT,
   UnitError,
   adoptUnit,
+  decodeUnit,
   docHasUnitInstances,
   extractUnit,
   insertUnit,
@@ -310,6 +311,103 @@ describe('a part whose source id is named like a member of Object.prototype', ()
     expect(rep.updated.map((p) => p.id)).not.toContain(part);
     expect(doc.getObject(part)).toBeNull();
     expect(unitStatus(doc, r.root)).toEqual({ edited: [], missing: [] });
+  });
+});
+
+describe("a unit's drivers in an instance", () => {
+  /** The kite, a version of it whose sail is driven by `expression` (none: null), and the sail. */
+  function kites() {
+    const src = stagedDoc();
+    const kite = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id }).unit;
+    const sail = srcNamed(kite.body, 'sail');
+    const version = (expression: string | null, edit?: (b: UnitBody) => void) =>
+      editedUnit(kite, (b) => {
+        b.drivers =
+          expression === null
+            ? []
+            : [
+                {
+                  target_type: 'object',
+                  target_id: sail,
+                  path: 'rotation_euler',
+                  index: 0,
+                  expression,
+                  variables: [
+                    { name: 'f', target_type: 'scene', target_id: '', path: 'frame_end', index: 0 },
+                  ],
+                  mute: false,
+                },
+              ];
+        edit?.(b);
+      });
+    return { kite, sail, version };
+  }
+  const placed = (u: UnitPayload, sail: string) => {
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, u, { ...pin(1, SHA1), key: `el:${KITE}` });
+    return { doc, root: r.root, sail: r.ids[`objects:${sail}`] };
+  };
+  const expressions = (doc: SceneDoc, id: string) => doc.listDrivers(id).map((d) => d.expression);
+
+  it('one the scene left untouched takes the next version, and goes when a later one drops it', () => {
+    const { sail, version } = kites();
+    const { doc, root, sail: id } = placed(version('frame / 10'), sail);
+    expect(expressions(doc, id)).toEqual(['frame / 10']);
+    const v2 = updateUnit(doc, root, version('frame / 20'), pin(2, SHA2));
+    expect(v2.warnings).toEqual([]);
+    expect(expressions(doc, id)).toEqual(['frame / 20']);
+    updateUnit(doc, root, version(null), pin(3, '3'.repeat(64)));
+    expect(doc.listDrivers()).toEqual([]);
+    expect(unitStatus(doc, root)).toEqual({ edited: [], missing: [] });
+  });
+
+  it('one deleted in the scene stays deleted at the next version', () => {
+    const { sail, version } = kites();
+    const { doc, root, sail: id } = placed(version('frame / 10'), sail);
+    doc.removeDriver(fcurveKey(doc.listDrivers(id)[0]));
+    const recoloured = version('frame / 10', (b) => {
+      const m = Object.values(b.blocks.materials!)[0];
+      m.base_color = [0.9, 0.1, 0.1, 1];
+    });
+    updateUnit(doc, root, recoloured, pin(2, SHA2));
+    expect(doc.listDrivers()).toEqual([]);
+  });
+
+  it('one edited in the scene is kept, with a warning when the next version changed it too', () => {
+    const { sail, version } = kites();
+    const { doc, root, sail: id } = placed(version('frame / 10'), sail);
+    doc.setDriver({ ...doc.listDrivers(id)[0], expression: 'frame / 5' });
+    const rep = updateUnit(doc, root, version('frame / 20'), pin(2, SHA2));
+    expect(expressions(doc, id)).toEqual(['frame / 5']);
+    expect(rep.warnings).toEqual([expect.stringContaining('rotation_euler[0]')]);
+    // and a version dropping it leaves it (it is the scene's now)
+    updateUnit(doc, root, version(null), pin(3, '3'.repeat(64)));
+    expect(expressions(doc, id)).toEqual(['frame / 5']);
+  });
+
+  it('a published scene adopts its drivers: the next version updates them', () => {
+    const doc = stagedDoc();
+    const kiteRoot = propOf(doc, KITE).id;
+    const sailId = doc.listObjects().find((o) => o.parent === kiteRoot && o.name.startsWith('sail'))!.id;
+    doc.setDriver({
+      target_type: 'object',
+      target_id: sailId,
+      path: 'rotation_euler',
+      index: 0,
+      expression: 'frame / 10',
+      variables: [],
+      mute: false,
+    });
+    const ex = extractUnit(doc, { kind: 'prop', root: kiteRoot }, { deskVersion: 'test' });
+    expect(ex.link.drivers).toEqual({
+      [`object:${srcNamed(decodeUnit(ex.data).body, 'sail')}:rotation_euler:0`]: expect.any(String),
+    });
+    const { root } = adoptUnit(doc, ex.link, pin(1, ex.sha256));
+    const v2 = editedUnit(decodeUnit(ex.data), (b) => {
+      b.drivers[0].expression = 'frame / 20';
+    });
+    updateUnit(doc, root, v2, pin(2, SHA2));
+    expect(expressions(doc, sailId)).toEqual(['frame / 20']);
   });
 });
 

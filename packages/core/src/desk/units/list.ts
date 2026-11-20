@@ -19,6 +19,8 @@ import { UNIT_BLOCK_KINDS, UNIT_KINDS, type UnitKind } from './kinds';
  *   unit_name     the unit's name
  *   unit_parts    canonical JSON {'<kind>:<sourceId>': '<sceneId>:<sum16>'}: every datablock the unit gave
  *                 (the root is 'objects:@root'), with the stamp of what the unit gave it
+ *   unit_drivers  canonical JSON {'<target type>:<sourceId>:<path>:<index>': '<sum16>'}: every driver the
+ *                 unit gave, with its stamp (drivers.ts); read leniently (absent or malformed: none)
  *
  * The table maps scene ids back to the unit's source ids (to publish a new version from the scene),
  * tells parts edited in the scene (their stamp no longer matches) and parts deleted there (absent),
@@ -36,6 +38,7 @@ export const UNIT_PROPS = {
   key: 'unit_key',
   name: 'unit_name',
   parts: 'unit_parts',
+  drivers: 'unit_drivers',
 } as const;
 
 /** A part of an instance as its table records it. */
@@ -58,6 +61,8 @@ export interface UnitInstance {
   name: string;
   /** '<kind>:<sourceId>' → the part. */
   parts: Map<string, UnitPartStamp>;
+  /** The unit's drivers: their key in source ids → their stamp (drivers.ts). */
+  drivers: Map<string, string>;
 }
 
 /** What listUnits reports of an instance. */
@@ -80,6 +85,7 @@ export interface UnitInstanceInfo {
 
 const SHA256 = /^[0-9a-f]{64}$/;
 const STAMP = /^([A-Za-z0-9_-]{1,64}):([0-9a-f]{16})$/;
+const SUM16 = /^[0-9a-f]{16}$/;
 
 /** '<kind>:<sourceId>' split (null for a malformed table key). */
 export function splitPartKey(key: string): { kind: DatablockKind; src: string } | null {
@@ -99,6 +105,27 @@ export function partsTableText(parts: ReadonlyMap<string, UnitPartStamp>): strin
   return canonicalJsonStrict(o);
 }
 
+/** The unit_drivers text of a driver table (canonical JSON, keys sorted). */
+export function driversTableText(drivers: ReadonlyMap<string, string>): string {
+  return canonicalJsonStrict(Object.fromEntries(drivers));
+}
+
+/** A unit_drivers table read leniently: what does not read is no driver (the instance stays one). */
+function parseDrivers(text: unknown): Map<string, string> {
+  const out = new Map<string, string>();
+  if (typeof text !== 'string') return out;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return out;
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return out;
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>))
+    if (typeof v === 'string' && SUM16.test(v)) out.set(k, v);
+  return out;
+}
+
 /** The custom props that make `root` an instance root. */
 export function provenanceProps(i: Omit<UnitInstance, 'root'>): Record<string, string | number> {
   return {
@@ -110,6 +137,7 @@ export function provenanceProps(i: Omit<UnitInstance, 'root'>): Record<string, s
     [UNIT_PROPS.key]: i.key,
     [UNIT_PROPS.name]: i.name,
     [UNIT_PROPS.parts]: partsTableText(i.parts),
+    [UNIT_PROPS.drivers]: driversTableText(i.drivers),
   };
 }
 
@@ -156,7 +184,8 @@ function parseInstance(root: string, props: unknown): UnitInstance | null {
   }
   const own = parts.get('objects:@root');
   if (!own || own.id !== root) return null;
-  return { root, ref, version, sha256, digest, kind: kind as UnitKind, key, name, parts };
+  const drivers = parseDrivers(p[UNIT_PROPS.drivers]);
+  return { root, ref, version, sha256, digest, kind: kind as UnitKind, key, name, parts, drivers };
 }
 
 /** The instance whose root is `root` (null: not an instance root, or its provenance does not read). */

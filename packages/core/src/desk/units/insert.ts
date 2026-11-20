@@ -10,6 +10,7 @@ import { provenanceProps, readInstance, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
 import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
 import { dataKey, deleteData, keptWarning, oldLook, unusedData } from './remove';
+import { driverKeyOf, driverSum16 } from './drivers';
 
 /*
  * Inserting a unit: its records are copied into the scene, each datablock under the id
@@ -149,7 +150,9 @@ export function writeUnitRecords(
   body: UnitBody,
   kind: UnitKind,
   o: Omit<InsertUnitOptions, 'ref' | 'version' | 'sha256'>,
-  provenance: ((parts: Map<string, UnitPartStamp>) => Record<string, string | number>) | null,
+  provenance:
+    | ((parts: Map<string, UnitPartStamp>, drivers: Map<string, string>) => Record<string, string | number>)
+    | null,
 ): InsertUnitResult {
   const key = requireUnitKey(o.key);
   const warnings: string[] = [];
@@ -222,6 +225,7 @@ export function writeUnitRecords(
     replace?: boolean;
   }[] = [];
   let drivers: DriverData[] = [];
+  const driverStamps = new Map<string, string>();
   try {
     for (const k of UNIT_BLOCK_KINDS) {
       const m = body.blocks[k];
@@ -258,7 +262,9 @@ export function writeUnitRecords(
     }
     drivers = body.drivers.flatMap((d) => {
       const mapped = mapDriverRefs(d, map);
-      return mapped ? [cloneJson(mapped) as unknown as DriverData] : [];
+      if (!mapped) return [];
+      driverStamps.set(driverKeyOf(d), driverSum16(d));
+      return [cloneJson(mapped) as unknown as DriverData];
     });
   } catch (err) {
     // a record of a shape decoding did not foresee is the unit's fault (out of memory is not)
@@ -266,7 +272,7 @@ export function writeUnitRecords(
       throw new UnitError('UNIT_BAD_RECORD', `the unit's records do not insert (${err.message})`);
     throw err;
   }
-  const provenanceOf = provenance ? provenance(stamps) : null;
+  const provenanceOf = provenance ? provenance(stamps, driverStamps) : null;
   const bones = o.replace ? unitBones(body) : null;
   doc.transact(() => {
     if (doomed.length) doc.removeObjects(doomed);
@@ -295,7 +301,7 @@ export function writeUnitRecords(
 export function insertUnit(doc: SceneDoc, unit: UnitPayload, o: InsertUnitOptions): InsertUnitResult {
   const pin = requirePin(o);
   const header: UnitHeader = unit.header;
-  return writeUnitRecords(doc, unit.body, header.kind, o, (parts) =>
+  return writeUnitRecords(doc, unit.body, header.kind, o, (parts, drivers) =>
     provenanceProps({
       ...pin,
       digest: header.digest,
@@ -303,6 +309,7 @@ export function insertUnit(doc: SceneDoc, unit: UnitPayload, o: InsertUnitOption
       key: o.key,
       name: header.name,
       parts,
+      drivers,
     }),
   );
 }

@@ -8,7 +8,7 @@ import { BlobTable, canonicalJsonStrict, isBlobRef } from './canonical';
 import { UnitError } from './errors';
 import { UNIT_ROOT, UNIT_SOURCE_ID_PATTERN } from './ids';
 import { UNIT_BLOCK_KINDS, UNIT_KINDS, type UnitBlockKind, type UnitKind } from './kinds';
-import { collectDriverRefs, collectRecordRefs, type UnitRecord } from './refs';
+import { ANIM_TARGET_KINDS, collectDriverRefs, collectRecordRefs, type UnitRecord } from './refs';
 import { DESK_PROPS } from '../props';
 
 /*
@@ -278,6 +278,8 @@ export function checkUnitBody(body: UnitBody, kind: UnitKind | null, reading: bo
         throw new UnitError('UNIT_BAD_RECORD', `object '${src}' has no known type`);
     }
   }
+  // a driver is a record too: each one is written into the scene and stamped
+  records += body.drivers.length;
   if (records > MAX_UNIT_RECORDS)
     throw new UnitError('UNIT_TOO_LARGE', `the unit holds ${records} records, over ${MAX_UNIT_RECORDS}`);
   const root = body.blocks.objects?.[UNIT_ROOT];
@@ -299,6 +301,18 @@ export function checkUnitBody(body: UnitBody, kind: UnitKind | null, reading: bo
           );
   for (const d of body.drivers) {
     if (!isRecord(d)) throw new UnitError('UNIT_BAD_RECORD', 'a driver is not a record');
+    // what a driver writes lies inside the unit: never the scene's world or settings (a variable may
+    // read them: that is no write)
+    if (
+      !Object.hasOwn(ANIM_TARGET_KINDS, String(d.target_type)) ||
+      typeof d.target_id !== 'string' ||
+      typeof d.path !== 'string' ||
+      !Number.isInteger(d.index)
+    )
+      throw new UnitError(
+        'UNIT_BAD_RECORD',
+        `a driver drives ${JSON.stringify(String(d.target_type))} '${String(d.path)}', not a datablock of the unit`,
+      );
     for (const ref of collectDriverRefs(d))
       if (!has(ref.kind, ref.id))
         throw new UnitError(

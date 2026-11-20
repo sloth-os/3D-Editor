@@ -994,19 +994,21 @@ in, so no part is a second instance, and an insert works out every record before
 so one that fails leaves the scene as it was.
 
 An instance is a root object with `unit_*` custom props: the library item, its version, the file's
-SHA-256, the body digest, the kind, the key, the name and `unit_parts` (each source id's scene id
-and a 16-digit stamp of the fields the unit owns). Insertion derives every id from the instance
+SHA-256, the body digest, the kind, the key, the name, `unit_parts` (each source id's scene id and a
+16-digit stamp of the fields the unit owns) and `unit_drivers` (each driver the unit gave, by its
+target's source id, path and index, with its stamp). Insertion derives every id from the instance
 key and the source id (`deriveUnitId`), so two replicas inserting the same unit agree. Taking an
 instance out removes all of it (`remove.ts`): its objects and the datablocks its part table lists
 that nothing left in the scene uses, so a unit placed in the slot again finds its ids free. A
-datablock at a derived id that nothing uses counts as free and goes in the insert's transaction;
-one something uses refuses the insert (`UNIT_ID_TAKEN`). An update
-replaces the parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep
-resolving; it keeps parts edited or deleted in the scene, adds new parts and removes dropped
-untouched ones. Scene-owned fields (names, the collection and rigid body of every object, the
-root's placement, pose and constraints, the scene's `desk_*` props) never count as edits, and a unit
-holds no rigid body: a drop preset that makes a library set's ground the floor edits nothing of the
-set. Measured on the sample brief:
+datablock at a derived id that nothing uses counts as free and goes in the insert's transaction; one
+something uses refuses the insert (`UNIT_ID_TAKEN`). An update replaces the parts the scene left
+untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts edited or
+deleted in the scene, adds new parts and removes dropped untouched ones, and treats the unit's
+drivers the same way by their own table. A unit's driver writes only the unit's own datablocks (it
+may read the world or the scene), and drivers count toward the 20,000 records. Scene-owned fields
+(names, the collection and rigid body of every object, the root's placement, pose and constraints,
+the scene's `desk_*` props) never count as edits, and a unit holds no rigid body: a drop preset that
+makes a library set's ground the floor edits nothing of the set. Measured on the sample brief:
 
 | Unit                            | File      | Body      | Objects |
 | ------------------------------- | --------- | --------- | ------- |

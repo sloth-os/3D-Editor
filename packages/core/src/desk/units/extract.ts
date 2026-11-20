@@ -40,6 +40,7 @@ import { writeUnitRecords } from './insert';
 import type { UnitBlockKind, UnitKind } from './kinds';
 import { readInstances, splitPartKey, type UnitInstance } from './list';
 import { isSceneProp, partSum16 } from './ownership';
+import { driverStamps } from './drivers';
 import { channelsUnder } from './place';
 import {
   ANIM_TARGET_KINDS,
@@ -113,6 +114,8 @@ export interface UnitLinkPlan {
   digest: string;
   /** '<kind>:<sourceId>' → the scene id it came from and its stamp. */
   parts: Record<string, { sceneId: string; sum16: string }>;
+  /** The unit's drivers: their key in source ids → their stamp (drivers.ts; absent in older plans: none). */
+  drivers?: Record<string, string>;
 }
 
 export interface UnitExtraction {
@@ -593,6 +596,7 @@ export function extractUnit(doc: SceneDoc, spec: UnitSpec, o: { deskVersion: str
     name: fileHeader.name,
     digest: fileHeader.digest,
     parts,
+    drivers: Object.fromEntries(driverStamps(drivers)),
   };
   return {
     data,

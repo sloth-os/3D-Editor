@@ -40,9 +40,16 @@ export function sourceIndex(
   return out;
 }
 
+/** Scene id → the instance's source id ('!<id>' for ids outside it). */
+export function toSourceId(
+  index: Map<DatablockKind, Map<string, string>>,
+): (kind: DatablockKind, id: string) => string {
+  return (kind, id) => index.get(kind)?.get(id) ?? `${OUTSIDE_MARK}${id}`;
+}
+
 /** A RefMap writing scene ids as the instance's source ids ('!<id>' for ids outside it). */
 export function toSourceMap(index: Map<DatablockKind, Map<string, string>>): RefMap {
-  return (kind, id) => index.get(kind)?.get(id) ?? `${OUTSIDE_MARK}${id}`;
+  return toSourceId(index);
 }
 
 /** The stamp a part's current record would have (its unit view, ids as source ids). */

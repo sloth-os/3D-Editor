@@ -16,7 +16,7 @@ import { channelsUnder } from './place';
  * new EMPTY at the origin) takes the provenance, with the table of the parts as extraction mapped
  * them (each keeps its scene id); part objects whose parent is outside the instance hang from the
  * root, keeping their world transform, with the very channels extraction wrote into the unit
- * (place.ts), so no part reads as edited. One transaction: the caller chooses its origin by calling
+ * (place.ts), so no part reads as edited; the drivers the unit took are stamped too (drivers.ts). One transaction: the caller chooses its origin by calling
  * it inside its own doc.transact(…, origin) (the desk applies it with its storage origin: not
  * undoable).
  */
@@ -46,7 +46,9 @@ function requireLink(link: UnitLinkPlan): UnitLinkPlan {
       ([pk, p]) =>
         !!splitPartKey(pk) && isRecord(p) && STAMP_ID.test(String(p.sceneId)) && SUM16.test(String(p.sum16)),
     ) &&
-    isRecord(link.parts[`objects:${UNIT_ROOT}`]);
+    isRecord(link.parts[`objects:${UNIT_ROOT}`]) &&
+    (link.drivers === undefined ||
+      (isRecord(link.drivers) && Object.values(link.drivers).every((v) => SUM16.test(String(v)))));
   if (!ok) throw new UnitError('UNIT_BAD_SPEC', 'not a link plan extractUnit made');
   requireUnitKey(link.key);
   return link;
@@ -112,7 +114,15 @@ export function adoptUnit(
     doc.updateObject(root, {
       custom_props: {
         ...(cur.custom_props as ObjectData['custom_props']),
-        ...provenanceProps({ ...p, digest: l.digest, kind: l.kind, key: l.key, name: l.name, parts }),
+        ...provenanceProps({
+          ...p,
+          digest: l.digest,
+          kind: l.kind,
+          key: l.key,
+          name: l.name,
+          parts,
+          drivers: new Map(Object.entries(l.drivers ?? {})),
+        }),
       },
     });
   });

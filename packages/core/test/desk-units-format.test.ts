@@ -5,6 +5,7 @@ import {
   MAX_UNIT_DEPTH,
   MAX_UNIT_HEADER_BYTES,
   MAX_UNIT_META_BYTES,
+  MAX_UNIT_RECORDS,
   UNIT_FORMAT,
   UNIT_KINDS,
   UNIT_VERSION,
@@ -388,6 +389,45 @@ describe('decoding is the gate: what decodes, inserts', () => {
     expect(code(() => decodeUnit(at(10)))).toBe('no error');
     expect(code(() => decodeUnit(at(MAX_UNIT_DEPTH)))).toBe('UNIT_CORRUPT');
     expect(code(() => decodeUnit(at(10_000)))).toBe('UNIT_CORRUPT');
+  });
+
+  /** A driver's JSON: on the box's root, its location z, unless `o` says otherwise. */
+  const drv = (o: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      expression: '1',
+      index: 2,
+      mute: false,
+      path: 'location',
+      target_id: '@root',
+      target_type: 'object',
+      variables: [],
+      ...o,
+    });
+
+  it("a driver that drives the world or the scene: UNIT_BAD_RECORD; one that only reads them is the unit's", () => {
+    const one = (d: string) => code(() => decodeUnit(edited('"drivers":[]', `"drivers":[${d}]`)));
+    expect(one(drv({ target_type: 'world', target_id: '', path: 'strength', index: 0 }))).toBe(
+      'UNIT_BAD_RECORD',
+    );
+    expect(one(drv({ target_type: 'scene', target_id: '', path: 'frame_end', index: 0 }))).toBe(
+      'UNIT_BAD_RECORD',
+    );
+    const reads = { name: 'f', target_type: 'scene', target_id: '', path: 'frame_end', index: 0 };
+    expect(one(drv({ variables: [reads] }))).toBe('no error');
+    // a target outside the unit is refused as before
+    expect(one(drv({ target_id: 'elsewhere0000000' }))).toBe('UNIT_BAD_RECORD');
+  });
+
+  it(`drivers count toward the ${MAX_UNIT_RECORDS} records: one over is UNIT_TOO_LARGE`, () => {
+    const body = boxBody();
+    const records = Object.values(body.blocks).reduce((n, m) => n + Object.keys(m ?? {}).length, 0);
+    const many = (n: number) =>
+      edited(
+        '"drivers":[]',
+        `"drivers":[${Array.from({ length: n }, (_, i) => drv({ index: i })).join(',')}]`,
+      );
+    expect(code(() => decodeUnit(many(MAX_UNIT_RECORDS - records)))).toBe('no error');
+    expect(code(() => decodeUnit(many(MAX_UNIT_RECORDS - records + 1)))).toBe('UNIT_TOO_LARGE');
   });
 
   it('counts blob references as written out: a 1 MiB blob referred to 200 times is UNIT_TOO_LARGE', () => {

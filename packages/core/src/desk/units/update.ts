@@ -8,10 +8,10 @@ import { requirePin, type UnitPin } from './insert';
 import { UNIT_BLOCK_KINDS, type UnitBlockKind } from './kinds';
 import { UNIT_PROPS, provenanceProps, requireInstance, splitPartKey, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
-import { collectDriverRefs, collectRecordRefs, mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
+import { collectDriverRefs, collectRecordRefs, mapRecordRefs, type UnitRecord } from './refs';
 import { dataKey, deleteData, unusedData } from './remove';
-import { currentSum, sourceIndex, toSourceMap, type UnitPartRef } from './status';
-import type { DriverData } from '../../doc/types';
+import { currentSum, sourceIndex, toSourceId, toSourceMap, type UnitPartRef } from './status';
+import { updateDrivers } from './drivers';
 import { cloneJson } from '../../util/json';
 
 /*
@@ -30,6 +30,8 @@ import { cloneJson } from '../../util/json';
  *   instance uses it (animation, drivers, shots, the scene camera, other objects' references), with
  *   the data and materials only it used; otherwise it is kept and taken out of the table
  *   ('dropped-but-edited', 'dropped-but-used').
+ *
+ * The unit's drivers follow the same rules, by their own table (unit_drivers, drivers.ts).
  *
  * The same content (an equal body digest) changes no part: only the provenance moves (noop).
  */
@@ -122,7 +124,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     kept: [],
     warnings: [],
   };
-  const writeProvenance = (parts: Map<string, UnitPartStamp>) => {
+  const writeProvenance = (parts: Map<string, UnitPartStamp>, drivers: Map<string, string>) => {
     const cur = doc.readRecord('objects', root)!;
     doc.updateObject(root, {
       custom_props: {
@@ -134,6 +136,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
           key: inst.key,
           name: header.name,
           parts,
+          drivers,
         }),
       },
     });
@@ -147,7 +150,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       props[UNIT_PROPS.sha256] !== p.sha256 ||
       props[UNIT_PROPS.name] !== header.name
     )
-      doc.transact(() => writeProvenance(inst.parts));
+      doc.transact(() => writeProvenance(inst.parts, inst.drivers));
     return report;
   }
 
@@ -170,7 +173,8 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       return s && s.kind !== 'objects' && doc.has(s.kind, id) ? [dataKey(s.kind, id)] : [];
     }),
   );
-  const toSrc = toSourceMap(sourceIndex(inst, added));
+  const index = sourceIndex(inst, added);
+  const toSrc = toSourceMap(index);
   const members = new Set<string>();
   for (const [pk, id] of idOf) if (pk.startsWith('objects:')) members.add(id);
   const place = (k: DatablockKind, src: string) => ({
@@ -301,16 +305,17 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
         else doc.map(d.kind).delete(d.id);
       }
     }
-    // drivers of the new version that the scene does not have yet
-    for (const d of unit.body.drivers) {
-      const mapped = mapDriverRefs(d, mapOut);
-      if (!mapped) continue;
-      const drv = cloneJson(mapped) as unknown as DriverData;
-      if (!doc.listDrivers(drv.target_id).some((x) => x.path === drv.path && x.index === drv.index))
-        doc.setDriver(drv);
-    }
+    // the unit's drivers, stamped as parts are (drivers.ts)
+    const drivers = updateDrivers(
+      doc,
+      inst.drivers,
+      unit.body.drivers,
+      toSourceId(index),
+      mapOut,
+      report.warnings,
+    );
     if (inst.kind === 'figure') report.warnings.push(...figureWarnings(doc, root, curRoot, nextRoot, unit));
-    writeProvenance(table);
+    writeProvenance(table, drivers);
   });
   return report;
 }
