@@ -9,10 +9,33 @@ import { HOST_ID_PATTERN } from '../rideo/schema';
  * (stage.ts). Validated exactly as the contract states it: limits, the id pattern, even sizes, shot
  * indexes strictly increasing, unique ids, and every id a shot names (cast, elements, layout) one of
  * the brief's.
+ *
+ * Library pins (docs/embedding.md "Library units"; additive to v1): the set, a cast member and an
+ * element may each carry `unit`, a pin {ref, version, sha256} to a version of an item of the host's
+ * library (a 'set' unit for the scene's place, a 'figure' unit for a cast member, a 'prop' unit for an
+ * element; a location element's pin is ignored, as the place's set goes in set.unit). The field is
+ * optional with no default, so a brief without pins parses to exactly what it did before pins (no
+ * `unit` key anywhere: its hash and its record are unchanged), and a desk from before pins drops them
+ * (unknown keys are left out of the result).
  */
 
 /** A host's id (the contract's Id): 1–100 characters, a letter or digit first, then letters, digits and `_ . : -`. */
 export const BriefIdSchema = z.string().regex(HOST_ID_PATTERN, 'an id of 1–100 letters, digits and _ . : -');
+
+/** The highest version a library pin may name (the contract's UnitVersionSchema). */
+export const MAX_UNIT_VERSION = 1_000_000_000;
+
+/**
+ * A library pin (the contract's {ref, version, sha256}): `ref` the host's library item id, `version`
+ * the item's version (an integer from 1, assigned by the host), `sha256` the SHA-256 of the unit
+ * file's exact bytes (64 lowercase hex digits).
+ */
+export const BriefUnitPinSchema = z.object({
+  ref: BriefIdSchema,
+  version: z.number().int().min(1).max(MAX_UNIT_VERSION),
+  sha256: z.string().regex(/^[0-9a-f]{64}$/, 'a SHA-256: 64 lowercase hex digits'),
+});
+export type BriefUnitPin = z.infer<typeof BriefUnitPinSchema>;
 
 /** The desk's 20 named camera moves (the contract's Move: DESK_MOVES). */
 export type Move = DeskMove;
@@ -67,6 +90,8 @@ export const BriefSetSchema = z.object({
   interior: z.boolean().nullable(),
   /** null: the desk's default sun. */
   timeOfDay: z.enum(TIMES_OF_DAY).nullable(),
+  /** A 'set' unit of the host's library for the scene's place (absent: the set from the words). */
+  unit: BriefUnitPinSchema.optional(),
 });
 
 export const BriefCastSchema = z.object({
@@ -76,6 +101,8 @@ export const BriefCastSchema = z.object({
   /** A hint such as "person", "child", "dog", "horse"; null: from the words. */
   kind: z.string().max(L.kindHint).nullable(),
   heightM: z.number().min(L.minHeightM).max(L.maxHeightM).nullable(),
+  /** A 'figure' unit of the host's library for this cast member (absent: the figure from the words). */
+  unit: BriefUnitPinSchema.optional(),
 });
 
 export const BriefElementSchema = z.object({
@@ -83,6 +110,8 @@ export const BriefElementSchema = z.object({
   name: z.string().min(1).max(L.elementName),
   description: z.string().max(L.elementDescription),
   kind: z.enum(BRIEF_ELEMENT_KINDS),
+  /** A 'prop' unit of the host's library for this element (ignored on a location: see set.unit). */
+  unit: BriefUnitPinSchema.optional(),
 });
 
 export const BriefLayoutSchema = z.object({

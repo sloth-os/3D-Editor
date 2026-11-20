@@ -105,6 +105,8 @@ export const OpenOptionsSchema = z.object({
   modes: z.array(ModeSchema).optional(),
   defaultMode: ModeSchema.optional(),
   readOnly: z.boolean().optional(),
+  /** Library units for this open (UnitsOptionSchema), read leniently with acceptUnits: never fails the open. */
+  units: z.unknown().optional(),
 });
 export type OpenOptions = z.infer<typeof OpenOptionsSchema>;
 
@@ -149,14 +151,228 @@ export const ResultFileSchema = z.object({
 });
 export type ResultFile = z.infer<typeof ResultFileSchema>;
 
+// ---------------------------------------------------------------- library units (additive to v1)
+//
+// docs/embedding.md "Library units": nothing here is sent unless the desk announced
+// ready.capabilities.units AND the host's open carried options.units (acceptUnits). A version of a
+// library item is {ref, version, sha256}: the host's item id, its version (an integer from 1, the
+// host's) and the SHA-256 of the unit file's exact bytes.
+
+/** The format and version of a unit file (core's UNIT_FORMAT and UNIT_VERSION). */
+export const UNIT_DATA_FORMAT = '3d-editor.desk-unit';
+export const UNIT_DATA_VERSION = 1;
+/** The kinds of unit: a set for the scene's place, a prop, a figure for a cast member. */
+export const UNIT_KINDS = ['set', 'prop', 'figure'] as const;
+export type UnitKind = (typeof UNIT_KINDS)[number];
+/** Bytes of one unit file at most (32 MiB). */
+export const MAX_UNIT_BYTES = 32 * 1024 * 1024;
+/** Bytes of all the units of one open at most (48 MiB): the host stops before it. */
+export const MAX_OPEN_UNIT_BYTES = 48 * 1024 * 1024;
+/** Units of one open at most: a set, 16 cast members and 64 elements. */
+export const MAX_OPEN_UNITS = 81;
+/** Bytes of a published unit's thumbnail at most (a PNG of at most 256 px a side). */
+export const MAX_THUMBNAIL_BYTES = 64 * 1024;
+/** Bytes of a published unit's `meta` at most, as JSON.stringify(meta) in UTF-8. */
+export const MAX_UNIT_META_BYTES = 16 * 1024;
+/** Rows of state.units at most. */
+export const MAX_STATE_UNITS = 128;
+/** The codes of a refused publish (unit-ack `code`; a desk reads any string of 1–40 characters). */
+export const PUBLISH_REFUSALS = [
+  'refused',
+  'conflict',
+  'too_large',
+  'invalid',
+  'unavailable',
+  'failed',
+] as const;
+export type PublishRefusal = (typeof PUBLISH_REFUSALS)[number];
+/** What a slot's pin is staged as in state.units: its unit, or the words while it waits or was refused. */
+export const UNIT_STAGED = ['unit', 'pending', 'refused'] as const;
+export type UnitStaged = (typeof UNIT_STAGED)[number];
+/** Why a pin waits (`pending`, tried again at the next open). */
+export const UNIT_PENDING_REASONS = ['missing', 'mismatch', 'unavailable'] as const;
+/** Why a pin was refused (`refused`, tried again only when the pin changes). */
+export const UNIT_REFUSED_REASONS = [
+  'unreadable',
+  'too_new',
+  'too_large',
+  'wrong_kind',
+  'figure_kind',
+  'figure_rig',
+  'over_budget',
+  'set_ground',
+] as const;
+/** How long the desk waits for a unit-ack: 120 s, and 10 s more per MiB of the unit. */
+export const PUBLISH_ACK_BASE_MS = 120_000;
+export const PUBLISH_ACK_PER_MIB_MS = 10_000;
+export const publishAckTimeoutMs = (unitBytes: number): number =>
+  PUBLISH_ACK_BASE_MS + Math.ceil(Math.max(0, unitBytes) / (1024 * 1024)) * PUBLISH_ACK_PER_MIB_MS;
+
+/** A SHA-256: 64 lowercase hex digits. */
+export const Sha256Schema = z.string().regex(/^[0-9a-f]{64}$/, 'a SHA-256: 64 lowercase hex digits');
+/** A version of a library item: an integer from 1 to 1e9, the host's. */
+export const UnitVersionSchema = z.number().int().min(1).max(1_000_000_000);
+
+/** Bytes as a host gives them (an ArrayBuffer or a view of one), as GivenStateSchema takes a state's. */
+const GivenBytesSchema = z.union([
+  ArrayBufferSchema,
+  z.custom<ArrayBufferView>((v) => ArrayBuffer.isView(v), 'an ArrayBuffer or a view of one'),
+]);
+const unitBytesInRange = (d: ArrayBuffer | ArrayBufferView) =>
+  d.byteLength >= 1 && d.byteLength <= MAX_UNIT_BYTES;
+const UNIT_BYTES_RANGE = '1 byte to 32 MiB';
+
+/** ready.capabilities.units: what the desk does with library units (a desk with units always sends it). */
+export const UnitsCapabilitySchema = z.object({
+  /** The units option versions it reads ([1]). */
+  versions: z.array(z.number().int().positive()).min(1),
+  /** The kinds it places (hosts read any strings and leave out kinds they do not know). */
+  kinds: z.array(z.enum(UNIT_KINDS)).min(1),
+  /** Bytes of one unit at most (MAX_UNIT_BYTES). */
+  maxBytes: z.number().int().positive(),
+  /** Whether it can send unit-publish. */
+  publish: z.boolean(),
+});
+export type UnitsCapability = z.infer<typeof UnitsCapabilitySchema>;
+
+/** open.options.units: the host turns units on for this open; `publish` false: no Save to library. */
+export const UnitsOptionSchema = z.object({ version: z.literal(1), publish: z.boolean() });
+export type UnitsOption = z.infer<typeof UnitsOptionSchema>;
+
+/**
+ * open.options.units read leniently: the units this open takes, or null (units off for this open)
+ * when absent, malformed or of a version this desk does not read. Never fails the open.
+ */
+export function acceptUnits(raw: unknown): UnitsOption | null {
+  const r = UnitsOptionSchema.safeParse(raw);
+  return r.success ? { version: 1, publish: r.data.publish } : null;
+}
+
+/** A unit's file as a host gives it in open.units (its format and version read by the desk later). */
+export const GivenUnitDataSchema = z.object({
+  format: z.string().min(1).max(64),
+  version: z.number().int().positive(),
+  data: GivenBytesSchema.refine(unitBytesInRange, UNIT_BYTES_RANGE),
+});
+
+/** One entry of open.units: the unit of a pinned ref@version (transferred). */
+export const OpenUnitSchema = z.object({
+  ref: IdSchema,
+  version: UnitVersionSchema,
+  sha256: Sha256Schema,
+  unit: GivenUnitDataSchema,
+});
+export type OpenUnit = z.infer<typeof OpenUnitSchema>;
+
+/**
+ * open.units read entry by entry: the entries that validate (at most MAX_OPEN_UNITS), and the others
+ * by index with their problems (index -1: `units` is not a list). A bad entry is left out and its pin
+ * counts as not sent; it never fails the open. Absent: no units.
+ */
+export function parseOpenUnits(raw: unknown): {
+  units: OpenUnit[];
+  dropped: { index: number; problem: string }[];
+} {
+  const units: OpenUnit[] = [];
+  const dropped: { index: number; problem: string }[] = [];
+  if (raw === undefined) return { units, dropped };
+  if (!Array.isArray(raw)) return { units, dropped: [{ index: -1, problem: 'units: not a list' }] };
+  raw.forEach((entry, index) => {
+    if (index >= MAX_OPEN_UNITS) {
+      dropped.push({ index, problem: `more than ${MAX_OPEN_UNITS} units: left out` });
+      return;
+    }
+    const r = OpenUnitSchema.safeParse(entry);
+    if (r.success) units.push(r.data);
+    else dropped.push({ index, problem: problems(r.error) });
+  });
+  return { units, dropped };
+}
+
+/** The bytes of an open unit's data (a copy of a view's bytes; an ArrayBuffer as it is). */
+export function openUnitBytes(u: OpenUnit): Uint8Array {
+  const d = u.unit.data;
+  if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer.slice(d.byteOffset, d.byteOffset + d.byteLength));
+  return new Uint8Array(d as ArrayBuffer);
+}
+
+/** The slot a pin is for: the brief's set, a cast member (`cast:<id>`) or an element (`el:<id>`). */
+export const UNIT_SLOT_PATTERN = /^(set|cast:[A-Za-z0-9_.:-]{1,100}|el:[A-Za-z0-9_.:-]{1,100})$/;
+
+/** UTF-8 bytes of a text. */
+const utf8Length = (s: string): number => new TextEncoder().encode(s).byteLength;
+
+/** The brief slot a published unit came from: exactly one of a cast member, an element, the set. */
+export const UnitFromSchema = z
+  .object({ castId: IdSchema.nullable(), elementId: IdSchema.nullable(), set: z.boolean() })
+  .refine(
+    (f) => [f.castId !== null, f.elementId !== null, f.set].filter(Boolean).length === 1,
+    'exactly one of castId, elementId, set',
+  );
+
+/** A published unit's facts (core's unitMeta): at most 16 KiB as JSON in UTF-8. */
+export const UnitMetaSchema = z
+  .object({
+    dimensionsM: z.tuple([z.number().min(0), z.number().min(0), z.number().min(0)]),
+    objects: z.number().int().min(0),
+    triangles: z.number().int().min(0),
+    actor: z.object({ kind: z.string().min(1).max(60), heightM: z.number().positive().max(8) }).nullable(),
+    credits: z
+      .array(
+        z.object({
+          name: z.string().min(1).max(120),
+          author: z.string().max(200).nullable(),
+          license: z.string().min(1).max(64),
+        }),
+      )
+      .max(32),
+    deskVersion: z.string().min(1).max(64),
+    /** The unit header's digest of its body (informational: the file's sha256 is what travels). */
+    digest: Sha256Schema,
+  })
+  .refine((m) => utf8Length(JSON.stringify(m)) <= MAX_UNIT_META_BYTES, 'at most 16 KiB as JSON');
+export type UnitMeta = z.infer<typeof UnitMetaSchema>;
+
+/** A row of state.units: a brief slot whose record has a pin, and what the scene holds for it. */
+export const StateUnitSchema = z
+  .strictObject({
+    slot: z.string().regex(UNIT_SLOT_PATTERN, "'set', 'cast:<id>' or 'el:<id>'"),
+    ref: IdSchema,
+    version: UnitVersionSchema,
+    sha256: Sha256Schema,
+    staged: z.enum(UNIT_STAGED),
+    /** Staged 'unit' but the slot no longer holds a linked instance (made local). */
+    local: z.boolean(),
+    /** Why the pin waits or was refused (UNIT_PENDING_REASONS, UNIT_REFUSED_REASONS). */
+    why: z.string().max(40).optional(),
+  })
+  .superRefine((u, ctx) => {
+    const reasons: readonly string[] | null =
+      u.staged === 'pending' ? UNIT_PENDING_REASONS : u.staged === 'refused' ? UNIT_REFUSED_REASONS : null;
+    if (reasons ? !reasons.includes(u.why ?? '') : u.why !== undefined)
+      ctx.addIssue({
+        code: 'custom',
+        path: ['why'],
+        message: reasons ? `one of ${reasons.join(', ')}` : "no reason for a pin staged 'unit'",
+      });
+    if (u.local && u.staged !== 'unit')
+      ctx.addIssue({ code: 'custom', path: ['local'], message: "only a pin staged 'unit' is local" });
+  });
+export type StateUnit = z.infer<typeof StateUnitSchema>;
+
 // ---------------------------------------------------------------- host → desk
 
-/** `open` without its scene checked (the scene is checked on its own: invalid_scene). */
+/**
+ * `open` without its scene checked (the scene is checked on its own: invalid_scene). `units`, the
+ * units of the brief's pins (OpenUnitSchema, transferred), is read entry by entry with
+ * parseOpenUnits: never fails the open.
+ */
 const OpenEnvelopeSchema = z.object({
   type: z.literal('open'),
   scene: z.unknown(),
   state: GivenStateSchema.nullable(),
   options: OpenOptionsSchema.optional(),
+  units: z.unknown().optional(),
 });
 
 export const OpenSchema = OpenEnvelopeSchema.extend({ scene: SceneBriefSchema });
@@ -190,6 +406,30 @@ export const ResultAckSchema = z.object({
 });
 export type ResultAckMessage = z.infer<typeof ResultAckSchema>;
 
+/**
+ * The host's answer to a unit-publish (the same `id`): `ok` with the item's `ref`, the `version` it
+ * made and whether it `linked` it to the entity `from` names (decision of the host: see
+ * docs/embedding.md), or not ok with a `code` (PUBLISH_REFUSALS, read leniently) and a `message`.
+ */
+export const UnitAckSchema = z
+  .object({
+    type: z.literal('unit-ack'),
+    id: MessageIdSchema,
+    ok: z.boolean(),
+    ref: IdSchema.optional(),
+    version: UnitVersionSchema.optional(),
+    linked: z.boolean().optional(),
+    code: z.string().min(1).max(40).optional(),
+    message: z.string().max(2000).optional(),
+  })
+  .superRefine((m, ctx) => {
+    if (!m.ok) return;
+    for (const key of ['ref', 'version', 'linked'] as const)
+      if (m[key] === undefined)
+        ctx.addIssue({ code: 'custom', path: [key], message: `required when ok is true` });
+  });
+export type UnitAckMessage = z.infer<typeof UnitAckSchema>;
+
 /** The schema of each message type a host sends on the port. */
 export const HOST_MESSAGE_SCHEMAS = {
   open: OpenSchema,
@@ -197,9 +437,11 @@ export const HOST_MESSAGE_SCHEMAS = {
   cancel: CancelSchema,
   save: SaveSchema,
   'result-ack': ResultAckSchema,
+  'unit-ack': UnitAckSchema,
 } as const;
 export type HostMessageType = keyof typeof HOST_MESSAGE_SCHEMAS;
-export type HostMessage = OpenMessage | ExportMessage | CancelMessage | SaveMessage | ResultAckMessage;
+export type HostMessage =
+  OpenMessage | ExportMessage | CancelMessage | SaveMessage | ResultAckMessage | UnitAckMessage;
 
 // ---------------------------------------------------------------- desk → host
 
@@ -216,6 +458,8 @@ export const ReadySchema = z.object({
       modes: z.array(ModeSchema),
     }),
     offline: z.boolean(),
+    /** Library units (absent: a desk without them; hosts read it leniently). */
+    units: UnitsCapabilitySchema.optional(),
   }),
 });
 export type ReadyMessage = z.infer<typeof ReadySchema>;
@@ -235,6 +479,24 @@ export const StateSchema = z.object({
   sceneId: IdSchema,
   state: DeskStateSchema,
   shots: z.number().int().min(0),
+  /**
+   * Only after an open with units: one row per brief slot whose record has a pin, sorted by slot
+   * (plain string order), each slot once.
+   */
+  units: z
+    .array(StateUnitSchema)
+    .max(MAX_STATE_UNITS)
+    .superRefine((rows, ctx) => {
+      rows.forEach((r, i) => {
+        if (i > 0 && !(rows[i - 1].slot < r.slot))
+          ctx.addIssue({
+            code: 'custom',
+            path: [i, 'slot'],
+            message: `rows sorted by slot, each once ('${r.slot}' after '${rows[i - 1].slot}')`,
+          });
+      });
+    })
+    .optional(),
 });
 export type StateMessage = z.infer<typeof StateSchema>;
 
@@ -274,6 +536,40 @@ export type ErrorMessage = z.infer<typeof ErrorSchema>;
 export const CloseSchema = z.object({ type: z.literal('close'), reason: z.enum(['done', 'cancel']) });
 export type CloseMessage = z.infer<typeof CloseSchema>;
 
+/**
+ * Save to library (only after an open whose options.units.publish was true): a unit file of the scene
+ * for the host's library, a new item or a new version of `newVersionOf` (its base version), from the
+ * brief slot `from` names. The host answers unit-ack with the same `id`. `unit.data` and
+ * `thumbnail.data` are transferred.
+ */
+export const UnitPublishSchema = z.object({
+  type: z.literal('unit-publish'),
+  id: MessageIdSchema,
+  kind: z.enum(UNIT_KINDS),
+  name: z.string().min(1).max(120),
+  description: z.string().max(2000).optional(),
+  newVersionOf: z.object({ ref: IdSchema, version: UnitVersionSchema }).optional(),
+  from: UnitFromSchema.optional(),
+  unit: z.object({
+    format: z.literal(UNIT_DATA_FORMAT),
+    version: z.literal(UNIT_DATA_VERSION),
+    data: ArrayBufferSchema.refine(unitBytesInRange, UNIT_BYTES_RANGE),
+  }),
+  /** The SHA-256 of unit.data. */
+  sha256: Sha256Schema,
+  thumbnail: z
+    .object({
+      mime: z.literal('image/png'),
+      data: ArrayBufferSchema.refine(
+        (b) => b.byteLength >= 1 && b.byteLength <= MAX_THUMBNAIL_BYTES,
+        '1 byte to 64 KiB',
+      ),
+    })
+    .nullable(),
+  meta: UnitMetaSchema,
+});
+export type UnitPublishMessage = z.infer<typeof UnitPublishSchema>;
+
 /** The schema of each message type the desk sends on the port. */
 export const DESK_MESSAGE_SCHEMAS = {
   ready: ReadySchema,
@@ -283,10 +579,18 @@ export const DESK_MESSAGE_SCHEMAS = {
   result: ResultSchema,
   error: ErrorSchema,
   close: CloseSchema,
+  'unit-publish': UnitPublishSchema,
 } as const;
 export type DeskMessageType = keyof typeof DESK_MESSAGE_SCHEMAS;
 export type DeskMessage =
-  ReadyMessage | OpenedMessage | StateMessage | ProgressMessage | ResultMessage | ErrorMessage | CloseMessage;
+  | ReadyMessage
+  | OpenedMessage
+  | StateMessage
+  | ProgressMessage
+  | ResultMessage
+  | ErrorMessage
+  | CloseMessage
+  | UnitPublishMessage;
 
 // ---------------------------------------------------------------- reading a host's message
 

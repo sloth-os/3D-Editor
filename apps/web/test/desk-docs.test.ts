@@ -13,16 +13,32 @@ import {
   DESK_MESSAGE_SCHEMAS,
   ERROR_CODES,
   HOST_MESSAGE_SCHEMAS,
+  MAX_OPEN_UNIT_BYTES,
+  MAX_OPEN_UNITS,
   MAX_STATE_BYTES,
+  MAX_STATE_UNITS,
+  MAX_THUMBNAIL_BYTES,
+  MAX_UNIT_BYTES,
+  MAX_UNIT_META_BYTES,
   MODES,
+  PUBLISH_ACK_BASE_MS,
+  PUBLISH_ACK_PER_MIB_MS,
+  PUBLISH_REFUSALS,
+  UNIT_DATA_FORMAT,
+  UNIT_DATA_VERSION,
+  UNIT_KINDS,
+  UNIT_PENDING_REASONS,
+  UNIT_REFUSED_REASONS,
+  publishAckTimeoutMs,
 } from '../src/embed/protocol';
 import { CONTAINER_VERSION, STATE_MAGIC } from '../src/embed/state';
 
 /*
  * docs/embedding.md against the code: the messages of each direction, the error codes and modes,
- * the timings and limits, the headers and their defaults, the desk state's container, the
- * fixtures it lists, links that resolve, the docs that link to it, and the Markdown the formatter
- * does not check (*.md is prettier-ignored).
+ * the timings and limits, library units' kinds, limits, publish refusals and the reasons a pin
+ * waits or is refused, the headers and their defaults, the desk state's container, the fixtures
+ * it lists, links that resolve, the docs that link to it, and the Markdown the formatter does not
+ * check (*.md is prettier-ignored).
  */
 
 const ROOT = resolve(__dirname, '../../..');
@@ -177,6 +193,52 @@ describe('docs/embedding.md', () => {
     }
   });
 
+  it("gives library units' kinds, limits, timings, refusals and reasons as the protocol has them", () => {
+    const units = section(doc, '## Library units');
+    const text = flat(units);
+    const MiB = 1024 * 1024;
+    expect([MAX_UNIT_BYTES, MAX_OPEN_UNIT_BYTES]).toEqual([32 * MiB, 48 * MiB]);
+    expect([MAX_THUMBNAIL_BYTES, MAX_UNIT_META_BYTES]).toEqual([64 * 1024, 16 * 1024]);
+    expect(text).toContain(`format \`${UNIT_DATA_FORMAT}\`, version ${UNIT_DATA_VERSION}`);
+    const types = /```ts\n([\s\S]*?)```/.exec(units)![1];
+    expect(types).toContain(`kinds: (${UNIT_KINDS.map((k) => `'${k}'`).join(' | ')})[];`);
+    expect(types).toContain(`format: '${UNIT_DATA_FORMAT}'; version: ${UNIT_DATA_VERSION};`);
+    const quoted = (decl: string) => [...decl.matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+    expect(quoted(/type PublishRefusal = ([^;]*);/.exec(types)![1])).toEqual([...PUBLISH_REFUSALS]);
+
+    // the limits table, row by row
+    const limits = new Map(
+      tables(section(doc, '### Unit limits and timings'))[0].rows.map((r) => [r[0], r[1]]),
+    );
+    expect(limits.get('A unit file')).toContain(
+      `1 byte to 32 MiB (\`capabilities.units.maxBytes\`: ${MAX_UNIT_BYTES})`,
+    );
+    expect(limits.get('`open.units`')).toBe(
+      `at most ${MAX_OPEN_UNITS} entries (a set, 16 cast members, 64 elements), at most 48 MiB in all`,
+    );
+    expect(limits.get('A thumbnail')).toContain('at most 64 KiB');
+    expect(limits.get('`meta`')).toContain('at most 16 KiB as JSON in UTF-8');
+    expect(limits.get('`state.units`')).toBe(`at most ${MAX_STATE_UNITS} rows`);
+    const wait = limits.get("The desk's wait for `unit-ack`")!;
+    expect(wait).toContain(
+      `${PUBLISH_ACK_BASE_MS / 1000} s plus ${PUBLISH_ACK_PER_MIB_MS / 1000} s per MiB of the file`,
+    );
+    expect(wait).toContain(`(${publishAckTimeoutMs(MAX_UNIT_BYTES) / 1000} s for 32 MiB)`);
+    expect(text).toContain(`${publishAckTimeoutMs(MAX_UNIT_BYTES) / 1000} s for 32 MiB`);
+
+    // the refusals of a publish, in the protocol's order
+    const codes = tables(section(doc, '### Publishing and linking'))[0].rows.map((r) => r[0]);
+    expect(codes).toEqual(PUBLISH_REFUSALS.map((c) => `\`${c}\``));
+
+    // every reason a slot waits or is refused, with its record state, in the protocol's order
+    const failures = tables(section(doc, '### When a unit is not used'))[0].rows;
+    const reasons = (staged: string) =>
+      failures.filter((r) => r[1] === `\`${staged}\`` && r[0].startsWith('`')).map((r) => r[0]);
+    expect(reasons('pending')).toEqual(UNIT_PENDING_REASONS.map((w) => `\`${w}\``));
+    expect(reasons('refused')).toEqual(UNIT_REFUSED_REASONS.map((w) => `\`${w}\``));
+    expect(failures.filter((r) => r[1] === '`unit`')).toHaveLength(2);
+  });
+
   it('describes the desk state container as state.ts writes it', () => {
     const rows = tables(section(doc, '### The desk state'))[0].rows;
     const magic = /`([^`]+)`/
@@ -185,6 +247,11 @@ describe('docs/embedding.md', () => {
       .replace('\\n', '\n');
     expect(new TextEncoder().encode(magic)).toEqual(STATE_MAGIC);
     expect(rows.find((r) => r[0] === '8')![1]).toContain(`\`${CONTAINER_VERSION}\``);
+    // version 2 for a document with instances of library units (the rule older desks refuse)
+    expect(rows.find((r) => r[0] === '8')![1]).toMatch(/`1`, or `2` when the document holds instances/);
+    expect(flat(section(doc, '### The desk state'))).toContain(
+      'it answers a version-2 state with `error` `state_unreadable`',
+    );
     const header = rows.find((r) => r[0] === 'header')![1];
     for (const key of ['sceneId', 'lineage', 'shots', 'savedAt', 'deskVersion', 'updateBytes'])
       expect(header).toContain(`\`${key}\``);

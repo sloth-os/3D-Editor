@@ -1,0 +1,7 @@
+{
+  "type": "unit-ack",
+  "id": "pub-3",
+  "ok": false,
+  "code": "conflict",
+  "message": "Mira has a newer version (v4) than the one this was based on (v2)."
+}

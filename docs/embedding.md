@@ -12,10 +12,10 @@ This repository owns the contract. Version 1 is frozen: a change that is not bac
 is version 2, and both sides list the versions they speak. A host needs nothing of this repository
 but a desk URL, this page and the [fixtures](#fixtures).
 
-Contents: [the contract](#the-contract) · [hosting the desk](#hosting-the-desk) ·
-[what the desk does](#what-the-desk-does) · [limits and timings](#limits-and-timings) ·
-[browser support](#browser-support) · [readings of the contract](#readings-of-the-contract) ·
-[testing a host](#testing-a-host)
+Contents: [the contract](#the-contract) · [library units](#library-units) ·
+[hosting the desk](#hosting-the-desk) · [what the desk does](#what-the-desk-does) ·
+[limits and timings](#limits-and-timings) · [browser support](#browser-support) ·
+[readings of the contract](#readings-of-the-contract) · [testing a host](#testing-a-host)
 
 ## The contract
 
@@ -74,23 +74,25 @@ port: what the host sends before it waits, and is handled in order once `ready` 
 
 | Type         | Fields                                                                                                                                                             | What the desk does                                                                                                                                                                                                                             |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `open`       | `scene`: SceneBrief; `state`: DeskState or null; `options`: OpenOptions (optional)                                                                                 | Opens the scene: restores `state` (merged with its local copy of the same scene, if any), else its local copy, else stages the brief from scratch. Replies `opened`. Sent once per connection; a second `open` is answered with `error` `busy` |
+| `open`       | `scene`: SceneBrief; `state`: DeskState or null; `options`: OpenOptions (optional); `units`: OpenUnit[] (optional, [library units](#library-units))                | Opens the scene: restores `state` (merged with its local copy of the same scene, if any), else its local copy, else stages the brief from scratch. Replies `opened`. Sent once per connection; a second `open` is answered with `error` `busy` |
 | `export`     | `id`; `shots`: shot ids (optional, default all); `modes`: Mode[] (optional, default `options.modes`, else `["camera"]`); `still`: boolean (optional, default true) | Renders reference clips (and stills) in the browser and replies `progress`… then `result`, or `error`. One export at a time (`busy`)                                                                                                           |
 | `cancel`     | `id` (of an export)                                                                                                                                                | Stops that export; it ends with `error` `cancelled`                                                                                                                                                                                            |
 | `save`       | `id`                                                                                                                                                               | Replies `state` with the same `id`, now                                                                                                                                                                                                        |
 | `result-ack` | `id` (of a `result`); `ok`: boolean; `message`: string (optional); `shots`: `[{shotId, ok, error?}]` (optional)                                                    | Shows the person what the host did with the result                                                                                                                                                                                             |
+| `unit-ack`   | `id` (of a `unit-publish`); `ok`: boolean; `ref`, `version`, `linked` (required when `ok`); `code`, `message` (optional)                                           | Tells the person what the host did with a unit they saved to its library, and adopts it when `linked` ([library units](#publishing-and-linking))                                                                                               |
 
 ### Messages from the desk
 
-| Type       | Fields                                                                                                                                                                                                       | When                                                                                                                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ready`    | `deskVersion`: string; `protocol`: 1; `capabilities.export`: `available` (boolean), `reason` (string or null), `container` `"mp4"`, `videoCodec` `"avc1"`, `modes` (Mode[]); `capabilities.offline`: boolean | Right after `connect`. `export.available` is false where the browser cannot encode H.264 (no WebCodecs, not a secure context): `reason` says why                                                         |
-| `opened`   | `sceneId`; `source`: `"state"`, `"local"` or `"brief"`; `changes`: BriefChanges or null                                                                                                                      | After `open`. `changes` lists how the brief differs from the scene the state was staged from (the desk offers to update its shots; it never drops the person's staging silently)                         |
-| `state`    | `id` (only when answering `save`); `sceneId`; `state`: DeskState; `shots`: number                                                                                                                            | After `opened`, after edits (at most every 5 s, 2 s after the last change), when the person presses Done, and in answer to `save`. The host stores `state` as it is and hands it back in the next `open` |
-| `progress` | `id` (of the export); `phase`: `"prepare"`, `"render"`, `"encode"` or `"finish"`; `done`: integer; `total`: integer; `shotId`: string (optional)                                                             | During an export                                                                                                                                                                                         |
-| `result`   | `id` (the export's id, or `desk-` and a number when the person pressed **Send** in the desk); `sceneId`; `fps`; `width`; `height`; `shots`: ShotResult[]; `files`: ResultFile[]                              | When an export finished. The ArrayBuffers of `files` are transferred                                                                                                                                     |
-| `error`    | `id` (optional); `code`: ErrorCode; `message`: string                                                                                                                                                        | A request failed, or something the host should show                                                                                                                                                      |
-| `close`    | `reason`: `"done"` or `"cancel"`                                                                                                                                                                             | The person pressed **Done** (after a final `state`) or **Close** in the desk                                                                                                                             |
+| Type           | Fields                                                                                                                                                                                                                                                                         | When                                                                                                                                                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ready`        | `deskVersion`: string; `protocol`: 1; `capabilities.export`: `available` (boolean), `reason` (string or null), `container` `"mp4"`, `videoCodec` `"avc1"`, `modes` (Mode[]); `capabilities.offline`: boolean; `capabilities.units` (optional, [library units](#library-units)) | Right after `connect`. `export.available` is false where the browser cannot encode H.264 (no WebCodecs, not a secure context): `reason` says why                                                                       |
+| `opened`       | `sceneId`; `source`: `"state"`, `"local"` or `"brief"`; `changes`: BriefChanges or null                                                                                                                                                                                        | After `open`. `changes` lists how the brief differs from the scene the state was staged from (the desk offers to update its shots; it never drops the person's staging silently)                                       |
+| `state`        | `id` (only when answering `save`); `sceneId`; `state`: DeskState; `shots`: number; `units`: StateUnit[] (only after an open with units)                                                                                                                                        | After `opened`, after edits (at most every 5 s, 2 s after the last change), when the person presses Done, and in answer to `save`. The host stores `state` as it is and hands it back in the next `open`               |
+| `progress`     | `id` (of the export); `phase`: `"prepare"`, `"render"`, `"encode"` or `"finish"`; `done`: integer; `total`: integer; `shotId`: string (optional)                                                                                                                               | During an export                                                                                                                                                                                                       |
+| `result`       | `id` (the export's id, or `desk-` and a number when the person pressed **Send** in the desk); `sceneId`; `fps`; `width`; `height`; `shots`: ShotResult[]; `files`: ResultFile[]                                                                                                | When an export finished. The ArrayBuffers of `files` are transferred                                                                                                                                                   |
+| `error`        | `id` (optional); `code`: ErrorCode; `message`: string                                                                                                                                                                                                                          | A request failed, or something the host should show                                                                                                                                                                    |
+| `close`        | `reason`: `"done"` or `"cancel"`                                                                                                                                                                                                                                               | The person pressed **Done** (after a final `state`) or **Close** in the desk                                                                                                                                           |
+| `unit-publish` | `id`; `kind`; `name`; `description`, `newVersionOf`, `from` (optional); `unit`; `sha256`; `thumbnail`; `meta`                                                                                                                                                                  | The person saved the set, a prop or an actor to the host's library (only after an open whose `options.units.publish` is true). The ArrayBuffers of `unit` and `thumbnail` are transferred; the host answers `unit-ack` |
 
 ### Types
 
@@ -111,6 +113,7 @@ type SceneBrief = {
     description: string;     // ≤ 4000: the place, as the host describes it
     interior: boolean | null;          // null: decide from the words
     timeOfDay: 'dawn' | 'morning' | 'noon' | 'afternoon' | 'golden_hour' | 'dusk' | 'night' | null;
+    unit?: UnitPin;          // a library set for the place (library units)
   };
   cast: {                    // ≤ 16
     id: Id;
@@ -118,12 +121,14 @@ type SceneBrief = {
     description: string;     // ≤ 4000: who they are (words such as "a golden retriever", "a girl of 8")
     kind: string | null;     // ≤ 60, a hint such as "person", "child", "dog", "horse"; null: from the words
     heightM: number | null;  // 0.1–4
+    unit?: UnitPin;          // a library figure for this cast member (library units)
   }[];
   elements: {                // ≤ 64: the location and the props
     id: Id;
     name: string;            // 1–120
     description: string;     // ≤ 2000
     kind: 'location' | 'prop' | 'other';
+    unit?: UnitPin;          // a library prop (library units; ignored on a 'location')
   }[];
   shots: {                   // 1–200, in order
     id: Id;
@@ -162,6 +167,7 @@ type OpenOptions = {
   modes?: Mode[];            // the reference modes the host takes, its order (default ["camera"])
   defaultMode?: Mode;        // preselected in the desk's Follow menu (default modes[0])
   readOnly?: boolean;        // default false: view and export, no edits
+  units?: UnitsOption;       // library units for this open (library units)
 };
 
 type BriefChanges = {
@@ -220,16 +226,289 @@ The contract comes with one valid example of every message and some invalid ones
 test their own schemas against them, so a change on one side that breaks the other shows up in its
 tests. In this repository:
 
-- `apps/web/test/fixtures/desk-protocol/`: the 22 valid messages (`hello.json`, `connect.json`,
+- `apps/web/test/fixtures/desk-protocol/`: the 31 valid messages (`hello.json`, `connect.json`,
   `open.json`, `open-with-state.json`, `ready.json`, `ready-no-export.json`, `opened.json`,
   `opened-changed.json`, `state.json`, `state-reply.json`, `progress.json`, `result.json`,
   `result-desk.json`, `export.json`, `export-defaults.json`, `cancel.json`, `save.json`,
-  `result-ack.json`, `result-ack-partial.json`, `error.json`, `error-no-id.json`, `close.json`)
-  and under `invalid/` the 10 that must not validate. `apps/web/test/desk-protocol.test.ts` checks
-  the desk's schemas (`apps/web/src/embed/protocol.ts`) against them.
+  `result-ack.json`, `result-ack-partial.json`, `error.json`, `error-no-id.json`, `close.json`,
+  and those of [library units](#library-units): `ready-units.json`, `open-units.json`,
+  `open-units-figure-hints.json`, `unit-publish-set.json`, `unit-publish-figure-new-version.json`,
+  `unit-ack-linked.json`, `unit-ack-unlinked.json`, `unit-ack-refused.json`, `state-units.json`)
+  and under `invalid/` the 16 that must not validate (those of library units:
+  `open-units-bad-pin.json` with a SHA-256 of 63 digits, `unit-publish-two-from.json`,
+  `unit-publish-bad-sha.json`, `unit-publish-thumbnail-too-large.json`,
+  `unit-ack-ok-without-ref.json`, `state-units-bad-staged.json`).
+  `apps/web/test/desk-protocol.test.ts` checks the desk's schemas (`apps/web/src/embed/protocol.ts`)
+  against them. The fixtures' unit files are short texts, not units (a desk refuses them as
+  `unreadable`), with their real SHA-256 values; the pins of `open-units.json` (on the set, a cast
+  member and a prop) and its `units` agree.
 - `packages/core/test/fixtures/desk-embed/`: copies of the briefs (`open.json`,
-  `open-with-state.json`, `opened-changed.json` and four invalid ones) that core's staging tests
-  read; `desk-protocol.test.ts` checks that they are the same files.
+  `open-with-state.json`, `opened-changed.json`, `open-units.json`, `open-units-figure-hints.json`
+  and five invalid ones) that core's staging tests read; `desk-protocol.test.ts` checks that they
+  are the same files. Next to them is core's own `staged-golden.json`: how the desk staged each of
+  those briefs without pins, and five more (an interior, water, animals, a rider on a mount, a kite
+  in flight), before library units; `desk-brief-golden.test.ts` holds staging to it.
+
+## Library units
+
+A host with a library of 3D pieces lets the person reuse them across scenes: the set of a place, a
+prop, an actor's figure. Each is a _unit_, a file the desk writes (format `3d-editor.desk-unit`,
+version 1) and the host keeps, one file per version of a library item. The brief _pins_ a unit to
+its set, a cast member or an element; the host sends the pinned units' files with `open`; the desk
+stages the scene with them and says in every `state` what it staged; and the person can save the
+set, a prop or an actor to the host's library (`unit-publish`), which the host may link to the
+scene. All of it is additive to version 1 of the protocol: a desk with units says so in
+`ready.capabilities.units`, and nothing else of them is sent unless the host's `open` then carries
+`options.units`, so desks and hosts from before library units keep working with each other and
+with the new ones.
+
+### Negotiation
+
+| The desk                  | The host                            | What happens                                                                                                                              |
+| ------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| from before library units | with units                          | Its `ready` has no `capabilities.units`, so the host sends no pins, no `options.units` and no `units`: the scene opens as before          |
+| with units                | from before library units           | The host ignores `capabilities.units` and its `open` has no `options.units`: the desk sends no `units` in `state` and no `unit-publish`   |
+| with units                | with units, units off for this open | The host leaves out `options.units` (the person may not use the library, the host is offline): as with a host from before units           |
+| with units                | with units, `options.units` given   | The brief's pins and `open.units` count, every `state` carries `units`, and with `publish` true the person can save to the host's library |
+
+The desk reads `options.units` leniently: an absent or malformed one, or one of another `version`,
+turns units off for that open (logged); it never fails the open. A host reads `capabilities.units`
+leniently too: kinds it does not know are dropped, and a malformed one or one without version 1 in
+`versions` means no units; it never fails the `ready`. With units off the desk takes no
+`open.units` and sends no `units` in `state` and no `unit-publish`; a pin in the brief is staged
+from the words.
+
+### Fields and messages
+
+```ts
+type UnitPin = {             // one unit file
+  ref: Id;                   // the host's library item
+  version: number;           // integer 1–1 000 000 000, given by the host: one per file of the item
+  sha256: string;            // 64 lowercase hex digits: the SHA-256 of the file's exact bytes
+};
+
+// SceneBrief's pins: optional, no default (a brief without pins has the hash and record it had)
+//   set.unit?: UnitPin          a 'set' unit for the scene's place
+//   cast[].unit?: UnitPin       a 'figure' unit for the cast member
+//   elements[].unit?: UnitPin   a 'prop' unit; on an element of kind 'location' ignored with a warning
+
+type UnitsCapability = {     // ready.capabilities.units: a desk with units always sends it
+  versions: number[];        // the versions of options.units it reads: [1]
+  kinds: ('set' | 'prop' | 'figure')[];
+  maxBytes: number;          // the largest unit file it takes: 33554432 (32 MiB)
+  publish: boolean;          // true: it can send unit-publish
+};
+
+type UnitsOption = {         // OpenOptions.units: the host turns units on for this open
+  version: 1;
+  publish: boolean;          // false: the desk offers no Save to library
+};
+
+type OpenUnit = {            // open.units[]: ≤ 81 entries, ≤ 48 MiB in all, the data transferred
+  ref: Id;
+  version: number;
+  sha256: string;            // of unit.data
+  unit: { format: string; version: number; data: ArrayBuffer };   // format 1–64 characters; data 1 B–32 MiB
+};
+
+type UnitPublish = {         // desk → host: a unit the person saves to the host's library
+  type: 'unit-publish';
+  id: string;                // 'pub-1', 'pub-2', …
+  kind: 'set' | 'prop' | 'figure';
+  name: string;              // 1–120
+  description?: string;      // ≤ 2000
+  newVersionOf?: { ref: Id; version: number };   // the item's version it is based on: save its next version
+  from?: { castId: Id | null; elementId: Id | null; set: boolean };   // the brief slot: exactly one of the three
+  unit: { format: '3d-editor.desk-unit'; version: 1; data: ArrayBuffer };   // 1 B–32 MiB, transferred
+  sha256: string;            // of unit.data
+  thumbnail: { mime: 'image/png'; data: ArrayBuffer } | null;   // ≤ 64 KiB, ≤ 256 px a side, transferred
+  meta: {                    // ≤ 16 KiB as JSON (UTF-8)
+    dimensionsM: [number, number, number];   // its size in metres along x, y and z, each ≥ 0
+    objects: number;         // integer ≥ 0
+    triangles: number;       // integer ≥ 0
+    actor: { kind: string; heightM: number } | null;   // a figure's kind (1–60) and height (> 0, ≤ 8)
+    credits: { name: string; author: string | null; license: string }[];   // ≤ 32; 1–120, ≤ 200, 1–64
+    deskVersion: string;     // 1–64
+    digest: string;          // the SHA-256 of the unit's unpacked body: informational
+  };
+};
+
+type UnitAck = {             // host → desk, with the unit-publish's id
+  type: 'unit-ack';
+  id: string;
+  ok: boolean;
+  ref?: Id;                  // required when ok: the item it saved
+  version?: number;          // required when ok: the version it saved
+  linked?: boolean;          // required when ok: it linked the unit to the slot of `from`
+  code?: string;             // when not ok: a PublishRefusal (any 1–40 characters are read)
+  message?: string;          // ≤ 2000, shown to the person
+};
+
+type PublishRefusal = 'refused' | 'conflict' | 'too_large' | 'invalid' | 'unavailable' | 'failed';
+
+type StateUnit = {           // state.units[]: one row per brief slot whose record has a pin, ≤ 128
+  slot: string;              // 'set', 'cast:<castId>' or 'el:<elementId>'; rows in plain string order
+  ref: Id;                   // the pin the slot's record holds
+  version: number;
+  sha256: string;
+  staged: 'unit' | 'pending' | 'refused';
+  local: boolean;            // staged 'unit', but the slot no longer holds a linked instance
+  why?: string;              // pending or refused: the reason (≤ 40)
+};
+```
+
+### The host's part
+
+- It sends pins, `options.units` and `open.units` only after a `ready` whose `capabilities.units`
+  lists version 1, and pins only the kinds it lists.
+- Pins: `set.unit` for the scene's place (a `set` unit), `cast[].unit` for a figure and
+  `elements[].unit` for a prop. A pin on an element of kind `location` is ignored with a staging
+  warning: the place's set goes in `set.unit`. With a figure pin it sends the figure's kind and
+  height as the cast member's `kind` and `heightM` (`heightM` only within 0.1–4 m), as
+  `open-units-figure-hints.json` does, so that the desk plans the actor as the figure even when the
+  file does not come.
+- `open.units`: the file of every pin of the brief it can get, in slot order (the set, the cast in
+  brief order, then the elements), each `ref@version` once, stopping before 48 MiB in all. It may
+  leave out a pin whose `ref@version` the scene's stored state lists in its `units` with `staged`
+  `unit`: the desk needs no file for a slot that already holds that version. A file it cannot get
+  (offline, a failed fetch, bytes that do not hash to the pin) is left out: the desk stages that
+  slot from the words (`pending`, `missing`), and a later open that brings the file offers Update
+  shots.
+- The files travel as transferred `ArrayBuffer`s in `open`: the host's page gets them from its own
+  server, and the desk is never given a URL or a token to fetch them.
+- It keeps each `state`'s `units` with the state: per slot, whether the scene holds the pinned
+  version. Rows it cannot read (malformed, more than 128) count as unknown.
+
+### The desk's part
+
+- It parses each `open.units` entry on its own: an entry that does not validate (its fields, data
+  of 1 byte to 32 MiB as an `ArrayBuffer` or a view of one) is left out and logged, entries after
+  the 81st are left out, and the open goes on; the pin of an entry left out counts as not sent.
+- An entry counts for a pin when its `ref`, `version` and `sha256` are the pin's, its bytes hash to
+  that SHA-256, its format and version are ones the desk reads, and the kind in its header fits the
+  pin's slot (the set takes a `set` unit, a cast member a `figure`, an element a `prop`). Otherwise
+  the slot is staged from the words and recorded `pending` or `refused`
+  ([when a unit is not used](#when-a-unit-is-not-used)). An entry that matches no pin is ignored.
+- Staging places a set unit as the scene's place (its ground and its pieces), a prop unit as the
+  element's prop and a figure unit as the cast member's actor. Each is an _instance_ of
+  `ref@version` that the person can edit in the desk; **Make local** cuts a slot's link to its unit
+  (it keeps the pieces, and its row says `staged` `unit` with `local` true).
+- It keeps the files it may still need for **Update shots** in memory while the scene is open, and
+  none after: it has no cache of units, so a later open needs the files again unless the scene
+  already holds their versions.
+- A later brief that moves a pin (a new version, another item, or none) is a change the desk offers
+  to bring in with **Update shots**, as one undo step that keeps the parts the person edited by
+  hand; it never moves a pin by itself. `opened.changes` lists shots and cast only, so it is `null`
+  for a change of pins alone, while the desk's banner offers Update shots.
+- After an open with units every `state` carries `units`: one row per brief slot whose record has a
+  pin, sorted by `slot` in plain string order (`cast:…`, `el:…`, `set`), at most 128.
+
+### Publishing and linking
+
+With `options.units.publish` true the person can save the set, a prop or an actor to the host's
+library: **Save to library…** in the desk sends `unit-publish` with the unit file, its SHA-256, a
+PNG thumbnail (or `null`) and `meta`. `from` names the brief slot the unit came from (exactly one
+of `castId`, `elementId` and `set`), and `newVersionOf` the library version it is based on when the
+slot holds an instance of an item (the host saves the unit as that item's next version); without
+it the unit is a new item. A read-only open may publish too. The host answers `unit-ack` with the
+same `id`: `ok` true with the `ref` and `version` it saved and `linked`, or `ok` false with a
+`code` and a `message`:
+
+| `code`        | The host                                                                            |
+| ------------- | ----------------------------------------------------------------------------------- |
+| `refused`     | does not let this person or this open save to its library                           |
+| `conflict`    | has a newer version of the item than `newVersionOf` (someone saved one since)       |
+| `too_large`   | does not take a file, a thumbnail or a `meta` this large                            |
+| `invalid`     | finds the file, the thumbnail or a field invalid (a SHA-256 that is not the file's) |
+| `unavailable` | cannot save now (offline, its storage unavailable): the person may try again later  |
+| `failed`      | failed for another reason                                                           |
+
+**The link rule.** The host saves the unit, and links it to the entity `from` names (its project's
+set, cast member or element, whose pin moves to the new `ref@version`) only when (a) the open is
+editable (not read-only), (b) the person may edit the project, and (c) the entity has no pin or
+pins the same `ref` (the unit is a new version of its own item). Otherwise it answers `ok` true and
+`linked` false, with the reason in `message`, and the entity keeps its pin.
+
+**What `linked` means for the desk.** With `linked` true the host's project pins the slot to
+`ref@version`, and its next brief says so. The desk adopts the unit at once: the slot's pieces
+become an instance of `ref@version` (their ids unchanged, and not an undo step: it records what the
+host did) and the slot's record takes the pin with `staged` `unit`, so the next brief brings no
+change for the slot and needs no file. With `linked` false, or `ok` false, the desk changes nothing
+in the scene; a read-only open never adopts.
+
+The desk waits for the `unit-ack` 120 s plus 10 s per MiB of the file (counted up: 440 s for
+32 MiB), then tells the person that the host did not say whether it saved the unit; an ack that
+comes later is not applied (a unit the host linked comes with the next open's brief, through Update
+shots). A `unit-ack` that does not validate but has a valid `id` is answered with `error`
+`bad_message` with that `id`, as for any message, and fails the publish waiting on it at once.
+
+### When a unit is not used
+
+A slot whose unit the desk does not use is staged from the brief's words, with a warning in the
+desk, and its record says why. The record's state is the row's `staged` and `why` in `state.units`:
+
+| The desk's reason  | Record and `state.units` | When                                                                                             | Tried again                         | A host shows                                                       |
+| ------------------ | ------------------------ | ------------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------ |
+| none               | `unit`                   | The slot holds an instance of the pinned version                                                 | —                                   | up to date, or a newer version of its pin waiting for Update shots |
+| none, `local` true | `unit`                   | The person made the slot local: its pieces stay, unlinked                                        | —                                   | made local                                                         |
+| `missing`          | `pending`                | No entry for the pin in `open.units`, or one left out                                            | at the next open                    | waiting for the unit                                               |
+| `mismatch`         | `pending`                | An entry for the pin's `ref` and `version` with another SHA-256, or bytes that do not hash to it | at the next open                    | waiting for the unit                                               |
+| `unavailable`      | `pending`                | The desk had the file but could not use it this time                                             | at the next open                    | waiting for the unit                                               |
+| `unreadable`       | `refused`                | Not a unit file the desk reads, or a damaged one                                                 | when the brief pins another version | cannot use the unit, with the reason                               |
+| `too_new`          | `refused`                | A unit of a newer format version than the desk reads                                             | when the brief pins another version | cannot use the unit, with the reason                               |
+| `too_large`        | `refused`                | Larger than the desk takes for one unit                                                          | when the brief pins another version | cannot use the unit, with the reason                               |
+| `wrong_kind`       | `refused`                | Its kind does not fit the slot (a `prop` unit on the set)                                        | when the brief pins another version | cannot use the unit, with the reason                               |
+| `figure_kind`      | `refused`                | A figure of a kind the desk does not build                                                       | when the brief pins another version | cannot use the unit, with the reason                               |
+| `figure_rig`       | `refused`                | A figure whose bones are not the desk's for its kind                                             | when the brief pins another version | cannot use the unit, with the reason                               |
+| `over_budget`      | `refused`                | Past the units one staging takes (48 MiB of files, 160 MiB unpacked), in slot order              | when the brief pins another version | cannot use the unit, with the reason                               |
+| `set_ground`       | `refused`                | A set whose ground is more than 1 cm off height 0                                                | when the brief pins another version | cannot use the unit, with the reason                               |
+| —                  | no `units` in `state`    | An open without units, a desk from before units, rows the host cannot read                       | —                                   | unknown                                                            |
+
+A `pending` slot is tried again at every open: when one brings its file, the desk offers Update
+shots. A `refused` slot is tried again only when the brief pins another version or item, so a unit
+the desk cannot use never offers Update shots again and again.
+
+### The three hashes
+
+- **The file's SHA-256**, 64 lowercase hex digits of the exact bytes of a unit file, is the only one
+  that travels: in every pin, each `open.units` entry, `unit-publish.sha256` and each `state.units`
+  row. The host keys unit files by it and checks what the desk publishes against it; the desk
+  checks every file the host sends against it.
+- **The unit's digest**, the SHA-256 of its unpacked body, is in the unit's header and in
+  `unit-publish.meta.digest`. Two files of one body packed differently have different SHA-256 values
+  and the same digest. It is informational: nothing in the protocol is keyed or checked by it.
+- **A host's own digests** of its library items stay inside the host (for a unit, rideo's version
+  digest is the file's SHA-256).
+
+### Unit limits and timings
+
+| What                                | Limit                                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------------- |
+| A unit file                         | 1 byte to 32 MiB (`capabilities.units.maxBytes`: 33554432)                      |
+| `open.units`                        | at most 81 entries (a set, 16 cast members, 64 elements), at most 48 MiB in all |
+| The units one staging places        | 48 MiB of files and 160 MiB unpacked; past that `over_budget`, in slot order    |
+| A version                           | an integer 1–1 000 000 000                                                      |
+| A thumbnail                         | a PNG of at most 64 KiB and at most 256 px a side                               |
+| `meta`                              | at most 16 KiB as JSON in UTF-8, at most 32 credits                             |
+| A saved unit's name and description | 1–120 characters, at most 2000                                                  |
+| `state.units`                       | at most 128 rows                                                                |
+| `unit-ack`                          | `code` 1–40 characters, `message` at most 2000                                  |
+| The desk's wait for `unit-ack`      | 120 s plus 10 s per MiB of the file, counted up (440 s for 32 MiB)              |
+
+### Server calls
+
+The units go from the host's server to its page and from the page to the desk in `open`, in one
+hop, and the desk calls no server. No host server calls the 3D-Editor's server either: its only
+part is serving the desk's static files, the best case for one server serving many people. A call
+from the host's server was weighed for this and left out, by measurement: staging a brief with
+core on a server takes 3.4 s and 91 MB of heap for a 60-shot brief, and 24 s and 444 MB at the
+brief's maximum (200 shots, 16 cast members), to save the person 1.7–2.5 s at the first open; and
+reference clips render only in the browser, so a state a server updates gives no new reference
+until someone opens the desk and sends again. The candidate for later is `update-units`: the
+server moves a unit pin to a new version inside a stored desk state, in about 0.3 s per 60-shot
+state and 0.9 s per 200-shot state, with a cache of unit files by SHA-256, a token scope of its
+own and a pool of processes. It pays off when many stored scenes must take a new version without
+being opened, and for agents that work without a browser.
 
 ## Hosting the desk
 
@@ -454,17 +733,26 @@ under the first.
 ### The desk state
 
 `state.data` is opaque to the host, at most 64 MiB. The desk writes a container of its own there
-(version 1, `apps/web/src/embed/state.ts`):
+(version 1, or 2 when the scene holds [library units](#library-units);
+`apps/web/src/embed/state.ts`):
 
 | Bytes   | Content                                                                                                                                  |
 | ------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | 0–7     | the magic `3DDESK\r\n`                                                                                                                   |
-| 8       | the container version, `1`                                                                                                               |
+| 8       | the container version: `1`, or `2` when the document holds instances of library units                                                    |
 | 9       | the payload's compression: `0` none, `1` gzip                                                                                            |
 | 10–11   | `0`                                                                                                                                      |
 | 12–15   | the header's length in bytes (unsigned 32-bit, little-endian)                                                                            |
 | header  | UTF-8 JSON of at most 64 KiB: `sceneId`, `lineage`, `shots`, `deskVersion`, `updateBytes`, in order (earlier desks also wrote `savedAt`) |
 | payload | the scene's Yjs document (`Y.encodeStateAsUpdate`), gzipped where the browser has `CompressionStream`                                    |
+
+Version 2 is version 1's layout, written exactly when the scene's document holds an instance of a
+library unit (a set, prop or figure placed from a unit the host sent, or linked after the person
+saved it to the host's library); a scene without one is written as version 1, so a state without
+units reads in every desk. This desk reads both. A desk from before library units reads only
+version 1: it answers a version-2 state with `error` `state_unreadable` and opens as without a
+state (its local copy, else the brief), and sends no `state` on its own, so the host keeps the
+state it stored unless the person edits the scene in that desk.
 
 The header reads without unpacking the payload, so another scene's state is recognized at once.
 `lineage` names the staging the document comes from: a random id written into the document when
@@ -692,7 +980,8 @@ From the contract: a brief has at most 200 shots, 16 cast members and 64 element
 most 600 s; a state at most 64 MiB. From the desk: an export at most 3840 × 2160 (3840 pixels
 wide, 2160 high), with a result the tab can hold at once, and one at a time; a state's header at
 most 64 KiB and its document at most 256 MiB unpacked; 10 s for the scene's storage to answer
-before the desk keeps the scene in memory.
+before the desk keeps the scene in memory. Library units have their own
+([unit limits and timings](#unit-limits-and-timings)).
 
 Measured in headless Chromium on a 4-core machine with 15 GB of memory and software WebGL, the
 desk served by the production server and embedded by a cross-origin isolated host on another site
@@ -857,4 +1146,8 @@ A host should check, besides its own logic, that it:
 - shows `opened.changes` or leaves them to the desk, and takes `state` messages at any time;
 - matches a `result` and the `error`s that follow it by `id`, takes files only of the shots in
   `result.shots`, and answers with `result-ack`;
-- ignores message types it does not know, as the desk does.
+- ignores message types it does not know, as the desk does;
+- with [library units](#library-units): sends pins, `options.units` and `open.units` only to a desk
+  whose `ready` announced `capabilities.units`, reads `capabilities.units` and `state.units`
+  leniently, and answers every `unit-publish` with a `unit-ack` (`ref`, `version` and `linked`
+  when `ok`) within the desk's wait.
