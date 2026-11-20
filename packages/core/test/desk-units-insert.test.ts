@@ -14,6 +14,7 @@ import {
   docHasUnitInstances,
   encodeUnit,
   encodeUnitBody,
+  exportedCustomProps,
   insertUnit,
   listUnits,
   makeLocal,
@@ -497,5 +498,16 @@ describe('an instance outside the editor', () => {
     expect(node.extras).not.toHaveProperty('unit_parts');
     expect(node.extras).not.toHaveProperty('unit_drivers');
     expect(node.extras).toMatchObject({ unit_ref: pin().ref, unit_version: 1, unit_parts_count: parts });
+  });
+
+  it('keeps every other prop as its own property, one named __proto__ too', () => {
+    const props = JSON.parse('{"__proto__":"x","unit_parts":"{\\"a\\":\\"b\\"}","note":"n"}') as Record<
+      string,
+      string
+    >;
+    const out = exportedCustomProps(props);
+    expect(Object.hasOwn(out, '__proto__')).toBe(true);
+    expect(Object.keys(out).sort()).toEqual(['__proto__', 'note', 'unit_parts_count']);
+    expect(out.unit_parts_count).toBe(1);
   });
 });

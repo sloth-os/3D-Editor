@@ -143,12 +143,17 @@ function tableSize(text: unknown): number {
  * (unit_parts_count, unit_drivers_count); every other prop is as it is.
  */
 export function exportedCustomProps<T>(props: Readonly<Record<string, T>>): Record<string, T | number> {
-  const out: Record<string, T | number> = {};
-  for (const [k, v] of Object.entries(props)) {
-    if (k === UNIT_PROPS.parts) out.unit_parts_count = tableSize(v);
-    else if (k === UNIT_PROPS.drivers) out.unit_drivers_count = tableSize(v);
-    else out[k] = v;
-  }
+  // a spread copies own data properties (a prop named '__proto__' too), as the copies before did
+  const out: Record<string, T | number> = { ...props };
+  for (const [table, count] of [
+    [UNIT_PROPS.parts, 'unit_parts_count'],
+    [UNIT_PROPS.drivers, 'unit_drivers_count'],
+  ] as const)
+    if (Object.hasOwn(out, table)) {
+      const n = tableSize(out[table]);
+      delete out[table];
+      out[count] = n;
+    }
   return out;
 }
 
