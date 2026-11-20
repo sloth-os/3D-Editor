@@ -598,8 +598,9 @@ and no other shot's keys are cut:
 - library pins act per slot ([library units](#library-units)): a set unit placed takes the place of
   the words' set (its ground, walls and landmarks go), a new version of the same item updates the
   instance (its root and the parts not edited in the desk keep their ids), another item replaces it,
-  and no pin brings the words' set back; the cameras still as staged are then solved again (one set
-  by hand is kept, with a warning). A figure restyles its member's actor in place (the same
+  and no pin brings the words' set back; what the person put on the set that goes stays, on the set
+  that takes its place, and the warnings name it; the cameras still as staged are then solved again
+  (one set by hand is kept, with a warning). A figure restyles its member's actor in place (the same
   armature, keys, holds and shots) when its kind and height (within 5 mm) are the actor's; another
   kind or height is refused and the actor kept (stage the brief in a new project to rebuild it), and
   no pin brings back the mannequin of the actor's kind and height. A prop unit replaces the
@@ -751,16 +752,22 @@ Another item pinned to the slot replaces the instance: its objects, edits and al
 new unit's, at the set's place or the prop's spot. So does a prop's new version whose root is
 another type of object than the instance's (an empty in one version, a mesh in the next), which no
 update turns into the other: a warning says so (naming the scene's object when the scene changed the
-instance's root). What the person put on a prop that another item or such a version replaces
-(objects of their own below it) stays, hung from the new root where it is in the world, and the
-warnings name it; one that the new root's uneven scale would change there stays where it was, no
-longer on the prop, and a warning says so. A figure, a new version or another item, restyles its
-member's actor in place (the same armature, keys, holds and shots) when its kind and height are the
-actor's, and is refused otherwise. A brief that drops the pin brings back the words' set, the
-mannequin or the words' prop. A new look in place of an old one (a figure or a library prop where
-the words built the mannequin or the prop, the mannequin again where a figure was) takes away only
-the old look: what the person put on the actor or the prop in the desk stays where it is, and the
-update's warnings name it. A slot made local takes none of it;
+instance's root). What the person put on a set or a prop that another item or such a version
+replaces (objects of their own below its root or its parts) stays, hung from the new root where it
+is in the world, and the warnings name it; one that the new root's uneven scale would change there
+stays where it was, no longer on the set or the prop, and a warning says so. An animated one keeps
+its keyed motion: where the new root is the old parent moved and scaled along its axes, its keys are
+rewritten in the same step so that it moves as it did, and otherwise a warning says that its keyed
+motion now follows the new root (a keyed turn under a root scaled unevenly, keys under a value
+modifier, a driven channel). A figure, a new version or another item, restyles its member's actor
+in place (the same armature, keys, holds and shots) when its kind and height are the actor's, and is
+refused otherwise. A brief that drops the pin brings back the words' set, the mannequin or the
+words' prop, and what the person put on the library set or prop stays the same way, on the words'
+ground or the words' prop; so does what they put on the words' set when a library set first takes
+its place. A new look in place of an old one (a figure or a library prop where the words built the
+mannequin or the prop, the mannequin again where a figure was) takes away only the old look: what
+the person put on the actor or the prop in the desk stays where it is, and the update's warnings
+name it. A slot made local takes none of it;
 [Updating from a later brief](#updating-from-a-later-brief) says the rest.
 
 #### Save to library

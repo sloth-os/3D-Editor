@@ -31,6 +31,8 @@ import {
   unitStatus,
   type UnitPayload,
 } from '../src/desk/units';
+import { FrameState } from '../src/eval/frame-state';
+import { invert4, multiply4 } from '../src/math/mat4';
 import type { Vec3 } from '../src/math/types';
 import { createCube } from '../src/mesh/primitives';
 import {
@@ -164,6 +166,23 @@ function update(
   expect(changes === null, `briefChanges ${JSON.stringify(changes)}`).toBe(!acted);
   return { r, changes };
 }
+
+/** Keys object `id`'s channel `path`[`index`] at frames 1, 25 and 50 (Bezier). */
+function keyed(doc: SceneDoc, id: string, path: string, index: number, values: [number, number, number]) {
+  doc.transact(() =>
+    doc.setFCurve({
+      target_type: 'object',
+      target_id: id,
+      path,
+      index,
+      keyframes: [1, 25, 50].map((frame, i) => ({ frame, value: values[i], interpolation: 'BEZIER' })),
+      extrapolation: 'CONSTANT',
+      mute: false,
+    }),
+  );
+}
+/** The frames keyed motion is compared at. */
+const FRAMES = [1, 13, 25, 37, 50];
 
 describe('a slot whose earlier instance left a part the scene still uses', () => {
   type Kind = 'set' | 'prop' | 'figure';
@@ -670,6 +689,128 @@ describe("a later version whose root is another type of object than the instance
     expect(said).not.toMatch(/v1's an? [A-Z]/);
   });
 
+  /**
+   * Where object `id` is at `frame` as seen from the kite's root, in metres along the root's own axes
+   * (its world matrix in the root's frame, the root's scale left out): what the person sees of it
+   * moving with the kite, whatever the root's size.
+   */
+  function onKite(doc: SceneDoc, id: string, frame: number): number[] {
+    const fs = new FrameState(doc, frame);
+    const r = fs.world(propOf(doc, KITE).id)!;
+    const rigid = r.slice();
+    for (let c = 0; c < 3; c++) {
+      const n = Math.hypot(r[c * 4], r[c * 4 + 1], r[c * 4 + 2]);
+      for (let k = 0; k < 3; k++) rigid[c * 4 + k] = r[c * 4 + k] / n;
+    }
+    return multiply4(invert4(rigid), fs.world(id)!);
+  }
+  it("keeps the keyed motion of an object of the person's under the old instance when the new root is a uniform scale of it", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    const anim = mine(doc, 'Anim', v1.id, [0.1, 0, 0], [0, 0, 0]);
+    // it rises 1 m and turns a quarter, and grows by half, over frames 1 to 50
+    keyed(doc, anim, 'location', 2, [0, 0.4, 1]);
+    keyed(doc, anim, 'rotation_euler', 2, [0, 0.5, Math.PI / 2]);
+    keyed(doc, anim, 'scale', 0, [1, 1.2, 1.5]);
+    const before = FRAMES.map((f) => onKite(doc, anim, f));
+    const undo = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
+    // v2's root is a mesh twice v1's size: the keys are rewritten in it, so the motion stays
+    const v2 = kiteRooted('MESH', 2, [2, 2, 2]);
+    const u = update(doc, withPins(openBrief(), { el: { [KITE]: v2 } }), source(v2));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    expect(propOf(doc, KITE)).toMatchObject({ id: v1.id, scale: [2, 2, 2] });
+    expect(doc.getObject(anim)?.parent).toBe(v1.id);
+    FRAMES.forEach((f, i) => sameWorld(onKite(doc, anim, f), before[i]));
+    const values = (path: string, index: number) =>
+      doc
+        .listFCurves(anim)
+        .find((fc) => fc.path === path && fc.index === index)!
+        .keyframes.map((k) => k.value);
+    const near = (got: number[], want: number[]) =>
+      want.forEach((v, i) => expect(got[i], `key ${i}`).toBeCloseTo(v, 12));
+    near(values('location', 2), [0, 0.2, 0.5]);
+    near(values('rotation_euler', 2), [0, 0.5, Math.PI / 2]);
+    near(values('scale', 0), [0.5, 0.6, 0.75]);
+    expect(u.r.warnings.join('\n')).not.toMatch(/animated/);
+    expect(u.r.warnings).toContainEqual(
+      expect.stringMatching(/: keeps 'Anim', which is not part of the look the library prop replaces$/),
+    );
+    // one undo step: its keys as they were under v1
+    undo.undo();
+    near(values('location', 2), [0, 0.4, 1]);
+    FRAMES.forEach((f, i) => sameWorld(onKite(doc, anim, f), before[i]));
+    undo.redo();
+    near(values('location', 2), [0, 0.2, 0.5]);
+    FRAMES.forEach((f, i) => sameWorld(onKite(doc, anim, f), before[i]));
+  });
+
+  it('keeps keyed moves along an unevenly scaled root, and names an object whose keyed turns now follow it', () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    const riser = mine(doc, 'Riser', v1.id, [0.1, 0, 0], [0, 0, 0]);
+    keyed(doc, riser, 'location', 1, [0, 0.4, 1]);
+    const spinner = mine(doc, 'Spinner', v1.id, [-0.1, 0, 0], [0, 0, 0]);
+    keyed(doc, spinner, 'rotation_euler', 2, [0, 0.5, Math.PI / 2]);
+    const rises = FRAMES.map((f) => onKite(doc, riser, f));
+    const v2 = kiteRooted('MESH', 2, [1, 2, 1]);
+    const u = update(doc, withPins(openBrief(), { el: { [KITE]: v2 } }), source(v2));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    expect(propOf(doc, KITE)).toMatchObject({ id: v1.id, scale: [1, 2, 1] });
+    // both hang from the new root (neither is turned at rest)
+    expect([riser, spinner].map((id) => doc.getObject(id)?.parent)).toEqual([v1.id, v1.id]);
+    // a move along the stretched axis is halved in its keys: it moves as it did
+    FRAMES.forEach((f, i) => sameWorld(onKite(doc, riser, f), rises[i]));
+    // a turn under a root stretched along one axis has no keys that keep it: named
+    expect(u.r.warnings).toContainEqual(
+      expect.stringMatching(/: 'Spinner' is animated: its keyed motion now follows the library prop's root$/),
+    );
+    expect(u.r.warnings.join('\n')).not.toMatch(/'Riser' is animated/);
+  });
+
+  it("brings back the words' prop with the person's own objects on it, when the brief drops the pin", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    const part = [...readInstance(doc, v1.id)!.parts.values()]
+      .map((p) => p.id)
+      .find((id) => id !== v1.id && doc.getObject(id)?.parent === v1.id)!;
+    const lantern = mine(doc, 'Lantern', v1.id, [0.3, -0.2, 0.4], [0.2, 0.1, 0.5]);
+    const wick = mine(doc, 'Wick', lantern, [0, 0, 0.2], [0, 0, 0.3]);
+    const ribbon = mine(doc, 'Ribbon', part, [0.1, 0, -0.3], [0, 0.4, 0]);
+    const ours = [lantern, wick, ribbon];
+    const worlds = () => ours.map((id) => doc.worldMatrix(id));
+    const before = worlds();
+    const undo = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
+    const u = update(doc, openBrief(), source(L.kite));
+    expect(listUnits(doc)).toEqual([]);
+    const kite = propOf(doc, KITE);
+    expect(readInstance(doc, kite.id)).toBeNull();
+    // the words' kite holds them where they were
+    expect(ours.map((id) => doc.getObject(id)?.parent)).toEqual([kite.id, lantern, kite.id]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    // the warning names the tops of what the person put there, in the outliner's order (the part
+    // the ribbon hangs from comes before or after the lantern by name)
+    const kept = u.r.warnings.find((w) => w.endsWith(', which are not part of the library prop'));
+    expect(kept).toMatch(new RegExp(`^${kite.name}: keeps '(Lantern|Ribbon)' and '(Lantern|Ribbon)', which`));
+    expect(kept).toMatch(/'Lantern'/);
+    expect(kept).toMatch(/'Ribbon'/);
+    undo.undo();
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 1 });
+    expect(ours.map((id) => doc.getObject(id)?.parent)).toEqual([v1.id, lantern, part]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    undo.redo();
+    expect(listUnits(doc)).toEqual([]);
+    expect(ours.map((id) => doc.getObject(id)?.parent)).toEqual([kite.id, lantern, kite.id]);
+  });
+
   it('cannot differ for a set or a figure: every version roots a set in an empty and a figure in an armature', () => {
     const L = library();
     const set = structuredClone(L.units.set.body);
@@ -712,5 +853,174 @@ describe("a later version whose root is another type of object than the instance
     const again = update(doc, b2, source(v2));
     expect(rowsOf(again.r)).toEqual(['set unit']);
     expect(readInstance(doc, root)).toMatchObject({ version: 2 });
+  });
+});
+
+describe('what the person put on a library set stays when the brief links another item there or drops the pin', () => {
+  const SET_ROOT = deriveUnitId('set', UNIT_ROOT);
+  /** A cube of the person's under `parent`, at local `location` and `rotation`. */
+  function mine(doc: SceneDoc, name: string, parent: string, location: Vec3, rotation: Vec3): string {
+    let id = '';
+    doc.transact(() => {
+      id = doc.addObject({
+        type: 'MESH',
+        name,
+        data: doc.addMesh(name, createCube()),
+        parent,
+        location,
+        rotation_euler: rotation,
+      });
+    });
+    return id;
+  }
+  /** Expects two world matrices to agree to rounding. */
+  const sameWorld = (a: readonly number[], b: readonly number[]) =>
+    a.forEach((v, i) => expect(v, `entry ${i}`).toBeCloseTo(b[i], 9));
+  /** The placed set's part named `name`. */
+  const partNamed = (doc: SceneDoc, name: string) =>
+    [...readInstance(doc, SET_ROOT)!.parts.values()]
+      .map((p) => p.id)
+      .find((id) => id !== SET_ROOT && doc.getObject(id)?.name === name)!;
+  /** Another library item holding the meadow, its root scaled by `scale` when given. */
+  function otherSet(scale?: Vec3): Lib {
+    const L = library();
+    if (!scale) return lib('lib_0123456789othr', 1, L.set.given.data);
+    const unit = editedUnit(L.units.set, (body) => {
+      body.blocks.objects![UNIT_ROOT].scale = scale;
+    });
+    return lib('lib_0123456789othr', 1, encodeUnit(unit.body, headerInput(unit.header)));
+  }
+  const undoOf = (doc: SceneDoc) =>
+    new Y.UndoManager(doc.sharedTypes(), { trackedOrigins: new Set([doc.origin]), captureTimeout: 0 });
+
+  it("another item linked to the slot hangs them from the new set's root in one undo step, and a reopened scene keeps them", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    expect(readInstance(doc, SET_ROOT)).toMatchObject({ ref: L.set.pin.ref });
+    const ground = partNamed(doc, 'Set Ground');
+    // a bench on the set's root with a cushion of its own, and moss on its ground
+    const bench = mine(doc, 'Bench', SET_ROOT, [2, -1, 0], [0, 0, 0.6]);
+    const cushion = mine(doc, 'Cushion', bench, [0, 0, 0.5], [0.1, 0, 0]);
+    const moss = mine(doc, 'Moss', ground, [-3, 2, 0.01], [0, 0, 1.2]);
+    const ours = [bench, cushion, moss];
+    const parents = (d: SceneDoc = doc) => ours.map((id) => d.getObject(id)?.parent);
+    const worlds = (d: SceneDoc = doc) => ours.map((id) => d.worldMatrix(id));
+    const before = worlds();
+    const undo = undoOf(doc);
+    const other = otherSet();
+    const b2 = withPins(openBrief(), { set: other });
+    const u = update(doc, b2, source(other));
+    expect(rowsOf(u.r)).toEqual(['set unit']);
+    expect(readInstance(doc, SET_ROOT)).toMatchObject({ ref: other.pin.ref, version: 1 });
+    expect(parents()).toEqual([SET_ROOT, bench, SET_ROOT]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    expect(u.r.warnings).toContain(
+      "the library set: keeps 'Bench' and 'Moss', which are not part of the set the library set replaces",
+    );
+    // one undo step: the first item again, the objects where they were on it
+    undo.undo();
+    expect(readInstance(doc, SET_ROOT)).toMatchObject({ ref: L.set.pin.ref });
+    expect(parents()).toEqual([SET_ROOT, bench, ground]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    undo.redo();
+    expect(readInstance(doc, SET_ROOT)).toMatchObject({ ref: other.pin.ref });
+    expect(parents()).toEqual([SET_ROOT, bench, SET_ROOT]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    // a reopened scene holds them so, and the brief it holds changes nothing more
+    const reopened = SceneDoc.fromUpdate(doc.encodeState());
+    expect(parents(reopened)).toEqual([SET_ROOT, bench, SET_ROOT]);
+    worlds(reopened).forEach((m, i) => sameWorld(m, before[i]));
+    const again = update(reopened, b2, source(other));
+    expect(again.changes).toBeNull();
+    expect(again.r.warnings.join('\n')).not.toMatch(/keeps/);
+  });
+
+  it("the words' set brought back holds them on its ground, and the library set pinned again takes them back", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    const ground = partNamed(doc, 'Set Ground');
+    const bench = mine(doc, 'Bench', SET_ROOT, [2, -1, 0], [0, 0, 0.6]);
+    const moss = mine(doc, 'Moss', ground, [-3, 2, 0.01], [0, 0, 1.2]);
+    const ours = [bench, moss];
+    const parents = () => ours.map((id) => doc.getObject(id)?.parent);
+    const worlds = () => ours.map((id) => doc.worldMatrix(id));
+    const before = worlds();
+    const undo = undoOf(doc);
+    const off = update(doc, openBrief(), source(L.set));
+    expect(listUnits(doc)).toEqual([]);
+    const words = doc.listObjects().filter((o) => prop(o, 'desk_label') === 'ground');
+    expect(words.map((o) => unitOf(doc, o.id))).toEqual([null]);
+    expect(parents()).toEqual([words[0].id, words[0].id]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    expect(off.r.warnings).toContain(
+      "the set: keeps 'Bench' and 'Moss', which are not part of the library set",
+    );
+    // one undo step: the library set again, the objects on it as they were
+    undo.undo();
+    expect(readInstance(doc, SET_ROOT)).toMatchObject({ ref: L.set.pin.ref, version: 1 });
+    expect(parents()).toEqual([SET_ROOT, ground]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    undo.redo();
+    expect(listUnits(doc)).toEqual([]);
+    expect(parents()).toEqual([words[0].id, words[0].id]);
+    // pinned again, the library set takes them from the words' ground, where they are
+    const on = update(doc, withPins(openBrief(), { set: L.set }), source(L.set));
+    expect(rowsOf(on.r)).toEqual(['set unit']);
+    expect(parents()).toEqual([SET_ROOT, SET_ROOT]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    expect(on.r.warnings).toContain(
+      "the library set: keeps 'Bench' and 'Moss', which are not part of the set the library set replaces",
+    );
+  });
+
+  it("an object of the person's that the new set root's uneven scale would skew stays where it was, named", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    const turned = mine(doc, 'Turned', SET_ROOT, [1, 1, 0], [0, 0, Math.PI / 4]);
+    const plain = mine(doc, 'Plain', SET_ROOT, [-1, 1, 0], [0, 0, 0]);
+    const before = [turned, plain].map((id) => doc.worldMatrix(id));
+    const other = otherSet([1, 2, 1]);
+    const u = update(doc, withPins(openBrief(), { set: other }), source(other));
+    expect(rowsOf(u.r)).toEqual(['set unit']);
+    expect(doc.getObject(SET_ROOT)!.scale).toEqual([1, 2, 1]);
+    // the turned one stays where the root's parent (the scene) holds it; the other hangs from the root
+    expect([turned, plain].map((id) => doc.getObject(id)?.parent)).toEqual([null, SET_ROOT]);
+    [turned, plain].forEach((id, i) => sameWorld(doc.worldMatrix(id), before[i]));
+    expect(u.r.warnings).toContain(
+      "the library set: 'Turned' stays where it was, not on the library set's root: its scale would change it there",
+    );
+  });
+
+  it("keyed objects of the person's on a set's part keep their moves on the new root; one whose turns cannot be kept is named", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    // the pond is a part stretched 5 × 4: a duck swims across it, a buoy turns on it
+    const pond = partNamed(doc, 'pond');
+    expect(doc.getObject(pond)!.scale).toEqual([5, 4, 1]);
+    const duck = mine(doc, 'Duck', pond, [0.1, 0, 0], [0, 0, 0]);
+    keyed(doc, duck, 'location', 0, [-0.3, 0, 0.3]);
+    keyed(doc, duck, 'location', 1, [0, 0.2, 0.1]);
+    const buoy = mine(doc, 'Buoy', pond, [-0.1, 0, 0], [0, 0, 0]);
+    keyed(doc, buoy, 'rotation_euler', 2, [0, 0.5, Math.PI / 2]);
+    // a camera the person hung on the pond pans: not named as kept, but its motion change is
+    let cam = '';
+    doc.transact(() => {
+      cam = doc.addObject({ type: 'CAMERA', name: 'Pond cam', data: doc.addCamera(), parent: pond });
+    });
+    keyed(doc, cam, 'rotation_euler', 2, [0, 0.3, 0.6]);
+    const swim = FRAMES.map((f) => new FrameState(doc, f).world(duck)!);
+    const other = otherSet();
+    const u = update(doc, withPins(openBrief(), { set: other }), source(other));
+    expect(rowsOf(u.r)).toEqual(['set unit']);
+    expect([duck, buoy, cam].map((id) => doc.getObject(id)?.parent)).toEqual([SET_ROOT, SET_ROOT, SET_ROOT]);
+    // the duck's moves, keyed along the pond's stretched axes, are rewritten: it swims as it did
+    FRAMES.forEach((f, i) => sameWorld(new FrameState(doc, f).world(duck)!, swim[i]));
+    expect(u.r.warnings).toContain(
+      "the library set: keeps 'Buoy' and 'Duck', which are not part of the set the library set replaces",
+    );
+    expect(u.r.warnings).toContain(
+      "the library set: 'Buoy' and 'Pond cam' are animated: their keyed motion now follows the library set's root",
+    );
+    expect(u.r.warnings.join('\n')).not.toMatch(/'Duck' (is|and)/);
   });
 });

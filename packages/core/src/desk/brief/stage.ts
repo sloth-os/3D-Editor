@@ -9,6 +9,7 @@ import { isActor } from '../characters';
 import { DESK_PROPS } from '../props';
 import { RIDEO_PROPS, importRideoBlocking, type StagedFigure, type StagedProp } from '../rideo/import';
 import { insertUnit } from '../units/insert';
+import { oldLook } from '../units/remove';
 import { setUnitRoot } from '../set';
 import { planBrief, shotCast } from './plan';
 import {
@@ -295,27 +296,32 @@ export function stagedCast(brief: SceneBrief): Set<string> {
  * key 'set', its root an EMPTY at the origin stamped with desk_role 'set', the scene (desk_rideo_clip),
  * the ground's name and its planning facts. `remove`: what it takes the place of (the words' set, the
  * library set before), taken out in the same transaction once it is sure to go in (insertUnit's
- * `remove`): a set that does not go in throws and leaves them as they are. Returns its root.
+ * `remove`): a set that does not go in throws and leaves them as they are. What the person put on
+ * what goes (objects of their own below it, not its look: remove.ts oldLook) stays, hung from the
+ * set's root where it is in the world (insertUnit's `keep`), and the warnings name it. Returns the
+ * set's root and the warnings.
  */
 export function insertSetUnit(
   doc: SceneDoc,
   sceneId: string,
   s: SlotUnit,
   remove: readonly string[] = [],
-): string {
+): { root: string; warnings: string[] } {
   const info = s.held!.info as SetPlanInfo;
-  return insertUnit(doc, s.payload!, {
+  const keep = remove.flatMap((id) => (doc.has('objects', id) ? oldLook(doc, id).kept : []));
+  const r = insertUnit(doc, s.payload!, {
     ...s.pin!,
     key: s.key,
     name: info.name,
-    ...(remove.length ? { remove } : {}),
+    ...(remove.length ? { remove, keep } : {}),
     rootProps: {
       [DESK_PROPS.role]: 'set',
       [RIDEO_PROPS.clip]: sceneId,
       [RIDEO_PROPS.ground]: info.ground,
       [UNIT_FACTS_PROP]: JSON.stringify(info),
     },
-  }).root;
+  });
+  return { root: r.root, warnings: r.warnings };
 }
 
 /**
@@ -436,16 +442,18 @@ export function stageBriefIn(
   // a library set is the scene's set before the import, so that the cameras it solves see it; one
   // that does not go in is not used (the words' set is staged, the slot says why), the rest goes on
   const done = new Set<string>();
+  const setWarnings: string[] = [];
   if (resolved.set?.action === 'place' && resolved.set.payload) {
     try {
-      insertSetUnit(doc, brief.id, resolved.set);
+      const placed = insertSetUnit(doc, brief.id, resolved.set);
+      setWarnings.push(...placed.warnings.map((w) => `the library set: ${w}`));
       done.add(resolved.set.key);
     } catch (err) {
       failSlot(resolved.set, err);
     }
   }
   const plan = planBrief(brief, { preRollFrames: opts.preRollFrames, units: planUnitsOf(doc, resolved) });
-  const warnings = [...plan.warnings, ...unitWarnings(resolved)];
+  const warnings = [...plan.warnings, ...unitWarnings(resolved), ...setWarnings];
   // a figure or prop that does not go in is staged from the words, its slot saying why (the others
   // and the shots stage as planned)
   const failed: string[] = [];

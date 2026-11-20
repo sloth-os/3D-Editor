@@ -24,7 +24,7 @@ import type { UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance, unitOf } from '../units/list';
 import { UNIT_ROOT } from '../units/ids';
-import { oldLook, removeObjectTrees } from '../units/remove';
+import { hangKept, keptPlaces, oldLook, removeObjectTrees, type KeptPlaces } from '../units/remove';
 import { unitStatus } from '../units/status';
 import { updateUnit, withArticle } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
@@ -348,10 +348,11 @@ function subtree(doc: SceneDoc, id: string): string[] {
 /**
  * Removes objects with everything below them; a library unit instance among them goes whole, with the
  * datablocks its part table lists that nothing else uses (units/remove.ts: a unit placed in its slot
- * again derives the same ids).
+ * again derives the same ids). `keep`: objects below them that stay, each with what is below it (see
+ * removeObjectTrees).
  */
-export function removeTrees(doc: SceneDoc, ids: readonly string[]): void {
-  removeObjectTrees(doc, ids);
+export function removeTrees(doc: SceneDoc, ids: readonly string[], keep: readonly string[] = []): void {
+  removeObjectTrees(doc, ids, keep);
 }
 
 const prop = (o: ObjectData | null | undefined, key: string): string => {
@@ -1990,7 +1991,10 @@ const stampFacts = (
  * cleared of its animation and of the import's holds, which the import keys anew, and put back on
  * its mark. With `unit`, the library prop (buildUnitProp); one that does not go in (its update or
  * insert throws before writing anything) leaves the prop the element had as it was and is staged as
- * without a unit (the words' prop, or that prop kept): `failed` holds the error.
+ * without a unit (the words' prop, or that prop kept): `failed` holds the error. `unit` null: the
+ * library prop the element had goes for the words' prop, and what the person put on it (objects of
+ * their own below it, not its parts) stays, hung from the words' prop where it is in the world; the
+ * warnings name it (units/remove.ts hangKept).
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2031,8 +2035,10 @@ export function buildProp(
       return { ...buildProp(doc, p, elementName, castNames, stamp, flies, old), failed: err };
     }
   // null: the element has no unit (any more): an instance of one goes, for the words' prop (the
-  // shots that named it name the new prop)
+  // shots that named it name the new prop), but for what the person put on it (objects of their own
+  // below it, not its parts), which the words' prop takes over where it is
   let replaced: string | null = null;
+  let kept: KeptPlaces | null = null;
   if (
     unit === null &&
     old &&
@@ -2040,7 +2046,8 @@ export function buildProp(
     (readInstance(doc, old.id) || unitBuildOf(doc, old.id))
   ) {
     replaced = old.id;
-    removeTrees(doc, [old.id]);
+    kept = keptPlaces(doc, readInstance(doc, old.id) ? oldLook(doc, old.id).kept : []);
+    removeTrees(doc, [old.id], kept.ids);
     old = undefined;
   }
   const queries = flies === 'kite' ? ['kite'] : flies === 'balloon' ? ['balloon'] : [elementName, p.label];
@@ -2105,9 +2112,10 @@ export function buildProp(
       custom_props: props,
     });
   }
+  const warnings = kept ? hangKept(doc, root, kept, { of: 'the library prop', on: "the words' prop" }) : [];
   if (replaced) remapShotRefs(doc, replaced, root);
   const s = doc.getObject(root)!.scale;
-  return { root, baseScale: [s[0], s[1], s[2]], model, created };
+  return { root, baseScale: [s[0], s[1], s[2]], model, created, ...(warnings.length ? { warnings } : {}) };
 }
 
 /**

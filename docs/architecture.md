@@ -1023,11 +1023,18 @@ the other slots, the shots and the rest of an update go on; one the scene was in
 pending `unavailable`, tried again at the next open or update. A prop's version whose root is
 another type of object than the instance's (a set's root is always an empty, a figure's an armature)
 is no update in place: it takes the instance's place in the insert's transaction, as another item
-does, and what the person put on the prop (objects of their own below it, not its look: remove.ts
-`oldLook`) stays, hung from the new root where it is in the world, or left where it was when the
-root's uneven scale would change it there (insertUnit's `keep`); an instance the scene changed so
-that no version fits it (its root's type changed by other means) leaves the slot pending
-`unavailable`. An update replaces the parts the
+does; an instance the scene changed so that no version fits it (its root's type changed by other
+means) leaves the slot pending `unavailable`. What the person put on a set or a prop whose look goes
+(objects of their own below its root or its parts, not its look: remove.ts `oldLook`), for another
+item, a version of another type, a library set in place of the words' set, or the words' set or prop
+back when the pin is dropped, stays in the same transaction (insertUnit's `keep`, removeObjectTrees'
+`keep`): `hangKept` hangs it from what takes the look's place (the new root, the words' ground or
+prop) where it is in the world, or leaves it where it was, under its parent of the moment, when the
+new root's uneven scale would change it there, and a warning names it. Its keys are in its parent's
+space: where the new parent is the old one moved and scaled along its axes, `keepMotion` rewrites its
+location and scale keys so that it moves as it did; otherwise (a keyed turn under a root scaled
+unevenly, keys under a modifier that changes values, a driven channel) they stay as they are and the
+warning says that its keyed motion now follows the new root. An update replaces the parts the
 scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts
 edited or deleted in the scene, adds new parts at ids of the instance's generation (or of the next
 free one) and removes dropped untouched ones that nothing staying uses (a record that stays refers

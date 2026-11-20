@@ -1,5 +1,7 @@
 import type { SceneDoc } from '../../doc/scene-doc';
-import type { AnimTargetType, DatablockKind, ObjectData } from '../../doc/types';
+import type { AnimTargetType, DatablockKind, FCurve, ObjectData } from '../../doc/types';
+import { identity4, invert4, multiply4 } from '../../math/mat4';
+import type { Mat4 } from '../../math/types';
 import { STORE_PART_PROP } from '../layout';
 import { DESK_PROPS } from '../props';
 import { readInstance, splitPartKey } from './list';
@@ -25,7 +27,10 @@ import {
  *
  * A new look in place of an old one (a library figure or prop replacing what the words built, an
  * actor back to its mannequin) takes away only the old look (oldLook); what the person put on the
- * object stays, and the caller names it in a warning.
+ * object stays, and the caller names it in a warning. So does what the person put below a look that
+ * goes with its root (another set or prop in the slot, the words' set or prop again): taken out
+ * around it (removeObjectTrees' `keep`), it is hung from what takes the look's place where it was in
+ * the world (hangKept), its keyed motion kept where the change of parent allows it (keepMotion).
  */
 
 /** The '<kind>:<id>' key of a datablock. */
@@ -155,14 +160,17 @@ export function instanceData(doc: SceneDoc, root: string): string[] {
  * Removes objects `ids` and everything below them, in one transaction (doc.removeObjects: their
  * animation, drivers and the object data no other object uses go too), and the datablocks the part
  * tables of the library unit instances among them list that nothing left in the document uses.
+ * `keep`: objects below them that stay, each with everything below it: they move up to the parent of
+ * what goes, where they are in the world (doc.removeObjects), for the caller to hang (hangKept).
  */
-export function removeObjectTrees(doc: SceneDoc, ids: readonly string[]): void {
+export function removeObjectTrees(doc: SceneDoc, ids: readonly string[], keep: readonly string[] = []): void {
   const index = doc.childrenIndex();
+  const keeping = new Set(keep);
   const all = new Set<string>();
   const visit = (id: string) => {
     if (all.has(id)) return;
     all.add(id);
-    for (const c of index.get(id) ?? []) visit(c);
+    for (const c of index.get(id) ?? []) if (!keeping.has(c)) visit(c);
   };
   for (const id of ids) if (doc.has('objects', id)) visit(id);
   if (!all.size) return;
@@ -226,9 +234,182 @@ export function oldLook(doc: SceneDoc, root: string): OldLook {
 export const namedWhenKept = (o: ObjectData): boolean =>
   o.type !== 'CAMERA' && o.custom_props?.[DESK_PROPS.role] !== 'actor';
 
+/** Names quoted and listed: "'A'", "'A' and 'B'", "'A', 'B' and 'C'". */
+function quoted(names: readonly string[]): string {
+  const q = names.map((n) => `'${n}'`);
+  return q.length > 1 ? `${q.slice(0, -1).join(', ')} and ${q[q.length - 1]}` : q[0];
+}
+
 /** The warning naming what stays (oldLook's `named`): "keeps 'A' and 'B', which are not part of `of`". */
 export function keptWarning(named: readonly string[], of: string): string {
-  const q = named.map((n) => `'${n}'`);
-  const list = q.length > 1 ? `${q.slice(0, -1).join(', ')} and ${q[q.length - 1]}` : q[0];
-  return `keeps ${list}, which ${q.length > 1 ? 'are' : 'is'} not part of ${of}`;
+  return `keeps ${quoted(named)}, which ${named.length > 1 ? 'are' : 'is'} not part of ${of}`;
+}
+
+/** Where the objects that stay below a look that goes were before it went (keptPlaces). */
+export interface KeptPlaces {
+  /** The objects that stay, each with everything below it (the tops of what stays). */
+  ids: readonly string[];
+  /** Each one's stored world matrix before anything went. */
+  worlds: ReadonlyMap<string, Mat4>;
+  /** Its parent's stored world matrix then (null: it had none). */
+  parentWorlds: ReadonlyMap<string, Mat4 | null>;
+}
+
+/**
+ * Where objects `ids` are, read before what is above them goes (see KeptPlaces); ids the scene does
+ * not hold are left out.
+ */
+export function keptPlaces(doc: SceneDoc, ids: Iterable<string>): KeptPlaces {
+  const list: string[] = [];
+  const worlds = new Map<string, Mat4>();
+  const parentWorlds = new Map<string, Mat4 | null>();
+  for (const id of ids) {
+    const o = doc.getObject(id);
+    if (!o || worlds.has(id)) continue;
+    list.push(id);
+    worlds.set(id, doc.worldMatrix(id));
+    parentWorlds.set(id, o.parent && doc.has('objects', o.parent) ? doc.worldMatrix(o.parent) : null);
+  }
+  return { ids: list, worlds, parentWorlds };
+}
+
+/** Whether world matrix `a` is `b` to rounding (1e-9 of the largest entry, or of 1). */
+export function sameWorld(a: Readonly<Mat4>, b: Readonly<Mat4>): boolean {
+  const tol = 1e-9 * Math.max(1, ...b.map(Math.abs));
+  return a.every((v, i) => Math.abs(v - b[i]) <= tol);
+}
+
+/** How hangKept's warnings name the look that went and what takes its place. */
+export interface KeptWords {
+  /** What the objects that stay are not part of (keptWarning's `of`): "the look the library prop replaces". */
+  of: string;
+  /** What they hang from: "the library prop's root". */
+  on: string;
+}
+
+/**
+ * Hangs the objects of `kept` (left where taking out what was above them put them) from `root` where
+ * they were in the world, in the caller's transaction, and returns the warnings naming them (cameras
+ * and actors are not named: namedWhenKept). One that the root's scale would change there (a root
+ * scaled unevenly shears an object turned under it, which no channels hold) goes back under its
+ * parent of the moment, where it was in the world, and a warning says so. The keyed motion of each
+ * stays where it was when its change of parent allows it (keepMotion); a warning names one whose
+ * keyed motion now follows its new parent instead, a camera or an actor too (what the shots show
+ * changes).
+ */
+export function hangKept(doc: SceneDoc, root: string, kept: KeptPlaces, words: KeptWords): string[] {
+  const named: string[] = [];
+  const stayed: string[] = [];
+  // the named objects whose keyed motion now follows their new parent, by that parent (null: none)
+  const moved = new Map<string | null, string[]>();
+  const rootWorld = doc.worldMatrix(root);
+  for (const id of kept.ids) {
+    const o = doc.getObject(id);
+    if (!o || doc.isAncestor(id, root)) continue;
+    const world = kept.worlds.get(id)!;
+    const was = o.parent;
+    let parent: string | null = root;
+    doc.setParent(id, root, true, { world, parentWorld: rootWorld });
+    if (!sameWorld(doc.worldMatrix(id), world)) {
+      parent = was;
+      doc.setParent(id, was, true, { world, parentWorld: was ? doc.worldMatrix(was) : null });
+      stayed.push(o.name);
+    }
+    const from = kept.parentWorlds.get(id) ?? null;
+    const motion = keepMotion(doc, id, world, from, parent ? doc.worldMatrix(parent) : null);
+    if (motion === 'changed') moved.set(parent, [...(moved.get(parent) ?? []), o.name]);
+    if (namedWhenKept(o)) named.push(o.name);
+  }
+  const out: string[] = [];
+  if (named.length) out.push(keptWarning(named, words.of));
+  if (stayed.length)
+    out.push(
+      stayed.length > 1
+        ? `${quoted(stayed)} stay where they were, not on ${words.on}: its scale would change them there`
+        : `${quoted(stayed)} stays where it was, not on ${words.on}: its scale would change it there`,
+    );
+  for (const [parent, names] of moved) {
+    const where =
+      parent === root ? words.on : parent ? `'${doc.getObject(parent)?.name ?? parent}'` : 'the scene';
+    out.push(
+      names.length > 1
+        ? `${quoted(names)} are animated: their keyed motion now follows ${where}`
+        : `${quoted(names)} is animated: its keyed motion now follows ${where}`,
+    );
+  }
+  return out;
+}
+
+/** The transform channels of an object that F-curves key and drivers set (its rotation is Euler). */
+const TRANSFORM_PATHS: ReadonlySet<string> = new Set(['location', 'rotation_euler', 'scale']);
+
+/** The value modifiers an F-curve's keys cannot be mapped through (all but STEPPED, which bends time only). */
+const changesValues = (fc: FCurve): boolean =>
+  (fc.modifiers ?? []).some((m) => !m.mute && m.type !== 'STEPPED');
+
+/**
+ * Keeps the keyed motion of object `id`, which stood at `world` under a parent whose world matrix
+ * was `from` and now hangs, its world placement kept, from one whose world matrix is `to` (null: no
+ * parent; every matrix the stored one): its transform channels are keyed in its parent's space, so
+ * its keys follow the new parent unless they are rewritten. A change of parent that moves and scales
+ * along the parent's axes (no turn) is undone in its keys, in the caller's transaction, so that it
+ * moves in the world as it did: location keys v become d + s·v on each axis (d the move, s the
+ * scale), scale keys are scaled as its own axes see that scale, rotation keys stay. A scale uneven
+ * across the axes leaves keyed rotations nothing to map to (the object would shear as it turns), and
+ * keys under a modifier that changes values (all but STEPPED) or channels a driver sets cannot be
+ * mapped either: then no key is rewritten. Returns 'still' (no keyed or driven transform channel),
+ * 'kept' (its motion is where it was) or 'changed' (its keyed motion now follows the new parent).
+ */
+export function keepMotion(
+  doc: SceneDoc,
+  id: string,
+  world: Readonly<Mat4>,
+  from: Readonly<Mat4> | null,
+  to: Readonly<Mat4> | null,
+): 'still' | 'kept' | 'changed' {
+  const curves = doc
+    .listFCurves(id)
+    .filter((fc) => fc.target_type === 'object' && TRANSFORM_PATHS.has(fc.path));
+  const driven = doc
+    .listDrivers(id)
+    .some((d) => d.target_type === 'object' && TRANSFORM_PATHS.has(d.path) && !d.mute);
+  if (!curves.length && !driven) return 'still';
+  // the object's local matrix L under the old parent becomes change · L under the new one
+  const change = multiply4(invert4(to ?? identity4()), from ?? identity4());
+  if (sameWorld(change, identity4())) return 'kept';
+  if (driven) return 'changed';
+  const tol = 1e-9 * Math.max(1, ...change.map(Math.abs));
+  for (let c = 0; c < 3; c++)
+    for (let r = 0; r < 3; r++) if (r !== c && Math.abs(change[c * 4 + r]) > tol) return 'changed';
+  const scale = [change[0], change[5], change[10]];
+  if (!scale.every((v) => v > tol)) return 'changed';
+  const uniform = Math.abs(scale[0] - scale[1]) <= tol && Math.abs(scale[0] - scale[2]) <= tol;
+  const keyed = (path: string) => curves.some((fc) => fc.path === path);
+  if (!uniform && keyed('rotation_euler')) return 'changed';
+  // the scale its own axes see: its rotation R under the old parent, Rᵀ·diag(scale)·R (diagonal when
+  // its axes are the parent's in some order, as they are when it hangs unsheared)
+  let own = scale;
+  if (!uniform && keyed('scale')) {
+    const local = multiply4(invert4(from ?? identity4()), world);
+    const axes = [0, 1, 2].map((c) => {
+      const v = [local[c * 4], local[c * 4 + 1], local[c * 4 + 2]];
+      const n = Math.hypot(v[0], v[1], v[2]) || 1;
+      return v.map((x) => x / n);
+    });
+    const seen = (i: number, j: number) => axes[i].reduce((sum, v, k) => sum + v * scale[k] * axes[j][k], 0);
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 3; j++) if (i !== j && Math.abs(seen(i, j)) > tol) return 'changed';
+    own = [seen(0, 0), seen(1, 1), seen(2, 2)];
+  }
+  const rewritten: FCurve[] = [];
+  for (const fc of curves) {
+    if (fc.path === 'rotation_euler' || !(fc.index >= 0 && fc.index < 3)) continue;
+    const add = fc.path === 'location' ? change[12 + fc.index] : 0;
+    const times = (fc.path === 'location' ? scale : own)[fc.index];
+    if (Math.abs(add) <= tol && Math.abs(times - 1) <= tol) continue;
+    if (changesValues(fc)) return 'changed';
+    rewritten.push({ ...fc, keyframes: fc.keyframes.map((k) => ({ ...k, value: add + times * k.value })) });
+  }
+  for (const fc of rewritten) doc.setFCurve(fc);
+  return 'kept';
 }

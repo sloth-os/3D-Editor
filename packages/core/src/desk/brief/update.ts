@@ -14,6 +14,7 @@ import { addDeskCamera, prepareDeskCamera, retimeCameraRange } from '../moves';
 import { DESK_PROPS } from '../props';
 import { buildSet, lightSet, setUnitRoot } from '../set';
 import { unitOf } from '../units/list';
+import { hangKept, keptPlaces, oldLook } from '../units/remove';
 import { updateUnit } from '../units/update';
 import { FRAMING_TABLE } from '../solver';
 import { MAX_SHOT_SUBJECTS, getDeskSettings, getShots, newShotId, setDeskSettings, setShots } from '../shots';
@@ -669,11 +670,12 @@ export function updateFromBriefIn(
         });
       } else {
         // the words' set (or the library set before) goes, in the insert's own transaction: the
-        // library set is the place
-        insertSetUnit(doc, sceneId, setSlot, [
+        // library set is the place; what the person put on what goes stays, on the set's root
+        const placed = insertSetUnit(doc, sceneId, setSlot, [
           ...(setAction === 'replace' ? [setSlot.inst!.root] : []),
           ...wordSet(doc, sceneId),
         ]);
+        warnings.push(...placed.warnings.map((w) => `the library set: ${w}`));
       }
       relightSet(doc, blocking);
       done.add(setSlot.key);
@@ -681,8 +683,17 @@ export function updateFromBriefIn(
       warnings.push(...slotFailed(setSlot, err, done));
     }
   } else if (setSlot && setAction === 'remove') {
-    removeTrees(doc, [setSlot.inst!.root]);
-    restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+    // the words' set comes back; what the person put on the library set (objects of their own below
+    // it, not its parts) stays, hung from the words' ground where it is in the world
+    const root = setSlot.inst!.root;
+    const kept = keptPlaces(doc, oldLook(doc, root).kept);
+    removeTrees(doc, [root], kept.ids);
+    const ground = restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+    warnings.push(
+      ...hangKept(doc, ground, kept, { of: 'the library set', on: "the words' ground" }).map(
+        (w) => `the set: ${w}`,
+      ),
+    );
   } else if (diff.set) {
     // a library set (or one made local) is relit; the words' set is built again
     if (plan.set.unit) relightSet(doc, blocking);
@@ -999,7 +1010,10 @@ function stageHeld(
   hideSpans(doc, root, scale, hidden);
 }
 
-/** Rebuilds the set as planned: ground, sky or sun, walls, and the landmarks (the water). */
+/**
+ * Rebuilds the set as planned: ground, sky or sun, walls, and the landmarks (the water). Returns the
+ * ground (a library set's root while the scene holds one).
+ */
 function restageSet(
   doc: SceneDoc,
   blocking: ReturnType<typeof parseRideoBlocking>,
@@ -1007,7 +1021,7 @@ function restageSet(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   sceneId: string,
-): void {
+): string {
   const set = blocking.set;
   const built = buildSet(doc, {
     width: set.width,
@@ -1019,7 +1033,7 @@ function restageSet(
     sky: !set.interior,
   });
   // a library set (an instance with key 'set', pinned or not) keeps its ground and pieces: lit only
-  if (setUnitRoot(doc)) return;
+  if (setUnitRoot(doc)) return built.ground;
   const ground = doc.getObject(built.ground);
   if (ground)
     doc.updateObject(built.ground, {
@@ -1038,6 +1052,7 @@ function restageSet(
     kept.add(l.id);
   }
   for (const [rid, o] of old) if (!kept.has(rid) && doc.getObject(o.id)) removeTrees(doc, [o.id]);
+  return built.ground;
 }
 
 /** Lights a set planned from a library unit (or made local) and records its size and interior: its ground and pieces stay. */
