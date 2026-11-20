@@ -272,6 +272,18 @@ describe('docs/embedding.md', () => {
     expect(linking).toContain('Update shots is off while the scene adopts a unit');
   });
 
+  it('lets a host leave out the file of a slot made local, which stays local whatever later briefs pin', () => {
+    const host = flat(section(doc, "### The host's part"));
+    expect(host).toContain(
+      'It may leave out the file of a slot whose row there says `local` true, whatever the brief pins on it: the desk places no unit in a slot made local.',
+    );
+    const desk = flat(section(doc, "### The desk's part"));
+    expect(desk).toContain('the slot stays local whatever later briefs pin');
+    expect(desk).toContain(
+      'its row keeping the `ref@version` it was made local from with `staged` `unit` and `local` true',
+    );
+  });
+
   it("says a new version keeps its item's name and takes the description as its note", () => {
     const fields = section(doc, '### Fields and messages');
     expect(fields).toMatch(

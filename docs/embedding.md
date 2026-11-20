@@ -404,10 +404,11 @@ its kind) and the body are the desk's own; what a host stores of a unit comes in
 - `open.units`: the file of every pin of the brief it can get, in slot order (the set, the cast in
   brief order, then the elements), each `ref@version` once, stopping before 48 MiB in all. It may
   leave out a pin whose `ref@version` the scene's stored state lists in its `units` with `staged`
-  `unit`: the desk needs no file for a slot that already holds that version. A file it cannot get
-  (offline, a failed fetch, bytes that do not hash to the pin) is left out: the desk stages that
-  slot from the words (`pending`, `missing`), and a later open that brings the file offers Update
-  shots.
+  `unit`: the desk needs no file for a slot that already holds that version. It may leave out the
+  file of a slot whose row there says `local` true, whatever the brief pins on it: the desk places
+  no unit in a slot made local. A file it cannot get (offline, a failed fetch, bytes that do not
+  hash to the pin) is left out: the desk stages that slot from the words (`pending`, `missing`), and
+  a later open that brings the file offers Update shots.
 - The files travel as transferred `ArrayBuffer`s in `open`: the host's page gets them from its own
   server, and the desk is never given a URL or a token to fetch them.
 - It keeps each `state`'s `units` with the state: per slot, whether the scene holds the pinned
@@ -425,8 +426,10 @@ its kind) and the body are the desk's own; what a host stores of a unit comes in
   ([when a unit is not used](#when-a-unit-is-not-used)). An entry that matches no pin is ignored.
 - Staging places a set unit as the scene's place (its ground and its pieces), a prop unit as the
   element's prop and a figure unit as the cast member's actor. Each is an _instance_ of
-  `ref@version` that the person can edit in the desk; **Make local** cuts a slot's link to its unit
-  (it keeps the pieces, and its row says `staged` `unit` with `local` true).
+  `ref@version` that the person can edit in the desk; **Make local** cuts a slot's link to its unit:
+  it keeps the pieces, and the slot stays local whatever later briefs pin (a new version, another
+  item or none; no Update shots places a unit there), its row keeping the `ref@version` it was made
+  local from with `staged` `unit` and `local` true.
 - After the open it keeps in memory the files an **Update shots** could place (those of slots that
   do not hold their pinned version yet, within one staging's budget), and only a file whose SHA-256
   is its pin's: another one is let go, and its pin waits as `mismatch`. It keeps them while the
@@ -511,7 +514,7 @@ desk, and its record says why. The record's state is the row's `staged` and `why
 | The desk's reason  | Record and `state.units` | When                                                                                             | Tried again                         | A host shows                                                       |
 | ------------------ | ------------------------ | ------------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------ |
 | none               | `unit`                   | The slot holds an instance of the pinned version                                                 | —                                   | up to date, or a newer version of its pin waiting for Update shots |
-| none, `local` true | `unit`                   | The person made the slot local: its pieces stay, unlinked                                        | —                                   | made local                                                         |
+| none, `local` true | `unit`                   | The person made the slot local: its pieces stay, unlinked, whatever later briefs pin             | —                                   | made local                                                         |
 | `missing`          | `pending`                | No entry for the pin in `open.units`, or one left out                                            | at the next open                    | waiting for the unit                                               |
 | `mismatch`         | `pending`                | An entry for the pin's `ref` and `version` with another SHA-256, or bytes that do not hash to it | at the next open                    | waiting for the unit                                               |
 | `unavailable`      | `pending`                | Sent and matching, but not usable this time: earlier slots spent the budget, or reading failed   | at the next open                    | waiting for the unit                                               |

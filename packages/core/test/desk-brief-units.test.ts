@@ -505,6 +505,31 @@ describe('a pin whose unit is not held', () => {
     expect(update(doc, dusk).changes?.other).toEqual(['the set']);
     expect(doc.listObjects().filter((o) => prop(o, 'desk_label') === 'ground')).toHaveLength(1);
   });
+
+  it('keeps a slot made local whatever a later brief pins, with the ref@version it was made local from', () => {
+    const L = library();
+    const b = withPins(openBrief(), { el: { [KITE]: L.kite } });
+    const { doc } = staged(b, source(L.kite));
+    const kite = listUnits(doc)[0].root;
+    makeLocal(doc, kite);
+    const row = {
+      slot: `el:${KITE}`,
+      ...pick(L.kite),
+      sha256: L.kite.pin.sha256,
+      staged: 'unit',
+      local: true,
+    };
+    expect(stateUnitRows(doc)).toEqual([row]);
+    // a new version of the item, or no pin: no file wanted (a host may leave it out), nothing placed
+    for (const later of [withPins(b, { el: { [KITE]: L.kite2 } }), withPins(b, { el: { [KITE]: null } })]) {
+      expect(pinsWanted(doc, later)).toEqual([]);
+      const u = update(doc, later, source(L.kite, L.kite2));
+      expect(u.changes).toBeNull();
+      expect(listUnits(doc)).toEqual([]);
+      expect(doc.getObject(kite)).not.toBeNull();
+      expect(stateUnitRows(doc)).toEqual([row]);
+    }
+  });
 });
 
 describe('a slot that held an instance before (its ids are derived from the slot)', () => {

@@ -727,7 +727,8 @@ host's state says per slot which version the scene holds and how (`state.units`)
 **Make local** (on a row with an instance; not in a read-only open) keeps the instance's objects as
 plain objects of the scene, no longer linked to the library, as one undo step (Ctrl+Z links them
 again). The slot stays local: no later brief, version or Update shots places a unit there again,
-and the host's state says so (`staged` `unit` with `local` true).
+and the host's state says so (`staged` `unit` with `local` true, and the `ref@version` it was made
+local from), so the host need not send that slot's file again.
 
 **What an update keeps and replaces.** Nothing moves until the person runs **Update shots** (one
 undo step). For a new version of the item a slot holds, the instance is updated in place:
