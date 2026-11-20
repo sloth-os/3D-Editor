@@ -1097,6 +1097,62 @@ describe('a pin on a location', () => {
 });
 
 describe('figures', () => {
+  /** An animal figure of Pip as `kind` (a library version), and the brief pinning it as the host sends it. */
+  function animalFigure(kind: 'dog' | 'horse'): { l: Lib; b: SceneBrief; heightM: number } {
+    const src = openBrief();
+    const pip = src.cast.find((c) => c.id === PIP)!;
+    pip.kind = kind;
+    if (kind === 'horse') pip.description = 'A brown horse.';
+    const srcDoc = stagedDoc(src);
+    const fig = unitFrom(srcDoc, { kind: 'figure', actor: actorOf(srcDoc, PIP).id, name: 'Pip' });
+    srcDoc.destroy();
+    const f = fig.ex.header.figure!;
+    expect(f.kind).toBe(kind);
+    const l = lib(`lib_0123456789${kind.slice(0, 4).padEnd(4, 'x')}`, 1, fig.ex.data);
+    // with a figure pin the host sends the figure's kind and height (the desk's) as the member's
+    const b = withPins(src, { cast: { [PIP]: l } });
+    const c = b.cast.find((x) => x.id === PIP)!;
+    c.kind = f.kind;
+    c.heightM = f.heightM;
+    return { l, b, heightM: f.heightM };
+  }
+
+  it.each(['dog', 'horse'] as const)(
+    'stands a %s figure that is not here in at its own height, so that Update shots places it once it comes',
+    (kind) => {
+      const { l, b, heightM } = animalFigure(kind);
+      const { doc, r } = staged(b, unitSourceOf([]));
+      expect(rowsOf(r)).toEqual([`cast:${PIP} words missing`]);
+      const stand = actorOf(doc, PIP);
+      expect(prop(stand, 'desk_kind')).toBe(kind);
+      expect(Number(prop(stand, 'desk_height_m'))).toBeCloseTo(heightM, 6);
+      // the file comes at a later open: offered, and placed on the stand-in
+      const u = update(doc, b, source(l));
+      expect(u.changes).toEqual({ ...NOTHING_LISTED, other: ['1 cast member from the library'] });
+      expect(rowsOf(u.r)).toEqual([`cast:${PIP} unit`]);
+      expect(actorOf(doc, PIP).id).toBe(stand.id);
+      expect(readInstance(doc, stand.id)).toMatchObject({ key: `cast:${PIP}`, ref: l.pin.ref, version: 1 });
+      expect(recordCast(doc, PIP).unit).toEqual({ ...l.pin, staged: 'unit' });
+    },
+  );
+
+  it('stands a member an update adds in at its pinned figure’s height, then places the figure', () => {
+    const { l, b, heightM } = animalFigure('dog');
+    // Pip in no shot at first: not staged
+    const first = structuredClone(b);
+    first.shots[0].castIds = [MIRA];
+    first.shots[0].layout = first.shots[0].layout.filter((e) => e.castId !== PIP);
+    const { doc } = staged(first, unitSourceOf([]));
+    expect(() => actorOf(doc, PIP)).toThrow();
+    const added = update(doc, b, unitSourceOf([]));
+    expect(added.changes?.recast).toEqual([b.shots[0].id]);
+    expect(rowsOf(added.r)).toEqual([`cast:${PIP} words missing`]);
+    expect(Number(prop(actorOf(doc, PIP), 'desk_height_m'))).toBeCloseTo(heightM, 6);
+    const u = update(doc, b, source(l));
+    expect(u.changes?.other).toEqual(['1 cast member from the library']);
+    expect(rowsOf(u.r)).toEqual([`cast:${PIP} unit`]);
+  });
+
   it('restyles the staged actor in place: its armature, keys, holds and shots stay', () => {
     const L = library();
     const { doc } = staged(openBrief());

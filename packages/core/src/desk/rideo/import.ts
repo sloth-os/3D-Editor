@@ -286,12 +286,17 @@ export interface StagedFigure extends StagedUnit {
 /**
  * Library units for the import (brief staging's; see the module comment): the opening marks to use
  * instead of the planned layouts' (state 'missing'), and per prop and per cast member the unit that
- * stages it (undefined: the built-in prop, the mannequin).
+ * stages it (undefined: the built-in prop, the mannequin). `figureHeight`: the height of a member
+ * whose figure is pinned but not placed (not here, or refused), which the host gives as the
+ * figure's own: the desk's height of its kind (an animal's withers), used as it is rather than as
+ * rideo's height, so that the mannequin standing in has the figure's rig and its arrival is a look
+ * swap (undefined: rideo's height, as for any member).
  */
 export interface ImportUnits {
   marks?: ReadonlyMap<string, RideoBlockingMark>;
   prop?(p: RideoBlockingProp): StagedProp | null | undefined;
   figure?(characterId: string): StagedFigure | undefined;
+  figureHeight?(characterId: string): number | undefined;
 }
 
 // ---------------------------------------------------------------- small helpers
@@ -853,17 +858,20 @@ export function importRideoBlocking(
     const b = blockActor.get(id);
     const c = characters.get(id);
     const humanoid = isHumanoid(kind);
-    // a library figure: its own height and colour
+    // a library figure: its own height and colour; one pinned but not placed: the figure's height
     const figure = units.figure?.(id);
+    const pinned = figure ? undefined : units.figureHeight?.(id);
     // people: rideo's height (the draft's, from the identity); animals: theirs when rideo has one,
     // their mannequin's top in rideo, made the withers the desk sizes an animal by
     let h = b?.heightM ?? c?.heightM ?? null;
     if (!humanoid && (h === null || Math.abs(h - 1.7) < 1e-6)) h = c?.heightM ?? null;
     const heightM = figure
       ? figure.heightM
-      : h && h > 0
-        ? h / rideoHeightRatio(kind)
-        : defaultActorHeight(kind);
+      : pinned !== undefined
+        ? pinned
+        : h && h > 0
+          ? h / rideoHeightRatio(kind)
+          : defaultActorHeight(kind);
     const color = figure ? figure.color : (b?.color ?? ACTOR_PALETTE[i % ACTOR_PALETTE.length]).toLowerCase();
     const first = markOf(ordered[0].id, id);
     const old = oldActors.get(id);

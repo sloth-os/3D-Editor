@@ -521,7 +521,10 @@ every pin is staged from the words. Per slot:
   (a later version or another set moves nobody).
 - **A figure** is its cast member's actor (key `cast:<castId>`): its kind, height and colour are the
   figure's (a kind or height in the brief that differs is no change, with a warning), on the desk's
-  rig for its kind, so it stands, walks, poses and holds as a mannequin of that kind would.
+  rig for its kind, so it stands, walks, poses and holds as a mannequin of that kind would. While
+  the figure is not placed, its member stands in as a mannequin of the brief's `kind` at the brief's
+  `heightM` taken as the desk height, not converted (the host sends the figure's own height: an
+  animal's withers), so that the figure fits the stand-in when its file comes.
 - **A prop** is its element's prop (key `el:<elementId>`) at the spot the words give it, its base on
   the ground, at the unit's own size; it is held, hidden and flown as the words' prop would be.
 
@@ -927,7 +930,8 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   to the right).
 - Heights: a SceneBlocking's or a brief's `heightM` is the top of the figure, the desk's `height_m`
   a person's height but an animal's withers: staging, import and export convert an animal's (a pony
-  drawn 1.3 m tall has its withers about 0.98 m up), a person's is the same number.
+  drawn 1.3 m tall has its withers about 0.98 m up), a person's is the same number. A brief's member
+  that pins a library figure is the exception: its `heightM` is the figure's desk height, as is.
 - The sun: a SceneBlocking's azimuth and elevation are the same numbers in `desk.set_build`
   (`sun_azimuth_deg`: 0 in front of the set, 90 to its right, 180 behind it). The SKY world gets
   `sun_rotation = rad(azimuth) + π` and `sun_elevation = rad(elevation)`.

@@ -56,6 +56,7 @@ import {
   hostShots,
   insertSetUnit,
   parseBrief,
+  pinnedFigureHeight,
   propHook,
   recordOf,
   recordPinsOf,
@@ -371,7 +372,8 @@ export function updateFromBriefIn(
     if (actors.has(cid)) continue;
     if (recordCast.has(cid) && stagedBefore.has(cid) && !restaged.some((s) => shotCast(s).includes(cid)))
       continue;
-    const figure = figureHook(units.cast.get(cid));
+    const slot = units.cast.get(cid);
+    const figure = figureHook(slot);
     const id = addActor(
       doc,
       cid,
@@ -381,6 +383,7 @@ export function updateFromBriefIn(
       actors,
       stamp,
       figure,
+      pinnedFigureHeight(brief, slot),
     );
     if (figure) done.add(figure.key);
     actors.set(cid, doc.getObject(id)!);
@@ -856,7 +859,11 @@ function layoutOf(s: BriefShot, actorId: (cid: string) => string | null): DeskLa
   return out;
 }
 
-/** Adds the actor of cast member `cid` on its planned mark (a free spot when an actor stands there). */
+/**
+ * Adds the actor of cast member `cid` on its planned mark (a free spot when an actor stands there):
+ * its library figure (`figure`), else a mannequin of the figure's height when its figure is pinned
+ * but not placed (`pinnedHeight`, the desk's own), else one of the brief's height.
+ */
 function addActor(
   doc: SceneDoc,
   cid: string,
@@ -866,6 +873,7 @@ function addActor(
   actors: ReadonlyMap<string, ObjectData>,
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   figure?: ReturnType<typeof figureHook>,
+  pinnedHeight?: number,
 ): string {
   const c = brief.cast.find((x) => x.id === cid)!;
   const taken: RideoBlockingMark[] = [...actors.values()].map((o) => {
@@ -875,7 +883,9 @@ function addActor(
   const want = mark ?? { x: 0, z: 0, facingDeg: 0, pose: 'stand', toX: null, toZ: null };
   const clear = taken.every((t) => Math.hypot(t.x - want.x, t.z - want.z) >= LAYOUT_SPACING_M / 2);
   const at = clear ? { x: want.x, z: want.z } : freeRowSpot(taken, want.x);
-  const heightM = c.heightM && c.heightM > 0 ? c.heightM / rideoHeightRatio(kind) : defaultActorHeight(kind);
+  const heightM =
+    pinnedHeight ??
+    (c.heightM && c.heightM > 0 ? c.heightM / rideoHeightRatio(kind) : defaultActorHeight(kind));
   // a library figure is the member: its own kind, height and colour
   const r = figure
     ? createFigureActor(doc, figure.unit, {

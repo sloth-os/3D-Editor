@@ -330,6 +330,19 @@ export function figureHook(s: SlotUnit | undefined): StagedFigure | undefined {
 }
 
 /**
+ * The height of the cast member of slot `s` when the slot pins a figure (placed or not): the brief's
+ * heightM, which a host gives as the figure's own (the desk's height of its kind: an animal's
+ * withers), so that the mannequin standing in for a figure not placed has the figure's rig and
+ * height (the figure's arrival is a look swap). Undefined without a figure pin or a height.
+ */
+export function pinnedFigureHeight(brief: SceneBrief, s: SlotUnit | undefined): number | undefined {
+  if (!s?.pin || !('castId' in s.slot)) return undefined;
+  const id = s.slot.castId;
+  const h = brief.cast.find((c) => c.id === id)?.heightM;
+  return h !== null && h !== undefined && h > 0 ? h : undefined;
+}
+
+/**
  * The import's prop unit for slot `s`: the unit to place, update or replace (decoded), or the slot's
  * instance kept as it is (only placed again: a version not held, or one made local); undefined for
  * the words' prop.
@@ -415,6 +428,7 @@ export function stageBriefIn(
       if (f) done.add(f.key);
       return f;
     },
+    figureHeight: (cid) => pinnedFigureHeight(brief, resolved.cast.get(cid)),
     prop: (p) => {
       const u = p.elementId ? propHook(doc, resolved.elements.get(p.elementId), null) : undefined;
       if (u) done.add(u.key);
