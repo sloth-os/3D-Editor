@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
+import * as Y from 'yjs';
 import { SceneDoc } from '../src/doc/scene-doc';
 import { SCHEMA_VERSION } from '../src/doc/types';
 import { solveShotCameras } from '../src/operators/desk-shots';
@@ -9,9 +10,12 @@ import {
   briefChanges,
   briefPins,
   briefWithoutPins,
+  forgetPublish,
+  pendingPublishes,
   pinsRefused,
   pinsWanted,
   planInfoOf,
+  recordPublish,
   stageBrief,
   stateUnitRows,
   unitBudget,
@@ -1324,6 +1328,163 @@ describe('adoptPublished', () => {
       expect(stateUnitRows(doc)).toHaveLength(linked ? 1 : 0);
     },
   );
+});
+
+describe('a unit saved to the library whose answer came too late (the host linked it)', () => {
+  const benches = (doc: SceneDoc) => doc.listObjects().filter((o) => /bench/i.test(o.name));
+  /** The scene staged from open.json with a park bench added by hand, its set extracted and sent. */
+  function savedSet(b: SceneBrief = openBrief(), units?: UnitSource) {
+    const { doc } = staged(b, units);
+    BUILTIN_CATALOG.find((e) => e.id === 'park_bench')!.build(doc, { location: [4, 6, 0] });
+    const ex = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
+    // the desk keeps what it sent until the answer is taken in (the host's never came)
+    recordPublish(doc, ex.from!, ex.sha256, ex.link);
+    return { doc, ex };
+  }
+  const pinned = (b: SceneBrief, pin: BriefUnitPin) => {
+    const next = structuredClone(b);
+    next.set.unit = pin;
+    return next;
+  };
+
+  it('adopts a set saved from the words’ set when the brief pins its file: no copy of the bench', () => {
+    const { doc, ex } = savedSet();
+    expect(pendingPublishes(doc)).toEqual([{ slot: 'set', sha256: ex.sha256, link: ex.link }]);
+    const objects = doc.listObjects().length;
+    const bench = benches(doc).map((o) => o.id);
+    expect(bench).toHaveLength(2);
+    const pin = { ref: 'lib_0123456789mead', version: 1, sha256: ex.sha256 };
+    const next = pinned(openBrief(), pin);
+    const units = unitSourceOf([{ ...pin, data: ex.data }]);
+    // the banner offers the set (as for a set placed from the library), and Update shots adopts it
+    const { r, changes } = update(doc, next, units);
+    expect(changes?.other).toEqual(['the set from the library']);
+    expect(benches(doc).map((o) => o.id)).toEqual(bench);
+    // the update adds the set's root and takes no object out
+    expect(doc.listObjects().length).toBe(objects + 1);
+    expect(listUnits(doc).map((i) => [i.key, i.ref, i.version, i.root])).toEqual([
+      ['set', pin.ref, 1, deriveUnitId('set', '@root')],
+    ]);
+    expect(unitStatus(doc, listUnits(doc)[0].root)).toEqual({ edited: [], missing: [] });
+    expect(rowsOf(r)).toEqual(['set unit']);
+    expect(readBriefRecord(doc)!.setUnit).toEqual({ ...pin, staged: 'unit' });
+    expect(pendingPublishes(doc)).toEqual([]);
+    expect(briefChanges(doc, next, { units })).toBeNull();
+  });
+
+  it('adopts a new version saved from a set placed from the library: no copy of the bench', () => {
+    const L = library();
+    const b = withPins(openBrief(), { set: L.set });
+    const { doc, ex } = savedSet(b, source(L.set));
+    expect(ex.basedOn).toEqual({ ref: L.set.pin.ref, version: 1 });
+    const root = listUnits(doc)[0].root;
+    const bench = benches(doc).map((o) => o.id);
+    const pin = { ref: L.set.pin.ref, version: 2, sha256: ex.sha256 };
+    const next = pinned(b, pin);
+    const { changes } = update(doc, next, unitSourceOf([{ ...pin, data: ex.data }]));
+    expect(changes?.other).toEqual(['a new version of the library set']);
+    expect(benches(doc).map((o) => o.id)).toEqual(bench);
+    expect(listUnits(doc).map((i) => [i.key, i.version, i.root])).toEqual([['set', 2, root]]);
+    expect(unitStatus(doc, root)).toEqual({ edited: [], missing: [] });
+    expect(pendingPublishes(doc)).toEqual([]);
+  });
+
+  it('adopts a prop and a figure saved from the scene: their objects stay, no copy goes in', () => {
+    const { doc } = staged(openBrief());
+    const kite = propOf(doc, KITE).id;
+    const mira = actorOf(doc, MIRA).id;
+    const exKite = extractUnit(doc, { kind: 'prop', root: kite, name: 'Red kite' }, { deskVersion: 'test' });
+    const exMira = extractUnit(doc, { kind: 'figure', actor: mira, name: 'Mira' }, { deskVersion: 'test' });
+    recordPublish(doc, exKite.from!, exKite.sha256, exKite.link);
+    recordPublish(doc, exMira.from!, exMira.sha256, exMira.link);
+    const ids = doc
+      .listObjects()
+      .map((o) => o.id)
+      .sort();
+    const pinKite = { ref: 'lib_0123456789kite', version: 1, sha256: exKite.sha256 };
+    const pinMira = { ref: 'lib_0123456789mira', version: 1, sha256: exMira.sha256 };
+    const next = withPins(openBrief(), {
+      cast: { [MIRA]: lib(pinMira.ref, 1, exMira.data) },
+      el: { [KITE]: lib(pinKite.ref, 1, exKite.data) },
+    });
+    const units = unitSourceOf([
+      { ...pinKite, data: exKite.data },
+      { ...pinMira, data: exMira.data },
+    ]);
+    const { r, changes } = update(doc, next, units);
+    expect(changes?.other).toEqual(['1 cast member from the library', '1 prop from the library']);
+    expect(
+      doc
+        .listObjects()
+        .map((o) => o.id)
+        .sort(),
+    ).toEqual(ids);
+    expect(listUnits(doc).map((i) => [i.key, i.version, i.root])).toEqual([
+      [`cast:${MIRA}`, 1, mira],
+      [`el:${KITE}`, 1, kite],
+    ]);
+    expect(rowsOf(r)).toEqual([`cast:${MIRA} unit`, `el:${KITE} unit`]);
+    expect(pendingPublishes(doc)).toEqual([]);
+  });
+
+  it('waits while the brief does not pin the file or the file is not here, and keeps it through Ctrl+Z', () => {
+    const { doc, ex } = savedSet();
+    const undo = new Y.UndoManager(doc.sharedTypes(), { trackedOrigins: new Set([doc.origin]) });
+    const pin = { ref: 'lib_0123456789mead', version: 1, sha256: ex.sha256 };
+    const next = pinned(openBrief(), pin);
+    const objects = doc.listObjects().length;
+    // the brief does not pin it yet (the host has not answered), then pins it without its file
+    expect(update(doc, openBrief()).changes).toBeNull();
+    update(doc, next, unitSourceOf([]));
+    expect(pendingPublishes(doc).map((p) => p.sha256)).toEqual([ex.sha256]);
+    expect(listUnits(doc)).toEqual([]);
+    // the file comes: Update shots adopts the set, and Ctrl+Z takes the adoption and the publish back
+    const units = unitSourceOf([{ ...pin, data: ex.data }]);
+    undo.stopCapturing();
+    update(doc, next, units);
+    expect(listUnits(doc).map((i) => i.key)).toEqual(['set']);
+    expect(pendingPublishes(doc)).toEqual([]);
+    undo.undo();
+    expect(listUnits(doc)).toEqual([]);
+    expect(doc.listObjects().length).toBe(objects);
+    expect(pendingPublishes(doc).map((p) => p.sha256)).toEqual([ex.sha256]);
+    // pressed again it adopts again: still no copy of the bench
+    update(doc, next, units);
+    expect(benches(doc)).toHaveLength(2);
+    expect(listUnits(doc).map((i) => [i.key, i.version])).toEqual([['set', 1]]);
+    undo.destroy();
+  });
+
+  it('puts the unit in as usual when the objects it was made from are gone, and lets the publish go', () => {
+    const { doc, ex } = savedSet();
+    const parts = Object.entries(ex.link.parts)
+      .filter(([k]) => k.startsWith('objects:') && k !== 'objects:@root')
+      .map(([, p]) => p.sceneId);
+    doc.transact(() => doc.removeObjects(parts.filter((id) => doc.has('objects', id))));
+    expect(benches(doc)).toEqual([]);
+    const pin = { ref: 'lib_0123456789mead', version: 1, sha256: ex.sha256 };
+    const { r } = update(doc, pinned(openBrief(), pin), unitSourceOf([{ ...pin, data: ex.data }]));
+    expect(rowsOf(r)).toEqual(['set unit']);
+    // placed from the file: its bench, once
+    expect(benches(doc)).toHaveLength(2);
+    expect(listUnits(doc).map((i) => [i.key, i.version])).toEqual([['set', 1]]);
+    expect(pendingPublishes(doc)).toEqual([]);
+    expect(r.warnings).toContainEqual(
+      `the set: the objects 'Meadow' was saved to the library from are no longer in the scene: its library unit lib_0123456789mead@1 is put in instead`,
+    );
+  });
+
+  it('is let go when the answer adopts it, and a later save from the slot takes its place', () => {
+    const { doc, ex } = savedSet();
+    recordPublish(doc, ex.from!, 'f'.repeat(64), ex.link);
+    expect(pendingPublishes(doc).map((p) => p.sha256)).toEqual(['f'.repeat(64)]);
+    forgetPublish(doc, 'f'.repeat(64));
+    expect(pendingPublishes(doc)).toEqual([]);
+    recordPublish(doc, ex.from!, ex.sha256, ex.link);
+    const pin = { ref: 'lib_0123456789mead', version: 1, sha256: ex.sha256 };
+    adoptPublished(doc, openBrief(), { slot: ex.from, link: ex.link, pin, linked: true, header: ex.header });
+    expect(pendingPublishes(doc)).toEqual([]);
+  });
 });
 
 describe('the blocking export of a library set', () => {

@@ -4,8 +4,8 @@
  * (stage.ts, with the SceneBlocking import as its engine), the record of what was staged (record.ts),
  * how a later brief differs (changes.ts), updating the staging to it (update.ts, timeline.ts), the
  * results of each shot (results.ts), and the brief's library pins (units.ts: the units held, what
- * staging does per slot; library.ts: the units an update wants, linking a published unit). Pure
- * core: every function runs in a web worker.
+ * staging does per slot; library.ts: the units an update wants, linking a published unit, the
+ * publishes not taken in yet). Pure core: every function runs in a web worker.
  */
 
 export {
@@ -65,9 +65,14 @@ export {
   type UnitSource,
 } from './units';
 export {
+  PUBLISH_KEY_PREFIX,
   adoptPublished,
+  forgetPublish,
+  pendingPublishes,
   pinsRefused,
   pinsWanted,
+  recordPublish,
   type AdoptPublishedOptions,
+  type PendingPublish,
   type RefusedPin,
 } from './library';

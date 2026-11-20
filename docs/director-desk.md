@@ -785,7 +785,9 @@ waiting for the host with the seconds counted, linking the scene), then what cam
 - "Not known whether rideo saved 'Harbor': it did not answer in time. Look in its library before
   saving again." when the host did not answer in time (or the desk closed first, or the answer was
   not valid): the host may have saved it, and linked it, all the same. An answer that comes later is
-  not applied; a link the host made comes with its next brief, through Update shots.
+  not applied; a link the host made comes with its next brief, and Update shots then makes the
+  scene's own pieces (or actor, or prop) the instance of that version, with no copy of them beside
+  them (where they are gone, it puts the unit in).
 
 Closing the dialog while the host saves lets the save go on: the tab says how far it is and how it
 ended. One save runs at a time, and Update shots is off while one links the scene; a link the host

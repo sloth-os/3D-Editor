@@ -6,9 +6,11 @@ import {
   briefChanges,
   briefRecord,
   docHasUnitInstances,
+  forgetPublish,
   getShots,
   pinKey,
   pinsWanted,
+  recordPublish,
   type BriefChanges,
   type BriefUnitPin,
   type DeskCheckResult,
@@ -108,7 +110,10 @@ import {
  *   instances of units is container version 2. Save to library makes the unit in the worker (read
  *   only); the version the host saved and linked is adopted with the storage origin (not an undo
  *   step: it records what the host did), and Ctrl+Z does not go back past it (Yjs cannot undo an
- *   older write of the record it rewrote). Make local is one undo step.
+ *   older write of the record it rewrote). What was sent from a slot stays in the scene until the
+ *   scene takes it in or the host refuses it (recordPublish, with the storage origin): a brief that
+ *   pins it later has Update shots adopt the scene's own objects (core adoptLinkedPublishes). Make
+ *   local is one undo step.
  */
 
 /**
@@ -988,6 +993,26 @@ export class DeskWorkspace {
       if (follow && r.recorded) this.brief = follow;
       return { root: r.root, recorded: r.recorded, warnings: r.warnings };
     });
+  }
+
+  /**
+   * Keeps in the scene the unit sent to the host's library from its slot (core recordPublish), in
+   * place of one sent from the slot before, until the scene takes it in (an adoption, or the Update
+   * shots of a brief that pins its file: core adoptLinkedPublishes) or the host refuses it
+   * (forgetPublish). Written at once with the storage origin: not an undo step, and Ctrl+Z keeps it.
+   * Nothing without a scene or a slot.
+   */
+  recordPublish(unit: Pick<UnitExtract, 'from' | 'sha256' | 'link'>): void {
+    const s = this.session;
+    const slot = unit.from;
+    if (!s || !slot) return;
+    s.doc.transact(() => recordPublish(s.doc, slot, unit.sha256, unit.link), s.storageOrigin);
+  }
+
+  /** Lets go of the unit sent with file SHA-256 `sha256` (core forgetPublish): the host did not save it. */
+  forgetPublish(sha256: string): void {
+    const s = this.session;
+    if (s) s.doc.transact(() => forgetPublish(s.doc, sha256), s.storageOrigin);
   }
 
   /**

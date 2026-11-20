@@ -456,13 +456,26 @@ read-only open never adopts. The desk changes the scene one step at a time: Upda
 while the scene adopts a unit, and an ack that comes while Update shots runs is adopted once the
 update has ended, in the scene the update left. A unit whose object is no longer in the scene (for
 a set: none of its pieces is), as when that update replaced it, is not adopted, and the person is
-told why; the link comes with the next open's brief, through Update shots.
+told why; the link comes with the next open's brief, whose Update shots puts the unit in.
 
 The desk waits for the `unit-ack` 120 s plus 10 s per MiB of the file (counted up: 440 s for
 32 MiB), then tells the person that the host did not say whether it saved the unit; an ack that
-comes later is not applied (a unit the host linked comes with the next open's brief, through Update
-shots). A `unit-ack` that does not validate but has a valid `id` is answered with `error`
-`bad_message` with that `id`, as for any message, and fails the publish waiting on it at once.
+comes later is not applied. A `unit-ack` that does not validate but has a valid `id` is answered
+with `error` `bad_message` with that `id`, as for any message, and fails the publish waiting on it
+at once.
+
+**A link the desk did not take in.** An editable open keeps in the scene each unit it sends from a
+slot (the file's SHA-256 and the objects it was made from; one per slot, a later save from the slot
+replacing it), not as an undo step, so that it travels with the local copy and the desk state. The
+desk lets go of it when the host answers `ok` false or the message cannot be sent, and when the
+scene takes the unit in. A unit the host saved and linked without the desk adopting it (its ack
+came after the wait, was not valid, or the desk closed first) comes with a later brief that pins
+that very file (`sha256` the one sent) in that slot, and the open sends the file as for any pin.
+Update shots then makes the scene's own objects the instance of `ref@version`, as the ack would have
+(one undo step with the rest of the update), and adds no copy of them. When those objects are no
+longer in the scene (a set's every piece; another unit's root, or the slot holds another instance),
+it puts the unit in as for any pin, with a warning. A unit the host saved without linking it stays
+kept as well, so that a link the person makes later in the host is taken in the same way.
 
 ### When a unit is not used
 

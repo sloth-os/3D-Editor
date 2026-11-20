@@ -151,6 +151,14 @@ export interface SceneWorkspace {
     linked: boolean,
     follow?: SceneBrief | null,
   ): Promise<{ root: string; recorded: boolean; warnings: string[] }>;
+  /**
+   * Keeps in the scene a unit sent to the host's library from its slot until the scene takes it in
+   * (not an undo step): a brief that pins its file later (the host linked it after the desk stopped
+   * waiting for its answer) has Update shots adopt the scene's own objects.
+   */
+  recordPublish?(unit: Pick<UnitExtract, 'from' | 'sha256' | 'link'>): void;
+  /** Lets go of the unit sent with file SHA-256 `sha256` (the host did not save it). */
+  forgetPublish?(sha256: string): void;
   /** Make local (one undo step). */
   makeLocal?(root: string): Promise<{ root: string; parts: number }>;
   /** Sets the brief the scene follows. */
@@ -943,9 +951,12 @@ export class DeskController {
    * instance it is with `asNewVersion`) and waits for the host's unit-ack: 120 s plus 10 s per MiB of
    * the file (an invalid ack ends the wait at once; a later one is not applied). When the host saved
    * and linked it and the open is editable and still open, the scene becomes an instance of the
-   * version (not an undo step) and the brief follows the pin the host moved. Only with units on and
-   * `publish`; a read-only open publishes but never links. Resolves with what came of it (also kept
-   * in lastPublish); never rejects.
+   * version (not an undo step) and the brief follows the pin the host moved. An editable open keeps
+   * the unit sent from a slot in the scene (recordPublish) until the scene takes it in or the host
+   * refuses it: a link the host makes after the desk stopped waiting comes with a later brief, and
+   * Update shots adopts the scene's own objects then. Only with units on and `publish`; a read-only
+   * open publishes but never links. Resolves with what came of it (also kept in lastPublish); never
+   * rejects.
    */
   async publish(p: {
     what: UnitTarget;
@@ -999,6 +1010,11 @@ export class DeskController {
       };
       const problem = deskMessageProblems(message);
       if (problem) return fail('invalid', `The unit could not be sent: ${problem}`);
+      const ws = this.deps.workspace;
+      // the scene keeps what it sends until it takes it in: a link the host makes after the desk
+      // stopped waiting comes with a later brief, whose Update shots adopts it (no copy of it goes in)
+      const kept = !this.options.peek().readOnly && !!unit.from;
+      if (kept) ws.recordPublish?.(unit);
       const wait = this.waitForAck(id, publishAckTimeoutMs(message.unit.data.byteLength));
       const transfer: Transferable[] = [
         message.unit.data,
@@ -1006,6 +1022,7 @@ export class DeskController {
       ];
       if (!this.deps.send(message, transfer)) {
         wait.cancel();
+        if (kept) ws.forgetPublish?.(unit.sha256);
         return fail('unavailable', 'No host is connected.');
       }
       this.publishing.value = { ...this.publishing.peek()!, kind, phase: 'waiting', id };
@@ -1016,13 +1033,15 @@ export class DeskController {
       if (answer.kind === 'invalid')
         return fail('bad_reply', `${host}'s answer was not valid: ${answer.problems}`);
       const ack = answer.message;
-      if (!ack.ok)
+      if (!ack.ok) {
+        // not saved: no later brief pins this file
+        if (kept) ws.forgetPublish?.(unit.sha256);
         return fail(ack.code ?? 'failed', ack.message ?? `${host} did not save '${unit.header.name}'.`);
+      }
       const pin = { ref: ack.ref!, version: ack.version!, sha256: unit.sha256 };
       const linked = ack.linked === true;
       let adopted = false;
       let note = ack.message;
-      const ws = this.deps.workspace;
       if (linked) {
         // an Update shots running ends first (no other starts while the scene links): the adoption
         // is of the scene it leaves, and the open may have closed meanwhile

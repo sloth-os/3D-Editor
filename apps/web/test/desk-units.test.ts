@@ -11,6 +11,7 @@ import {
   extractUnit,
   getShots,
   listUnits,
+  pendingPublishes,
   readUnitHeader,
   renderItems,
   sha256Hex as coreSha256Hex,
@@ -1373,9 +1374,63 @@ describe("the scene's writes, one at a time", () => {
   });
 });
 
+describe('a save the host linked after the desk stopped waiting', () => {
+  it("comes with a later brief: Update shots makes the scene's own pieces the set's instance, with no copy beside them", async () => {
+    const host = origin();
+    const first = await realDesk({ scene: exampleBrief(), options: UNITS_ON, host });
+    const ids = (t: Awaited<ReturnType<typeof realDesk>>) => t.ws.session!.doc.listObjects().map((o) => o.id);
+    const before = ids(first);
+    const p = first.c.publish({ what: { set: true }, name: 'Meadow' });
+    await waitUntil(() => expect(first.ofType('unit-publish')).toHaveLength(1));
+    const [m] = first.ofType('unit-publish');
+    // the host takes longer than the desk waits
+    first.timers.advance(publishAckTimeoutMs(m.unit.data.byteLength));
+    expect(await p).toMatchObject({ ok: false, code: 'timeout' });
+    // the scene keeps what it sent (no undo step), in its local copy and the states it sends
+    expect(pendingPublishes(first.ws.session!.doc)).toMatchObject([{ slot: 'set', sha256: m.sha256 }]);
+    expect(first.ws.session!.undo.canUndo()).toBe(false);
+    first.c.dispose();
+    first.ws.close();
+    // the host saved and linked it meanwhile: its next brief pins that file, and the open sends it
+    const meadow = lib('lib_0123456789set1', 1, new Uint8Array(m.unit.data));
+    const t = await realDesk({
+      scene: withPins(exampleBrief(), { set: meadow }),
+      options: UNITS_ON,
+      units: [openUnit(meadow)],
+      host,
+    });
+    expect(await bannerWords(t.c.changes.value!)).toBe('the set from the library');
+    await t.c.updateShots();
+    const s = t.ws.session!;
+    // the pieces it was made from are its parts: only the set's root is new
+    expect(ids(t).filter((id) => !before.includes(id))).toHaveLength(1);
+    expect(before.filter((id) => !ids(t).includes(id))).toEqual([]);
+    expect(
+      listUnits(s.doc).map((i) => [i.key, i.ref, i.version, unitStatus(s.doc, i.root).missing.length]),
+    ).toEqual([['set', meadow.pin.ref, 1, 0]]);
+    expect(stateUnitRows(s.doc).map((r) => [r.slot, r.staged])).toEqual([['set', 'unit']]);
+    expect(pendingPublishes(s.doc)).toEqual([]);
+    expect(t.c.changes.value).toBeNull();
+    // Ctrl+Z takes the Update shots back with the adoption, and the publish waits again
+    s.undo.undo();
+    t.timers.advance(CHANGES_QUIET_MS);
+    expect(listUnits(s.doc)).toEqual([]);
+    expect(ids(t).sort()).toEqual([...before].sort());
+    expect(pendingPublishes(s.doc)).toMatchObject([{ slot: 'set', sha256: m.sha256 }]);
+    expect(await bannerWords(t.c.changes.value!)).toBe('the set from the library');
+  });
+});
+
 describe('Save to library', () => {
   /** The controller over a fake scene whose units are the kite's; opened with `options`. */
-  async function fakeDesk(o: { options?: Record<string, unknown>; ws?: Partial<SceneWorkspace> } = {}) {
+  async function fakeDesk(
+    o: {
+      options?: Record<string, unknown>;
+      ws?: Partial<SceneWorkspace>;
+      /** Whether the host gets a message (default: every one). */
+      delivers?: (message: DeskMessage) => boolean;
+    } = {},
+  ) {
     const unit = kiteUnit();
     const base = {
       open: vi.fn(async () => ({
@@ -1402,6 +1457,8 @@ describe('Save to library', () => {
       projectId: 'desk-0123',
       extractUnit: vi.fn(async (): Promise<UnitExtract> => copyOf(unit)),
       adoptUnit: vi.fn(async () => ({ root: 'kite-root', recorded: true, warnings: [] })),
+      recordPublish: vi.fn(),
+      forgetPublish: vi.fn(),
       setBrief: vi.fn(),
       revision: () => 7,
       libraryRows: () => [],
@@ -1413,6 +1470,7 @@ describe('Save to library', () => {
     const timers = handTimers();
     const c = new DeskController({
       send: (message, transfer) => {
+        if (o.delivers && !o.delivers(message)) return false;
         sent.push({ message, transfer });
         return true;
       },
@@ -1612,6 +1670,52 @@ describe('Save to library', () => {
     t.c.dispose();
     expect(await p2).toMatchObject({ ok: false, code: 'closed' });
     expect(t.ws.adoptUnit).not.toHaveBeenCalled();
+  });
+
+  it('keeps in the scene what it sent from a slot until the host refuses it: a link the host makes later comes with its next brief', async () => {
+    let delivers = true;
+    const t = await fakeDesk({ options: UNITS_ON, delivers: (m) => m.type !== 'unit-publish' || delivers });
+    const kept = expect.objectContaining({ from: t.unit.from, sha256: t.unit.sha256, link: t.unit.link });
+    const answer = async (id: string, ack: Record<string, unknown> | null) => {
+      const p = t.c.publish({ what: KITE_ROOT, name: 'Red kite' });
+      await waitUntil(() => expect(t.ws.recordPublish).toHaveBeenCalledTimes(Number(id.slice(4))));
+      // kept before the host can answer
+      expect(t.ws.recordPublish).toHaveBeenLastCalledWith(kept);
+      if (ack) t.c.message({ type: 'unit-ack', id, ...ack } as never);
+      else t.timers.advance(publishAckTimeoutMs(t.unit.data.byteLength));
+      return p;
+    };
+    // saved but not linked, never answered, an answer that is not valid: a later brief may pin it
+    await answer('pub-1', { ok: true, ref: 'lib_0123456789kite', version: 1, linked: false });
+    expect(await answer('pub-2', null)).toMatchObject({ ok: false, code: 'timeout' });
+    const p3 = t.c.publish({ what: KITE_ROOT, name: 'Red kite' });
+    await waitUntil(() => expect(t.ws.recordPublish).toHaveBeenCalledTimes(3));
+    t.c.invalidReply('unit-ack', 'pub-3', 'ref: required when ok is true');
+    expect(await p3).toMatchObject({ ok: false, code: 'bad_reply' });
+    expect(t.ws.forgetPublish).not.toHaveBeenCalled();
+    // refused: no brief pins it
+    expect(await answer('pub-4', { ok: false, code: 'conflict' })).toMatchObject({ code: 'conflict' });
+    expect(t.ws.forgetPublish).toHaveBeenCalledTimes(1);
+    expect(t.ws.forgetPublish).toHaveBeenLastCalledWith(t.unit.sha256);
+    // not sent at all
+    delivers = false;
+    expect(await t.c.publish({ what: KITE_ROOT, name: 'Red kite' })).toEqual({
+      ok: false,
+      code: 'unavailable',
+      message: 'No host is connected.',
+    });
+    expect(t.ws.recordPublish).toHaveBeenCalledTimes(5);
+    expect(t.ws.forgetPublish).toHaveBeenCalledTimes(2);
+    expect(t.ws.forgetPublish).toHaveBeenLastCalledWith(t.unit.sha256);
+    expect(t.ws.adoptUnit).not.toHaveBeenCalled();
+    // a read-only open keeps nothing (its scene is never written)
+    const ro = await fakeDesk({ options: { ...UNITS_ON, readOnly: true } });
+    const p = ro.c.publish({ what: KITE_ROOT, name: 'Red kite' });
+    await waitUntil(() => expect(ro.published()).toHaveLength(1));
+    ro.c.message({ type: 'unit-ack', id: 'pub-1', ok: false, code: 'refused' });
+    await p;
+    expect(ro.ws.recordPublish).not.toHaveBeenCalled();
+    expect(ro.ws.forgetPublish).not.toHaveBeenCalled();
   });
 
   it('publishes from a read-only open but never links the scene', async () => {

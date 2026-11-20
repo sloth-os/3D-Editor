@@ -38,6 +38,7 @@ import { hideSpans } from '../rideo/keys';
 import { editorPose, flyerKind, isHumanoid, isRideable, ridersByText, shotText } from '../rideo/rules';
 import { RideoImportInputSchema, type RideoBlockingMark, type RideoBlockingProp } from '../rideo/schema';
 import { briefFrames, diffBrief, holderRuns, planWithUnits, resolveBriefUnits } from './changes';
+import { adoptLinkedPublishes } from './library';
 import { shotCast } from './plan';
 import {
   digest,
@@ -145,7 +146,11 @@ import {
  * - a prop unit replaces the element's prop, or updates it to a new version of the same item (its
  *   root id stays), held or flown again; no pin brings back the words' prop;
  * - a unit not held changes nothing (the words, or the version placed, stay), a slot made local stays
- *   local, a refused pin is not tried again; the record says what each slot holds.
+ *   local, a refused pin is not tried again; the record says what each slot holds;
+ * - a unit saved to the host's library from a slot whose answer the desk did not take in (library.ts
+ *   pendingPublishes), and which the brief now pins there, is adopted first: the scene's objects it
+ *   was made from become the instance (no copy of them goes in beside them), as the answer would
+ *   have made them (library.ts adoptLinkedPublishes).
  */
 
 /** Whether object `id` animates as the desk last staged it (its recorded motion digest). */
@@ -259,20 +264,24 @@ export function updateFromBriefIn(
 ): StageBriefReport {
   const brief = parseBrief(raw);
   const doc = ctx.doc;
-  const record = readBriefRecord(doc);
-  if (!record)
+  const recorded = readBriefRecord(doc);
+  if (!recorded)
     throw new OperatorError(
       `the project is not staged from a brief: stage scene '${brief.id}' first (stageBrief, desk.stage_brief)`,
       'INVALID_PARAMS',
     );
-  if (record.sceneId !== brief.id)
+  if (recorded.sceneId !== brief.id)
     throw new OperatorError(
-      `the project is staged from scene '${record.sceneId}', not '${brief.id}': stage this brief in another project`,
+      `the project is staged from scene '${recorded.sceneId}', not '${brief.id}': stage this brief in another project`,
       'INVALID_PARAMS',
     );
   const sceneId = brief.id;
-  // the library units: what is held of each pin, decoded for the slots the update places
   const source = opts.units ?? null;
+  // units saved to the host's library from this scene that the brief now pins (the host linked them
+  // after the desk stopped waiting for its answer): the scene's own objects become the instances
+  const late = adoptLinkedPublishes(doc, brief, source);
+  const record = late.adopted.length ? readBriefRecord(doc)! : recorded;
+  // the library units: what is held of each pin, decoded for the slots the update places
   const units = resolveBriefUnits(doc, brief, record, source);
   decodeHeld(units, source);
   const plan = planWithUnits(doc, brief, units);
@@ -285,7 +294,7 @@ export function updateFromBriefIn(
   const elementById = new Map(brief.elements.map((e) => [e.id, e]));
   const recordShot = new Map(record.shots.map((s) => [s.id, s]));
   const recordCast = new Map(record.cast.map((c) => [c.id, c]));
-  const warnings: string[] = [...plan.warnings, ...unitWarnings(units)];
+  const warnings: string[] = [...plan.warnings, ...late.warnings, ...unitWarnings(units)];
   const stamp = (o: Record<string, string | number | boolean>) => ({ ...o, [RIDEO_PROPS.clip]: sceneId });
   const castNames = plan.order.map((id) => castById.get(id)!.name);
   const solve = new Set<string>();
