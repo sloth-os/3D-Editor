@@ -372,9 +372,11 @@ type StateUnit = {           // state.units[]: one row per brief slot whose reco
 - Pins: `set.unit` for the scene's place (a `set` unit), `cast[].unit` for a figure and
   `elements[].unit` for a prop. A pin on an element of kind `location` is ignored with a staging
   warning: the place's set goes in `set.unit`. With a figure pin it sends the figure's kind and
-  height as the cast member's `kind` and `heightM` (`heightM` only within 0.1–4 m), as
+  height (its `meta.actor` when it was published: the desk's height, an animal's withers) as the
+  cast member's `kind` and `heightM` (`heightM` only within 0.1–4 m), as
   `open-units-figure-hints.json` does, so that the desk plans the actor as the figure even when the
-  file does not come.
+  file does not come: the actor standing in takes that height as it is, and the figure fits it when
+  its file comes.
 - `open.units`: the file of every pin of the brief it can get, in slot order (the set, the cast in
   brief order, then the elements), each `ref@version` once, stopping before 48 MiB in all. It may
   leave out a pin whose `ref@version` the scene's stored state lists in its `units` with `staged`
