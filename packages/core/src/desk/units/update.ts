@@ -2,12 +2,12 @@ import type { SceneDoc } from '../../doc/scene-doc';
 import type { DatablockKind, ObjectData } from '../../doc/types';
 import { getShots } from '../shots';
 import { UnitError } from './errors';
-import type { UnitPayload } from './format';
+import { unitRecord, type UnitPayload } from './format';
 import { UNIT_ROOT, deriveUnitId } from './ids';
 import { requirePin, type UnitPin } from './insert';
-import { UNIT_BLOCK_KINDS } from './kinds';
+import { UNIT_BLOCK_KINDS, type UnitBlockKind } from './kinds';
 import { UNIT_PROPS, provenanceProps, requireInstance, splitPartKey, type UnitPartStamp } from './list';
-import { mergeForUpdate, partSum16 } from './ownership';
+import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
 import { collectDriverRefs, collectRecordRefs, mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
 import { dataKey, deleteData, unusedData } from './remove';
 import { currentSum, sourceIndex, toSourceMap, type UnitPartRef } from './status';
@@ -195,7 +195,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     const id = idOf.get(pk)!;
     const cur = free.has(dataKey(s.kind, id)) ? null : doc.readRecord(s.kind, id);
     current.set(pk, cur);
-    const next = unit.body.blocks[s.kind as keyof typeof unit.body.blocks]?.[s.src];
+    const next = unitRecord(unit.body, s.kind as UnitBlockKind, s.src);
     if (!old) fate.set(pk, cur ? 'taken' : 'add');
     else if (!next) fate.set(pk, 'drop');
     else if (!cur) fate.set(pk, 'deleted');
@@ -223,13 +223,13 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
         const src = pk.slice(k.length + 1);
         const id = idOf.get(pk)!;
         const old = inst.parts.get(pk);
-        const next = unit.body.blocks[k]?.[src];
+        const next = unitRecord(unit.body, k, src);
         const cur = current.get(pk) ?? null;
         const f = fate.get(pk)!;
         const sum = next ? partSum16(k, next, place(k, src)) : null;
         switch (f) {
           case 'add': {
-            const fields = mapRecordRefs(k, next!, mapOut);
+            const fields = mapRecordRefs(k, withUnitProps(k, next!, place(k, src)), mapOut);
             doc.addRecord(k, id, { ...copyFields(fields), name: String(next!.name ?? 'Unit') });
             current.set(pk, doc.readRecord(k, id));
             table.set(pk, { id, sum: sum! });
@@ -333,7 +333,7 @@ function figureWarnings(
 ): string[] {
   const out: string[] = [];
   const armSrc = typeof next.data === 'string' ? next.data : null;
-  const arm = armSrc ? unit.body.blocks.armatures?.[armSrc] : null;
+  const arm = armSrc ? unitRecord(unit.body, 'armatures', armSrc) : null;
   const bones = new Set(
     (Array.isArray(arm?.bones) ? (arm.bones as unknown[]) : []).map((b) =>
       isRecord(b) ? String(b.name) : '',

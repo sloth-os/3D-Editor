@@ -26,14 +26,16 @@ import {
 import { planBrief } from '../src/desk/brief/plan';
 import { BRIEF_RECORD_KEY, readBriefRecord } from '../src/desk/brief/record';
 import { docContext } from '../src/desk/brief/stage';
-import { sha256Hex } from '../src/desk/container';
+import { UNIT_MAGIC, gzipDeterministic, sha256Hex, writeContainer } from '../src/desk/container';
 import { exportRideoBlocking } from '../src/desk/rideo';
 import { importRideoBlocking } from '../src/desk/rideo/import';
 import { getShots } from '../src/desk/shots';
 import {
   UnitError,
+  decodeUnit,
   deriveUnitId,
   encodeUnit,
+  encodeUnitBody,
   extractUnit,
   listUnits,
   makeLocal,
@@ -91,6 +93,28 @@ function reheadered(u: UnitPayload, edit: (h: UnitHeaderInput) => void): Uint8Ar
   const h = headerInput(u.header);
   edit(h);
   return encodeUnit(u.body, h);
+}
+
+/** Library version `l` (same ref and version) with its body's manifest edited by hand, written without checks. */
+function crafted(l: Lib, edit: (manifest: string) => string): Lib {
+  const unit = decodeUnit(l.given.data);
+  const raw = encodeUnitBody(unit.body).bytes;
+  const n = new DataView(raw.buffer, raw.byteOffset).getUint32(0, true);
+  const text = new TextEncoder().encode(edit(new TextDecoder().decode(raw.subarray(4, 4 + n))));
+  const blobs = raw.subarray(4 + n);
+  const body = new Uint8Array(4 + text.length + blobs.length);
+  new DataView(body.buffer).setUint32(0, text.length, true);
+  body.set(text, 4);
+  body.set(blobs, 4 + text.length);
+  const header = { ...unit.header, digest: sha256Hex(body), bodyBytes: body.length };
+  const data = writeContainer({
+    magic: UNIT_MAGIC,
+    version: 1,
+    codec: 'gzip',
+    header: new TextEncoder().encode(JSON.stringify(header)),
+    payload: gzipDeterministic(body),
+  });
+  return lib(l.pin.ref, l.pin.version, data);
 }
 
 /** A new version of a unit: its first material made blue. */
@@ -667,6 +691,26 @@ describe('a unit that cannot be used is refused, with its reason', () => {
       expect(update(doc, scene, unitSourceOf(given)).changes).toBeNull();
     },
   );
+
+  it.each([
+    ['a number that is not finite', (m: string) => m.replace('"scale":[', '"scale":[1e400,')],
+    [
+      'a key named __proto__',
+      (m: string) => m.replace('"custom_props":{', '"custom_props":{"__proto__":{"x":1},'),
+    ],
+    [
+      'a value nested 10,000 deep',
+      (m: string) =>
+        m.replace('"custom_props":{', `"custom_props":{"deep":${'['.repeat(10_000)}${']'.repeat(10_000)},`),
+    ],
+  ])('a kite file with %s is refused (unreadable) beside a good set, which is placed', (_what, edit) => {
+    const L = library();
+    const bad = crafted(L.kite, edit);
+    const { doc, r } = staged(withPins(openBrief(), { set: L.set, el: { [KITE]: bad } }), source(L.set, bad));
+    expect(rowsOf(r)).toEqual(['set unit', `el:${KITE} words unreadable`]);
+    expect(listUnits(doc).map((i) => i.key)).toEqual(['set']);
+    expect(recordElement(doc, KITE).unit).toMatchObject({ staged: 'refused', why: 'unreadable' });
+  });
 
   it('files that are not the pinned ones are pending (mismatch), tried again at the next open', () => {
     const { scene, given } = fixture('open-units.json');

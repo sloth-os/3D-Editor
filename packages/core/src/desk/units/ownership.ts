@@ -92,6 +92,17 @@ export function splitProps(
   return { unit, scene };
 }
 
+/**
+ * A unit record as it is written into the scene: an object's custom props without those the scene
+ * owns (extraction never writes them; a crafted unit carrying unit_* props on a part would plant a
+ * second instance). The record's stamp is the same, as unitView leaves them out too.
+ */
+export function withUnitProps(kind: DatablockKind, record: UnitRecord, place: PartPlace): UnitRecord {
+  return kind === 'objects' && isRecord(record.custom_props)
+    ? { ...record, custom_props: splitProps(record.custom_props, place).unit }
+    : record;
+}
+
 /** Whether a constraint targets an object outside the instance (ids already mapped: outside ones start with '!'). */
 const external = (c: unknown, outside: (id: string) => boolean): boolean =>
   isRecord(c) && typeof c.target === 'string' && !!c.target && outside(c.target);

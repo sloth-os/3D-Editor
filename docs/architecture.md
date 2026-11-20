@@ -985,6 +985,13 @@ The same content gives the same bytes in Node, the page and the staging worker; 
 is the body's SHA-256 and the protocol pins the file's. Reading is bounded: at most 32 MiB of
 file, 64 KiB of header and 128 MiB of body, unpacked in 4 KiB slices into one buffer of exactly
 the declared size, every reference checked to stay inside the unit before anything is inserted.
+Decoding is the gate, so what decodes inserts: a manifest nested deeper than 64, a number that is
+not finite, a key `__proto__`, `constructor` or `prototype`, a reference to an id only
+`Object.prototype` has, or a figure whose body is not the actor its header names (role, kind,
+height within 5 mm, rig) is refused as damaged. The custom props the scene owns (`unit_*`,
+`desk_element_id` and the rest that `ownership.ts` lists) are left out of every part as it goes
+in, so no part is a second instance, and an insert works out every record before it writes one,
+so one that fails leaves the scene as it was.
 
 An instance is a root object with `unit_*` custom props: the library item, its version, the file's
 SHA-256, the body digest, the kind, the key, the name and `unit_parts` (each source id's scene id

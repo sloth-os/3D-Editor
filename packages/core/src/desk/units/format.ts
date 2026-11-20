@@ -9,6 +9,7 @@ import { UnitError } from './errors';
 import { UNIT_ROOT, UNIT_SOURCE_ID_PATTERN } from './ids';
 import { UNIT_BLOCK_KINDS, UNIT_KINDS, type UnitBlockKind, type UnitKind } from './kinds';
 import { collectDriverRefs, collectRecordRefs, type UnitRecord } from './refs';
+import { DESK_PROPS } from '../props';
 
 /*
  * The library unit file (docs/embedding.md, "Library units"; docs/architecture.md, "Library units"):
@@ -27,7 +28,10 @@ import { collectDriverRefs, collectRecordRefs, type UnitRecord } from './refs';
  * The same content gives the same bytes in every browser, worker and Node. Reading is bounded: the
  * file is at most 32 MiB, its header 64 KiB, its body 128 MiB, 20,000 records and 50,000 blobs; the
  * body unpacks into one buffer of exactly bodyBytes; its digest, its manifest and every reference in it
- * (each must name a datablock of the unit) are checked before anything is inserted.
+ * (each must name a datablock of the unit) are checked before anything is inserted. Decoding is the
+ * gate: what decodes inserts. The manifest nests at most MAX_UNIT_DEPTH deep, holds only finite
+ * numbers and no key '__proto__', 'constructor' or 'prototype', references are looked up as own
+ * properties only, and a figure's body is the actor its header describes (role, kind, height, rig).
  */
 
 /** The `format` of a unit file (the protocol's UNIT_DATA_FORMAT). */
@@ -56,6 +60,13 @@ export const MAX_UNIT_LANDMARKS = 128;
 export const MAX_UNIT_META_CREDITS = 32;
 /** Largest publish meta, as JSON in UTF-8 (the protocol's MAX_UNIT_META_BYTES): 16 KiB. */
 export const MAX_UNIT_META_BYTES = 16 * 1024;
+/** Deepest a body's manifest nests (honest records are under about 10 deep): deeper is UNIT_CORRUPT. */
+export const MAX_UNIT_DEPTH = 64;
+/** Heights (m) closer than this are the same rig (a figure's body and header; an actor and a figure). */
+export const FIGURE_HEIGHT_TOLERANCE_M = 0.005;
+
+/** Keys no record has: built into an object, '__proto__' would set its prototype. UNIT_BAD_RECORD. */
+const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 const Num = z.number().finite();
 const Vec3 = z.tuple([Num, Num, Num]);
@@ -219,6 +230,15 @@ export interface UnitPayload {
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Uint8Array);
 
+/**
+ * Record `src` of a body's `kind` (own properties only: a source id named like a member of
+ * Object.prototype, 'toString' or 'valueOf', is no record unless the unit holds one by that id).
+ */
+export function unitRecord(body: UnitBody, kind: UnitBlockKind, src: string): UnitRecord | undefined {
+  const m = Object.hasOwn(body.blocks, kind) ? body.blocks[kind] : undefined;
+  return m && Object.hasOwn(m, src) ? m[src] : undefined;
+}
+
 /** The object types a unit may hold. */
 const OBJECT_TYPES: readonly ObjectType[] = ['MESH', 'EMPTY', 'CAMERA', 'LIGHT', 'CURVE', 'FONT', 'ARMATURE'];
 
@@ -260,7 +280,7 @@ export function checkUnitBody(body: UnitBody, kind: UnitKind | null, reading: bo
     throw new UnitError('UNIT_BAD_RECORD', "a set's root is an empty");
   if (root.type === 'CAMERA') throw new UnitError('UNIT_BAD_RECORD', 'a unit holds no cameras as its root');
   const has = (kind: string, id: string) =>
-    !!(body.blocks as Record<string, Record<string, unknown>>)[kind]?.[id];
+    (UNIT_BLOCK_KINDS as readonly string[]).includes(kind) && !!unitRecord(body, kind as UnitBlockKind, id);
   for (const [k, m] of Object.entries(body.blocks) as [UnitBlockKind, Record<string, UnitRecord>][])
     for (const [src, rec] of Object.entries(m))
       for (const ref of collectRecordRefs(k, rec))
@@ -351,8 +371,16 @@ export function decodeUnitBody(bytes: Uint8Array): UnitBody {
     at += len as number;
   }
   if (at !== bytes.length) throw new UnitError('UNIT_CORRUPT', 'the body has bytes after its blobs');
-  const thaw = (v: unknown): unknown => {
-    if (Array.isArray(v)) return v.map(thaw);
+  // recursion is bounded by the depth limit, so a deep manifest is refused, not a stack overflow
+  const thaw = (v: unknown, depth: number): unknown => {
+    if (depth > MAX_UNIT_DEPTH)
+      throw new UnitError('UNIT_CORRUPT', `the body's manifest nests deeper than ${MAX_UNIT_DEPTH}`);
+    if (typeof v === 'number') {
+      if (!Number.isFinite(v))
+        throw new UnitError('UNIT_BAD_RECORD', 'a record holds a number that is not finite');
+      return v;
+    }
+    if (Array.isArray(v)) return v.map((x) => thaw(x, depth + 1));
     if (isBlobRef(v)) {
       const i = v.$blob;
       if (!Number.isInteger(i) || i < 0 || i >= blobs.length)
@@ -364,16 +392,44 @@ export function decodeUnitBody(bytes: Uint8Array): UnitBody {
     }
     if (isRecord(v)) {
       const o: Record<string, unknown> = {};
-      for (const [k, x] of Object.entries(v)) o[k] = thaw(x);
+      for (const [k, x] of Object.entries(v)) {
+        if (FORBIDDEN_KEYS.has(k)) throw new UnitError('UNIT_BAD_RECORD', `a record has the key '${k}'`);
+        o[k] = thaw(x, depth + 1);
+      }
       return o;
     }
     return v;
   };
   return {
     root: manifest.root as typeof UNIT_ROOT,
-    blocks: thaw(manifest.blocks) as UnitBody['blocks'],
-    drivers: Array.isArray(manifest.drivers) ? (thaw(manifest.drivers) as UnitRecord[]) : (null as never),
+    blocks: thaw(manifest.blocks, 0) as UnitBody['blocks'],
+    drivers: Array.isArray(manifest.drivers) ? (thaw(manifest.drivers, 0) as UnitRecord[]) : (null as never),
   };
+}
+
+/**
+ * UNIT_BAD_RECORD unless a figure's body is the actor its header describes: its root an actor
+ * (desk_role 'actor') of the header's kind and height (within 5 mm), its armature's bones the rig the
+ * header names. Extraction writes exactly these, so only a crafted or damaged file fails.
+ */
+function checkFigureBody(body: UnitBody, figure: NonNullable<UnitHeader['figure']>): void {
+  const root = unitRecord(body, 'objects', UNIT_ROOT);
+  const props = isRecord(root?.custom_props) ? root.custom_props : {};
+  const arm = typeof root?.data === 'string' ? unitRecord(body, 'armatures', root.data) : undefined;
+  const bones = Array.isArray(arm?.bones) ? (arm.bones as unknown[]) : [];
+  const height = Number(props[DESK_PROPS.heightM]);
+  const why =
+    props[DESK_PROPS.role] !== 'actor'
+      ? 'its root is not an actor'
+      : props[DESK_PROPS.kind] !== figure.kind
+        ? `its root is a ${String(props[DESK_PROPS.kind])}, not a ${figure.kind}`
+        : !(Math.abs(height - figure.heightM) < FIGURE_HEIGHT_TOLERANCE_M)
+          ? `its root is ${String(props[DESK_PROPS.heightM])} m tall, not ${figure.heightM} m`
+          : rigDigest(bones.map((b) => String(isRecord(b) ? (b.name ?? '') : ''))) !== figure.rig
+            ? "its armature's bones are not the rig its header names"
+            : null;
+  if (why)
+    throw new UnitError('UNIT_BAD_RECORD', `the figure's body is not the one its header describes: ${why}`);
 }
 
 // ---------------------------------------------------------------- files
@@ -501,8 +557,17 @@ export function decodeUnit(bytes: Uint8Array): UnitPayload {
   else body = payload.slice();
   if (sha256Hex(body) !== header.digest)
     throw new UnitError('UNIT_CORRUPT', 'its body does not match its digest');
-  const decoded = decodeUnitBody(body);
-  checkUnitBody(decoded, header.kind, true);
+  let decoded: UnitBody;
+  try {
+    decoded = decodeUnitBody(body);
+    checkUnitBody(decoded, header.kind, true);
+    if (header.figure) checkFigureBody(decoded, header.figure);
+  } catch (err) {
+    // a record of a shape no check foresaw is the unit's fault (out of memory is not: it stays as it is)
+    if (err instanceof TypeError)
+      throw new UnitError('UNIT_BAD_RECORD', `its records do not read (${err.message})`);
+    throw err;
+  }
   return { header, body: decoded, bytes };
 }
 

@@ -31,6 +31,7 @@ import {
   UNIT_FACTS_PROP,
   afterOf,
   decodeHeld,
+  failSlot,
   heldPropFacts,
   planUnitsOf,
   recordPinOf,
@@ -394,14 +395,19 @@ export function stageBriefIn(
     },
   });
   decodeHeld(resolved, source);
-  const plan = planBrief(brief, { preRollFrames: opts.preRollFrames, units: planUnitsOf(doc, resolved) });
-  const warnings = [...plan.warnings, ...unitWarnings(resolved)];
-  // a library set is the scene's set before the import, so that the cameras it solves see it
+  // a library set is the scene's set before the import, so that the cameras it solves see it; one
+  // that does not go in is not used (the words' set is staged, the slot says why), the rest goes on
   const done = new Set<string>();
   if (resolved.set?.action === 'place' && resolved.set.payload) {
-    insertSetUnit(doc, brief.id, resolved.set);
-    done.add(resolved.set.key);
+    try {
+      insertSetUnit(doc, brief.id, resolved.set);
+      done.add(resolved.set.key);
+    } catch (err) {
+      failSlot(resolved.set, err);
+    }
   }
+  const plan = planBrief(brief, { preRollFrames: opts.preRollFrames, units: planUnitsOf(doc, resolved) });
+  const warnings = [...plan.warnings, ...unitWarnings(resolved)];
   const r = importRideoBlocking(briefContext(ctx, warnings), plan.input, solveShotCameras, {
     ...(plan.units.set ? { marks: plan.marks } : {}),
     figure: (cid) => {

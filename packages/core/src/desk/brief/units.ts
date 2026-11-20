@@ -673,12 +673,20 @@ export function decodeHeld(resolved: ResolvedUnits, source: UnitSource | null): 
       if (!source) throw new UnitError('UNIT_NOT_FOUND', 'no units are held');
       s.payload = source.unit(s.pin);
     } catch (err) {
-      s.payload = null;
-      s.held = null;
-      s.problem = unitReadProblem(err);
-      s.action = 'none';
+      failSlot(s, err);
     }
   }
+}
+
+/**
+ * Slot `s`'s unit is not used after all (it did not decode, or did not go in): the slot keeps what it
+ * has, with the problem (refused, or pending 'unavailable' for an error that is not the unit's).
+ */
+export function failSlot(s: SlotUnit, err: unknown): void {
+  s.payload = null;
+  s.held = null;
+  s.problem = unitReadProblem(err);
+  s.action = 'none';
 }
 
 // ---------------------------------------------------------------- the slots after staging

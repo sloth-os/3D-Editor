@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
-import { fcurveKey } from '../src/doc/scene-doc';
+import { SceneDoc, fcurveKey } from '../src/doc/scene-doc';
 import { createConstraint } from '../src/constraints/catalogue';
 import { applyPose, holdProp } from '../src/desk/characters';
 import { getShots } from '../src/desk/shots';
@@ -279,6 +279,37 @@ describe('updateUnit', () => {
     const prop = unitFrom(src, { kind: 'prop', root: bench }).unit;
     expect(code(() => updateUnit(doc, mira, prop, pin(2, SHA2)))).toBe('UNIT_KIND_MISMATCH');
     expect(code(() => updateUnit(doc, propOf(doc, KITE).id, prop, pin(2, SHA2)))).toBe('UNIT_NOT_FOUND');
+  });
+});
+
+describe('a part whose source id is named like a member of Object.prototype', () => {
+  it("is dropped like any other when the next version lacks it ('toString' is not Object.prototype.toString)", () => {
+    const src = stagedDoc();
+    const kite = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id }).unit;
+    // the sail (a mesh nothing hangs from) renamed 'toString' in v1; v2 drops it
+    const leaf = srcNamed(kite.body, 'sail');
+    expect(Object.values(kite.body.blocks.objects!).some((r) => r.parent === leaf)).toBe(false);
+    const name: string = 'toString';
+    const v1 = editedUnit(kite, (body) => {
+      const objects = body.blocks.objects!;
+      objects[name] = objects[leaf];
+      delete objects[leaf];
+    });
+    const v2 = editedUnit(v1, (body) => {
+      const mesh = body.blocks.objects![name].data as string;
+      delete body.blocks.objects![name];
+      if (!Object.values(body.blocks.objects!).some((r) => r.data === mesh)) delete body.blocks.meshes![mesh];
+    });
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, v1, { ...pin(1, SHA1), key: `el:${KITE}` });
+    const part = r.ids['objects:toString'];
+    const before = doc.getObject(part)!;
+    expect(before.type).toBe('MESH');
+    const rep = updateUnit(doc, r.root, v2, pin(2, SHA2));
+    expect(rep.removed.map((p) => p.id)).toContain(part);
+    expect(rep.updated.map((p) => p.id)).not.toContain(part);
+    expect(doc.getObject(part)).toBeNull();
+    expect(unitStatus(doc, r.root)).toEqual({ edited: [], missing: [] });
   });
 });
 

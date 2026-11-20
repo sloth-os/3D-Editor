@@ -9,18 +9,35 @@ import { fcurveKey } from '../src/doc/scene-doc';
 import {
   UNIT_ROOT,
   UnitError,
+  decodeUnit,
   deriveUnitId,
+  docHasUnitInstances,
+  encodeUnit,
+  encodeUnitBody,
   insertUnit,
   listUnits,
   makeLocal,
   readInstance,
   removeObjectTrees,
   unitStatus,
+  type UnitBody,
   type UnitPayload,
 } from '../src/desk/units';
+import { UNIT_MAGIC, gzipDeterministic, sha256Hex, writeContainer } from '../src/desk/container';
 import type { DatablockKind } from '../src/doc/types';
 import { createCube } from '../src/mesh/primitives';
-import { MIRA, PIP, actorOf, dress, pin, stagedDoc, unitFrom } from './desk-units-helpers';
+import {
+  KITE,
+  MIRA,
+  PIP,
+  actorOf,
+  dress,
+  headerInput,
+  pin,
+  propOf,
+  stagedDoc,
+  unitFrom,
+} from './desk-units-helpers';
 
 /*
  * Inserting a decoded unit (desk/units/insert.ts): derived ids, names, placement, scene props, the
@@ -397,5 +414,71 @@ describe('a slot an instance was taken out of', () => {
     expect(again.ids).toEqual(r.ids);
     expect(held(doc, again.ids)).toHaveLength(Object.keys(r.ids).length);
     expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
+  });
+});
+
+describe("a figure's body is the actor its header describes", () => {
+  /** Mira's unit file with its body changed by `edit`, written as given (encodeUnit would refuse it). */
+  function crafted(edit: (body: UnitBody) => void): Uint8Array {
+    const unit = miraUnit();
+    const body = structuredClone(unit.body);
+    edit(body);
+    const b = encodeUnitBody(body);
+    const header = {
+      ...unit.header,
+      counts: { ...unit.header.counts, blobBytes: b.blobBytes },
+      digest: sha256Hex(b.bytes),
+      bodyBytes: b.bytes.length,
+    };
+    return writeContainer({
+      magic: UNIT_MAGIC,
+      version: 1,
+      codec: 'gzip',
+      header: new TextEncoder().encode(JSON.stringify(header)),
+      payload: gzipDeterministic(b.bytes),
+    });
+  }
+  const rootProps = (b: UnitBody) => b.blocks.objects![UNIT_ROOT].custom_props as Record<string, unknown>;
+
+  it('decodes as extracted; a root that is no actor, of another kind or height, or another rig is UNIT_BAD_RECORD', () => {
+    expect(code(() => decodeUnit(crafted(() => {})))).toBe('no error');
+    expect(code(() => decodeUnit(crafted((b) => void (rootProps(b).desk_role = 'prop'))))).toBe(
+      'UNIT_BAD_RECORD',
+    );
+    expect(code(() => decodeUnit(crafted((b) => void (rootProps(b).desk_kind = 'dog'))))).toBe(
+      'UNIT_BAD_RECORD',
+    );
+    const taller = (b: UnitBody) =>
+      void (rootProps(b).desk_height_m = Number(rootProps(b).desk_height_m) + 0.01);
+    expect(code(() => decodeUnit(crafted(taller)))).toBe('UNIT_BAD_RECORD');
+    const renamed = (b: UnitBody) => {
+      const arm = Object.values(b.blocks.armatures!)[0];
+      (arm.bones as { name: string }[])[3].name = 'renamed';
+    };
+    expect(code(() => decodeUnit(crafted(renamed)))).toBe('UNIT_BAD_RECORD');
+  });
+});
+
+describe("a unit whose records carry the scene's props", () => {
+  it('inserts without them: a part stamped unit_* is no second instance, and nothing is left after Make local', () => {
+    const src = stagedDoc();
+    const { unit } = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id });
+    const body = structuredClone(unit.body);
+    const part = Object.keys(body.blocks.objects!).find((k) => k !== UNIT_ROOT)!;
+    body.blocks.objects![part].custom_props = {
+      ...(body.blocks.objects![part].custom_props as object),
+      unit_ref: 'lib:fake',
+      unit_version: 1,
+      unit_key: 'el:fake',
+      desk_element_id: 'ele_0123456789fake',
+    };
+    const crafted = decodeUnit(encodeUnit(body, headerInput(unit.header)));
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, crafted, { ...pin(), key: `el:${KITE}` });
+    expect(listUnits(doc).map((i) => i.root)).toEqual([r.root]);
+    expect(doc.getObject(r.ids[`objects:${part}`])?.custom_props).not.toHaveProperty('unit_ref');
+    expect(doc.getObject(r.ids[`objects:${part}`])?.custom_props).not.toHaveProperty('desk_element_id');
+    makeLocal(doc, r.root);
+    expect(docHasUnitInstances(doc)).toBe(false);
   });
 });

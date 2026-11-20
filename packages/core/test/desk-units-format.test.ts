@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   MAX_UNIT_BODY_BYTES,
   MAX_UNIT_BYTES,
+  MAX_UNIT_DEPTH,
   MAX_UNIT_HEADER_BYTES,
   MAX_UNIT_META_BYTES,
   UNIT_FORMAT,
@@ -332,6 +333,72 @@ describe('what a unit file is refused for', () => {
     ).toBe('UNIT_BAD_RECORD');
     delete body.blocks.objects!['@root'];
     expect(code(() => encodeUnit(body, propHeader()))).toBe('UNIT_BAD_RECORD');
+  });
+});
+
+describe('decoding is the gate: what decodes, inserts', () => {
+  const dec = new TextDecoder();
+  /** The box's manifest text and the blob bytes after it, to break by hand. */
+  function boxManifest(): { text: string; blobs: Uint8Array } {
+    const raw = encodeUnitBody(boxBody()).bytes;
+    const n = new DataView(raw.buffer, raw.byteOffset).getUint32(0, true);
+    return { text: dec.decode(raw.subarray(4, 4 + n)), blobs: raw.subarray(4 + n) };
+  }
+  /** A file whose body is manifest `text` (as given, no checks) and `blobs`, with the box's header. */
+  function fromManifest(text: string, blobs: Uint8Array): Uint8Array {
+    const t = enc.encode(text);
+    const raw = new Uint8Array(4 + t.length + blobs.length);
+    new DataView(raw.buffer).setUint32(0, t.length, true);
+    raw.set(t, 4);
+    raw.set(blobs, 4 + t.length);
+    return file(fullHeader(boxBody(), { digest: sha256Hex(raw), bodyBytes: raw.length }), raw);
+  }
+  /** The box's file with the first `from` of its manifest written as `to`. */
+  function edited(from: string, to: string): Uint8Array {
+    const { text, blobs } = boxManifest();
+    expect(text).toContain(from);
+    return fromManifest(text.replace(from, to), blobs);
+  }
+
+  it('reads the box as written (the edits below are what is refused)', () => {
+    const { text, blobs } = boxManifest();
+    expect(code(() => decodeUnit(fromManifest(text, blobs)))).toBe('no error');
+  });
+
+  it('a number that is not finite (1e400 reads as Infinity): UNIT_BAD_RECORD', () => {
+    expect(code(() => decodeUnit(edited('"location":[0,0,0.5]', '"location":[0,0,1e400]')))).toBe(
+      'UNIT_BAD_RECORD',
+    );
+  });
+
+  it("a record with the key '__proto__', 'constructor' or 'prototype': UNIT_BAD_RECORD", () => {
+    for (const k of ['__proto__', 'constructor', 'prototype'])
+      expect(
+        code(() =>
+          decodeUnit(edited('"custom_props":{"license"', `"custom_props":{"${k}":{"x":1},"license"`)),
+        ),
+        k,
+      ).toBe('UNIT_BAD_RECORD');
+  });
+
+  it(`nesting deeper than ${MAX_UNIT_DEPTH}: UNIT_CORRUPT (not a stack overflow), however deep`, () => {
+    const nest = (n: number) => '['.repeat(n) + ']'.repeat(n);
+    const at = (n: number) =>
+      edited('"custom_props":{"license"', `"custom_props":{"deep":${nest(n)},"license"`);
+    expect(code(() => decodeUnit(at(10)))).toBe('no error');
+    expect(code(() => decodeUnit(at(MAX_UNIT_DEPTH)))).toBe('UNIT_CORRUPT');
+    expect(code(() => decodeUnit(at(10_000)))).toBe('UNIT_CORRUPT');
+  });
+
+  it("an id named like a member of Object.prototype ('valueOf', 'constructor') names nothing: UNIT_BAD_RECORD", () => {
+    expect(code(() => decodeUnit(edited('"parent":"@root"', '"parent":"valueOf"')))).toBe('UNIT_BAD_RECORD');
+    expect(
+      code(() =>
+        decodeUnit(
+          edited('"constraints":[]', '"constraints":[{"target":"constructor","type":"COPY_LOCATION"}]'),
+        ),
+      ),
+    ).toBe('UNIT_BAD_RECORD');
   });
 });
 

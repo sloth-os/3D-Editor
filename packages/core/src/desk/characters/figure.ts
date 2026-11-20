@@ -2,7 +2,7 @@ import type { Vec3 } from '../../math/types';
 import type { SceneDoc } from '../../doc/scene-doc';
 import { OperatorError } from '../../operators/context';
 import { DESK_PROPS } from '../props';
-import { rigDigest, type UnitHeader, type UnitPayload } from '../units/format';
+import { FIGURE_HEIGHT_TOLERANCE_M, rigDigest, type UnitHeader, type UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance } from '../units/list';
 import { dataKey, deleteData, instanceData, keptWarning, oldLook, unusedData } from '../units/remove';
@@ -30,8 +30,8 @@ import type { ActorKind } from './types';
  *   project.
  */
 
-/** Heights (m) closer than this are the same rig: a figure restyles an actor in place. */
-export const FIGURE_HEIGHT_TOLERANCE_M = 0.005;
+/** Heights (m) closer than this are the same rig: a figure restyles an actor in place (units/format.ts). */
+export { FIGURE_HEIGHT_TOLERANCE_M };
 
 /** A figure's kind, height and colour (a unit header's figure facts). */
 export interface FigureLook {

@@ -3,11 +3,11 @@ import { ROOT_COLLECTION_ID, type DatablockKind, type DriverData, type ObjectDat
 import type { Vec3 } from '../../math/types';
 import { cloneJson } from '../../util/json';
 import { UnitError } from './errors';
-import type { UnitBody, UnitHeader, UnitPayload } from './format';
+import { unitRecord, type UnitBody, type UnitHeader, type UnitPayload } from './format';
 import { UNIT_ROOT, deriveUnitId, requireUnitKey } from './ids';
 import { UNIT_BLOCK_KINDS, type UnitKind } from './kinds';
 import { provenanceProps, readInstance, type UnitPartStamp } from './list';
-import { mergeForUpdate, partSum16, splitProps } from './ownership';
+import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
 import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
 import { dataKey, deleteData, keptWarning, oldLook, unusedData } from './remove';
 
@@ -104,7 +104,7 @@ function fieldsOf(rec: UnitRecord): Record<string, unknown> & { name: string } {
 function unitBones(body: UnitBody): Set<string> | null {
   const root = body.blocks.objects?.[UNIT_ROOT];
   if (!root || root.type !== 'ARMATURE' || typeof root.data !== 'string') return null;
-  const arm = body.blocks.armatures?.[root.data];
+  const arm = unitRecord(body, 'armatures', root.data);
   const bones = Array.isArray(arm?.bones) ? (arm.bones as { name?: unknown }[]) : [];
   return new Set(bones.map((b) => String(b?.name ?? '')));
 }
@@ -211,27 +211,37 @@ export function writeUnitRecords(
     throw new UnitError('UNIT_NOT_FOUND', `the collection '${o.collection}' is not in the scene`);
 
   const map = (k: DatablockKind, src: string) => ids[`${k}:${src}`] ?? null;
+  // everything read from the unit's records is worked out before anything is written, so a unit that
+  // does not insert leaves the scene as it was (a Yjs transaction does not roll back)
   const stamps = new Map<string, UnitPartStamp>();
-  doc.transact(() => {
-    if (doomed.length) doc.removeObjects(doomed);
-    deleteData(doc, free);
+  // in the order the records were always written (names are made unique in that order)
+  const writes: {
+    kind: DatablockKind;
+    id: string;
+    fields: Record<string, unknown> & { name: string };
+    replace?: boolean;
+  }[] = [];
+  let drivers: DriverData[] = [];
+  try {
     for (const k of UNIT_BLOCK_KINDS) {
       const m = body.blocks[k];
       if (!m) continue;
       for (const src of Object.keys(m).sort()) {
         const rec = m[src];
         const id = ids[`${k}:${src}`];
-        const isRoot = k === 'objects' && src === UNIT_ROOT;
-        stamps.set(`${k}:${src}`, { id, sum: partSum16(k, rec, { isRoot, unitKind: kind }) });
-        const fields = fieldsOf(mapRecordRefs(k, rec, map));
-        if (!isRoot) {
-          doc.addRecord(k, id, fields);
+        const place = { isRoot: k === 'objects' && src === UNIT_ROOT, unitKind: kind };
+        stamps.set(`${k}:${src}`, { id, sum: partSum16(k, rec, place) });
+        // the scene's custom props are never the unit's (withUnitProps), on the root or any part
+        const fields = fieldsOf(mapRecordRefs(k, withUnitProps(k, rec, place), map));
+        if (!place.isRoot) {
+          writes.push({ kind: k, id, fields });
           continue;
         }
         if (o.replace && old) {
-          const merged = mergeForUpdate('objects', fields, old, { isRoot: true, unitKind: kind }, () => true);
+          const merged = mergeForUpdate('objects', fields, old, place, () => true);
           merged.custom_props = { ...(merged.custom_props as object), ...(o.rootProps ?? {}) };
-          doc.replaceRecord('objects', id, merged);
+          const fieldsOut = merged as Record<string, unknown> & { name: string };
+          writes.push({ kind: k, id, fields: fieldsOut, replace: true });
           continue;
         }
         fields.location = o.location ? [...o.location] : [0, 0, 0];
@@ -242,25 +252,36 @@ export function writeUnitRecords(
         fields.parent_bone = '';
         fields.collection = o.collection ?? ROOT_COLLECTION_ID;
         if (o.name) fields.name = o.name;
-        fields.custom_props = {
-          ...splitProps(fields.custom_props, { isRoot: true, unitKind: kind }).unit,
-          ...(o.rootProps ?? {}),
-        };
-        doc.addRecord('objects', id, fields);
+        fields.custom_props = { ...(fields.custom_props as object | undefined), ...(o.rootProps ?? {}) };
+        writes.push({ kind: k, id, fields });
       }
     }
-    for (const d of body.drivers) {
+    drivers = body.drivers.flatMap((d) => {
       const mapped = mapDriverRefs(d, map);
-      if (mapped) doc.setDriver(cloneJson(mapped) as unknown as DriverData);
-    }
-    if (provenance) {
+      return mapped ? [cloneJson(mapped) as unknown as DriverData] : [];
+    });
+  } catch (err) {
+    // a record of a shape decoding did not foresee is the unit's fault (out of memory is not)
+    if (err instanceof TypeError)
+      throw new UnitError('UNIT_BAD_RECORD', `the unit's records do not insert (${err.message})`);
+    throw err;
+  }
+  const provenanceOf = provenance ? provenance(stamps) : null;
+  const bones = o.replace ? unitBones(body) : null;
+  doc.transact(() => {
+    if (doomed.length) doc.removeObjects(doomed);
+    deleteData(doc, free);
+    for (const w of writes)
+      if (w.replace) doc.replaceRecord(w.kind, w.id, w.fields);
+      else doc.addRecord(w.kind, w.id, w.fields);
+    for (const d of drivers) doc.setDriver(d);
+    if (provenanceOf) {
       const cur = doc.readRecord('objects', rootId)!;
       doc.updateObject(rootId, {
-        custom_props: { ...(cur.custom_props as ObjectData['custom_props']), ...provenance(stamps) },
+        custom_props: { ...(cur.custom_props as ObjectData['custom_props']), ...provenanceOf },
       });
     }
     if (named.length) warnings.push(keptWarning(named, `the look the library ${kind} replaces`));
-    const bones = o.replace ? unitBones(body) : null;
     if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
   });
   return { root: rootId, ids, warnings };
