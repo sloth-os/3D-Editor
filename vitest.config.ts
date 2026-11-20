@@ -30,6 +30,11 @@ export default defineConfig({
           root: './apps/server',
           include: ['test/unit/**/*.test.ts'],
           environment: 'node',
+          // render and model store tests are CPU heavy too: under coverage, store-thumbnails'
+          // byte-for-byte test (ten 256 px renders) took 3.6–7.1 s here and timed out at vitest's
+          // 5 s default on a CI runner, and store-rest's aborted-download test took 4.2 s
+          testTimeout: 30_000,
+          hookTimeout: 30_000,
           env: FREEZE_EVALUATION_INPUT,
         },
       },
