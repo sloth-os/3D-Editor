@@ -4,7 +4,7 @@ import { docChangeToken } from '../../doc/change-token';
 import type { DatablockKind } from '../../doc/types';
 import { canonicalJsonStrict } from './canonical';
 import { UnitError } from './errors';
-import { UNIT_SOURCE_ID_PATTERN, parseSlotKey, type UnitSlot } from './ids';
+import { MAX_UNIT_GENERATION, UNIT_SOURCE_ID_PATTERN, parseSlotKey, type UnitSlot } from './ids';
 import { UNIT_BLOCK_KINDS, UNIT_KINDS, type UnitKind } from './kinds';
 
 /*
@@ -21,6 +21,9 @@ import { UNIT_BLOCK_KINDS, UNIT_KINDS, type UnitKind } from './kinds';
  *                 (the root is 'objects:@root'), with the stamp of what the unit gave it
  *   unit_drivers  canonical JSON {'<target type>:<sourceId>:<path>:<index>': '<sum16>'}: every driver the
  *                 unit gave, with its stamp (drivers.ts); read leniently (absent or malformed: none)
+ *   unit_gen      the generation the instance derives its parts' ids in (ids.ts derivePartId: a slot
+ *                 whose earlier instance left a part the scene still uses), from 1; absent for
+ *                 generation 0, and read leniently (malformed: 0)
  *
  * The table maps scene ids back to the unit's source ids (to publish a new version from the scene),
  * tells parts edited in the scene (their stamp no longer matches) and parts deleted there (absent),
@@ -39,6 +42,7 @@ export const UNIT_PROPS = {
   name: 'unit_name',
   parts: 'unit_parts',
   drivers: 'unit_drivers',
+  generation: 'unit_gen',
 } as const;
 
 /** A part of an instance as its table records it. */
@@ -63,6 +67,8 @@ export interface UnitInstance {
   parts: Map<string, UnitPartStamp>;
   /** The unit's drivers: their key in source ids → their stamp (drivers.ts). */
   drivers: Map<string, string>;
+  /** The generation the instance derives the ids of the parts it adds in (ids.ts derivePartId). */
+  generation: number;
 }
 
 /** What listUnits reports of an instance. */
@@ -157,8 +163,10 @@ export function exportedCustomProps<T>(props: Readonly<Record<string, T>>): Reco
   return out;
 }
 
-/** The custom props that make `root` an instance root. */
-export function provenanceProps(i: Omit<UnitInstance, 'root'>): Record<string, string | number> {
+/** The custom props that make `root` an instance root (unit_gen only from generation 1: see withProvenance). */
+export function provenanceProps(
+  i: Omit<UnitInstance, 'root' | 'generation'> & { generation?: number },
+): Record<string, string | number> {
   return {
     [UNIT_PROPS.ref]: i.ref,
     [UNIT_PROPS.version]: i.version,
@@ -169,7 +177,26 @@ export function provenanceProps(i: Omit<UnitInstance, 'root'>): Record<string, s
     [UNIT_PROPS.name]: i.name,
     [UNIT_PROPS.parts]: partsTableText(i.parts),
     [UNIT_PROPS.drivers]: driversTableText(i.drivers),
+    ...(i.generation ? { [UNIT_PROPS.generation]: i.generation } : {}),
   };
+}
+
+/**
+ * A root's custom props `props` with provenance `p` (provenanceProps) written over them: a generation
+ * `p` leaves out (0) is no longer there either.
+ */
+export function withProvenance<T>(
+  props: Readonly<Record<string, T>> | undefined,
+  p: Record<string, string | number>,
+): Record<string, T | string | number> {
+  const out: Record<string, T | string | number> = { ...props, ...p };
+  if (!Object.hasOwn(p, UNIT_PROPS.generation)) delete out[UNIT_PROPS.generation];
+  return out;
+}
+
+/** A unit_gen value read leniently: a whole number from 1 to MAX_UNIT_GENERATION, else 0. */
+function parseGeneration(v: unknown): number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= MAX_UNIT_GENERATION ? v : 0;
 }
 
 function parseInstance(root: string, props: unknown): UnitInstance | null {
@@ -216,7 +243,20 @@ function parseInstance(root: string, props: unknown): UnitInstance | null {
   const own = parts.get('objects:@root');
   if (!own || own.id !== root) return null;
   const drivers = parseDrivers(p[UNIT_PROPS.drivers]);
-  return { root, ref, version, sha256, digest, kind: kind as UnitKind, key, name, parts, drivers };
+  const generation = parseGeneration(p[UNIT_PROPS.generation]);
+  return {
+    root,
+    ref,
+    version,
+    sha256,
+    digest,
+    kind: kind as UnitKind,
+    key,
+    name,
+    parts,
+    drivers,
+    generation,
+  };
 }
 
 /** The instance whose root is `root` (null: not an instance root, or its provenance does not read). */

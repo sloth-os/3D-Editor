@@ -116,6 +116,11 @@ export interface UnitLinkPlan {
   parts: Record<string, { sceneId: string; sum16: string }>;
   /** The unit's drivers: their key in source ids → their stamp (drivers.ts; absent in older plans: none). */
   drivers?: Record<string, string>;
+  /**
+   * The generation of the slot's ids the instance it was made from derives in (ids.ts derivePartId;
+   * absent: 0), which the instance adoption makes keeps.
+   */
+  generation?: number;
 }
 
 export interface UnitExtraction {
@@ -606,6 +611,7 @@ export function extractUnit(doc: SceneDoc, spec: UnitSpec, o: { deskVersion: str
     digest: fileHeader.digest,
     parts,
     drivers: Object.fromEntries(driverStamps(drivers)),
+    ...(m.instance?.generation ? { generation: m.instance.generation } : {}),
   };
   return {
     data,

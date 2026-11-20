@@ -1,5 +1,5 @@
 import { fcurveKey, type SceneDoc } from '../../doc/scene-doc';
-import type { DatablockKind, DriverData } from '../../doc/types';
+import type { AnimTargetType, DatablockKind, DriverData } from '../../doc/types';
 import { cloneJson } from '../../util/json';
 import { sha256HexOfText } from '../container/digest';
 import { canonicalJsonStrict } from './canonical';
@@ -12,9 +12,12 @@ import { ANIM_TARGET_KINDS, mapDriverRefs, type UnitRecord } from './refs';
  * target's source id: '<target type>:<source id>:<path>:<index>') with the first 16 hex digits of the
  * SHA-256 of its canonical JSON in source ids. An update treats a driver as it treats a part
  * (update.ts): one the scene left as the unit gave it takes the new version, or goes when the new
- * version drops it; one edited in the scene is kept, with a warning when the new version changed it
- * too; one deleted in the scene stays deleted; a driver only the new version has is added unless the
- * scene drives that channel itself. Drivers outside the table (the scene's own) are never touched.
+ * version drops it (when the new version drops the part it drives too, it goes with that part: a
+ * dropped part the scene still uses stays, driven as it was); one edited in the scene is kept, with
+ * a warning when the new version changed it too; one deleted in the scene stays deleted; a driver
+ * only the new version has is added unless the scene drives that channel itself. Drivers outside the
+ * table (the scene's own) are never touched. unitStatus (status.ts) names the ones edited or
+ * deleted in the scene (driversChanged).
  */
 
 /** A driver's key: its target type, target id, path and index (fcurveKey), ids as the driver has them. */
@@ -47,6 +50,40 @@ function sceneDrivers(doc: SceneDoc, toSrc: IdMap): Map<string, { scene: DriverD
   return out;
 }
 
+/**
+ * The keys of the drivers in `stamps` (an instance's unit_drivers) the scene edited and deleted,
+ * sorted; `toSrc` maps scene ids to the instance's source ids.
+ */
+export function driversChanged(
+  doc: SceneDoc,
+  stamps: ReadonlyMap<string, string>,
+  toSrc: IdMap,
+): { edited: string[]; missing: string[] } {
+  const edited: string[] = [];
+  const missing: string[] = [];
+  if (!stamps.size) return { edited, missing };
+  const current = sceneDrivers(doc, toSrc);
+  for (const key of [...stamps.keys()].sort()) {
+    const cur = current.get(key);
+    if (!cur) missing.push(key);
+    else if (driverSum16(cur.src) !== stamps.get(key)) edited.push(key);
+  }
+  return { edited, missing };
+}
+
+/** The datablocks a driver's variables read (the world and the scene left out). */
+export function driverReads(d: DriverData): { kind: DatablockKind; id: string }[] {
+  const out: { kind: DatablockKind; id: string }[] = [];
+  for (const v of Array.isArray(d.variables) ? (d.variables as unknown[]) : []) {
+    if (!v || typeof v !== 'object') continue;
+    const { target_type: type, target_id: id } = v as { target_type?: unknown; target_id?: unknown };
+    if (typeof type !== 'string' || !Object.hasOwn(ANIM_TARGET_KINDS, type) || typeof id !== 'string')
+      continue;
+    out.push({ kind: ANIM_TARGET_KINDS[type as AnimTargetType]!, id });
+  }
+  return out;
+}
+
 /** How a driver reads in a warning: its target's name, path and index. */
 function driverName(doc: SceneDoc, d: DriverData): string {
   const kind = ANIM_TARGET_KINDS[d.target_type];
@@ -58,7 +95,9 @@ function driverName(doc: SceneDoc, d: DriverData): string {
  * Updates the unit's drivers in the scene (inside the update's transaction, after its parts) from the
  * instance's `stamps` to the new version's `next` drivers (source ids), as the module comment says.
  * `toSrc` maps scene ids to source ids, `toScene` source ids to the scene ids of the parts the update
- * keeps (null: none). Returns the new table and pushes warnings.
+ * keeps (null: none). Returns the new table (`table`) and the drivers the new version drops together
+ * with the part they drive, left in place (`withPart`: the update removes each with its part, or
+ * leaves it to the scene with the part when the scene still uses that), and pushes warnings.
  */
 export function updateDrivers(
   doc: SceneDoc,
@@ -67,8 +106,9 @@ export function updateDrivers(
   toSrc: IdMap,
   toScene: IdMap,
   warnings: string[],
-): Map<string, string> {
+): { table: Map<string, string>; withPart: DriverData[] } {
   const out = new Map<string, string>();
+  const withPart: DriverData[] = [];
   const current = sceneDrivers(doc, toSrc);
   const nextByKey = new Map(next.map((d) => [driverKeyOf(d), d]));
   const write = (d: UnitRecord): boolean => {
@@ -102,11 +142,15 @@ export function updateDrivers(
       }
       continue;
     }
-    // left as the unit gave it: the new version's, or gone
-    if (!nd) doc.removeDriver(fcurveKey(cur.scene));
-    else if (driverSum16(nd) === old) out.set(key, old);
+    // left as the unit gave it: the new version's, or gone (with the part it drives when the new
+    // version drops that too)
+    if (!nd) {
+      const kind = ANIM_TARGET_KINDS[cur.src.target_type as AnimTargetType]!;
+      if (toScene(kind, String(cur.src.target_id)) === null) withPart.push(cur.scene);
+      else doc.removeDriver(fcurveKey(cur.scene));
+    } else if (driverSum16(nd) === old) out.set(key, old);
     else if (write(nd)) out.set(key, driverSum16(nd));
     else out.set(key, old);
   }
-  return out;
+  return { table: out, withPart };
 }

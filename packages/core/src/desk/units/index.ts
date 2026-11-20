@@ -53,9 +53,11 @@ export {
   type UnitPublishMeta,
 } from './format';
 export {
+  MAX_UNIT_GENERATION,
   UNIT_KEY_PATTERN,
   UNIT_ROOT,
   UNIT_SOURCE_ID_PATTERN,
+  derivePartId,
   deriveUnitId,
   parseSlotKey,
   requireUnitKey,
@@ -105,4 +107,4 @@ export {
   type UnitInstanceInfo,
   type UnitPartStamp,
 } from './list';
-export { unitStatus, type UnitPartRef } from './status';
+export { unitStatus, type UnitDriverRef, type UnitPartRef, type UnitStatus } from './status';

@@ -1,12 +1,20 @@
-import type { SceneDoc } from '../../doc/scene-doc';
-import type { DatablockKind, ObjectData } from '../../doc/types';
+import { fcurveKey, type SceneDoc } from '../../doc/scene-doc';
+import type { DatablockKind, DriverData, ObjectData } from '../../doc/types';
 import { getShots } from '../shots';
 import { UnitError } from './errors';
 import { unitRecord, type UnitPayload } from './format';
-import { UNIT_ROOT, deriveUnitId } from './ids';
+import { MAX_UNIT_GENERATION, UNIT_ROOT, derivePartId } from './ids';
 import { requirePin, type UnitPin } from './insert';
 import { UNIT_BLOCK_KINDS, type UnitBlockKind } from './kinds';
-import { UNIT_PROPS, provenanceProps, requireInstance, splitPartKey, type UnitPartStamp } from './list';
+import {
+  UNIT_PROPS,
+  provenanceProps,
+  requireInstance,
+  splitPartKey,
+  withProvenance,
+  type UnitInstance,
+  type UnitPartStamp,
+} from './list';
 import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
 import {
   ANIM_TARGET_KINDS,
@@ -18,7 +26,7 @@ import {
 } from './refs';
 import { dataKey, deleteData, unusedData } from './remove';
 import { currentSum, sourceIndex, toSourceId, toSourceMap, type UnitPartRef } from './status';
-import { updateDrivers } from './drivers';
+import { driverReads, updateDrivers } from './drivers';
 import { cloneJson } from '../../util/json';
 
 /*
@@ -31,8 +39,10 @@ import { cloneJson } from '../../util/json';
  *   physics, hiding and pose, the scene's props, constraints targeting outside) are kept;
  * - a part edited in the scene is kept as it is and reported ('edited'; with a warning when the new
  *   version changed it too); a part deleted in the scene stays deleted ('deleted');
- * - a part only the new version has is added with a derived id (a datablock nothing uses at that id,
- *   left behind by an instance taken out of the slot before, is deleted for it; remove.ts);
+ * - a part only the new version has is added with an id derived in the instance's generation (ids.ts
+ *   derivePartId; a datablock nothing uses at that id, left behind by an instance taken out of the
+ *   slot before, is deleted for it, remove.ts; an id something the scene keeps holds moves the part on
+ *   to the next generation whose id is free);
  * - a part the new version drops is removed when the scene left it untouched and nothing that stays
  *   uses it (a record that stays refers to it: another object, a part the update keeps, a camera's
  *   focus; or animation, drivers, shots, the scene camera), with the data and materials only it used;
@@ -42,7 +52,10 @@ import { cloneJson } from '../../util/json';
  * A part the update writes is stamped as written: a reference to a part that is not in the scene
  * (deleted here, taken or dropped) is cut, and the stamp is the cut record's, so the part reads
  * untouched afterwards. The unit's drivers follow the same rules, by their own table (unit_drivers,
- * drivers.ts); they are updated before the dropped parts go, so a driver the unit drops is not a use.
+ * drivers.ts); they are updated before the dropped parts go, so a driver the unit drops is no use of
+ * the part it drives. One the new version drops together with the part it drives goes with that
+ * part, or stays with it when the scene still uses the part (the scene's then, as the part is), and
+ * what it reads stays with it.
  *
  * The same content (an equal body digest) changes no part: only the provenance moves (noop).
  */
@@ -66,12 +79,21 @@ export interface UnitUpdateReport {
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Uint8Array);
 
+/** The datablock a unit driver drives, as '<kind>:<id>'. */
+const partOf = (d: DriverData): string => dataKey(ANIM_TARGET_KINDS[d.target_type]!, d.target_id);
+
 /**
  * The parts among `drops` ('<kind>:<id>') that nothing staying in the document uses: no record outside
  * them refers to one, and no F-curve, driver, shot, the scene camera or the desk's main pair names
- * one. A dropped part something staying uses stays, and then so does what it uses.
+ * one. A dropped part something staying uses stays, and then so does what it uses. `withPart`: the
+ * unit's drivers the new version drops together with the part they drive (drivers.ts), which are no
+ * use of that part and stay or go with it: what one reads is used while its part stays.
  */
-function unusedDrops(doc: SceneDoc, drops: ReadonlySet<string>): Set<string> {
+function unusedDrops(
+  doc: SceneDoc,
+  drops: ReadonlySet<string>,
+  withPart: readonly DriverData[],
+): Set<string> {
   const going = new Set(drops);
   const refsOf = new Map<string, string[]>();
   const used: string[] = [];
@@ -90,8 +112,17 @@ function unusedDrops(doc: SceneDoc, drops: ReadonlySet<string>): Set<string> {
     const kind = ANIM_TARGET_KINDS[fc.target_type];
     if (kind) use(dataKey(kind, fc.target_id));
   }
-  for (const d of doc.listDrivers())
+  const deferred = new Set(withPart.map((d) => fcurveKey(d)));
+  for (const d of doc.listDrivers()) {
+    if (deferred.has(fcurveKey(d))) continue;
     for (const r of collectDriverRefs(d as unknown as UnitRecord)) use(dataKey(r.kind, r.id));
+  }
+  for (const d of withPart) {
+    const part = partOf(d);
+    const reads = driverReads(d).map((r) => dataKey(r.kind, r.id));
+    if (going.has(part)) refsOf.set(part, [...(refsOf.get(part) ?? []), ...reads]);
+    else if (doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id)) reads.forEach(use);
+  }
   for (const s of getShots(doc)) {
     if (s.camera) use(dataKey('objects', s.camera));
     for (const id of s.subjects) use(dataKey('objects', id));
@@ -103,6 +134,47 @@ function unusedDrops(doc: SceneDoc, drops: ReadonlySet<string>): Set<string> {
   for (let key = used.pop(); key !== undefined; key = used.pop())
     if (going.delete(key)) for (const r of refsOf.get(key) ?? []) use(r);
   return going;
+}
+
+/**
+ * The ids of the parts `fresh` ('<kind>:<sourceId>') an update adds to instance `inst`, each derived
+ * in the instance's generation, or in the next one whose id is free when something the scene keeps
+ * holds it (a part may land in a later generation than the instance's other parts: its id is in the
+ * table); and the datablocks nothing uses at those ids, which go for them. A part no generation
+ * frees keeps the instance's id, taken (the update leaves it out, with a warning).
+ */
+function addedIds(
+  doc: SceneDoc,
+  inst: UnitInstance,
+  fresh: readonly string[],
+): { added: Map<string, string>; free: Set<string> } {
+  const added = new Map<string, string>();
+  const free = new Set<string>();
+  const taken = new Set([...inst.parts.values()].map((p) => p.id));
+  const idAt = (pk: string, generation: number) => {
+    const src = splitPartKey(pk)!.src;
+    return src === UNIT_ROOT ? inst.root : derivePartId(inst.key, src, generation);
+  };
+  let left = fresh.filter((pk) => splitPartKey(pk));
+  for (let g = inst.generation; left.length && g <= MAX_UNIT_GENERATION; g++) {
+    const at = left.map((pk) => [pk, idAt(pk, g), splitPartKey(pk)!.kind] as const);
+    const held = at.flatMap(([, id, kind]) =>
+      kind !== 'objects' && doc.has(kind, id) ? [dataKey(kind, id)] : [],
+    );
+    const unused = held.length ? unusedData(doc, held) : new Set<string>();
+    const next: string[] = [];
+    for (const [pk, id, kind] of at) {
+      const here = doc.has(kind, id);
+      if (!taken.has(id) && (!here || (kind !== 'objects' && unused.has(dataKey(kind, id))))) {
+        added.set(pk, id);
+        taken.add(id);
+        if (here) free.add(dataKey(kind, id));
+      } else next.push(pk);
+    }
+    left = next;
+  }
+  for (const pk of left) added.set(pk, idAt(pk, inst.generation));
+  return { added, free };
 }
 
 /**
@@ -142,9 +214,9 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
   const writeProvenance = (parts: Map<string, UnitPartStamp>, drivers: Map<string, string>) => {
     const cur = doc.readRecord('objects', root)!;
     doc.updateObject(root, {
-      custom_props: {
-        ...(cur.custom_props as ObjectData['custom_props']),
-        ...provenanceProps({
+      custom_props: withProvenance(
+        cur.custom_props as ObjectData['custom_props'],
+        provenanceProps({
           ...p,
           digest: header.digest,
           kind: inst.kind,
@@ -152,8 +224,9 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
           name: header.name,
           parts,
           drivers,
+          generation: inst.generation,
         }),
-      },
+      ) as ObjectData['custom_props'],
     });
   };
   if (inst.digest === header.digest) {
@@ -172,22 +245,14 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
   // the scene id of every part, old and new: old ones keep theirs, new ones derive theirs
   const idOf = new Map<string, string>();
   for (const [pk, s] of inst.parts) idOf.set(pk, s.id);
-  const added = new Map<string, string>();
+  const fresh: string[] = [];
   for (const k of UNIT_BLOCK_KINDS)
     for (const src of Object.keys(unit.body.blocks[k] ?? {})) {
       const pk = `${k}:${src}`;
-      if (idOf.has(pk)) continue;
-      const id = src === UNIT_ROOT ? root : deriveUnitId(inst.key, src);
-      idOf.set(pk, id);
-      added.set(pk, id);
+      if (!idOf.has(pk)) fresh.push(pk);
     }
-  const free = unusedData(
-    doc,
-    [...added].flatMap(([pk, id]) => {
-      const s = splitPartKey(pk);
-      return s && s.kind !== 'objects' && doc.has(s.kind, id) ? [dataKey(s.kind, id)] : [];
-    }),
-  );
+  const { added, free } = addedIds(doc, inst, fresh);
+  for (const [pk, id] of added) idOf.set(pk, id);
   const index = sourceIndex(inst, added);
   const toSrc = toSourceMap(index);
   const members = new Set<string>();
@@ -293,7 +358,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     }
     // the unit's drivers, stamped as parts are (drivers.ts), before the dropped parts go: a driver
     // of the unit on a part it drops goes with it and does not keep it
-    const drivers = updateDrivers(
+    const { table: drivers, withPart } = updateDrivers(
       doc,
       inst.drivers,
       unit.body.drivers,
@@ -301,11 +366,15 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       mapOut,
       report.warnings,
     );
-    const going = unusedDrops(doc, new Set(drops.map((d) => dataKey(d.kind, d.id))));
+    const going = unusedDrops(doc, new Set(drops.map((d) => dataKey(d.kind, d.id))), withPart);
     const gone = drops.filter((d) => going.has(dataKey(d.kind, d.id)));
     for (const d of drops)
       if (going.has(dataKey(d.kind, d.id))) report.removed.push(refOf(d.pk));
       else report.kept.push({ ...refOf(d.pk), reason: 'dropped-but-used' });
+    // a driver dropped with its part goes with it; one whose part stays is the scene's, as the part is
+    for (const d of withPart)
+      if (going.has(partOf(d)) || !doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id))
+        doc.removeDriver(fcurveKey(d));
     const objects = gone.filter((d) => d.kind === 'objects').map((d) => d.id);
     if (objects.length) doc.removeObjects(objects);
     for (const d of gone) {

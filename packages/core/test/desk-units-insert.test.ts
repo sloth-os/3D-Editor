@@ -9,8 +9,11 @@ import { fcurveKey } from '../src/doc/scene-doc';
 import {
   UNIT_ROOT,
   UnitError,
+  adoptUnit,
   decodeUnit,
+  derivePartId,
   deriveUnitId,
+  extractUnit,
   docHasUnitInstances,
   encodeUnit,
   encodeUnitBody,
@@ -21,6 +24,7 @@ import {
   readInstance,
   removeObjectTrees,
   unitStatus,
+  updateUnit,
   type UnitBody,
   type UnitPayload,
 } from '../src/desk/units';
@@ -34,6 +38,7 @@ import {
   PIP,
   actorOf,
   dress,
+  editedUnit,
   headerInput,
   pin,
   propOf,
@@ -140,7 +145,7 @@ describe('insertUnit', () => {
     expect(unitStatus(d2, r2.root).edited.map((p) => p.src)).toEqual([UNIT_ROOT]);
   });
 
-  it('refuses a second insert with the same key, a taken id, a bad key, a bad pin, a missing parent', () => {
+  it('refuses a second insert with the same key, a taken root id, a bad key, a bad pin, a missing parent', () => {
     const unit = miraUnit();
     const doc = SceneDoc.create({ empty: true });
     insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
@@ -148,16 +153,7 @@ describe('insertUnit', () => {
     const seeded = SceneDoc.create({ empty: true });
     seeded.addObject({ type: 'EMPTY', name: 'In the way' }, deriveUnitId('cast:b', UNIT_ROOT));
     expect(code(() => insertUnit(seeded, unit, { ...pin(), key: 'cast:b' }))).toBe('UNIT_ID_TAKEN');
-    const part = Object.keys(unit.body.blocks.meshes!)[0];
-    // a datablock at a derived id is taken while something uses it (one nothing uses is free: remove.ts)
-    const seeded2 = SceneDoc.create({ empty: true });
-    const user = seeded2.addObject({
-      type: 'MESH',
-      name: 'Uses it',
-      data: seeded2.addMesh('x', createCube(), deriveUnitId('cast:c', part)),
-    });
-    expect(code(() => insertUnit(seeded2, unit, { ...pin(), key: 'cast:c' }))).toBe('UNIT_ID_TAKEN');
-    expect(seeded2.objectIds()).toEqual([user]);
+    expect(seeded.objectIds()).toHaveLength(1);
     expect(code(() => insertUnit(doc, unit, { ...pin(), key: 'has space' }))).toBe('UNIT_BAD_KEY');
     expect(code(() => insertUnit(doc, unit, { ...pin(0), key: 'cast:d' }))).toBe('UNIT_BAD_SPEC');
     expect(code(() => insertUnit(doc, unit, { ...pin(1, 'ABC'), key: 'cast:d' }))).toBe('UNIT_BAD_SPEC');
@@ -378,10 +374,16 @@ describe('a slot an instance was taken out of', () => {
     removeObjectTrees(doc, [r.root]);
     expect(held(doc, r.ids)).toEqual([`materials:${mat}`]);
     expect(doc.getObject(cube)?.material_slots).toEqual([mat]);
-    expect(code(() => insertUnit(doc, unit, { ...pin(), key: 'cast:a' }))).toBe('UNIT_ID_TAKEN');
+    // the slot takes the unit again in the next generation of its ids; the material stays the cube's
+    const again = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
+    expect(again.generation).toBe(1);
+    expect(again.root).toBe(r.root);
+    expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
+    expect(doc.getObject(cube)?.material_slots).toEqual([mat]);
+    expect(doc.getMaterial(mat)).not.toBeNull();
   });
 
-  it('what an older removal left at the ids the slot derives is deleted for the unit; one in use refuses it', () => {
+  it('what an older removal left at the ids the slot derives is deleted for the unit; one in use moves it on a generation', () => {
     const unit = miraUnit();
     const doc = SceneDoc.create({ empty: true });
     const r = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
@@ -400,8 +402,11 @@ describe('a slot an instance was taken out of', () => {
       data: used.addMesh('Cube', createCube()),
       material_slots: [mat],
     });
-    expect(code(() => insertUnit(used, unit, { ...pin(), key: 'cast:a' }))).toBe('UNIT_ID_TAKEN');
-    expect(used.objectIds()).toEqual([cube]);
+    const moved = insertUnit(used, unit, { ...pin(), key: 'cast:a' });
+    expect(moved.generation).toBe(1);
+    // the parts left at generation 0 that nothing uses stay where they are: generation 1 is all new
+    for (const k of left) expect(used.has(...(k.split(':') as [DatablockKind, string]))).toBe(true);
+    expect(used.getObject(cube)?.material_slots).toEqual([mat]);
     const again = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
     expect(again.ids).toEqual(r.ids);
     expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
@@ -416,6 +421,133 @@ describe('a slot an instance was taken out of', () => {
     expect(again.ids).toEqual(r.ids);
     expect(held(doc, again.ids)).toHaveLength(Object.keys(r.ids).length);
     expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
+  });
+});
+
+describe('a slot whose earlier instance left a part the scene keeps (generations of its ids)', () => {
+  /** The kite prop unit, made once from a staged scene. */
+  function kiteUnit(): UnitPayload {
+    const src = stagedDoc();
+    return unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id, name: 'Red kite' }).unit;
+  }
+  const key = `el:${KITE}`;
+  /** A kite inserted and taken out again, its first material kept by a cube of the person's. */
+  function leftMaterial(unit: UnitPayload): { doc: SceneDoc; first: Record<string, string>; mat: string } {
+    const doc = SceneDoc.create({ empty: true });
+    const first = insertUnit(doc, unit, { ...pin(), key }).ids;
+    const mat = Object.entries(first).find(([pk]) => kindOf(pk) === 'materials')![1];
+    doc.addObject({
+      type: 'MESH',
+      name: 'Mine',
+      data: doc.addMesh('Mine', createCube()),
+      material_slots: [mat],
+    });
+    removeObjectTrees(doc, [deriveUnitId(key, UNIT_ROOT)]);
+    return { doc, first, mat };
+  }
+
+  it('derives the parts in the first generation whose ids are all free; the root keeps its id', () => {
+    const unit = kiteUnit();
+    const { doc, first, mat } = leftMaterial(unit);
+    const r = insertUnit(doc, unit, { ...pin(), key });
+    expect(r.generation).toBe(1);
+    for (const [pk, id] of Object.entries(r.ids)) {
+      const src = pk.slice(pk.indexOf(':') + 1);
+      expect(id).toBe(src === UNIT_ROOT ? deriveUnitId(key, UNIT_ROOT) : derivePartId(key, src, 1));
+      if (src !== UNIT_ROOT) expect(id).not.toBe(first[pk]);
+    }
+    expect(derivePartId(key, 'abc', 0)).toBe(deriveUnitId(key, 'abc'));
+    expect(derivePartId(key, UNIT_ROOT, 3)).toBe(deriveUnitId(key, UNIT_ROOT));
+    expect(doc.getObject(r.root)?.custom_props.unit_gen).toBe(1);
+    expect(readInstance(doc, r.root)?.generation).toBe(1);
+    expect(unitStatus(doc, r.root)).toEqual({ edited: [], missing: [] });
+    expect(doc.getMaterial(mat)?.name).toBeTruthy();
+    // generation 0 writes no unit_gen at all (the provenance of every instance before is as it was)
+    const plain = SceneDoc.create({ empty: true });
+    const p = insertUnit(plain, unit, { ...pin(), key });
+    expect(p.generation).toBe(0);
+    expect(plain.getObject(p.root)?.custom_props).not.toHaveProperty('unit_gen');
+    expect(readInstance(plain, p.root)?.generation).toBe(0);
+  });
+
+  it('moves on a generation for an object the person moved out from under the instance', () => {
+    const unit = kiteUnit();
+    const doc = SceneDoc.create({ empty: true });
+    const first = insertUnit(doc, unit, { ...pin(), key });
+    const part = Object.entries(first.ids).find(
+      ([pk, id]) => kindOf(pk) === 'objects' && id !== first.root,
+    )![1];
+    doc.setParent(part, null, true);
+    removeObjectTrees(doc, [first.root]);
+    expect(doc.has('objects', part)).toBe(true);
+    const r = insertUnit(doc, unit, { ...pin(), key });
+    expect(r.generation).toBe(1);
+    expect(Object.values(r.ids)).not.toContain(part);
+    expect(doc.has('objects', part)).toBe(true);
+  });
+
+  it('two replicas move on to the same generation: the same ids, merged without doubling', () => {
+    const unit = kiteUnit();
+    const { doc } = leftMaterial(unit);
+    const a = SceneDoc.fromUpdate(doc.encodeState());
+    const b = SceneDoc.fromUpdate(doc.encodeState());
+    const ra = insertUnit(a, unit, { ...pin(), key });
+    const rb = insertUnit(b, unit, { ...pin(), key });
+    expect(rb.ids).toEqual(ra.ids);
+    expect(rb.generation).toBe(1);
+    const count = a.listObjects().length;
+    Y.applyUpdate(a.ydoc, Y.encodeStateAsUpdate(b.ydoc));
+    expect(a.listObjects()).toHaveLength(count);
+    expect(listUnits(a)).toHaveLength(1);
+    expect(unitStatus(a, ra.root)).toEqual({ edited: [], missing: [] });
+  });
+
+  it('a later version adds its new parts in the generation, or the next one whose id is free', () => {
+    const unit = kiteUnit();
+    const { doc } = leftMaterial(unit);
+    const r = insertUnit(doc, unit, { ...pin(), key });
+    const extra = (body: UnitBody, src: string) => {
+      const mats = body.blocks.materials!;
+      mats[src] = { ...Object.values(mats)[0], name: src };
+    };
+    const v2 = editedUnit(unit, (b) => extra(b, 'added1'));
+    // something of the person's holds the id 'added1' would take in generation 1
+    const mine = doc.addMaterial({ name: 'Theirs' }, derivePartId(key, 'added1', 1));
+    doc.addObject({
+      type: 'MESH',
+      name: 'Theirs',
+      data: doc.addMesh('T', createCube()),
+      material_slots: [mine],
+    });
+    const rep = updateUnit(doc, r.root, v2, pin(2, 'c'.repeat(64)));
+    expect(rep.added.map((p) => [p.src, p.id])).toEqual([['added1', derivePartId(key, 'added1', 2)]]);
+    expect(rep.warnings).toEqual([]);
+    expect(readInstance(doc, r.root)?.generation).toBe(1);
+    expect(doc.getMaterial(mine)?.name).toBe('Theirs');
+    const v3 = editedUnit(v2, (b) => extra(b, 'added2'));
+    const rep3 = updateUnit(doc, r.root, v3, pin(3, 'd'.repeat(64)));
+    expect(rep3.added.map((p) => [p.src, p.id])).toEqual([['added2', derivePartId(key, 'added2', 1)]]);
+    expect(unitStatus(doc, r.root)).toEqual({ edited: [], missing: [] });
+  });
+
+  it('a version saved from the instance keeps its generation through adoption; Make local drops it', () => {
+    const unit = kiteUnit();
+    const { doc } = leftMaterial(unit);
+    const r = insertUnit(doc, unit, { ...pin(), key });
+    const ex = extractUnit(doc, { kind: 'prop', root: r.root, name: 'Red kite' }, { deskVersion: 'test' });
+    expect(ex.link.generation).toBe(1);
+    expect(Object.fromEntries(Object.entries(ex.link.parts).map(([pk, p]) => [pk, p.sceneId]))).toEqual(
+      r.ids,
+    );
+    makeLocal(doc, r.root);
+    expect(doc.getObject(r.root)?.custom_props).not.toHaveProperty('unit_gen');
+    const adopted = adoptUnit(doc, ex.link, pin(2, ex.sha256));
+    expect(readInstance(doc, adopted.root)?.generation).toBe(1);
+    expect(unitStatus(doc, adopted.root)).toEqual({ edited: [], missing: [] });
+    // a plan of a generation the desk does not make is not one extractUnit made
+    expect(code(() => adoptUnit(doc, { ...ex.link, generation: -1 }, pin(3, ex.sha256)))).toBe(
+      'UNIT_BAD_SPEC',
+    );
   });
 });
 

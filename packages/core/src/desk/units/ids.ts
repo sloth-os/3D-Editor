@@ -15,6 +15,14 @@ import { UnitError } from './errors';
  * same unit in the same slot make the same ids, so a merge of the same lineage never duplicates parts,
  * and the root ('@root') depends only on the key: relinking a slot to another item keeps the root,
  * and with it shot subjects, holds and the root's animation.
+ *
+ * Generations: a slot whose earlier instance left a part the scene still uses (the person gave its
+ * material to an object of their own, or moved one of its objects out from under it) cannot take the
+ * same ids again. An insert then derives its parts in the first generation n whose ids are all free
+ * (derivePartId: generation 0 is deriveUnitId(key, sourceId), generation n ≥ 1 hashes the key as
+ * `${key}#${n}`, which no key can be), and the instance keeps n (list.ts unit_gen) for the parts a
+ * later version adds. The root is never salted. The choice depends on the document alone, so every
+ * replica makes the same one.
  */
 
 /** newId's alphabet (util/id.ts). */
@@ -75,13 +83,32 @@ export function requireUnitKey(key: unknown): string {
 
 const encoder = new TextEncoder();
 
-/** The scene id of source `src` in the instance with key `key` (16 base62 characters). */
-export function deriveUnitId(key: string, src: string): string {
-  requireUnitKey(key);
+/** The most generations of a slot's ids an insert tries (see the module comment). */
+export const MAX_UNIT_GENERATION = 64;
+
+/** 16 characters of newId's alphabet from SHA-256('3d-editor/unit-id/v1' LF seed LF src). */
+function hashId(seed: string, src: string): string {
   if (!UNIT_SOURCE_ID_PATTERN.test(src))
     throw new UnitError('UNIT_BAD_RECORD', `'${src}' is not a source id`);
-  const h = sha256Bytes(encoder.encode(`3d-editor/unit-id/v1\n${key}\n${src}`));
+  const h = sha256Bytes(encoder.encode(`3d-editor/unit-id/v1\n${seed}\n${src}`));
   let out = '';
   for (let i = 0; i < 16; i++) out += ALPHABET[h[i] % 62];
   return out;
+}
+
+/** The scene id of source `src` in the instance with key `key` (16 base62 characters). */
+export function deriveUnitId(key: string, src: string): string {
+  return hashId(requireUnitKey(key), src);
+}
+
+/**
+ * The scene id of source `src` in generation `generation` (0 to MAX_UNIT_GENERATION) of the
+ * instance with key `key`: generation 0 is deriveUnitId(key, src), generation n hashes `${key}#${n}`;
+ * the root ('@root') is deriveUnitId(key, '@root') in every generation.
+ */
+export function derivePartId(key: string, src: string, generation: number): string {
+  requireUnitKey(key);
+  if (!Number.isInteger(generation) || generation < 0 || generation > MAX_UNIT_GENERATION)
+    throw new UnitError('UNIT_BAD_SPEC', `a generation is a whole number from 0 to ${MAX_UNIT_GENERATION}`);
+  return generation === 0 || src === UNIT_ROOT ? hashId(key, src) : hashId(`${key}#${generation}`, src);
 }

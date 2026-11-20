@@ -4,12 +4,12 @@ import type { Vec3 } from '../../math/types';
 import { cloneJson } from '../../util/json';
 import { UnitError } from './errors';
 import { unitRecord, type UnitBody, type UnitHeader, type UnitPayload } from './format';
-import { UNIT_ROOT, deriveUnitId, requireUnitKey } from './ids';
+import { MAX_UNIT_GENERATION, UNIT_ROOT, derivePartId, deriveUnitId, requireUnitKey } from './ids';
 import { UNIT_BLOCK_KINDS, type UnitKind } from './kinds';
-import { provenanceProps, readInstance, type UnitPartStamp } from './list';
+import { provenanceProps, readInstance, withProvenance, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
 import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
-import { dataKey, deleteData, keptWarning, oldLook, unusedData } from './remove';
+import { dataKey, deleteData, instanceData, keptWarning, oldLook, unusedData } from './remove';
 import { driverKeyOf, driverSum16 } from './drivers';
 
 /*
@@ -18,11 +18,19 @@ import { driverKeyOf, driverSum16 } from './drivers';
  * step). The root takes the placement given (location, rotation, parent, collection; scale from the
  * unit unless given) and the scene-owned props given (rootProps: the staging stamps desk_role 'set'
  * and desk_rideo_clip on a set's root, desk_character_id on a figure's …), then the provenance
- * (list.ts). Names are made unique as every new datablock's are. If a derived id is taken the insert
- * is refused rather than salted, so two replicas stay identical: UNIT_INSTANCE_EXISTS when the slot
- * already holds an instance with this key, UNIT_ID_TAKEN otherwise. A datablock (not an object) at
- * a derived id that nothing in the document uses (remove.ts: left behind by an instance taken out
- * before) does not count as taken: the insert deletes it and writes the unit's.
+ * (list.ts). Names are made unique as every new datablock's are. A datablock (not an object) at a
+ * derived id that nothing in the document uses (remove.ts: left behind by an instance taken out
+ * before) does not count as taken: the insert deletes it and writes the unit's. A part's id held by
+ * anything else (a material of the instance taken out before that the person gave to an object of
+ * their own, one of its objects the person moved out from under it) moves the whole unit on to the
+ * next generation of the slot's ids (ids.ts derivePartId): the first whose ids are all free, which
+ * the instance keeps (unit_gen), so that a slot can always take a unit again and two replicas still
+ * derive the same ids. The root's id is never salted: when it is taken the insert is refused,
+ * UNIT_INSTANCE_EXISTS when the slot already holds an instance with this key, UNIT_ID_TAKEN otherwise.
+ *
+ * `remove`: what the unit takes the place of (the words' set, the instance of another item it
+ * replaces) goes in the same transaction, once the unit is sure to go in, with the datablocks only
+ * it used; a unit that does not go in leaves it as it is.
  *
  * `replace` makes an existing object the root (a procedural actor or prop swapped for a library
  * one): its id, name, placement, parent, constraints, physics, pose, F-curves and scene-owned props
@@ -59,6 +67,12 @@ export interface InsertUnitOptions extends UnitPin {
   rootProps?: Record<string, string | number | boolean>;
   /** An existing object (not an instance root) that becomes the root. */
   replace?: string;
+  /**
+   * Objects the unit takes the place of, taken out with everything below them in the insert's own
+   * transaction, with the datablocks only they used (their data and materials, the part tables of the
+   * instances among them): see the module comment.
+   */
+  remove?: readonly string[];
 }
 
 export interface InsertUnitResult {
@@ -66,6 +80,8 @@ export interface InsertUnitResult {
   root: string;
   /** The scene id of every datablock inserted, by '<kind>:<sourceId>'. */
   ids: Record<string, string>;
+  /** The generation of the slot's ids the parts took (ids.ts derivePartId; 0 unless one was in use). */
+  generation: number;
   warnings: string[];
 }
 
@@ -141,9 +157,24 @@ function dataOf(rec: UnitRecord | null): string[] {
   return out;
 }
 
+/** The objects `ids` and everything below them, in the order removeObjectTrees takes them out. */
+function treesOf(doc: SceneDoc, ids: readonly string[]): string[] {
+  if (!ids.length) return [];
+  const index = doc.childrenIndex();
+  const all = new Set<string>();
+  const visit = (id: string) => {
+    if (all.has(id)) return;
+    all.add(id);
+    for (const c of index.get(id) ?? []) visit(c);
+  };
+  for (const id of ids) if (doc.has('objects', id)) visit(id);
+  return [...all];
+}
+
 /**
  * Writes a body's records into `doc` under derived ids and returns the ids and the stamps of the
- * parts (no provenance; the caller writes it). Shared by insertUnit and extraction's probe document.
+ * parts (no provenance; the caller writes it, given the parts, drivers and generation). Shared by
+ * insertUnit and extraction's probe document.
  */
 export function writeUnitRecords(
   doc: SceneDoc,
@@ -151,19 +182,22 @@ export function writeUnitRecords(
   kind: UnitKind,
   o: Omit<InsertUnitOptions, 'ref' | 'version' | 'sha256'>,
   provenance:
-    | ((parts: Map<string, UnitPartStamp>, drivers: Map<string, string>) => Record<string, string | number>)
+    | ((
+        parts: Map<string, UnitPartStamp>,
+        drivers: Map<string, string>,
+        generation: number,
+      ) => Record<string, string | number>)
     | null,
 ): InsertUnitResult {
   const key = requireUnitKey(o.key);
   const warnings: string[] = [];
-  const ids: Record<string, string> = {};
-  for (const k of UNIT_BLOCK_KINDS)
-    for (const src of Object.keys(body.blocks[k] ?? {}))
-      ids[`${k}:${src}`] =
-        k === 'objects' && src === UNIT_ROOT && o.replace ? o.replace : deriveUnitId(key, src);
-  const rootId = ids[`objects:${UNIT_ROOT}`];
   const unitRoot = body.blocks.objects?.[UNIT_ROOT];
-  if (!rootId || !unitRoot) throw new UnitError('UNIT_BAD_RECORD', "the unit has no root object ('@root')");
+  if (!unitRoot) throw new UnitError('UNIT_BAD_RECORD', "the unit has no root object ('@root')");
+  const rootId = o.replace ?? deriveUnitId(key, UNIT_ROOT);
+  const rootKey = `objects:${UNIT_ROOT}`;
+  // what the unit takes the place of: those objects and everything below them
+  const removed = treesOf(doc, o.remove ?? []);
+  const removing = new Set(removed);
 
   let old: UnitRecord | null = null;
   let doomed: string[] = [];
@@ -171,7 +205,8 @@ export function writeUnitRecords(
   let named: string[] = [];
   if (o.replace) {
     old = doc.readRecord('objects', o.replace);
-    if (!old) throw new UnitError('UNIT_NOT_FOUND', `object '${o.replace}' is not in the scene`);
+    if (!old || removing.has(o.replace))
+      throw new UnitError('UNIT_NOT_FOUND', `object '${o.replace}' is not in the scene`);
     if (old.type !== unitRoot.type)
       throw new UnitError(
         'UNIT_KIND_MISMATCH',
@@ -180,35 +215,72 @@ export function writeUnitRecords(
     if (readInstance(doc, o.replace))
       throw new UnitError('UNIT_INSTANCE_EXISTS', `'${o.replace}' is already an instance: update it instead`);
     const look = oldLook(doc, o.replace);
-    doomed = look.look;
+    doomed = look.look.filter((id) => !removing.has(id));
     kept = new Set(look.kept);
     named = look.named;
-  } else if (doc.has('objects', rootId)) {
+  } else if (doc.has('objects', rootId) && !removing.has(rootId)) {
     const props = doc.readRecord('objects', rootId)?.custom_props as Record<string, unknown> | undefined;
     if (props?.unit_key === key)
       throw new UnitError('UNIT_INSTANCE_EXISTS', `the scene already holds the instance '${key}'`);
     throw new UnitError('UNIT_ID_TAKEN', `the id ${rootId} the unit's root derives to is taken`);
   }
-  // what the insert frees (remove.ts): the ids it derives that a datablock nothing uses holds, and,
-  // replacing an object, its own data and materials and its old parts' once nothing else uses them
-  const going = new Set(doomed);
-  const candidates: string[] = [];
-  for (const [pk, id] of Object.entries(ids)) {
-    const k = pk.slice(0, pk.indexOf(':')) as DatablockKind;
-    if (id !== rootId && k !== 'objects' && doc.has(k, id)) candidates.push(dataKey(k, id));
+  // what the insert frees (remove.ts): the ids it derives that a datablock nothing uses holds;
+  // replacing an object, its own data and materials and its old parts' once nothing else uses them;
+  // and what the objects it takes the place of alone used
+  const going = new Set([...doomed, ...removed]);
+  const freed: string[] = [];
+  if (old) freed.push(...dataOf(old));
+  for (const id of going) freed.push(...dataOf(doc.readRecord('objects', id)));
+  for (const id of removed) freed.push(...instanceData(doc, id));
+  // the parts' ids in a generation of the slot's, or why one of them is taken there
+  const idsAt = (generation: number): Record<string, string> => {
+    const ids: Record<string, string> = {};
+    for (const k of UNIT_BLOCK_KINDS)
+      for (const src of Object.keys(body.blocks[k] ?? {}))
+        ids[`${k}:${src}`] =
+          k === 'objects' && src === UNIT_ROOT ? rootId : derivePartId(key, src, generation);
+    return ids;
+  };
+  const freeAt = (ids: Record<string, string>): { free: Set<string> } | { taken: string } => {
+    const candidates = [...freed];
+    const held: [string, string][] = [];
+    for (const [pk, id] of Object.entries(ids)) {
+      if (pk === rootKey) continue;
+      const k = pk.slice(0, pk.indexOf(':')) as DatablockKind;
+      if (id === rootId) return { taken: `${id} (${pk})` };
+      if (!doc.has(k, id)) continue;
+      if (k === 'objects') {
+        if (!going.has(id)) return { taken: `${id} (${pk})` };
+        continue;
+      }
+      candidates.push(dataKey(k, id));
+      held.push([pk, dataKey(k, id)]);
+    }
+    const free = unusedData(doc, candidates, { going, replaced: o.replace });
+    for (const [pk, dk] of held)
+      if (!free.has(dk)) return { taken: `${dk.slice(dk.indexOf(':') + 1)} (${pk})` };
+    return { free };
+  };
+  // the first generation whose ids are all free (0 unless something the scene keeps holds one)
+  let ids: Record<string, string> = {};
+  let free = new Set<string>();
+  let generation = 0;
+  let first = '';
+  for (; ; generation++) {
+    if (generation > MAX_UNIT_GENERATION)
+      throw new UnitError(
+        'UNIT_ID_TAKEN',
+        `the ids the unit's parts derive to are taken in all ${MAX_UNIT_GENERATION + 1} generations of the slot's ids (first ${first})`,
+      );
+    ids = idsAt(generation);
+    const r = freeAt(ids);
+    if ('free' in r) {
+      free = r.free;
+      break;
+    }
+    first ||= r.taken;
   }
-  if (old) {
-    candidates.push(...dataOf(old));
-    for (const id of doomed) candidates.push(...dataOf(doc.readRecord('objects', id)));
-  }
-  const free = unusedData(doc, candidates, { going, replaced: o.replace });
-  for (const [pk, id] of Object.entries(ids)) {
-    if (id === rootId) continue;
-    const k = pk.slice(0, pk.indexOf(':')) as DatablockKind;
-    if (!doc.has(k, id) || (k === 'objects' ? going.has(id) : free.has(dataKey(k, id)))) continue;
-    throw new UnitError('UNIT_ID_TAKEN', `the id ${id} a part derives to is taken (${pk})`);
-  }
-  if (o.parent && !doc.has('objects', o.parent))
+  if (o.parent && (!doc.has('objects', o.parent) || removing.has(o.parent)))
     throw new UnitError('UNIT_NOT_FOUND', `the parent '${o.parent}' is not in the scene`);
   if (o.collection && o.collection !== ROOT_COLLECTION_ID && !doc.has('collections', o.collection))
     throw new UnitError('UNIT_NOT_FOUND', `the collection '${o.collection}' is not in the scene`);
@@ -272,9 +344,10 @@ export function writeUnitRecords(
       throw new UnitError('UNIT_BAD_RECORD', `the unit's records do not insert (${err.message})`);
     throw err;
   }
-  const provenanceOf = provenance ? provenance(stamps, driverStamps) : null;
+  const provenanceOf = provenance ? provenance(stamps, driverStamps, generation) : null;
   const bones = o.replace ? unitBones(body) : null;
   doc.transact(() => {
+    if (removed.length) doc.removeObjects(removed);
     if (doomed.length) doc.removeObjects(doomed);
     deleteData(doc, free);
     for (const w of writes)
@@ -284,24 +357,28 @@ export function writeUnitRecords(
     if (provenanceOf) {
       const cur = doc.readRecord('objects', rootId)!;
       doc.updateObject(rootId, {
-        custom_props: { ...(cur.custom_props as ObjectData['custom_props']), ...provenanceOf },
+        custom_props: withProvenance(
+          cur.custom_props as ObjectData['custom_props'],
+          provenanceOf,
+        ) as ObjectData['custom_props'],
       });
     }
     if (named.length) warnings.push(keptWarning(named, `the look the library ${kind} replaces`));
     if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
   });
-  return { root: rootId, ids, warnings };
+  return { root: rootId, ids, generation, warnings };
 }
 
 /**
  * Inserts a decoded unit into the scene (one transaction): see the module comment. Throws
- * UNIT_BAD_KEY, UNIT_BAD_SPEC (pin), UNIT_INSTANCE_EXISTS, UNIT_ID_TAKEN, UNIT_NOT_FOUND (parent,
- * collection or `replace`) or UNIT_KIND_MISMATCH (`replace` of another object type).
+ * UNIT_BAD_KEY, UNIT_BAD_SPEC (pin), UNIT_INSTANCE_EXISTS, UNIT_ID_TAKEN (the root's id, or every
+ * generation of the parts'), UNIT_NOT_FOUND (parent, collection or `replace`) or UNIT_KIND_MISMATCH
+ * (`replace` of another object type), each before anything is written.
  */
 export function insertUnit(doc: SceneDoc, unit: UnitPayload, o: InsertUnitOptions): InsertUnitResult {
   const pin = requirePin(o);
   const header: UnitHeader = unit.header;
-  return writeUnitRecords(doc, unit.body, header.kind, o, (parts, drivers) =>
+  return writeUnitRecords(doc, unit.body, header.kind, o, (parts, drivers, generation) =>
     provenanceProps({
       ...pin,
       digest: header.digest,
@@ -310,6 +387,7 @@ export function insertUnit(doc: SceneDoc, unit: UnitPayload, o: InsertUnitOption
       name: header.name,
       parts,
       drivers,
+      generation,
     }),
   );
 }

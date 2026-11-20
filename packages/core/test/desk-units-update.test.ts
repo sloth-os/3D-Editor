@@ -473,6 +473,110 @@ describe("a unit's drivers in an instance", () => {
     expect(doc.listDrivers()).toEqual([]);
   });
 
+  describe('a part the next version drops that the scene keeps keeps the driver the unit gave it', () => {
+    /** The kite whose tail.2 is driven by tail.3's height, and a next version dropping both tails. */
+    function tails() {
+      const { kite } = kites();
+      const [tail2, tail3] = ['tail.2', 'tail.3'].map((n) => srcNamed(kite.body, n));
+      const v1 = editedUnit(kite, (b) => {
+        b.drivers = [
+          {
+            target_type: 'object',
+            target_id: tail2,
+            path: 'rotation_euler',
+            index: 0,
+            expression: 'z / 10',
+            variables: [{ name: 'z', target_type: 'object', target_id: tail3, path: 'location', index: 2 }],
+            mute: false,
+          },
+        ];
+      });
+      const v2 = editedUnit(kite, (b) => {
+        for (const t of [tail2, tail3]) {
+          const mesh = b.blocks.objects![t].data as string;
+          delete b.blocks.objects![t];
+          if (!Object.values(b.blocks.objects!).some((o) => o.data === mesh)) delete b.blocks.meshes![mesh];
+        }
+      });
+      const doc = SceneDoc.create({ empty: true });
+      const r = insertUnit(doc, v1, { ...pin(1, SHA1), key: `el:${KITE}` });
+      const id = (s: string) => r.ids[`objects:${s}`];
+      const table = () => JSON.parse(String(doc.getObject(r.root)!.custom_props.unit_drivers)) as object;
+      return { doc, root: r.root, v2, two: id(tail2), three: id(tail3), table };
+    }
+    /** The objects an update kept, with why, sorted. */
+    const objectsKept = (rep: ReturnType<typeof updateUnit>) =>
+      rep.kept
+        .filter((p) => p.kind === 'objects')
+        .map((p) => [p.id, p.reason])
+        .sort();
+
+    it("used: it stays driven, and what its driver reads stays with it, out of the unit's tables", () => {
+      const { doc, root, v2, two, three, table } = tails();
+      expect(Object.keys(table())).toHaveLength(1);
+      // a camera focuses on tail.2
+      const cam = doc.addCamera({ name: 'Cam', dof_focus_object: two });
+      doc.addObject({ type: 'CAMERA', name: 'Cam', data: cam });
+      const rep = updateUnit(doc, root, v2, pin(2, SHA2));
+      expect(objectsKept(rep)).toEqual(
+        [
+          [two, 'dropped-but-used'],
+          [three, 'dropped-but-used'],
+        ].sort(),
+      );
+      expect(rep.removed).toEqual([]);
+      expect(doc.listDrivers(two).map((d) => d.expression)).toEqual(['z / 10']);
+      expect(doc.getObject(three)).toBeTruthy();
+      // the scene's now: a later version leaves it
+      expect(table()).toEqual({});
+      const v3 = editedUnit(v2, (b) => {
+        Object.values(b.blocks.materials!)[0].base_color = [0.9, 0.1, 0.1, 1];
+      });
+      expect(updateUnit(doc, root, v3, pin(3, '3'.repeat(64))).updated).not.toEqual([]);
+      expect(doc.listDrivers(two).map((d) => d.expression)).toEqual(['z / 10']);
+    });
+
+    it('edited: it stays driven', () => {
+      const { doc, root, v2, two, three } = tails();
+      doc.updateObject(two, { location: [0.3, 0.2, 0.1] });
+      const rep = updateUnit(doc, root, v2, pin(2, SHA2));
+      expect(objectsKept(rep)).toEqual(
+        [
+          [two, 'dropped-but-edited'],
+          [three, 'dropped-but-used'],
+        ].sort(),
+      );
+      expect(doc.listDrivers(two).map((d) => d.expression)).toEqual(['z / 10']);
+    });
+
+    it('unused: both tails go, and the driver with them', () => {
+      const { doc, root, v2, two, three } = tails();
+      const rep = updateUnit(doc, root, v2, pin(2, SHA2));
+      expect(rep.removed.map((p) => p.id)).toEqual(expect.arrayContaining([two, three]));
+      expect(rep.kept).toEqual([]);
+      expect(doc.listDrivers()).toEqual([]);
+    });
+  });
+
+  it('unitStatus names the drivers the unit gave that the scene edited or deleted', () => {
+    const { sail, version } = kites();
+    const { doc, root, sail: id } = placed(version('frame / 10'), sail);
+    const key = `object:${sail}:rotation_euler:0`;
+    expect(unitStatus(doc, root)).toEqual({ edited: [], missing: [] });
+    doc.setDriver({ ...doc.listDrivers(id)[0], expression: 'frame / 5' });
+    expect(unitStatus(doc, root)).toEqual({
+      edited: [],
+      missing: [],
+      drivers: { edited: [{ key, target: id }], missing: [] },
+    });
+    doc.removeDriver(fcurveKey(doc.listDrivers(id)[0]));
+    expect(unitStatus(doc, root).drivers).toEqual({ edited: [], missing: [{ key, target: id }] });
+    // the scene's own drivers on its parts are not the unit's
+    updateUnit(doc, root, version(null), pin(2, SHA2));
+    doc.setDriver({ ...version('frame / 10').body.drivers[0], target_id: id } as never);
+    expect(unitStatus(doc, root)).toEqual({ edited: [], missing: [] });
+  });
+
   it('a published scene adopts its drivers: the next version updates them', () => {
     const doc = stagedDoc();
     const kiteRoot = propOf(doc, KITE).id;

@@ -3,10 +3,10 @@ import type { SceneDoc } from '../../doc/scene-doc';
 import type { ObjectData } from '../../doc/types';
 import { UnitError } from './errors';
 import type { UnitLinkPlan } from './extract';
-import { UNIT_ROOT, requireUnitKey } from './ids';
+import { MAX_UNIT_GENERATION, UNIT_ROOT, requireUnitKey } from './ids';
 import { requirePin, type UnitPin } from './insert';
 import { UNIT_KINDS } from './kinds';
-import { provenanceProps, readInstance, splitPartKey, type UnitPartStamp } from './list';
+import { provenanceProps, readInstance, splitPartKey, withProvenance, type UnitPartStamp } from './list';
 import { channelsUnder } from './place';
 
 /*
@@ -14,7 +14,8 @@ import { channelsUnder } from './place';
  * publish (unit-ack with linked true): the scene becomes an instance of the new version without a
  * new id anywhere. The root (the prop, the actor, the set's instance root; for a first set publish a
  * new EMPTY at the origin) takes the provenance, with the table of the parts as extraction mapped
- * them (each keeps its scene id); part objects whose parent is outside the instance hang from the
+ * them (each keeps its scene id) and the generation of the instance it was made from (the parts a
+ * later version adds derive their ids in it); part objects whose parent is outside the instance hang from the
  * root, keeping their world transform, with the very channels extraction wrote into the unit
  * (place.ts), so no part reads as edited; the drivers the unit took are stamped too (drivers.ts). One transaction: the caller chooses its origin by calling
  * it inside its own doc.transact(…, origin) (the desk applies it with its storage origin: not
@@ -48,7 +49,9 @@ function requireLink(link: UnitLinkPlan): UnitLinkPlan {
     ) &&
     isRecord(link.parts[`objects:${UNIT_ROOT}`]) &&
     (link.drivers === undefined ||
-      (isRecord(link.drivers) && Object.values(link.drivers).every((v) => SUM16.test(String(v)))));
+      (isRecord(link.drivers) && Object.values(link.drivers).every((v) => SUM16.test(String(v))))) &&
+    (link.generation === undefined ||
+      (Number.isInteger(link.generation) && link.generation >= 0 && link.generation <= MAX_UNIT_GENERATION));
   if (!ok) throw new UnitError('UNIT_BAD_SPEC', 'not a link plan extractUnit made');
   requireUnitKey(link.key);
   return link;
@@ -112,9 +115,9 @@ export function adoptUnit(
       warnings.push(`${gone} part(s) published are no longer in the scene: they count as deleted here`);
     const cur = doc.readRecord('objects', root)!;
     doc.updateObject(root, {
-      custom_props: {
-        ...(cur.custom_props as ObjectData['custom_props']),
-        ...provenanceProps({
+      custom_props: withProvenance(
+        cur.custom_props as ObjectData['custom_props'],
+        provenanceProps({
           ...p,
           digest: l.digest,
           kind: l.kind,
@@ -122,8 +125,9 @@ export function adoptUnit(
           name: l.name,
           parts,
           drivers: new Map(Object.entries(l.drivers ?? {})),
+          generation: l.generation ?? 0,
         }),
-      },
+      ) as ObjectData['custom_props'],
     });
   });
   return { root, warnings };
