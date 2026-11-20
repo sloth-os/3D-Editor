@@ -481,7 +481,14 @@ change nothing of the staging; such an update gives only the warnings every upda
 repeats (how the desk reads the brief, a shot whose length was changed in the desk, a cast member
 kept as the kind staged), so a desk that offers the update on a non-null value offers it whenever it
 does something. A lens and move the host gives back as the desk staged them (copied from the shot
-results) are no change.
+results) are no change. `briefChanges(doc, brief, {units})` counts the library pins whose unit the
+desk holds ([library units](#library-units); headers are enough): what an update does with them is
+named in `other` only, in the desk's words ("the set from the library", "a new version of the
+library set", "another library set", "the set from the words (no library set)", "1 cast member from
+the library", "2 cast members with a new library figure", "1 cast member back to a mannequin", "1
+prop from the library", "1 prop with a new library version", "1 prop back to the words"); the
+contract's lists never carry a pin. A pin whose unit the desk does not hold, or cannot use, is no
+change.
 
 `shotResults(doc, {shots?})` (`desk.shot_results`, and `desk_shot_results` over MCP) is what the
 desk tells a host about each staged shot besides its files, in brief order: its frames and duration,
@@ -489,6 +496,54 @@ the staged camera's lens (an integer 8–800 mm) and move, the blocking line thr
 first frame, who walks where (`moves`, null when nobody moves), whether the camera shows the planned
 layout (`planAgrees`, null without a plan) and its checks (errors and warnings). An export adds the
 reference clips and stills.
+
+### Library units
+
+A brief may pin library units ([embedding.md](embedding.md#library-units)): the set (`set.unit`, a
+set unit), a cast member (a figure) and an element of kind `prop` or `other` (a prop); a pin on a
+location is ignored, with a warning (the place's set is `set.unit`).
+`stageBrief(doc, brief, {units})` and `updateFromBrief(doc, brief, {units})` take the units the desk
+holds for the pins: `unitSourceOf(files, problems)` reads the header of each file the host sent
+(their SHA-256 checked by the caller) at once and decodes a body only to place it. Without `units`
+every pin is staged from the words. Per slot:
+
+- **The set** is put in before the cast as the scene's place: an instance with key `set` whose root
+  (an empty at the origin) carries `desk_role` `set`, the scene, its ground's name and its planning
+  facts. No ground, wall, landmark or water of the words is built; the set is lit (the sun or sky of
+  the time of day) and the desk takes its stage (its width and depth, 2–200 m) and interior. A mark
+  of the words within 0.3 m of one of its pieces (its landmarks but the ground and the lights) moves
+  to the nearest free spot on rings 0.3 m apart (out to 3 m, starting toward the audience, inside
+  the stage), and a standing prop's spot keeps clear of them too: when the set is first placed only
+  (a later version or another set moves nobody).
+- **A figure** is its cast member's actor (key `cast:<castId>`): its kind, height and colour are the
+  figure's (a kind or height in the brief that differs is no change, with a warning), on the desk's
+  rig for its kind, so it stands, walks, poses and holds as a mannequin of that kind would.
+- **A prop** is its element's prop (key `el:<elementId>`) at the spot the words give it, its base on
+  the ground, at the unit's own size; it is held, hidden and flown as the words' prop would be.
+
+A pin whose unit is not held, or cannot be used, is staged from the words, with a warning, and the
+record says why: `pending` (not sent, not the pinned file, the budget spent, a failed read) is tried
+again at the next open, `refused` (unreadable, too new, too large, of another kind, a figure the
+desk does not build or whose bones are not its kind's, a set whose ground is off height 0, a unit
+that can never fit a staging) only when the brief pins another version ([when a unit is not
+used](embedding.md#when-a-unit-is-not-used)). The units one staging takes are counted in slot order
+(the set, the cast, the elements): 48 MiB of files and 160 MiB unpacked (twice each body). The
+report's `units` has a row per pin: its slot (`set`, `cast:<castId>`, `el:<elementId>`), `ref`,
+`version`, the object (the set's root, the actor, the prop) and `staged` `unit` (the slot holds that
+version) or `words` with `why` (a reason above, or `local`). The record keeps each pin with what was
+staged for it; a brief without pins records nothing more, so it stages, records and reports exactly
+as before.
+
+`pinsWanted(doc, brief)` lists the pins whose slot an update would place, update or replace if the
+unit were held (not those the scene holds, made local, or refused at that version): the files a desk
+keeps for a later Update shots. `adoptPublished(doc, brief, {slot, link, pin, linked, header})`
+makes the scene's published objects an instance of the version the host saved (no id changes; the
+caller chooses the transaction's origin); only when `linked` does the slot's record take the pin
+(`staged` `unit`, and for a set the record's set is the unit's), so that the next brief, which pins
+it, is no change. `stateUnitRows(doc)` is the desk state's `units`. An exported blocking
+(`desk.export_rideo_blocking`) writes no landmark of a library set's pieces (a warning says how
+many) and takes its ground's name from the set's root, so importing it again keeps the set and adds
+no copies.
 
 ### Updating from a later brief
 
@@ -527,7 +582,18 @@ and no other shot's keys are cut:
 - props whose element went go and new ones are placed; a held prop whose holder or holder's shots
   changed is held (or flown) again; the set is built again when its plan changed;
 - notes the desk did not edit follow the brief's words, and the desk's own shot names (`Shot 3`)
-  follow the brief's order.
+  follow the brief's order;
+- library pins act per slot ([library units](#library-units)): a set unit placed takes the place of
+  the words' set (its ground, walls and landmarks go), a new version of the same item updates the
+  instance (its root and the parts not edited in the desk keep their ids), another item replaces it,
+  and no pin brings the words' set back; the cameras still as staged are then solved again (one set
+  by hand is kept, with a warning). A figure restyles its member's actor in place (the same
+  armature, keys, holds and shots) when its kind and height (within 5 mm) are the actor's; another
+  kind or height is refused and the actor kept (stage the brief in a new project to rebuild it), and
+  no pin brings back the mannequin of the actor's kind and height. A prop unit replaces the
+  element's prop or updates it to a new version (its root id stays), and no pin brings the words'
+  prop back. A unit not held changes nothing (the words, or the version placed, stay), a slot made
+  local stays local, and a refused pin is not tried again.
 
 A ripple moves everything keyed after the edit: F-curve keys (where frames are cut or inserted, a
 curve keeps the values it had on both sides of the edit, so an actor a later shot hides stays shown
@@ -817,6 +883,10 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   `shotResults` and an update each took about 40 % of that. Most of it is the camera solve and the
   checks, which measure every actor of the scene in every shot: stage long scenes in a worker and
   show progress.
+- **Library units**: a set's pieces do not block the camera solver, and no check says an actor
+  stands inside one; marks keep clear of them only when the set is first placed, so a later version
+  or another set moves no actor or prop staged before. An update does not rebuild an actor for a
+  figure of another kind or height (it keeps the actor and refuses the figure).
 - **SceneBlocking import**: the kind of each character and who rides whom are read from English
   text only; hand-made keys on imported actors and props are replaced on re-import (user objects,
   shots, physics and materials are kept), and the re-import's warnings name the actors, props,

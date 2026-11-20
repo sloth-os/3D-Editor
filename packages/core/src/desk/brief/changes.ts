@@ -16,8 +16,9 @@ import {
   type BriefRecord,
   type BriefRecordShot,
 } from './record';
-import { hostShots, parseBrief, stagedActors, stagedBy } from './stage';
+import { hostShots, parseBrief, stagedActors, stagedBy, stagedCast } from './stage';
 import type { BriefChanges, BriefShot, SceneBrief } from './schema';
+import { planUnitsOf, resolveUnits, type ResolvedUnits, type SlotUnit, type UnitSource } from './units';
 
 export { briefFrames } from './record';
 
@@ -40,6 +41,16 @@ export { briefFrames } from './record';
  *
  * A lens or a move the host gives back as the desk staged it (a host that copies the shot results
  * into its shots, then sends the brief again) agrees with the staging: no change.
+ *
+ * Library pins (brief/units.ts) change what an update does per slot (place, update, replace or
+ * remove a unit): only in the desk's own `other` words ("the set from the library", "a new version of
+ * the library set", "another library set", "the set from the words (no library set)", "1 cast member
+ * from the library", "2 cast members with a new library figure", "1 cast member back to a mannequin",
+ * "1 prop from the library", "1 prop with a new library version", "1 prop back to the words"): the
+ * contract's lists never carry pin changes. A pin whose unit the desk does not hold (`units`) moves
+ * nothing, so it is no change until the unit is here; a pending pin whose unit is now held is one,
+ * even when the brief is the one staged (the hash shortcut is not taken then). The kind and height of
+ * a member that is (or becomes) a library figure are the figure's: the brief's are no change.
  */
 
 const sameSet = (a: readonly string[], b: readonly string[]) => {
@@ -91,6 +102,82 @@ export interface BriefDiff {
   castWords: Set<string>;
   /** The brief's plan (null: the brief is the one staged, nothing to plan). */
   plan: BriefPlan | null;
+  /** The library units' slots and what an update does in each (null: none were resolved). */
+  units: ResolvedUnits | null;
+}
+
+/**
+ * The library slots of brief `b` against record `r` (this scene's) and the document, with what
+ * `source` holds (see brief/units.ts resolveUnits): a cast member's slot acts only for a member staged
+ * now, or one the update stages (new to the brief or to its shots); an element's for an element that
+ * is not a location.
+ */
+export function resolveBriefUnits(
+  doc: SceneDoc,
+  b: SceneBrief,
+  r: BriefRecord | null,
+  source: UnitSource | null,
+): ResolvedUnits {
+  const staged = r && r.sceneId === b.id ? r : null;
+  const actors = staged ? stagedActors(doc, b.id) : new Map<string, ObjectData>();
+  const inShots = stagedCast(b);
+  const recordCast = new Set(staged?.cast.map((c) => c.id) ?? []);
+  const castBefore = new Set(staged?.shots.flatMap((s) => s.castIds) ?? []);
+  return resolveUnits(doc, b, staged, source, {
+    stageable: {
+      cast: (cid) => inShots.has(cid) && (actors.has(cid) || !recordCast.has(cid) || !castBefore.has(cid)),
+      element: (eid) => b.elements.some((e) => e.id === eid && e.kind !== 'location'),
+    },
+    actors,
+  });
+}
+
+/** The plan of brief `b` with the library units `units` resolved (null: none). */
+export function planWithUnits(doc: SceneDoc, b: SceneBrief, units: ResolvedUnits | null): BriefPlan {
+  if (!units) return planBrief(b);
+  return planBrief(b, {
+    units: planUnitsOf(doc, units, {
+      actors: stagedActors(doc, b.id),
+      props: stagedBy(doc, 'prop', b.id, (o) => o.custom_props?.[DESK_PROPS.elementId]),
+    }),
+  });
+}
+
+const acts = (s: SlotUnit) => s.action !== 'none';
+
+/** The words of the library slots' actions (see the module comment). */
+export function unitWords(units: ResolvedUnits | null): string[] {
+  if (!units) return [];
+  const out: string[] = [];
+  const set = units.set;
+  if (set && acts(set))
+    out.push(
+      set.action === 'place'
+        ? 'the set from the library'
+        : set.action === 'update'
+          ? 'a new version of the library set'
+          : set.action === 'replace'
+            ? 'another library set'
+            : 'the set from the words (no library set)',
+    );
+  const count = (slots: Iterable<SlotUnit>, ...what: SlotUnit['action'][]) =>
+    [...slots].filter((s) => what.includes(s.action)).length;
+  const cast = units.cast.values();
+  const castList = [...cast];
+  const elements = [...units.elements.values()];
+  const n1 = count(castList, 'place');
+  const n2 = count(castList, 'update', 'replace');
+  const n3 = count(castList, 'remove');
+  if (n1) out.push(`${plural(n1, 'cast member')} from the library`);
+  if (n2) out.push(`${plural(n2, 'cast member')} with a new library figure`);
+  if (n3) out.push(`${plural(n3, 'cast member')} back to a mannequin`);
+  const p1 = count(elements, 'place');
+  const p2 = count(elements, 'update', 'replace');
+  const p3 = count(elements, 'remove');
+  if (p1) out.push(`${plural(p1, 'prop')} from the library`);
+  if (p2) out.push(`${plural(p2, 'prop')} with a new library version`);
+  if (p3) out.push(`${plural(p3, 'prop')} back to the words`);
+  return out;
 }
 
 /** The runs of consecutive shots (by host id) in which `holder` is cast; [] without a holder. */
@@ -149,12 +236,13 @@ export function diffBrief(
   r: BriefRecord | null,
   b: SceneBrief,
   plan: BriefPlan | null = null,
+  units: ResolvedUnits | null = null,
 ): BriefDiff {
   const staged = r && r.sceneId === b.id ? r : null;
   const shots = new Map<string, ShotDiff>();
   const none = { restage: new Set<string>(), removed: new Set<string>() };
-  // the brief staged, as it was: nothing differs
-  if (staged && staged.hash === briefHash(b)) {
+  // the brief staged, as it was: nothing differs (unless a library unit the record waits for is here)
+  if (staged && staged.hash === briefHash(b) && !units?.all.some(acts)) {
     for (const s of b.shots)
       shots.set(s.id, {
         added: !staged.shots.some((x) => x.id === s.id),
@@ -174,9 +262,10 @@ export function diffBrief(
       props: none,
       castWords: new Set(),
       plan,
+      units,
     };
   }
-  const p = plan ?? planBrief(b);
+  const p = plan ?? planWithUnits(doc, b, units);
   const before = new Map((staged?.shots ?? []).map((s) => [s.id, s]));
   const desk = staged ? hostShots(doc, b.id) : new Map<string, ShotData>();
   let scene: DeskScene | null = null;
@@ -237,6 +326,7 @@ export function diffBrief(
       props: none,
       castWords: new Set(),
       plan: p,
+      units,
     };
 
   // ---------------------------------------------------------------- what else differs
@@ -255,8 +345,10 @@ export function diffBrief(
     if (!was || !actor || !p.order.includes(c.id) || was.digest === castDigest(c)) continue;
     // renamed (or, renamed in the desk, kept with a warning) unless the actor has the new name
     const name = was.name !== c.name && actor.name !== c.name;
-    const kind = was.kind !== null && was.kind !== p.cast.get(c.id)?.kind;
-    const height = was.heightM !== undefined && was.heightM !== c.heightM;
+    // a library figure's kind and height are the figure's, not the brief's
+    const figure = p.units.figures.has(c.id);
+    const kind = !figure && was.kind !== null && was.kind !== p.cast.get(c.id)?.kind;
+    const height = !figure && was.heightM !== undefined && was.heightM !== c.heightM;
     renamed += +name;
     rekinded += +kind;
     reheighted += +height;
@@ -295,6 +387,8 @@ export function diffBrief(
     )
       restage.add(eid);
   }
+  // an element whose library prop an update places, updates, replaces or removes is staged again
+  for (const [eid, slot] of units?.elements ?? []) if (acts(slot) && planned.has(eid)) restage.add(eid);
   const removedProps = new Set(
     [...stagedBy(doc, 'prop', b.id, (o) => o.custom_props?.[DESK_PROPS.elementId]).keys()].filter(
       (eid) => !planned.has(eid),
@@ -307,7 +401,9 @@ export function diffBrief(
   const other: string[] = [];
   if (fps) other.push(`the frame rate (${staged.fps} to ${b.fps} fps)`);
   if (resized) other.push(`the frame size (${staged.width}×${staged.height} to ${b.width}×${b.height})`);
-  if (set) other.push('the set');
+  // a library set that comes, changes or goes says so in its own words
+  if (set && !(units?.set && acts(units.set))) other.push('the set');
+  other.push(...unitWords(units));
   if (propWords || removedProps.size) other.push('the props');
   const replanned = kept.filter((d) => d.replanned).length;
   if (replanned) other.push(`${plural(replanned, 'shot')} with a new camera plan`);
@@ -329,6 +425,7 @@ export function diffBrief(
     props: { restage, removed: removedProps },
     castWords,
     plan: p,
+    units,
   };
 }
 
@@ -344,10 +441,18 @@ export const noChanges = (c: BriefChanges): boolean =>
 
 /**
  * How `brief` differs from the brief `doc` was staged from (see the module comment); null when it
- * does not, which is exactly when updateFromBrief would change nothing. A document not staged from a
- * brief, or staged from another scene's, differs by every shot and cast member of `brief`. Throws an
- * OperatorError (INVALID_PARAMS) for a brief that does not validate.
+ * does not, which is exactly when updateFromBrief (given the same `units`) would change nothing. A
+ * document not staged from a brief, or staged from another scene's, differs by every shot and cast
+ * member of `brief`. `units`: the library units the desk holds (headers are enough: nothing is
+ * decoded); without it a pinned unit counts as not held. Throws an OperatorError (INVALID_PARAMS) for
+ * a brief that does not validate.
  */
-export function briefChanges(doc: SceneDoc, brief: SceneBrief): BriefChanges | null {
-  return diffBrief(doc, readBriefRecord(doc), parseBrief(brief)).changes;
+export function briefChanges(
+  doc: SceneDoc,
+  brief: SceneBrief,
+  o: { units?: UnitSource } = {},
+): BriefChanges | null {
+  const b = parseBrief(brief);
+  const record = readBriefRecord(doc);
+  return diffBrief(doc, record, b, null, resolveBriefUnits(doc, b, record, o.units ?? null)).changes;
 }

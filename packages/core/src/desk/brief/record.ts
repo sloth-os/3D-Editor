@@ -18,10 +18,33 @@ import { BRIEF_ELEMENT_KINDS, type SceneBrief } from './schema';
  * or shorter in the desk keeps the brief's frames here, so that a later brief is compared with the
  * brief before it; an actor renamed in the desk keeps the name staged here, so that an update tells
  * the desk's names from its own. Reads are validated and cached until the document changes.
+ *
+ * Library pins (brief/units.ts): the set (`setUnit`), a cast member and an element (`unit`) keep the
+ * pin of the brief staged with what the scene holds for it (RecordPin: `staged` 'unit' when the slot
+ * holds that version, or held it before the person made it local; 'pending' when it was staged from
+ * the words and is tried again at the next open; 'refused' when the unit cannot be used, tried again
+ * only when the brief pins another version), with the reason (`why`) of the last two. The keys are
+ * written only when the slot has a pin, so the record of a brief without pins is what it was before
+ * pins. A set planned from a unit digests as the unit's pin and the sun (setDigest): its facts never
+ * take part in change detection.
  */
 
 /** The scene settings key the record is kept under. */
 export const BRIEF_RECORD_KEY = 'brief';
+
+/** What a record keeps of a slot's pin: what the scene holds for it (see the module comment). */
+export const RECORD_PIN_STAGED = ['unit', 'pending', 'refused'] as const;
+export type RecordPinStaged = (typeof RECORD_PIN_STAGED)[number];
+
+const RecordPinSchema = z.object({
+  ref: z.string(),
+  version: z.number(),
+  sha256: z.string(),
+  staged: z.enum(RECORD_PIN_STAGED),
+  /** Pending or refused: why (docs/embedding.md "When a unit is not used"). */
+  why: z.string().optional(),
+});
+export type RecordPin = z.infer<typeof RecordPinSchema>;
 
 const RecordShotSchema = z.object({
   id: z.string(),
@@ -60,6 +83,8 @@ const RecordCastSchema = z.object({
   actorName: z.string().optional(),
   /** Digest of the member's name, description, kind hint and height. */
   digest: z.string(),
+  /** The member's figure pin and what was staged for it (absent: the brief pins none). */
+  unit: RecordPinSchema.optional(),
 });
 
 const RecordElementSchema = z.object({
@@ -69,6 +94,8 @@ const RecordElementSchema = z.object({
   /** The cast member holding it, by the words (null: it stands on the ground). */
   holder: z.string().nullable(),
   digest: z.string(),
+  /** The element's prop pin and what was staged for it (absent: the brief pins none). */
+  unit: RecordPinSchema.optional(),
 });
 
 export const BriefRecordSchema = z.object({
@@ -80,6 +107,8 @@ export const BriefRecordSchema = z.object({
   height: z.number(),
   /** Digest of the set as planned (size, ground, interior, sun, landmarks: setDigest). */
   set: z.string(),
+  /** The set's pin and what was staged for it (absent: the brief pins none). */
+  setUnit: RecordPinSchema.optional(),
   shots: z.array(RecordShotSchema),
   cast: z.array(RecordCastSchema),
   elements: z.array(RecordElementSchema),
@@ -150,8 +179,21 @@ export const elementDigest = (e: SceneBrief['elements'][number]): string =>
 export const shotCameraDigest = (s: SceneBrief['shots'][number]): string =>
   digest(canonicalJson([s.framing, s.movement, s.lensMm, s.move, s.layout, s.continuity]));
 
-/** The digest of the set as planned (plan.ts: the SceneBlocking set the import builds). */
-export const setDigest = (plannedSet: unknown): string => digest(canonicalJson(plannedSet));
+/**
+ * The digest of the set as planned (plan.ts: the SceneBlocking set the import builds). A set planned
+ * from a library unit (one with `unit`) digests as its pin and its sun only.
+ */
+export function setDigest(plannedSet: unknown): string {
+  const s = plannedSet as { unit?: { ref: string; version: number; sha256: string }; sun?: unknown } | null;
+  if (s && typeof s === 'object' && s.unit)
+    return digest(
+      canonicalJson({
+        unit: { ref: s.unit.ref, version: s.unit.version, sha256: s.unit.sha256 },
+        sun: s.sun,
+      }),
+    );
+  return digest(canonicalJson(plannedSet));
+}
 
 // ---------------------------------------------------------------- reads and writes
 

@@ -19,7 +19,8 @@ import {
   RideoImportInputSchema,
   type RideoBlockingMark,
 } from '../rideo/schema';
-import type { BriefShot, SceneBrief } from './schema';
+import type { BriefShot, BriefUnitPin, SceneBrief } from './schema';
+import { pinKey, type PlannedFigure, type PropPlanInfo, type SetPiece, type SetPlanInfo } from './units';
 import {
   WATER_SIZES,
   animalOf,
@@ -54,6 +55,13 @@ import {
  *   sun from the time of day; a pond, a lake, a river or the sea named by the set or a location is a
  *   water landmark on the side the words give it (behind the cast when they give none), clear of the
  *   cast; the set grows to hold the cast, the props and the water.
+ *
+ * Library units (`units`, brief/units.ts: what the scene will hold after staging): a set unit gives
+ * the stage (its size), the interior and the ground, no water and no landmarks from the words, the
+ * set does not grow, and the opening marks and the standing props keep clear of its pieces
+ * (clearOfPieces); its planned set digests as its pin and the sun. A figure fixes its member's kind
+ * (warning when the brief's kind or height says otherwise). A prop unit gives its prop's size, and
+ * an element of kind 'other' with one is staged. A location's pin is ignored, with a warning.
  */
 
 /** How far beside its first cast member a prop stands (m), and the clearance it keeps from the others. */
@@ -118,6 +126,8 @@ export interface BriefPlan {
   set: BriefPlannedSet;
   /** The props as planned (the blocking's props in the import's input), each with its element id. */
   blockingProps: z.input<typeof RideoBlockingPropSchema>[];
+  /** The library units the plan stages with (NO_PLAN_UNITS: none). */
+  units: PlanUnits;
   warnings: string[];
 }
 
@@ -129,6 +139,71 @@ export interface BriefPlannedSet {
   interior: boolean;
   sun: { azimuthDeg: number; elevationDeg: number };
   landmarks: z.input<typeof RideoBlockingLandmarkSchema>[];
+  /** A set unit's pin (present only for a set planned from a unit: setDigest digests it and the sun). */
+  unit?: BriefUnitPin;
+}
+
+/**
+ * What a scene will hold of library units after staging (brief/units.ts afterOf): the set unit (its
+ * pin and facts), the cast members' figures and the elements' props (a prop's facts null when they
+ * are not known: its words' size is kept).
+ */
+export interface PlanUnits {
+  set: { pin: BriefUnitPin; info: SetPlanInfo } | null;
+  figures: ReadonlyMap<string, PlannedFigure>;
+  props: ReadonlyMap<string, { pin: BriefUnitPin; info: PropPlanInfo | null }>;
+}
+
+/** No library units: the plan is the words' alone. */
+export const NO_PLAN_UNITS: PlanUnits = { set: null, figures: new Map(), props: new Map() };
+
+/** How far (m) a mark or a standing prop keeps from a set unit's pieces, and marks from each other. */
+export const PIECE_CLEARANCE_M = 0.3;
+export const MARK_CLEARANCE_M = 0.6;
+/** The rings clearOfPieces searches: this far apart (m), out to RING_MAX_M, in RING_DIRECTIONS directions. */
+export const RING_STEP_M = 0.3;
+export const RING_MAX_M = 3;
+export const RING_DIRECTIONS = 16;
+
+/** Distance (m) from editor point (x, y) to piece `p`'s footprint (0 inside it). */
+export function pieceDistance(x: number, y: number, p: SetPiece): number {
+  const t = (p.rotationDeg * Math.PI) / 180;
+  const dx = x - p.x;
+  const dy = y - p.y;
+  const lx = dx * Math.cos(t) + dy * Math.sin(t);
+  const ly = -dx * Math.sin(t) + dy * Math.cos(t);
+  return Math.hypot(Math.max(Math.abs(lx) - p.width / 2, 0), Math.max(Math.abs(ly) - p.depth / 2, 0));
+}
+
+/** Whether rideo floor point (x, z) keeps PIECE_CLEARANCE_M from every piece (water included). */
+const clearOfAll = (at: { x: number; z: number }, pieces: readonly SetPiece[]) =>
+  pieces.every((p) => pieceDistance(at.x, -at.z, p) >= PIECE_CLEARANCE_M);
+
+/**
+ * A spot for a mark at rideo floor point `at` that keeps clear of a set unit's pieces: `at` itself
+ * when it is 0.3 m from every piece (water included) and 0.6 m from the marks `taken`, else the
+ * nearest such spot on rings 0.3 m apart out to 3 m, in 16 directions starting toward the audience,
+ * inside the stage (`stage`, centred on the origin); null when none is free.
+ */
+export function clearOfPieces(
+  at: { x: number; z: number },
+  pieces: readonly SetPiece[],
+  taken: readonly { x: number; z: number }[],
+  stage: { width: number; depth: number },
+): { x: number; z: number } | null {
+  const free = (p: { x: number; z: number }) =>
+    Math.abs(p.x) <= stage.width / 2 &&
+    Math.abs(p.z) <= stage.depth / 2 &&
+    clearOfAll(p, pieces) &&
+    taken.every((t) => Math.hypot(t.x - p.x, t.z - p.z) >= MARK_CLEARANCE_M);
+  if (free(at)) return at;
+  for (let r = RING_STEP_M; r <= RING_MAX_M + 1e-9; r += RING_STEP_M)
+    for (let k = 0; k < RING_DIRECTIONS; k++) {
+      const a = (2 * Math.PI * k) / RING_DIRECTIONS;
+      const p = { x: round3(at.x + r * Math.sin(a)), z: round3(at.z + r * Math.cos(a)) };
+      if (free(p)) return p;
+    }
+  return null;
 }
 
 /** A shot's cast as the desk stages it: its castIds, then the members its planned layout names besides (each once). */
@@ -168,12 +243,28 @@ function colorOf(name: string, description: string): string {
 export function castKinds(
   brief: SceneBrief,
   evidence: { holders: ReadonlySet<string> } = { holders: new Set() },
+  figures: ReadonlyMap<string, PlannedFigure> = new Map(),
 ): { kinds: Map<string, BriefCastPlan>; warnings: string[] } {
   const warnings: string[] = [];
   const kinds = new Map<string, BriefCastPlan>();
   const fixed = new Map<string, BriefCastPlan>();
   const words = (c: SceneBrief['cast'][number]) => castWords(c.name, c.description);
   for (const c of brief.cast) {
+    const f = figures.get(c.id);
+    if (f) {
+      // a library figure is the member: its kind and height, whatever the brief's say
+      fixed.set(c.id, { kind: f.kind, reason: `the library figure '${f.name}' (a ${f.kind})` });
+      const h = c.kind === null ? null : readKindHint(c.kind);
+      if (h?.type === 'kind' && h.kind !== f.kind)
+        warnings.push(
+          `${c.name}'s library figure '${f.name}' is a ${f.kind}: the brief's kind '${c.kind}' is not used`,
+        );
+      if (c.heightM !== null && Math.abs(c.heightM - f.heightM) > 0.01)
+        warnings.push(
+          `${c.name}'s library figure '${f.name}' is ${f.heightM} m tall: the brief's height ${c.heightM} m is not used`,
+        );
+      continue;
+    }
     if (c.kind === null) continue;
     const h = readKindHint(c.kind);
     if (h.type === 'kind') fixed.set(c.id, { kind: h.kind, reason: `the brief's kind '${c.kind}'` });
@@ -281,8 +372,12 @@ function besideSpots(mark: RideoBlockingMark): { x: number; z: number }[] {
 const round3 = (v: number) => Math.round(v * 1000) / 1000;
 
 /** Plans a validated brief (see the module comment). */
-export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {}): BriefPlan {
+export function planBrief(
+  brief: SceneBrief,
+  o: { preRollFrames?: number; units?: PlanUnits } = {},
+): BriefPlan {
   const warnings: string[] = [];
+  const units = o.units ?? NO_PLAN_UNITS;
   const castById = new Map(brief.cast.map((c) => [c.id, c]));
   const elementById = new Map(brief.elements.map((e) => [e.id, e]));
 
@@ -290,8 +385,18 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
   const props: string[] = [];
   const skipped: { id: string; why: string }[] = [];
   for (const e of brief.elements) {
-    if (e.kind === 'location') continue;
-    if (e.kind === 'other' && !modelFor([e.name], { exclude: brief.cast.map((c) => c.name) })) {
+    if (e.kind === 'location') {
+      if (e.unit)
+        warnings.push(
+          `${e.name}'s library unit ${pinKey(e.unit)} is ignored: the place's set is the set's own pin (set.unit)`,
+        );
+      continue;
+    }
+    if (
+      e.kind === 'other' &&
+      !units.props.has(e.id) &&
+      !modelFor([e.name], { exclude: brief.cast.map((c) => c.name) })
+    ) {
       skipped.push({
         id: e.id,
         why: 'names no built-in model (not staged: a style, or something the desk has no model of)',
@@ -322,7 +427,7 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
   );
 
   // ------------------------------------------------------------ the cast
-  const { kinds, warnings: kindWarnings } = castKinds(brief, { holders: personHolders });
+  const { kinds, warnings: kindWarnings } = castKinds(brief, { holders: personHolders }, units.figures);
   warnings.push(...kindWarnings);
   const order: string[] = [];
   for (const s of brief.shots)
@@ -342,6 +447,20 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
     layout: s.layout.map((e) => ({ characterId: e.castId, side: e.side, facing: e.facing })),
   }));
   const marks = openingMarks(shotsIn, order);
+  // a set unit's pieces: the opening marks keep clear of them (where they are first placed)
+  const pieces = units.set?.info.pieces ?? [];
+  if (units.set) {
+    const placed: { x: number; z: number }[] = [];
+    for (const [id, m] of marks) {
+      const at = clearOfPieces({ x: m.x, z: m.z }, pieces, placed, units.set.info.stage);
+      if (at) marks.set(id, { ...m, x: at.x, z: at.z });
+      else
+        warnings.push(
+          `${castById.get(id)!.name}'s opening mark is in or near a piece of the library set '${units.set.info.name}', with no free spot within ${RING_MAX_M} m: it stays`,
+        );
+      placed.push(at ?? { x: m.x, z: m.z });
+    }
+  }
 
   // ------------------------------------------------------------ where the props stand
   const taken: { x: number; z: number }[] = [...marks.values()].map((m) => ({ x: m.x, z: m.z }));
@@ -350,8 +469,15 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
     const e = elementById.get(id)!;
     const holder = holders.get(id) ?? null;
     const flies = holder ? flyerKind(`${e.name} ${e.description}`) : null;
-    const found = modelFor(flies ? [flies] : [e.name], { exclude: brief.cast.map((c) => c.name) });
-    const size = found ? Math.max(...found.entry.dimensions_m) : 0.4;
+    const unitFacts = units.props.get(id)?.info ?? null;
+    const found = unitFacts
+      ? null
+      : modelFor(flies ? [flies] : [e.name], { exclude: brief.cast.map((c) => c.name) });
+    const size = unitFacts
+      ? Math.max(...unitFacts.dimensions)
+      : found
+        ? Math.max(...found.entry.dimensions_m)
+        : 0.4;
     let at: { x: number; z: number };
     if (holder) {
       const m = marks.get(holder)!;
@@ -363,7 +489,7 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
         ? marks.get(owner)!
         : { x: 0, z: -1.5, facingDeg: 0, pose: 'stand', toX: null, toZ: null };
       const free = (p: { x: number; z: number }) =>
-        taken.every((t) => Math.hypot(t.x - p.x, t.z - p.z) >= PROP_CLEARANCE_M);
+        taken.every((t) => Math.hypot(t.x - p.x, t.z - p.z) >= PROP_CLEARANCE_M) && clearOfAll(p, pieces);
       at = besideSpots(anchor).find(free) ?? { x: anchor.x + PROP_OFFSET_M * (i + 1), z: anchor.z };
       taken.push(at);
     }
@@ -384,22 +510,30 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
   const placeWords = [...locations.map((e) => `${e.name}. ${e.description}`), brief.set.description].join(
     '. ',
   );
-  const interior = brief.set.interior ?? interiorFromWords(placeWords) ?? false;
-  const ground = groundFromWords(placeWords, interior);
-  const sun = sunOf(brief.set.timeOfDay);
+  const setUnit = units.set;
+  if (setUnit && brief.set.interior !== null && brief.set.interior !== setUnit.info.interior)
+    warnings.push(
+      `the library set '${setUnit.info.name}' is ${setUnit.info.interior ? 'an interior' : 'outdoors'}: the brief's interior ${brief.set.interior} is not used`,
+    );
+  const interior = setUnit
+    ? setUnit.info.interior
+    : (brief.set.interior ?? interiorFromWords(placeWords) ?? false);
+  const ground = setUnit ? setUnit.info.ground : groundFromWords(placeWords, interior);
   const landmarks: z.input<typeof RideoBlockingLandmarkSchema>[] = [];
   let water: { noun: string; side: 'left' | 'right' | 'behind' | 'front' | null } | null = null;
   let waterElement: string | null = null;
-  for (const [text, element] of [
-    [brief.set.description, null] as const,
-    ...locations.map((e) => [`${e.name}. ${e.description}`, e.id] as const),
-  ]) {
-    water = waterFromWords(text);
-    if (water) {
-      waterElement = element;
-      break;
+  // a library set is the place: no water from the words
+  if (!setUnit)
+    for (const [text, element] of [
+      [brief.set.description, null] as const,
+      ...locations.map((e) => [`${e.name}. ${e.description}`, e.id] as const),
+    ]) {
+      water = waterFromWords(text);
+      if (water) {
+        waterElement = element;
+        break;
+      }
     }
-  }
   const xs = taken.map((t) => t.x);
   const zs = taken.map((t) => t.z);
   const minX = Math.min(0, ...xs);
@@ -440,8 +574,13 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
       z: Math.max(extent.z, Math.abs(at.z) + d / 2),
     };
   }
-  const width = Math.min(MAX_SET_M, Math.max(MIN_SET_WIDTH_M, Math.ceil(2 * (extent.x + SET_MARGIN_M))));
-  const depth = Math.min(MAX_SET_M, Math.max(MIN_SET_DEPTH_M, Math.ceil(2 * (extent.z + SET_MARGIN_M))));
+  // a library set's stage is its own: it does not grow
+  const width = setUnit
+    ? setUnit.info.stage.width
+    : Math.min(MAX_SET_M, Math.max(MIN_SET_WIDTH_M, Math.ceil(2 * (extent.x + SET_MARGIN_M))));
+  const depth = setUnit
+    ? setUnit.info.stage.depth
+    : Math.min(MAX_SET_M, Math.max(MIN_SET_DEPTH_M, Math.ceil(2 * (extent.z + SET_MARGIN_M))));
 
   // ------------------------------------------------------------ the shots
   const shots = brief.shots.map((s) => {
@@ -471,11 +610,13 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
     depth,
     ground,
     interior,
-    sun: { azimuthDeg: sun.azimuthDeg, elevationDeg: Math.max(2, sun.elevationDeg) },
+    sun: plannedSun(brief),
     landmarks,
+    ...(setUnit ? { unit: setUnit.pin } : {}),
   };
+  const { unit: _unit, ...blockingSet } = set;
   const input: z.input<typeof RideoImportInputSchema> = {
-    blocking: { set, props: blockingProps },
+    blocking: { set: blockingSet, props: blockingProps },
     state: 'missing',
     shots,
     characters: brief.cast
@@ -511,6 +652,13 @@ export function planBrief(brief: SceneBrief, o: { preRollFrames?: number } = {})
     marks,
     set,
     blockingProps,
+    units,
     warnings,
   };
+}
+
+/** The sun a plan gives the set (the time of day's, at least 2° up). */
+export function plannedSun(brief: Pick<SceneBrief, 'set'>): { azimuthDeg: number; elevationDeg: number } {
+  const sun = sunOf(brief.set.timeOfDay);
+  return { azimuthDeg: sun.azimuthDeg, elevationDeg: Math.max(2, sun.elevationDeg) };
 }

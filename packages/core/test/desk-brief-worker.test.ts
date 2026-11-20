@@ -24,12 +24,16 @@ const FIXTURES = new URL('./fixtures/desk-embed/', import.meta.url);
 const WORKER_IMPORTS = [
   'SCHEMA_VERSION',
   'SceneDoc',
+  'adoptPublished',
   'briefChanges',
   'briefRecord',
   'checkShots',
   'getShots',
+  'pinsWanted',
   'shotResults',
   'stageBrief',
+  'stateUnitRows',
+  'unitSourceOf',
   'updateFromBrief',
 ];
 
@@ -107,6 +111,9 @@ describe('the staging worker’s import graph', () => {
       'desk/units/extract.ts',
       'desk/units/insert.ts',
       'desk/units/update.ts',
+      'desk/brief/units.ts',
+      'desk/brief/library.ts',
+      'desk/characters/figure.ts',
     ])
       expect(
         inputs.some((i) => i.endsWith(f)),
@@ -127,7 +134,7 @@ describe('the staging worker’s import graph', () => {
         `(() => {
           const brief = JSON.parse(OPEN).scene;
           const doc = Core.SceneDoc.create({ empty: true });
-          const staged = Core.stageBrief(doc, brief);
+          const staged = Core.stageBrief(doc, brief, { units: Core.unitSourceOf([]) });
           const next = JSON.parse(OPEN).scene;
           next.shots[1].durationSec = 3.5;
           const changes = Core.briefChanges(doc, next);
@@ -141,6 +148,7 @@ describe('the staging worker’s import graph', () => {
             results: results.map((r) => r.shotId),
             record: Core.briefRecord(doc) !== null,
             checks: Array.isArray(checks.issues),
+            units: [staged.units.length, Core.pinsWanted(doc, next).length, Core.stateUnitRows(doc).length],
           });
         })()`,
         realm,
@@ -153,6 +161,7 @@ describe('the staging worker’s import graph', () => {
       results: ['sht_0123456789aaaa', 'sht_0123456789bbbb'],
       record: true,
       checks: true,
+      units: [0, 0, 0],
     });
   });
 });

@@ -5,6 +5,7 @@ import { srgbToLinear } from '../render/color';
 import { DESK_PROPS } from './props';
 import { deskProp, rideoSunVector } from './layout';
 import { setDeskSettings } from './shots';
+import { listUnits, unitOf } from './units/list';
 
 /*
  * The set of a scene (spec §4 desk.set_build, §1 sun): rideo's set rebuilt in the editor.
@@ -24,6 +25,13 @@ import { setDeskSettings } from './shots';
  *
  * Everything the builder makes has desk_role 'set' and desk_label ground | wall | sun; building again
  * replaces it (and the materials only it used).
+ *
+ * A library set (desk/units: an instance with key 'set', placed by brief staging from a pinned unit)
+ * is the scene's ground and walls: with one in the scene buildSet builds and removes no ground and
+ * no walls (they are the unit's, owned by unit actions only), lights the set (lightSet: the sky or a
+ * sun lamp, removing only sun lamps outside units) and records the set's size and interior, and
+ * returns the set's root as the ground (the SceneBlocking import writes the ground's name on it).
+ * Objects inside any unit instance are never removed as the previous set.
  */
 
 export interface DeskSetOptions {
@@ -94,10 +102,22 @@ const SET_LABELS = new Set(['ground', 'wall', 'sun']);
 export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
   const width = Math.max(0.01, o.width);
   const depth = Math.max(0.01, o.depth);
-  // the previous set (and the materials nothing else uses)
+  const unitRoot = setUnitRoot(doc);
+  if (unitRoot) {
+    // a library set: its ground and walls are the unit's; only the light and the settings change
+    const lit = lightSet(doc, o);
+    setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
+    return { ground: unitRoot, walls: [], sun: lit.sun, removed: lit.removed };
+  }
+  // the previous set (and the materials nothing else uses), never a piece of a unit instance
   const old = doc
     .listObjects()
-    .filter((x) => deskProp(x, DESK_PROPS.role) === 'set' && SET_LABELS.has(deskProp(x, DESK_PROPS.label)));
+    .filter(
+      (x) =>
+        deskProp(x, DESK_PROPS.role) === 'set' &&
+        SET_LABELS.has(deskProp(x, DESK_PROPS.label)) &&
+        unitOf(doc, x.id) === null,
+    );
   const oldMaterials = new Set(old.flatMap((x) => x.material_slots.filter((m): m is string => !!m)));
   doc.removeObjects(old.map((x) => x.id));
   const used = new Set(doc.listObjects().flatMap((x) => x.material_slots));
@@ -182,7 +202,45 @@ export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
     }
   }
 
-  let sun: string | null = null;
+  const sun = lightUp(doc, o);
+  setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
+  return { ground, walls, sun, removed: old.map((x) => x.id) };
+}
+
+/** The root of the scene's library set (the unit instance with key 'set'), else null. */
+export function setUnitRoot(doc: SceneDoc): string | null {
+  for (const i of listUnits(doc)) if (i.key === 'set' && i.kind === 'set') return i.root;
+  return null;
+}
+
+/**
+ * Lights the set: the procedural SKY whose sun is the key light (`sky`), else the world's own
+ * environment (a SKY one becomes STUDIO) and a 'Set Sun' lamp. Sun lamps of an earlier set are
+ * removed first, never one inside a unit instance (a library set's own lights stay). Returns the sun
+ * lamp (null with `sky`) and the objects removed.
+ */
+export function lightSet(
+  doc: SceneDoc,
+  o: Pick<DeskSetOptions, 'sun_azimuth_deg' | 'sun_elevation_deg' | 'sky'>,
+): { sun: string | null; removed: string[] } {
+  const old = doc
+    .listObjects()
+    .filter(
+      (x) =>
+        deskProp(x, DESK_PROPS.role) === 'set' &&
+        deskProp(x, DESK_PROPS.label) === 'sun' &&
+        unitOf(doc, x.id) === null,
+    )
+    .map((x) => x.id);
+  doc.removeObjects(old);
+  return { sun: lightUp(doc, o), removed: old };
+}
+
+/** The sky or the sun lamp of a set (see lightSet), with no old one removed. */
+function lightUp(
+  doc: SceneDoc,
+  o: Pick<DeskSetOptions, 'sun_azimuth_deg' | 'sun_elevation_deg' | 'sky'>,
+): string | null {
   const world = doc.getWorld();
   if (o.sky) {
     doc.updateWorld({
@@ -191,30 +249,28 @@ export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
       sun_rotation: skySunRotation(o.sun_azimuth_deg),
       sun_elevation: (Math.max(0, Math.min(90, o.sun_elevation_deg)) * Math.PI) / 180,
     });
-  } else {
-    if (world.environment === 'SKY') doc.updateWorld({ environment: 'STUDIO' });
-    const toward = rideoSunVector(o.sun_azimuth_deg, o.sun_elevation_deg);
-    // a sun lamp shines along its −Z: its +Z (Rz(yaw)·Rx(pitch)·Z = (sin yaw sin pitch, −cos yaw sin
-    // pitch, cos pitch)) points towards the sun
-    const yaw = Math.atan2(toward[0], -toward[1]);
-    const pitch = Math.acos(Math.max(-1, Math.min(1, toward[2])));
-    const data = doc.addLight({
-      name: 'Set Sun',
-      type: 'SUN',
-      energy: world.sun_intensity || 3,
-      use_shadow: true,
-    });
-    sun = doc.addObject({
-      type: 'LIGHT',
-      name: 'Set Sun',
-      data,
-      location: [0, 0, 10],
-      rotation_euler: [pitch, 0, yaw],
-      custom_props: { [DESK_PROPS.role]: 'set', [DESK_PROPS.label]: 'sun' },
-    });
+    return null;
   }
-  setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
-  return { ground, walls, sun, removed: old.map((x) => x.id) };
+  if (world.environment === 'SKY') doc.updateWorld({ environment: 'STUDIO' });
+  const toward = rideoSunVector(o.sun_azimuth_deg, o.sun_elevation_deg);
+  // a sun lamp shines along its −Z: its +Z (Rz(yaw)·Rx(pitch)·Z = (sin yaw sin pitch, −cos yaw sin
+  // pitch, cos pitch)) points towards the sun
+  const yaw = Math.atan2(toward[0], -toward[1]);
+  const pitch = Math.acos(Math.max(-1, Math.min(1, toward[2])));
+  const data = doc.addLight({
+    name: 'Set Sun',
+    type: 'SUN',
+    energy: world.sun_intensity || 3,
+    use_shadow: true,
+  });
+  return doc.addObject({
+    type: 'LIGHT',
+    name: 'Set Sun',
+    data,
+    location: [0, 0, 10],
+    rotation_euler: [pitch, 0, yaw],
+    custom_props: { [DESK_PROPS.role]: 'set', [DESK_PROPS.label]: 'sun' },
+  });
 }
 
 /**

@@ -9,7 +9,8 @@ import { OperatorError } from '../../operators/context';
 import { DESK_PROPS } from '../props';
 import { getDeskSettings, getShots } from '../shots';
 import { DESK_SHAPE_PROP, DeskScene, isWater, toRideo, v3len, v3sub } from '../layout';
-import { GROUND_COLORS } from '../set';
+import { GROUND_COLORS, setUnitRoot } from '../set';
+import { readInstance, unitOf } from '../units/list';
 import { viewTarget } from '../moves';
 import { blueprintFor, posedBones, posesOf, requireBuiltKind } from '../characters/kinds';
 import { footprint, restSize, type PartsOf } from './footprint';
@@ -50,7 +51,10 @@ import {
  * - Landmarks and props: their footprints (centre, width × depth × height, rotation) at the first
  *   shot's start; a prop's size is its largest extent; a held prop names its holder (heldBy).
  * - The set: its size and interior from the desk settings, its ground's name, the sun's azimuth and
- *   elevation as rideo measures them.
+ *   elevation as rideo measures them. A library set (a unit instance with key 'set') is the set's
+ *   ground and pieces: its landmarks are not written (with a warning), so that importing the blocking
+ *   again keeps the set and adds no copies of its pieces, and its ground's name is the one staging
+ *   wrote on its root.
  * Shots are keyed by their source's shot id (external.shot: a host's, or an imported clip's), else by
  * their own id. Their moves are returned beside the blocking (a host keeps them as the shot's camera
  * move): a move the blocking's end does not name (a tracking shot's end reads as a push in) stays the
@@ -99,6 +103,10 @@ function hexOf(c: readonly number[]): string {
 
 /** rideo's name of a ground colour (the first word of its table that names it), else 'ground'. */
 function groundName(doc: SceneDoc): string {
+  // a library set: the name staging wrote on its root
+  const setRoot = setUnitRoot(doc);
+  const unitGround = setRoot ? prop(doc.getObject(setRoot), RIDEO_PROPS.ground) : '';
+  if (unitGround) return unitGround.slice(0, 80);
   const ground = doc
     .listObjects()
     .find((o) => prop(o, DESK_PROPS.role) === 'set' && prop(o, DESK_PROPS.label) === 'ground');
@@ -418,7 +426,17 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   };
   const landmarks: RideoSceneBlocking['set']['landmarks'] = [];
   const landmarkIds = new Set<string>();
+  // a library set's pieces are the set's: a re-import keeps the set
+  const inSetUnit = (id: string) => {
+    const owner = unitOf(doc, id);
+    return owner !== null && readInstance(doc, owner)?.kind === 'set';
+  };
+  let setPieces = 0;
   for (const l of objects.filter((x) => prop(x, DESK_PROPS.role) === 'landmark' && isRoot(x, 'landmark'))) {
+    if (inSetUnit(l.id)) {
+      setPieces++;
+      continue;
+    }
     if (landmarks.length >= RIDEO_MAX_LANDMARKS) {
       warnings.push(`a blocking's set holds at most ${RIDEO_MAX_LANDMARKS} landmarks: '${l.name}' left out`);
       continue;
@@ -452,6 +470,14 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
       color: HEX.test(color) ? color.toLowerCase() : rideoLandmarkColor(label, shape),
       elementId: isRideoId(element) ? element : null,
     });
+  }
+
+  if (setPieces) {
+    const root = setUnitRoot(doc);
+    const name = (root && readInstance(doc, root)?.name) || 'library set';
+    warnings.push(
+      `the set is the library's '${name}': its ${setPieces} piece(s) are not written as landmarks (a re-import keeps the set)`,
+    );
   }
 
   // ------------------------------------------------------------ props

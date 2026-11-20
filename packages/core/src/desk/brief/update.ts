@@ -6,12 +6,15 @@ import { checkShots } from '../checks';
 import { createActor, defaultActorHeight, holdProp } from '../characters';
 import { nextActorColor } from '../characters/actor';
 import { attachSpans } from '../characters/attach';
+import { createFigureActor, restyleActor } from '../characters/figure';
 import { isActorKind } from '../characters/kinds';
 import { RIDE_PREFIX } from '../characters/rig';
-import type { ActorKind } from '../characters/types';
+import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { addDeskCamera, prepareDeskCamera, retimeCameraRange } from '../moves';
 import { DESK_PROPS } from '../props';
-import { buildSet } from '../set';
+import { buildSet, lightSet, setUnitRoot } from '../set';
+import { unitOf } from '../units/list';
+import { updateUnit } from '../units/update';
 import { FRAMING_TABLE } from '../solver';
 import { MAX_SHOT_SUBJECTS, getDeskSettings, getShots, newShotId, setDeskSettings, setShots } from '../shots';
 import {
@@ -34,8 +37,8 @@ import {
 import { hideSpans } from '../rideo/keys';
 import { editorPose, flyerKind, isHumanoid, isRideable, ridersByText, shotText } from '../rideo/rules';
 import { RideoImportInputSchema, type RideoBlockingMark, type RideoBlockingProp } from '../rideo/schema';
-import { briefFrames, diffBrief, holderRuns } from './changes';
-import { planBrief, shotCast } from './plan';
+import { briefFrames, diffBrief, holderRuns, planWithUnits, resolveBriefUnits } from './changes';
+import { shotCast } from './plan';
 import {
   digest,
   readBriefRecord,
@@ -49,13 +52,28 @@ import {
   briefContext,
   briefIssues,
   docContext,
+  figureHook,
   hostShots,
+  insertSetUnit,
   parseBrief,
+  propHook,
   recordOf,
+  recordPinsOf,
   stagedActors,
   stagedBy,
   type StageBriefReport,
 } from './stage';
+import {
+  SET_ROOT_ID,
+  UNIT_FACTS_PROP,
+  decodeHeld,
+  reportRowOf,
+  unitWarnings,
+  type SetPlanInfo,
+  type SlotUnit,
+  type StageUnitRow,
+  type UnitSource,
+} from './units';
 import {
   deleteSceneRanges,
   insertSceneTime,
@@ -113,6 +131,20 @@ import {
  * the brief now orders them otherwise than it did and the desk does not: stage the brief in a new
  * project to follow a new order. A brief that changes nothing the update acts on (briefChanges null)
  * leaves the staging as it is (changes.ts).
+ *
+ * Library pins (brief/units.ts; `units`, the units the desk holds) act per slot:
+ * - the set: a unit placed takes the place of the words' set (its ground, walls and landmarks go) and
+ *   is lit; a new version updates the instance (its root and the parts not edited here keep their
+ *   ids); another item replaces it; no pin brings the words' set back; the cameras still as staged
+ *   are solved again (one set by hand is kept, with a warning);
+ * - a figure restyles its member's actor in place (same armature, keys, holds, shots) when its kind
+ *   and height are the actor's; a member the update adds stands as the figure; no pin brings back the
+ *   mannequin of the actor's kind and height (another kind or height is refused and the actor kept:
+ *   rebuilding it is left to staging the brief in a new project);
+ * - a prop unit replaces the element's prop, or updates it to a new version of the same item (its
+ *   root id stays), held or flown again; no pin brings back the words' prop;
+ * - a unit not held changes nothing (the words, or the version placed, stay), a slot made local stays
+ *   local, a refused pin is not tried again; the record says what each slot holds.
  */
 
 /** Whether object `id` animates as the desk last staged it (its recorded motion digest). */
@@ -219,7 +251,11 @@ function ridesAt(doc: SceneDoc, riderId: string, mountId: string, frame: number)
  * transaction (desk.update_from_brief's execute; see updateFromBrief). INVALID_PARAMS for a brief
  * that does not validate, a project not staged from a brief or staged from another scene.
  */
-export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBriefReport {
+export function updateFromBriefIn(
+  ctx: OperatorContext,
+  raw: unknown,
+  opts: { units?: UnitSource } = {},
+): StageBriefReport {
   const brief = parseBrief(raw);
   const doc = ctx.doc;
   const record = readBriefRecord(doc);
@@ -234,8 +270,13 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
       'INVALID_PARAMS',
     );
   const sceneId = brief.id;
-  const plan = planBrief(brief);
-  const diff = diffBrief(doc, record, brief, plan);
+  // the library units: what is held of each pin, decoded for the slots the update places
+  const source = opts.units ?? null;
+  const units = resolveBriefUnits(doc, brief, record, source);
+  decodeHeld(units, source);
+  const plan = planWithUnits(doc, brief, units);
+  const diff = diffBrief(doc, record, brief, plan, units);
+  const done = new Set<string>();
   const input = RideoImportInputSchema.parse(plan.input);
   const blocking = parseRideoBlocking(input.blocking ?? {});
   const plannedShot = new Map(input.shots.map((s) => [s.id, s]));
@@ -243,7 +284,7 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
   const elementById = new Map(brief.elements.map((e) => [e.id, e]));
   const recordShot = new Map(record.shots.map((s) => [s.id, s]));
   const recordCast = new Map(record.cast.map((c) => [c.id, c]));
-  const warnings: string[] = [...plan.warnings];
+  const warnings: string[] = [...plan.warnings, ...unitWarnings(units)];
   const stamp = (o: Record<string, string | number | boolean>) => ({ ...o, [RIDEO_PROPS.clip]: sceneId });
   const castNames = plan.order.map((id) => castById.get(id)!.name);
   const solve = new Set<string>();
@@ -330,7 +371,18 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
     if (actors.has(cid)) continue;
     if (recordCast.has(cid) && stagedBefore.has(cid) && !restaged.some((s) => shotCast(s).includes(cid)))
       continue;
-    const id = addActor(doc, cid, brief, plan.cast.get(cid)!.kind, plan.marks.get(cid), actors, stamp);
+    const figure = figureHook(units.cast.get(cid));
+    const id = addActor(
+      doc,
+      cid,
+      brief,
+      plan.cast.get(cid)!.kind,
+      plan.marks.get(cid),
+      actors,
+      stamp,
+      figure,
+    );
+    if (figure) done.add(figure.key);
     actors.set(cid, doc.getObject(id)!);
     created.add(cid);
   }
@@ -362,12 +414,29 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
       warnings.push(
         `${c.name} now reads as a ${now} but stays the ${kind} staged before (its keys kept): stage the brief in a new project to rebuild it`,
       );
-    if (was && was.heightM !== undefined && was.heightM !== c.heightM) {
+    // a library figure's height is the figure's
+    if (was && was.heightM !== undefined && was.heightM !== c.heightM && !plan.units.figures.has(cid)) {
       const height = (h: number | null) => (h === null ? 'unset' : `${h} m`);
       warnings.push(
         `${c.name}'s height in the brief is now ${height(c.heightM)} (${height(was.heightM)} before), but the actor keeps the height it was staged with: stage the brief in a new project to rebuild it`,
       );
     }
+  }
+  // library figures on the actors the update keeps: a new look in place, or the mannequin again
+  for (const [cid, slot] of units.cast) {
+    const actor = actors.get(cid);
+    if (!actor || created.has(cid) || slot.action === 'none') continue;
+    const name = castById.get(cid)?.name ?? actor.name;
+    if (slot.action === 'remove') {
+      const color = ACTOR_PALETTE[Math.max(0, plan.order.indexOf(cid)) % ACTOR_PALETTE.length];
+      const r = restyleActor(doc, actor.id, { mannequin: { color } });
+      warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
+    } else if (slot.payload) {
+      const r = restyleActor(doc, actor.id, { figure: slot.payload, pin: slot.pin!, key: slot.key });
+      warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
+      done.add(slot.key);
+    }
+    actors.set(cid, doc.getObject(actor.id)!);
   }
   const actorId = (cid: string) => actors.get(cid)?.id ?? null;
   const actorCast = new Map([...actors].map(([cid, o]) => [o.id, cid]));
@@ -559,7 +628,48 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
   }
 
   // ------------------------------------------------------------ the set
-  if (diff.set) restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+  const setSlot = units.set;
+  const setAction = setSlot?.action ?? 'none';
+  if (setSlot && (setAction === 'place' || setAction === 'replace' || setAction === 'update')) {
+    if (setAction === 'update') {
+      const root = setSlot.inst!.root;
+      const rep = updateUnit(doc, root, setSlot.payload!, setSlot.pin!);
+      warnings.push(...rep.warnings.map((w) => `the library set: ${w}`));
+      const info = setSlot.held!.info as SetPlanInfo;
+      const o = doc.getObject(root)!;
+      doc.updateObject(root, {
+        custom_props: {
+          ...o.custom_props,
+          [RIDEO_PROPS.ground]: info.ground,
+          [UNIT_FACTS_PROP]: JSON.stringify(info),
+        },
+      });
+    } else {
+      // the words' set (or the library set before) goes: the library set is the place
+      if (setAction === 'replace') removeTrees(doc, [setSlot.inst!.root]);
+      removeWordSet(doc, sceneId);
+      insertSetUnit(doc, sceneId, setSlot);
+    }
+    relightSet(doc, blocking);
+    done.add(setSlot.key);
+  } else if (setSlot && setAction === 'remove') {
+    removeTrees(doc, [setSlot.inst!.root]);
+    restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+  } else if (diff.set) {
+    // a library set (or one made local) is relit; the words' set is built again
+    if (plan.set.unit) relightSet(doc, blocking);
+    else restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+  }
+  // the cameras still as staged see the new set: solved again (one set by hand is kept)
+  if (setAction !== 'none')
+    for (const d of hostShots(doc, sceneId).values()) {
+      if (!d.camera || solve.has(d.id)) continue;
+      if (staged.get(d.camera) === false)
+        warnings.push(
+          `${d.name}: its camera was set by hand in the desk and is kept; the set changed, so check its framing (solve it again with desk.shot_solve)`,
+        );
+      else solve.add(d.id);
+    }
 
   // ------------------------------------------------------------ props
   const plannedProps = new Map(blocking.props.filter((p) => p.elementId).map((p) => [p.elementId!, p]));
@@ -585,15 +695,13 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
           .some((id) => place.has(id)));
     if (!restage) continue;
     if (old) for (const x of tetherPartsOf(doc, old.id)) removeTrees(doc, [x]);
-    const made = buildProp(
-      doc,
-      p,
-      e.name,
-      castNames,
-      stamp,
-      flies,
-      old && doc.getObject(old.id) ? old : undefined,
-    );
+    const current = old && doc.getObject(old.id) ? old : undefined;
+    const slot = units.elements.get(eid);
+    // the element's library prop: placed, updated or replaced; kept (another version not held, made
+    // local); none any more (the words' prop again)
+    const unit = slot?.action === 'remove' ? null : propHook(doc, slot, current?.id ?? null);
+    if (unit?.unit) done.add(unit.key);
+    const made = buildProp(doc, p, e.name, castNames, stamp, flies, current, unit);
     const rest = { ...doc.getObject(made.root)!.custom_props };
     delete rest[RIDEO_PROPS.heldBy];
     doc.updateObject(made.root, {
@@ -659,8 +767,26 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
       actorName: actorNames.get(cid),
     });
   }
-  const next = recordOf(brief, desk, kinds, plan.holders, plan.set, keptNotes, removedKept);
+  const next = recordOf(
+    brief,
+    desk,
+    kinds,
+    plan.holders,
+    plan.set,
+    keptNotes,
+    removedKept,
+    recordPinsOf(units, done),
+  );
   writeBriefRecord(doc, next);
+  const objectOf = (s: SlotUnit): string | null =>
+    'set' in s.slot
+      ? (setUnitRoot(doc) ?? (doc.getObject(SET_ROOT_ID()) ? SET_ROOT_ID() : null))
+      : 'castId' in s.slot
+        ? actorId(s.slot.castId)
+        : (props.get(s.slot.elementId)?.id ?? null);
+  const unitRows = units.all
+    .map((s) => reportRowOf(s, objectOf(s), done.has(s.key)))
+    .filter((x): x is StageUnitRow => x !== null);
   const hostOf = new Map([...desk].map(([host, s]) => [s.id, host]));
   const issues = checkShots(doc, { shots: [...desk.values()].map((s) => s.id) }).issues;
   return {
@@ -693,6 +819,7 @@ export function updateFromBriefIn(ctx: OperatorContext, raw: unknown): StageBrie
     })),
     changes: diff.changes,
     solved: [...desk].filter(([, s]) => solve.has(s.id)).map(([host]) => host),
+    units: unitRows,
     warnings,
     issues: briefIssues(issues, hostOf),
   };
@@ -737,6 +864,7 @@ function addActor(
   mark: RideoBlockingMark | undefined,
   actors: ReadonlyMap<string, ObjectData>,
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
+  figure?: ReturnType<typeof figureHook>,
 ): string {
   const c = brief.cast.find((x) => x.id === cid)!;
   const taken: RideoBlockingMark[] = [...actors.values()].map((o) => {
@@ -747,16 +875,27 @@ function addActor(
   const clear = taken.every((t) => Math.hypot(t.x - want.x, t.z - want.z) >= LAYOUT_SPACING_M / 2);
   const at = clear ? { x: want.x, z: want.z } : freeRowSpot(taken, want.x);
   const heightM = c.heightM && c.heightM > 0 ? c.heightM / rideoHeightRatio(kind) : defaultActorHeight(kind);
-  const r = createActor(doc, {
-    kind,
-    name: c.name,
-    color: nextActorColor(doc),
-    height_m: heightM,
-    location: [at.x, -at.z, 0],
-    facing_deg: want.facingDeg,
-    pose: editorPose('stand', kind),
-    character_id: cid,
-  });
+  // a library figure is the member: its own kind, height and colour
+  const r = figure
+    ? createFigureActor(doc, figure.unit, {
+        pin: figure.pin,
+        key: figure.key,
+        name: c.name,
+        location: [at.x, -at.z, 0],
+        facing_deg: want.facingDeg,
+        pose: editorPose('stand', figure.kind),
+        character_id: cid,
+      })
+    : createActor(doc, {
+        kind,
+        name: c.name,
+        color: nextActorColor(doc),
+        height_m: heightM,
+        location: [at.x, -at.z, 0],
+        facing_deg: want.facingDeg,
+        pose: editorPose('stand', kind),
+        character_id: cid,
+      });
   const used = new Set(
     doc
       .listObjects()
@@ -833,12 +972,19 @@ function restageSet(
     sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
     sky: !set.interior,
   });
+  // a library set (an instance with key 'set', pinned or not) keeps its ground and pieces: lit only
+  if (setUnitRoot(doc)) return;
   const ground = doc.getObject(built.ground);
   if (ground)
     doc.updateObject(built.ground, {
       custom_props: { ...ground.custom_props, [RIDEO_PROPS.ground]: set.ground },
     });
-  const old = stagedBy(doc, 'landmark', sceneId, (o) => o.custom_props?.[RIDEO_PROPS.id]);
+  // a library unit's pieces are never an old landmark of the words'
+  const old = new Map(
+    [...stagedBy(doc, 'landmark', sceneId, (o) => o.custom_props?.[RIDEO_PROPS.id])].filter(
+      ([, o]) => unitOf(doc, o.id) === null,
+    ),
+  );
   const kept = new Set<string>();
   for (const l of set.landmarks) {
     const element = l.elementId ? (brief.elements.find((e) => e.id === l.elementId)?.name ?? null) : null;
@@ -848,14 +994,55 @@ function restageSet(
   for (const [rid, o] of old) if (!kept.has(rid) && doc.getObject(o.id)) removeTrees(doc, [o.id]);
 }
 
+/** Lights a set planned from a library unit (or made local) and records its size and interior: its ground and pieces stay. */
+function relightSet(doc: SceneDoc, blocking: ReturnType<typeof parseRideoBlocking>): void {
+  const set = blocking.set;
+  lightSet(doc, {
+    sun_azimuth_deg: set.sun.azimuthDeg,
+    sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
+    sky: !set.interior,
+  });
+  setDeskSettings(doc, { set_width: set.width, set_depth: set.depth, interior: set.interior });
+}
+
+/**
+ * Removes the words' set of scene `sceneId` (its ground and walls, its landmarks, and the materials
+ * only they used), never an object inside a library unit instance.
+ */
+function removeWordSet(doc: SceneDoc, sceneId: string): void {
+  const ground = doc
+    .listObjects()
+    .filter(
+      (o) =>
+        o.custom_props?.[DESK_PROPS.role] === 'set' &&
+        (o.custom_props?.[DESK_PROPS.label] === 'ground' || o.custom_props?.[DESK_PROPS.label] === 'wall') &&
+        unitOf(doc, o.id) === null,
+    );
+  const landmarks = [
+    ...stagedBy(doc, 'landmark', sceneId, (o) => o.custom_props?.[RIDEO_PROPS.id]).values(),
+  ].filter((o) => unitOf(doc, o.id) === null);
+  const materials = new Set(ground.flatMap((o) => o.material_slots.filter((m): m is string => !!m)));
+  removeTrees(
+    doc,
+    [...ground, ...landmarks].map((o) => o.id),
+  );
+  const used = new Set(doc.listObjects().flatMap((o) => o.material_slots));
+  for (const m of materials) if (!used.has(m)) doc.removeMaterial(m);
+}
+
 /**
  * Updates a project staged from a brief (stageBrief) to a later brief of the same scene, in one
  * transaction (one undo step), keeping the staging of what did not change: see the module comment.
  * The report's `changes` say how the brief differed from the one staged before, as briefChanges
  * did (null: nothing to update; the staging stays as it is). Throws an OperatorError (INVALID_PARAMS)
  * for a brief that does not validate, a project not staged from a brief, or one staged from another
- * scene. Runs in a web worker: no DOM, no Node API.
+ * scene. `units`: the library units the desk holds for the brief's pins (see the module comment;
+ * without it a pin's unit counts as not held). Runs in a web worker: no DOM, no Node API.
  */
-export function updateFromBrief(doc: SceneDoc, brief: SceneBrief): StageBriefReport {
-  return doc.transact(() => updateFromBriefIn(docContext(doc), brief));
+export function updateFromBrief(
+  doc: SceneDoc,
+  brief: SceneBrief,
+  opts: { units?: UnitSource } = {},
+): StageBriefReport {
+  return doc.transact(() => updateFromBriefIn(docContext(doc), brief, opts));
 }

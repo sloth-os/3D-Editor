@@ -19,6 +19,11 @@ import { cameraMoveOf, FRAMING_TABLE } from '../solver';
 import { fitShotToPlan, planFit } from '../plan';
 import { checkShots, type DeskIssue } from '../checks';
 import { applyPose, createActor, holdProp, isActor, mount, moveAlongPath } from '../characters';
+import { createFigureActor } from '../characters/figure';
+import type { UnitPayload } from '../units/format';
+import { insertUnit, type UnitPin } from '../units/insert';
+import { readInstance, unitOf } from '../units/list';
+import { updateUnit } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { defaultActorHeight } from '../characters';
 import { deskTetherFly } from '../physics';
@@ -101,6 +106,17 @@ import {
  * describes the same way is kept with what was added to it (physics, materials, modifiers), else it is
  * built anew. The animation of imported actors and props is rebuilt from rideo's (keys added to them
  * by hand are lost).
+ *
+ * Library units (code-level hooks, ImportUnits; the SceneBlocking JSON is unchanged): brief staging
+ * hands the import a prop unit per element and a figure unit per cast member it places (desk/brief),
+ * and the opening marks it planned clear of a set unit's pieces. A prop unit is put in as an instance
+ * (key 'el:<elementId>') at its spot, its base on the ground and its own size, and held or flown as a
+ * built-in prop is; an earlier instance of the same library item is kept and updated to the pinned
+ * version (its root id stays). A figure is put in as the cast member's actor (key 'cast:<castId>'),
+ * its kind, height and colour the figure's. Objects inside an instance are the unit's: an import never
+ * takes them for its own landmarks, props or actors (only an instance's root is), and a re-import
+ * without hooks keeps an imported prop that is an instance (with its look) and a figure actor of the
+ * same kind and height (with its colour).
  */
 
 /** Custom properties the import writes (besides DESK_PROPS). */
@@ -242,6 +258,41 @@ export interface RideoImportResult {
   warnings: string[];
 }
 
+/** A unit staging places through the import: its instance key, its pin and the decoded unit. */
+export interface StagedUnit {
+  /** The instance key (slotKey): 'el:<elementId>', 'cast:<castId>'. */
+  key: string;
+  pin: UnitPin;
+  /** The decoded unit (null: the slot's instance is kept as it is, only placed again). */
+  unit: UnitPayload | null;
+}
+
+/** A prop unit: its base (its root stands at z = −base) and the planning facts stamped on its root. */
+export interface StagedProp extends StagedUnit {
+  base: number;
+  /** The scene prop desk_unit_facts of its root (JSON), or null. */
+  facts: string | null;
+}
+
+/** A figure unit: the actor's kind, height and colour (the figure's). */
+export interface StagedFigure extends StagedUnit {
+  unit: UnitPayload;
+  kind: ActorKind;
+  heightM: number;
+  color: string;
+}
+
+/**
+ * Library units for the import (brief staging's; see the module comment): the opening marks to use
+ * instead of the planned layouts' (state 'missing'), and per prop and per cast member the unit that
+ * stages it (undefined: the built-in prop, the mannequin).
+ */
+export interface ImportUnits {
+  marks?: ReadonlyMap<string, RideoBlockingMark>;
+  prop?(p: RideoBlockingProp): StagedProp | null | undefined;
+  figure?(characterId: string): StagedFigure | undefined;
+}
+
 // ---------------------------------------------------------------- small helpers
 
 const rad = (deg: number) => (deg * Math.PI) / 180;
@@ -304,6 +355,9 @@ function importedBy(
   const out = new Map<string, ObjectData>();
   for (const o of doc.listObjects()) {
     if (prop(o, DESK_PROPS.role) !== role) continue;
+    // a part of a library unit instance is the unit's, not the import's (its root may be the import's)
+    const owner = unitOf(doc, o.id);
+    if (owner !== null && owner !== o.id) continue;
     const k = key(o);
     if (!k) continue;
     const from = prop(o, RIDEO_PROPS.clip);
@@ -487,6 +541,7 @@ export function importRideoBlocking(
   ctx: OperatorContext,
   raw: unknown,
   solve: ShotSolver,
+  units: ImportUnits = {},
 ): RideoImportResult {
   const parsed = RideoImportInputSchema.safeParse(raw);
   if (!parsed.success)
@@ -563,7 +618,8 @@ export function importRideoBlocking(
   // opening marks: the blocking's (missing state: placed from the shots' planned layouts)
   const opening = new Map<string, RideoBlockingMark>();
   if (missing) {
-    for (const [id, mark] of openingMarks(ordered, cast)) opening.set(id, mark);
+    for (const [id, mark] of units.marks ?? openingMarks(ordered, cast))
+      if (cast.includes(id)) opening.set(id, mark);
     // a brief never has positions: saying so would be noise there
     if (source === 'rideo')
       warnings.push(
@@ -794,12 +850,18 @@ export function importRideoBlocking(
     const b = blockActor.get(id);
     const c = characters.get(id);
     const humanoid = isHumanoid(kind);
+    // a library figure: its own height and colour
+    const figure = units.figure?.(id);
     // people: rideo's height (the draft's, from the identity); animals: theirs when rideo has one,
     // their mannequin's top in rideo, made the withers the desk sizes an animal by
     let h = b?.heightM ?? c?.heightM ?? null;
     if (!humanoid && (h === null || Math.abs(h - 1.7) < 1e-6)) h = c?.heightM ?? null;
-    const heightM = h && h > 0 ? h / rideoHeightRatio(kind) : defaultActorHeight(kind);
-    const color = (b?.color ?? ACTOR_PALETTE[i % ACTOR_PALETTE.length]).toLowerCase();
+    const heightM = figure
+      ? figure.heightM
+      : h && h > 0
+        ? h / rideoHeightRatio(kind)
+        : defaultActorHeight(kind);
+    const color = figure ? figure.color : (b?.color ?? ACTOR_PALETTE[i % ACTOR_PALETTE.length]).toLowerCase();
     const first = markOf(ordered[0].id, id);
     const old = oldActors.get(id);
     let actorId: string | null = null;
@@ -807,14 +869,38 @@ export function importRideoBlocking(
     if (old) {
       const sameKind = prop(old, DESK_PROPS.kind) === kind;
       const oldH = Number(old.custom_props?.[DESK_PROPS.heightM]);
-      if (sameKind && Number.isFinite(oldH) && Math.abs(oldH - heightM) < 0.005 && isActor(doc, old.id)) {
+      const inst = readInstance(doc, old.id);
+      // a figure is kept only as that very version
+      const sameFigure = figure
+        ? !!inst && inst.ref === figure.pin.ref && inst.version === figure.pin.version
+        : true;
+      if (
+        sameKind &&
+        sameFigure &&
+        Number.isFinite(oldH) &&
+        Math.abs(oldH - heightM) < 0.005 &&
+        isActor(doc, old.id)
+      ) {
         actorId = old.id;
         resetActor(doc, old.id, nameOf(id), color);
       } else {
         removeTrees(doc, [old.id]);
       }
     }
-    if (!actorId) {
+    if (!actorId && figure) {
+      const r = createFigureActor(doc, figure.unit, {
+        pin: figure.pin,
+        key: figure.key,
+        name: nameOf(id),
+        location: floor(first.x, first.z),
+        facing_deg: first.facingDeg,
+        pose: editorPose(first.pose, kind),
+        character_id: id,
+      });
+      for (const w of r.warnings) warnings.push(`${nameOf(id)}: ${w}`);
+      actorId = r.actor;
+      created = true;
+    } else if (!actorId) {
       const r = createActor(doc, {
         kind,
         name: nameOf(id),
@@ -885,7 +971,7 @@ export function importRideoBlocking(
       for (const x of tetherPartsOf(doc, old.id)) removeTrees(doc, [x]);
       keptProps.add(p.id);
     }
-    const made = buildProp(doc, p, elementName, castNames, stamp, flies, old);
+    const made = buildProp(doc, p, elementName, castNames, stamp, flies, old, units.prop?.(p));
     props.set(p.id, { ...made, plan: p, flies });
     // rideo's holder, for the export to write back while the desk has no hold of theirs
     const rest = { ...doc.getObject(made.root)!.custom_props };
@@ -1627,7 +1713,9 @@ function resetActor(doc: SceneDoc, id: string, name: string, color: string): voi
   removeAttachments(doc, id);
   const o = doc.getObject(id)!;
   if (o.name !== name) doc.rename('objects', id, name);
-  doc.updateObject(id, { custom_props: { ...o.custom_props, [DESK_PROPS.color]: color } });
+  // a library figure's colour is the figure's (the unit's): it stays
+  if (readInstance(doc, id)?.kind !== 'figure')
+    doc.updateObject(id, { custom_props: { ...o.custom_props, [DESK_PROPS.color]: color } });
   applyPose(doc, id, 'stand');
 }
 
@@ -1740,9 +1828,99 @@ export function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
 function keepable(doc: SceneDoc, old: ObjectData | undefined, build: string): old is ObjectData {
   if (!old || !doc.getObject(old.id)) return false;
   if (prop(doc.getObject(old.id), RIDEO_PROPS.build) === build) return true;
+  // a library unit instance is kept with its look (only unit actions change it)
+  if (readInstance(doc, old.id)) return true;
   removeTrees(doc, [old.id]);
   return false;
 }
+
+/** The library item and version an imported prop was built from ('unit:<ref>@<version>' recipes), else null. */
+function unitBuildOf(doc: SceneDoc, id: string): { ref: string; version: number } | null {
+  try {
+    const b = JSON.parse(prop(doc.getObject(id), RIDEO_PROPS.build)) as unknown;
+    const m = Array.isArray(b) && typeof b[1] === 'string' ? /^unit:(.+)@(\d+)$/.exec(b[1]) : null;
+    return m ? { ref: m[1], version: Number(m[2]) } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Points the shots' subjects and layouts that name object `from` at `to`. */
+function remapShotRefs(doc: SceneDoc, from: string, to: string): void {
+  const shots = getShots(doc);
+  if (!shots.some((s) => s.subjects.includes(from) || s.layout.some((e) => e.subject === from))) return;
+  setShots(
+    doc,
+    shots.map((s) => ({
+      ...s,
+      subjects: s.subjects.map((id) => (id === from ? to : id)),
+      layout: s.layout.map((e) => (e.subject === from ? { ...e, subject: to } : e)),
+    })),
+  );
+}
+
+/**
+ * A prop staged from a library unit (see buildProp): the instance with key `unit.key`, its root at the
+ * prop's spot with its base on the ground and the unit's own size. An earlier root of the same library
+ * item (an instance, or one made local) is kept, updated to the pin's version, cleared of its
+ * animation and of the import's holds; another earlier root is swapped for the unit (the unit's root
+ * takes its id when their types agree, else shots that named it name the new root).
+ */
+function buildUnitProp(
+  doc: SceneDoc,
+  p: RideoBlockingProp,
+  label: string,
+  props: Record<string, string | number | boolean>,
+  flies: 'kite' | 'balloon' | null,
+  old: ObjectData | undefined,
+  unit: StagedProp,
+): { root: string; baseScale: Vec3; model: string | null; created: boolean } {
+  const model = `unit:${unit.pin.ref}@${unit.pin.version}`;
+  const build = JSON.stringify(['prop', model, label, flies]);
+  const own = stampFacts({ ...props, [RIDEO_PROPS.build]: build }, unit.facts);
+  const at: Vec3 = [p.x, -p.z, -unit.base];
+  const cur = old && doc.getObject(old.id) ? old : undefined;
+  const inst = cur ? readInstance(doc, cur.id) : null;
+  const sameItem = cur && (inst ? inst.ref === unit.pin.ref : unitBuildOf(doc, cur.id)?.ref === unit.pin.ref);
+  let root: string;
+  let created = false;
+  if (cur && sameItem) {
+    root = cur.id;
+    if (inst && unit.unit && (inst.version !== unit.pin.version || inst.sha256 !== unit.pin.sha256))
+      updateUnit(doc, root, unit.unit, unit.pin);
+    clearAnimation(doc, root);
+    removeAttachments(doc, root);
+  } else {
+    if (!unit.unit) throw new OperatorError(`the library unit of '${label}' is not here to place`, 'FAILED');
+    const unitRoot = unit.unit.body.blocks.objects?.['@root'];
+    const swap =
+      cur && !inst && unitRoot && doc.getObject(cur.id)?.type === unitRoot.type ? cur.id : undefined;
+    if (cur && !swap) removeTrees(doc, [cur.id]);
+    root = insertUnit(doc, unit.unit, {
+      ...unit.pin,
+      key: unit.key,
+      name: label,
+      ...(swap ? { replace: swap } : {}),
+      rootProps: own,
+    }).root;
+    if (cur && !swap) remapShotRefs(doc, cur.id, root);
+    created = !swap;
+  }
+  const o = doc.getObject(root)!;
+  doc.updateObject(root, {
+    location: at,
+    rotation_euler: [0, 0, 0],
+    custom_props: { ...o.custom_props, ...own },
+  });
+  const s = doc.getObject(root)!.scale;
+  return { root, baseScale: [s[0], s[1], s[2]], model, created };
+}
+
+/** `props` with the planning facts a unit's root keeps (desk_unit_facts), when there are any. */
+const stampFacts = (
+  props: Record<string, string | number | boolean>,
+  facts: string | null,
+): Record<string, string | number | boolean> => (facts ? { ...props, desk_unit_facts: facts } : props);
 
 /**
  * Adds a prop: the built-in model its element or label names, fitted to `size`, else a cube of edge
@@ -1758,8 +1936,38 @@ export function buildProp(
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   flies: 'kite' | 'balloon' | null,
   old?: ObjectData,
+  unit?: StagedProp | null,
 ): { root: string; baseScale: Vec3; model: string | null; created: boolean } {
   const label = p.label || elementName || p.id;
+  if (unit)
+    return buildUnitProp(
+      doc,
+      p,
+      label,
+      stamp({
+        [DESK_PROPS.role]: 'prop',
+        [DESK_PROPS.label]: label,
+        [RIDEO_PROPS.id]: p.id,
+        [DESK_PROPS.color]: p.color,
+        ...(p.elementId ? { [DESK_PROPS.elementId]: p.elementId } : {}),
+      }),
+      flies,
+      old,
+      unit,
+    );
+  // null: the element has no unit (any more): an instance of one goes, for the words' prop (the
+  // shots that named it name the new prop)
+  let replaced: string | null = null;
+  if (
+    unit === null &&
+    old &&
+    doc.getObject(old.id) &&
+    (readInstance(doc, old.id) || unitBuildOf(doc, old.id))
+  ) {
+    replaced = old.id;
+    removeTrees(doc, [old.id]);
+    old = undefined;
+  }
   const queries = flies === 'kite' ? ['kite'] : flies === 'balloon' ? ['balloon'] : [elementName, p.label];
   const found = modelFor(queries.filter(Boolean), { exclude: castNames });
   const build = JSON.stringify([
@@ -1785,13 +1993,18 @@ export function buildProp(
   if (keepable(doc, old, build)) {
     root = old.id;
     created = false;
-    for (const id of subtree(doc, root)) clearAnimation(doc, id);
+    const inst = readInstance(doc, root);
+    // a library unit's own parts carry no animation of the import's: only its root is cleared
+    for (const id of inst ? [root] : subtree(doc, root)) clearAnimation(doc, id);
     removeAttachments(doc, root);
     const o = doc.getObject(root)!;
     doc.updateObject(root, {
-      location: at,
+      // a library prop stands on its base (its root's height is kept)
+      location: inst ? [at[0], at[1], o.location[2]] : at,
       rotation_euler: [0, 0, 0],
-      custom_props: { ...o.custom_props, ...props },
+      custom_props: inst
+        ? { ...o.custom_props, ...props, [RIDEO_PROPS.build]: prop(o, RIDEO_PROPS.build) || build }
+        : { ...o.custom_props, ...props },
     });
   } else if (found) {
     const entry: CatalogEntry = found.entry;
@@ -1817,6 +2030,7 @@ export function buildProp(
       custom_props: props,
     });
   }
+  if (replaced) remapShotRefs(doc, replaced, root);
   const s = doc.getObject(root)!.scale;
   return { root, baseScale: [s[0], s[1], s[2]], model, created };
 }

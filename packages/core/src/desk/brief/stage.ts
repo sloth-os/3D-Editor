@@ -7,7 +7,9 @@ import type { DeskIssue, DeskIssueSeverity } from '../checks';
 import { getShots } from '../shots';
 import { isActor } from '../characters';
 import { DESK_PROPS } from '../props';
-import { RIDEO_PROPS, importRideoBlocking } from '../rideo/import';
+import { RIDEO_PROPS, importRideoBlocking, type StagedFigure, type StagedProp } from '../rideo/import';
+import { insertUnit } from '../units/insert';
+import { setUnitRoot } from '../set';
 import { planBrief, shotCast } from './plan';
 import {
   briefFrames,
@@ -22,8 +24,27 @@ import {
   writeBriefRecord,
   type BriefRecord,
   type BriefRecordShot,
+  type RecordPin,
 } from './record';
 import { SceneBriefSchema, briefProblems, type BriefChanges, type SceneBrief } from './schema';
+import {
+  UNIT_FACTS_PROP,
+  afterOf,
+  decodeHeld,
+  heldPropFacts,
+  planUnitsOf,
+  recordPinOf,
+  reportRowOf,
+  resolveUnits,
+  unitWarnings,
+  type PropPlanInfo,
+  type FigurePlanInfo,
+  type ResolvedUnits,
+  type SetPlanInfo,
+  type SlotUnit,
+  type StageUnitRow,
+  type UnitSource,
+} from './units';
 
 /*
  * stageBrief: a host's SceneBrief (schema.ts) staged in an empty project, in one transaction (one
@@ -36,6 +57,11 @@ import { SceneBriefSchema, briefProblems, type BriefChanges, type SceneBrief } f
  * hidden in it, and the desk's checks run. plan.ts decides what the brief's words leave open; the
  * SceneBlocking import (desk/rideo/import.ts) is the staging engine. A record of the brief is kept
  * in the document (record.ts) for later updates (update.ts).
+ *
+ * Library pins (brief/units.ts): with `units`, the library units the desk holds, a pinned set unit is
+ * placed as the scene's set before the import (its cameras are solved with the set there), a figure
+ * as its cast member's actor and a prop unit as its element's prop; a pin whose unit is not held, or
+ * cannot be used, is staged from the words (a warning says so) and recorded 'pending' or 'refused'.
  *
  * Pure core: no DOM, no Node API, so it runs in a web worker as well as on the server.
  */
@@ -57,6 +83,7 @@ export interface BriefIssue {
  * - `props`: every element staged as a prop, with its object and the cast member holding it;
  * - `changes`: how the brief differed from the one staged before (updateFromBrief; null otherwise);
  * - `solved`: the host shots whose cameras were solved by this call;
+ * - `units`: per library pin of the brief, whether the scene holds it;
  * - `warnings`: what the desk read differently from the brief, or could not stage as it says;
  * - `issues`: the desk's checks of the brief's shots after staging.
  */
@@ -68,8 +95,22 @@ export interface StageBriefReport {
   props: { elementId: string; object: string; heldBy: string | null }[];
   changes: BriefChanges | null;
   solved: string[];
+  /**
+   * The brief's library pins, one row per slot it pins (the set, a cast member staged, a prop or
+   * 'other' element): whether the scene holds the pinned version ('unit') or not ('words', with why).
+   * [] for a brief without pins.
+   */
+  units: StageUnitRow[];
   warnings: string[];
   issues: BriefIssue[];
+}
+
+/** Options of staging a brief. */
+export interface StageBriefOptions {
+  /** The gap before a cut where marks jump (see stageBrief). */
+  preRollFrames?: number;
+  /** The library units the desk holds (brief/units.ts unitSourceOf); without it every pin is staged from the words. */
+  units?: UnitSource;
 }
 
 /** A brief validated by SceneBriefSchema, or INVALID_PARAMS naming its first problems. */
@@ -164,6 +205,7 @@ export function recordOf(
   plannedSet: unknown,
   notes: ReadonlyMap<string, string> = new Map(),
   removed: ReadonlyMap<string, BriefRecordShot> = new Map(),
+  pins: RecordPins = {},
 ): BriefRecord {
   return {
     version: 1,
@@ -173,6 +215,7 @@ export function recordOf(
     width: b.width,
     height: b.height,
     set: setDigest(plannedSet),
+    ...(pins.set ? { setUnit: pins.set } : {}),
     shots: b.shots
       .filter((s) => desk.has(s.id) || removed.has(s.id))
       .map((s) => {
@@ -202,6 +245,7 @@ export function recordOf(
         heightM: c.heightM,
         ...(actorName === undefined ? {} : { actorName }),
         digest: castDigest(c),
+        ...(pins.cast?.get(c.id) ? { unit: pins.cast.get(c.id) } : {}),
       };
     }),
     elements: b.elements.map((e) => ({
@@ -210,8 +254,100 @@ export function recordOf(
       name: e.name,
       holder: holders.get(e.id) ?? null,
       digest: elementDigest(e),
+      ...(pins.elements?.get(e.id) ? { unit: pins.elements.get(e.id) } : {}),
     })),
   };
+}
+
+/** The pins a record keeps per slot (record.ts RecordPin). */
+export interface RecordPins {
+  set?: RecordPin;
+  cast?: ReadonlyMap<string, RecordPin>;
+  elements?: ReadonlyMap<string, RecordPin>;
+}
+
+/** The record pins of resolved slots (`done`: the slots whose place, update or replace was carried out). */
+export function recordPinsOf(resolved: ResolvedUnits, done: ReadonlySet<string>): RecordPins {
+  const pin = (s: SlotUnit | undefined) => (s ? recordPinOf(s, done.has(s.key)) : undefined);
+  const cast = new Map<string, RecordPin>();
+  for (const [cid, s] of resolved.cast) {
+    const p = pin(s);
+    if (p) cast.set(cid, p);
+  }
+  const elements = new Map<string, RecordPin>();
+  for (const [eid, s] of resolved.elements) {
+    const p = pin(s);
+    if (p) elements.set(eid, p);
+  }
+  return { set: pin(resolved.set ?? undefined), cast, elements };
+}
+
+/** The members a brief stages (cast in a shot, or in a shot's planned layout), in brief order of first shot. */
+export function stagedCast(brief: SceneBrief): Set<string> {
+  const ids = new Set(brief.cast.map((c) => c.id));
+  return new Set(brief.shots.flatMap((s) => shotCast(s)).filter((id) => ids.has(id)));
+}
+
+/**
+ * Puts the set unit of slot `s` (placing, its unit decoded) in as the scene's set: the instance with
+ * key 'set', its root an EMPTY at the origin stamped with desk_role 'set', the scene (desk_rideo_clip),
+ * the ground's name and its planning facts. Returns its root.
+ */
+export function insertSetUnit(doc: SceneDoc, sceneId: string, s: SlotUnit): string {
+  const info = s.held!.info as SetPlanInfo;
+  return insertUnit(doc, s.payload!, {
+    ...s.pin!,
+    key: s.key,
+    name: info.name,
+    rootProps: {
+      [DESK_PROPS.role]: 'set',
+      [RIDEO_PROPS.clip]: sceneId,
+      [RIDEO_PROPS.ground]: info.ground,
+      [UNIT_FACTS_PROP]: JSON.stringify(info),
+    },
+  }).root;
+}
+
+/** The import's figure for slot `s` when it places one (its unit decoded), else undefined. */
+export function figureHook(s: SlotUnit | undefined): StagedFigure | undefined {
+  if (
+    !s ||
+    !s.payload ||
+    !s.held ||
+    (s.action !== 'place' && s.action !== 'replace' && s.action !== 'update')
+  )
+    return undefined;
+  const f = (s.held.info as FigurePlanInfo).figure;
+  return {
+    key: s.key,
+    pin: s.pin!,
+    unit: s.payload,
+    kind: f.kind as StagedFigure['kind'],
+    heightM: f.heightM,
+    color: f.color,
+  };
+}
+
+/**
+ * The import's prop unit for slot `s`: the unit to place, update or replace (decoded), or the slot's
+ * instance kept as it is (only placed again: a version not held, or one made local); undefined for
+ * the words' prop.
+ */
+export function propHook(
+  doc: SceneDoc,
+  s: SlotUnit | undefined,
+  root: string | null,
+): StagedProp | undefined {
+  if (!s) return undefined;
+  if (s.payload && s.held && (s.action === 'place' || s.action === 'update' || s.action === 'replace')) {
+    const info = s.held.info as PropPlanInfo;
+    return { key: s.key, pin: s.pin!, unit: s.payload, base: info.base, facts: JSON.stringify(info) };
+  }
+  const a = afterOf(s);
+  if (!a || a.from === 'held' || !root) return undefined;
+  const facts = heldPropFacts(doc, root);
+  const z = doc.getObject(root)?.location[2] ?? 0;
+  return { key: s.key, pin: a.pin, unit: null, base: facts ? facts.base : -z, facts: null };
 }
 
 /** The longest pre-roll a staging puts before a cut: the SceneBlocking import's limit (rideo/schema.ts preRollFrames). */
@@ -225,7 +361,7 @@ export const MAX_BRIEF_PRE_ROLL = 1000;
 export function stageBriefIn(
   ctx: OperatorContext,
   raw: unknown,
-  opts: { preRollFrames?: number } = {},
+  opts: StageBriefOptions = {},
 ): StageBriefReport {
   const brief = parseBrief(raw);
   const pre = opts.preRollFrames;
@@ -248,9 +384,37 @@ export function stageBriefIn(
       'the project already has shots: a brief is staged in an empty project (one without shots)',
       'INVALID_PARAMS',
     );
-  const plan = planBrief(brief, opts);
-  const warnings = [...plan.warnings];
-  const r = importRideoBlocking(briefContext(ctx, warnings), plan.input, solveShotCameras);
+  // the library units: what is held of each pin, decoded for the slots that place them
+  const source = opts.units ?? null;
+  const castStaged = stagedCast(brief);
+  const resolved = resolveUnits(doc, brief, null, source, {
+    stageable: {
+      cast: (cid) => castStaged.has(cid),
+      element: (eid) => brief.elements.some((e) => e.id === eid && e.kind !== 'location'),
+    },
+  });
+  decodeHeld(resolved, source);
+  const plan = planBrief(brief, { preRollFrames: opts.preRollFrames, units: planUnitsOf(doc, resolved) });
+  const warnings = [...plan.warnings, ...unitWarnings(resolved)];
+  // a library set is the scene's set before the import, so that the cameras it solves see it
+  const done = new Set<string>();
+  if (resolved.set?.action === 'place' && resolved.set.payload) {
+    insertSetUnit(doc, brief.id, resolved.set);
+    done.add(resolved.set.key);
+  }
+  const r = importRideoBlocking(briefContext(ctx, warnings), plan.input, solveShotCameras, {
+    ...(plan.units.set ? { marks: plan.marks } : {}),
+    figure: (cid) => {
+      const f = figureHook(resolved.cast.get(cid));
+      if (f) done.add(f.key);
+      return f;
+    },
+    prop: (p) => {
+      const u = p.elementId ? propHook(doc, resolved.elements.get(p.elementId), null) : undefined;
+      if (u) done.add(u.key);
+      return u;
+    },
+  });
   warnings.push(...r.warnings);
   for (const s of plan.skipped) {
     const e = brief.elements.find((x) => x.id === s.id)!;
@@ -263,7 +427,21 @@ export function stageBriefIn(
   const kinds = new Map(
     [...plan.cast].map(([cid, k]) => [cid, { kind: k.kind, actorName: actors.get(cid)?.name }]),
   );
-  writeBriefRecord(doc, recordOf(brief, desk, kinds, plan.holders, plan.set));
+  writeBriefRecord(
+    doc,
+    recordOf(brief, desk, kinds, plan.holders, plan.set, new Map(), new Map(), recordPinsOf(resolved, done)),
+  );
+  const propObjects = new Map(r.props.filter((p) => p.element_id).map((p) => [p.element_id!, p.id]));
+  const objectOf = (s: SlotUnit): string | null =>
+    'set' in s.slot
+      ? setUnitRoot(doc)
+      : 'castId' in s.slot
+        ? (actors.get(s.slot.castId)?.id ?? null)
+        : (propObjects.get(s.slot.elementId) ?? null);
+  const units = resolved.all
+    .filter((s) => s.stageable || s.pin)
+    .map((s) => reportRowOf(s, objectOf(s), done.has(s.key)))
+    .filter((x): x is StageUnitRow => x !== null);
   const hostOf = new Map([...desk].map(([host, s]) => [s.id, host]));
   return {
     sceneId: brief.id,
@@ -290,6 +468,7 @@ export function stageBriefIn(
       })),
     changes: null,
     solved: r.shots.filter((s) => s.camera_from === 'solved').map((s) => s.rideo_shot),
+    units,
     warnings,
     issues: briefIssues(r.issues, hostOf),
   };
@@ -299,14 +478,12 @@ export function stageBriefIn(
  * Stages a host's SceneBrief in an empty project, in one transaction (one undo step): see the module
  * comment. `preRollFrames` (0 to MAX_BRIEF_PRE_ROLL, default 12): the gap the SceneBlocking import
  * puts before a cut where marks jump: in a brief, where a rider gets on or off a mount between two
- * shots (its shots' words say who rides whom). Throws an OperatorError (INVALID_PARAMS) for a brief
- * that does not validate, a pre-roll out of range, or a project that has shots or is staged from a
- * brief already (updateFromBrief updates that). Runs in a web worker: no DOM, no Node API.
+ * shots (its shots' words say who rides whom). `units`: the library units the desk holds for the
+ * brief's pins (see the module comment; without it pins are staged from the words). Throws an
+ * OperatorError (INVALID_PARAMS) for a brief that does not validate, a pre-roll out of range, or a
+ * project that has shots or is staged from a brief already (updateFromBrief updates that). Runs in a
+ * web worker: no DOM, no Node API.
  */
-export function stageBrief(
-  doc: SceneDoc,
-  brief: SceneBrief,
-  opts: { preRollFrames?: number } = {},
-): StageBriefReport {
+export function stageBrief(doc: SceneDoc, brief: SceneBrief, opts: StageBriefOptions = {}): StageBriefReport {
   return doc.transact(() => stageBriefIn(docContext(doc), brief, opts));
 }
