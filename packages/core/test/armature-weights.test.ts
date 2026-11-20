@@ -158,15 +158,22 @@ describe('automatic (bone heat) weights', () => {
       tail: [0, 0, z0 + len * (i + 1)],
     }));
     computeHeatWeights(body, bones); // warm up
-    // CPU time, so that a busy machine slows neither measurement: the ratio was 1.4 to 2.2; ray
-    // testing every bone for each vertex of the shell (the old code) made it 7.5 to 8.4, and 18 to
-    // 21 under coverage
-    let t = cpuMs();
-    computeHeatWeights(body, bones);
-    const bodyMs = cpuMs() - t;
-    t = cpuMs();
-    const res = computeHeatWeights(both, bones);
-    const bothMs = cpuMs() - t;
+    // CPU time, so that a busy machine slows neither measurement, and the least of 3 rounds of the
+    // two meshes each, so that a garbage collection falls on one sample, not on the only one: the
+    // ratio was 1.9 to 2.3, with and without coverage and with every CPU busy; ray testing every
+    // bone for each vertex of the shell (the old code) made it 7.5 to 8.4, and 18 to 21 under
+    // coverage
+    let bodyMs = Infinity;
+    let bothMs = Infinity;
+    let res!: ReturnType<typeof computeHeatWeights>;
+    for (let round = 0; round < 3; round++) {
+      let t = cpuMs();
+      computeHeatWeights(body, bones);
+      bodyMs = Math.min(bodyMs, cpuMs() - t);
+      t = cpuMs();
+      res = computeHeatWeights(both, bones);
+      bothMs = Math.min(bothMs, cpuMs() - t);
+    }
     expect(bothMs).toBeLessThan(4 * bodyMs + 50);
     const nBody = body.positions.length / 3;
     const n = both.positions.length / 3;
