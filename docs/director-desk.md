@@ -702,16 +702,21 @@ library unit the scene holds or its brief pins, in slot order (the set, the cast
 then instances of no slot): the unit's name (else the slot's), its kind (set, figure or prop), the
 version, and its status in words:
 
-| The row says                                                | When                                                                                     |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
-| up to date                                                  | The slot holds an instance of the version its pin names                                  |
-| 3 parts edited here                                         | It does, with three of the instance's parts edited or deleted in the desk                |
-| v3 is here: Update shots places it                          | The brief pins a version the slot does not hold, and the host sent its file              |
-| the brief pins v3: Update shots brings it in                | The same over the version the slot holds: Update shots updates or replaces it            |
-| waiting: its file was not sent; staged from the words       | The pin waits (`pending`, with its reason): tried again at the next open                 |
-| the brief pins v3: waiting for its file; v2 stays           | The same over the version the slot holds, which stays                                    |
-| refused: it was made by a newer desk; staged from the words | The pin cannot be used (`refused`, with its reason) until the brief pins another version |
-| made local: it stays as it is                               | The slot was made local                                                                  |
+| The row says                                                       | When                                                                                     |
+| ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
+| up to date                                                         | The slot holds an instance of the version its pin names                                  |
+| 3 parts edited here                                                | It does, with three of the instance's parts edited or deleted in the desk                |
+| v3 is here: Update shots places it                                 | The brief pins a version the slot does not hold, and the host sent its file              |
+| the brief pins v3: Update shots brings it in                       | The same over the version the slot holds: Update shots updates or replaces it            |
+| waiting: its file was not sent; staged from the words              | The pin waits (`pending`, with its reason): tried again at the next open                 |
+| the brief pins v3: waiting for its file; v2 stays                  | The same over the version the slot holds, which stays                                    |
+| refused: it was made by a newer desk; staged from the words        | The pin cannot be used (`refused`, with its reason) until the brief pins another version |
+| the brief pins v3: refused (it was made by a newer desk); v2 stays | The same over the version the slot holds, which stays                                    |
+| made local: it stays as it is                                      | The slot was made local                                                                  |
+
+A pinned version whose file the host sent but the staging cannot use (a newer desk's, one that does
+not read, a figure that does not fit the actor) shows refused, with why, as soon as the scene opens,
+not as one Update shots brings in; the Update shots the banner offers then records it so.
 
 **Linked instances.** A unit that staging or Update shots places, or that the host links after a
 save, is an _instance_ of the library's `ref@version`: its objects are the scene's own, which the

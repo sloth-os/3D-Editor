@@ -15,6 +15,7 @@ import {
   type BriefUnitPin,
   type GivenProblem,
   type GivenUnit,
+  type RefusedPin,
   type SceneBrief,
   type SceneDoc,
   type StageUnitRow,
@@ -381,7 +382,8 @@ export function stateUnits(doc: SceneDoc): StateUnit[] {
  * What the Library tab says of a slot or an instance: 'current' up to date; 'edited' parts edited
  * here; 'update' the brief pins another version whose file the desk holds (Update shots places it);
  * 'pending' the pinned version waits (not sent yet, or not usable this time); 'refused' the pinned
- * version cannot be used; 'local' the slot was made local.
+ * version cannot be used (the record says so, or the desk holds its file and the staging refuses
+ * it); 'local' the slot was made local.
  */
 export type LibraryStatus = 'current' | 'edited' | 'update' | 'pending' | 'refused' | 'local';
 
@@ -424,16 +426,22 @@ function slotOrder(brief: SceneBrief): Map<string, number> {
  * The Library tab's rows of the scene (see LibraryStatus): one per instance of a library unit
  * (listUnits, with unitStatus's edited and deleted parts and the brief's pin of its slot), and one
  * per brief slot with a pin or a record pin but no instance (pending, refused, made local, or a
- * version the desk holds for Update shots). `held(pin)`: whether the desk holds the pin's file now.
- * In slot order (the set, the cast, the elements), then instances of no slot.
+ * version the desk holds for Update shots). `held(pin)`: whether the desk holds the pin's file now;
+ * `refused`: the pins whose file the desk holds but the staging cannot use (core pinsRefused), which
+ * show as refused with why, not as versions Update shots brings in (its update records them so). In
+ * slot order (the set, the cast, the elements), then instances of no slot.
  */
 export function libraryRows(
   doc: SceneDoc,
   brief: SceneBrief,
   held: (pin: BriefUnitPin) => boolean,
+  refused: readonly RefusedPin[] = [],
 ): LibraryRow[] {
   const pins = new Map(briefPins(brief).map((p) => [p.key, p]));
   const records = new Map(stateUnitRows(doc).map((r) => [r.slot, r]));
+  /** The refusal of `pin` in `slot` the staging would record, if any. */
+  const refusal = (slot: string, pin: { ref: string; version: number }) =>
+    refused.find((r) => r.slot === slot && r.pin.ref === pin.ref && r.pin.version === pin.version) ?? null;
   const rows: LibraryRow[] = [];
   const covered = new Set<string>();
   const v = (version: number) => `v${version}`;
@@ -469,7 +477,12 @@ export function libraryRows(
         ? v(other.version)
         : `${other.ref} ${v(other.version)}`
       : '';
-    if (
+    const refusedNow = slot && other ? refusal(slot, other) : null;
+    if (refusedNow) {
+      row.status = 'refused';
+      row.why = refusedNow.why;
+      row.text = `the brief pins ${pinWords}: refused (${reasonWords(refusedNow.why)}); ${v(inst.version)} stays`;
+    } else if (
       other &&
       rec &&
       rec.staged !== 'unit' &&
@@ -518,6 +531,19 @@ export function libraryRows(
     }
     if (!pin) continue;
     const samePin = rec && rec.ref === pin.ref && rec.version === pin.version;
+    const refusedNow = refusal(slot, pin);
+    if (refusedNow) {
+      rows.push({
+        ...base,
+        ref: pin.ref,
+        version: pin.version,
+        status: 'refused',
+        pinned: null,
+        why: refusedNow.why,
+        text: `refused: ${reasonWords(refusedNow.why)}; staged from the words`,
+      });
+      continue;
+    }
     if (held(pin) && !(samePin && rec!.staged === 'refused')) {
       rows.push({
         ...base,

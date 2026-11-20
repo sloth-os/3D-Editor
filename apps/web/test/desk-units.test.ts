@@ -7,6 +7,8 @@ import {
   SceneEvaluator,
   briefWithoutPins,
   decodePNG,
+  decodeUnit,
+  encodeUnit,
   evaluatedBounds,
   extractUnit,
   getShots,
@@ -866,6 +868,80 @@ describe('the desk workspace with library units', () => {
     expect(update).toHaveBeenCalledTimes(1);
     expect(update.mock.calls[0][2]?.units).toEqual([]);
     expect(listUnits(s.doc).map((i) => i.key)).toEqual([`el:${KITE}`]);
+  });
+
+  it('shows a version the brief pins but the staging cannot use as refused, with why, before and after the Update shots that records it', async () => {
+    const host = origin();
+    const b1 = withPins(exampleBrief(), { cast: { [MIRA]: L().mira } });
+    const first = workspace();
+    await first.open({
+      hostOrigin: host,
+      brief: b1,
+      state: null,
+      units: await readOpenUnits([openUnit(L().mira)], b1),
+    });
+    first.close();
+    // v2 of Mira's item is 6 cm taller: it cannot be her actor's figure (figure_rig)
+    const v1 = decodeUnit(L().mira.data);
+    const { format: _f, version: _v, digest: _d, bodyBytes: _b, ...header } = structuredClone(v1.header);
+    header.figure!.heightM += 0.06;
+    const v2 = lib(L().mira.pin.ref, 2, encodeUnit(v1.body, header));
+    const b2 = withPins(exampleBrief(), { cast: { [MIRA]: v2 } });
+    const ws = workspace();
+    const r = await ws.open({
+      hostOrigin: host,
+      brief: b2,
+      state: null,
+      units: await readOpenUnits([openUnit(v2)], b2),
+    });
+    expect(r.source).toBe('local');
+    const refused = {
+      key: `cast:${MIRA}`,
+      version: 1,
+      status: 'refused',
+      pinned: { ref: v2.pin.ref, version: 2 },
+      why: 'figure_rig',
+      text: 'the brief pins v2: refused (the figure does not fit the actor’s rig or height); v1 stays',
+    };
+    expect(ws.libraryRows()).toMatchObject([refused]);
+    // the banner offers the Update shots that records the refusal; the row says the same after it
+    expect(ws.changes()).not.toBeNull();
+    await ws.updateFromBrief();
+    expect(stateUnits(ws.session!.doc)).toMatchObject([
+      { slot: `cast:${MIRA}`, version: 2, staged: 'refused', why: 'figure_rig' },
+    ]);
+    expect(ws.changes()).toBeNull();
+    expect(ws.libraryRows()).toMatchObject([refused]);
+  });
+
+  it('shows a version pinned in a slot staged from the words that the staging cannot use as refused, not as one Update shots places', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: exampleBrief(), state: null, units: emptyIntake() });
+    first.close();
+    // the host pins the kite later, a version this desk cannot read (another format of unit file)
+    const bad = lib(L().kite.pin.ref, 2, new TextEncoder().encode('not a unit file'));
+    const brief = withPins(exampleBrief(), { elements: { [KITE]: bad } });
+    const ws = workspace();
+    await ws.open({
+      hostOrigin: host,
+      brief,
+      state: null,
+      units: await readOpenUnits([openUnit(bad)], brief),
+    });
+    const refused = {
+      key: `el:${KITE}`,
+      root: null,
+      version: 2,
+      status: 'refused',
+      why: 'unreadable',
+      text: 'refused: it is not a unit file this desk reads; staged from the words',
+    };
+    expect(ws.libraryRows()).toMatchObject([refused]);
+    expect(ws.changes()).not.toBeNull();
+    await ws.updateFromBrief();
+    expect(ws.changes()).toBeNull();
+    expect(ws.libraryRows()).toMatchObject([refused]);
   });
 
   it('makes an instance local as one undo step: the record keeps its pin as local, and the next state is version 1', async () => {

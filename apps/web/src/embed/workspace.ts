@@ -9,6 +9,7 @@ import {
   forgetPublish,
   getShots,
   pinKey,
+  pinsRefused,
   pinsWanted,
   recordPublish,
   type BriefChanges,
@@ -925,13 +926,21 @@ export class DeskWorkspace {
     this.brief = brief;
   }
 
-  /** The Library tab's rows of the scene (units.ts libraryRows); [] without a scene. */
+  /**
+   * The Library tab's rows of the scene (units.ts libraryRows), a pin whose file the desk holds but
+   * the staging cannot use shown refused (core pinsRefused); [] without a scene.
+   */
   libraryRows(): LibraryRow[] {
     const s = this.session;
     const brief = this.brief;
     if (!s || !brief) return [];
     const source = this.unitSource();
-    return libraryRows(s.doc, brief, (pin) => !!source?.header(pin));
+    return libraryRows(
+      s.doc,
+      brief,
+      (pin) => !!source?.header(pin),
+      source ? pinsRefused(s.doc, brief, source) : [],
+    );
   }
 
   /** What Save to library can save of the scene (units.ts saveTargets); [] without a scene. */
