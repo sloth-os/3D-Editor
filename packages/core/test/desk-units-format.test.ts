@@ -588,6 +588,20 @@ describe('unitMeta', () => {
     expect(code(() => unitMeta(h, other))).toBe('UNIT_BAD_SPEC');
   });
 
+  it("gives a set's size as its stage and the height of its bounds, whatever stands beyond the stage", () => {
+    const setMeta = (bounds: UnitHeaderInput['bounds']) => {
+      const bytes = encodeUnit(boxBody(), {
+        ...propHeader({ kind: 'set', prop: undefined, bounds }),
+        set: { width: 12, depth: 10, interior: true, hasGround: true, groundZ: 0, lights: 0, landmarks: [] },
+      });
+      return unitMeta(readUnitHeader(bytes), bytes).dimensionsM;
+    };
+    expect(setMeta({ min: [-6, -5, 0], max: [6, 5, 3.2] })).toEqual([12, 10, 3.2]);
+    // a lighthouse beyond the stage's edge and a pit below its floor
+    expect(setMeta({ min: [-6, -5, -1.5], max: [21, 5, 18.25] })).toEqual([12, 10, 19.75]);
+    expect(setMeta(null)).toEqual([12, 10, 0]);
+  });
+
   it('keeps at most 32 credits in at most 16 KiB, leaving out the longest first, with a warning', () => {
     const credits: UnitCredit[] = Array.from({ length: 64 }, (_, i) => ({
       name: `Model ${String(i).padStart(2, '0')} ${'n'.repeat(i % 7 === 0 ? 100 : 5)}`.slice(0, 120),

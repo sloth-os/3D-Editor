@@ -3,12 +3,14 @@ import { SceneDoc } from '../../doc/scene-doc';
 import { ROOT_COLLECTION_ID, SCHEMA_VERSION, type DatablockKind, type ObjectData } from '../../doc/types';
 import { FrameState } from '../../eval/frame-state';
 import type { Mat4, Vec3 } from '../../math/types';
+import type { MeshData } from '../../mesh/types';
 import { linearToSrgb } from '../../render/color';
 import { sha256Hex, sha256HexOfText } from '../container/digest';
 import { ACTOR_KINDS } from '../characters/types';
 import { HIDDEN_SCALE_EPS, HIDE_SCALE } from '../hide';
 import { DESK_SHAPE_PROP, STORE_PART_PROP, isWater } from '../layout';
 import { DESK_PROPS } from '../props';
+import { GROUND_BEYOND_SLOT } from '../set';
 import { getDeskSettings } from '../shots';
 import { round4 } from './canonical';
 import { UnitError } from './errors';
@@ -653,12 +655,39 @@ function encodeFitting(
   }
 }
 
-/** World bounds (and triangle count) of mesh objects `ids` in the probe, in the frame `turn` (z rotation). */
+/**
+ * The vertices of a set's ground (desk_role 'set', desk_label 'ground') that only the world beyond the
+ * set uses, its faces in material slot GROUND_BEYOND_SLOT (desk/set.ts groundMesh: a ring out to the
+ * horizon, hundreds of metres wide), as a mask by vertex; null for any other object or a ground
+ * without them. A vertex the ground's other faces or loose edges use is the set's.
+ */
+function beyondVertices(o: ObjectData, mesh: MeshData): Uint8Array | null {
+  if (role(o) !== 'set' || prop(o, DESK_PROPS.label) !== 'ground') return null;
+  const beyond = new Uint8Array(Math.floor(mesh.positions.length / 3));
+  let any = false;
+  mesh.faces.forEach((f, i) => {
+    if (mesh.faceMaterials[i] !== GROUND_BEYOND_SLOT) return;
+    for (const v of f) beyond[v] = 1;
+    any = true;
+  });
+  if (!any) return null;
+  mesh.faces.forEach((f, i) => {
+    if (mesh.faceMaterials[i] !== GROUND_BEYOND_SLOT) for (const v of f) beyond[v] = 0;
+  });
+  for (const v of mesh.looseEdges) beyond[v] = 0;
+  return beyond;
+}
+
+/**
+ * World bounds of mesh objects `ids` in the probe, in the frame turned `yaw` about z; with `own`, a
+ * set's own: without the world beyond the set its ground reaches out to (beyondVertices).
+ */
 function boundsOf(
   probe: SceneDoc,
   fs: FrameState,
   ids: readonly string[],
   yaw = 0,
+  own = false,
 ): { min: Vec3; max: Vec3 } | null {
   const c = Math.cos(-yaw);
   const s = Math.sin(-yaw);
@@ -671,8 +700,10 @@ function boundsOf(
     const mesh = probe.getMesh(o.data);
     const w = mesh ? fs.world(id) : null;
     if (!mesh || !w) continue;
+    const skip = own ? beyondVertices(o, mesh) : null;
     const P = mesh.positions;
     for (let i = 0; i + 2 < P.length; i += 3) {
+      if (skip?.[i / 3]) continue;
       const x = w[0] * P[i] + w[4] * P[i + 1] + w[8] * P[i + 2] + w[12];
       const y = w[1] * P[i] + w[5] * P[i + 1] + w[9] * P[i + 2] + w[13];
       const z = w[2] * P[i] + w[6] * P[i + 1] + w[10] * P[i + 2] + w[14];
@@ -714,7 +745,8 @@ function headerOf(
     faces += n.faces;
     triangles += Math.max(0, n.corners - 2 * n.faces);
   }
-  const b = boundsOf(probe, fs, objectIds);
+  // a set's own bounds: the world beyond the set is no part of its size (unitMeta)
+  const b = boundsOf(probe, fs, objectIds, 0, kind === 'set');
   const bounds = b ? { min: r3(b.min), max: r3(b.max) } : null;
   const objects = objectIds.map((id) => probe.getObject(id)!).filter(Boolean);
 

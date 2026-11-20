@@ -56,6 +56,11 @@ export interface DeskSetResult {
 
 /** Height of interior walls (m), as rideo's. */
 export const WALL_HEIGHT_M = 3.2;
+/**
+ * The ground's material slot of the world beyond the set (groundMesh: its ring out to the horizon),
+ * which is no part of the set's size (a library set's meta, desk/units/extract.ts).
+ */
+export const GROUND_BEYOND_SLOT = 1;
 /** Colour of interior walls (sRGB), as rideo's. */
 export const WALL_COLOR = '#c9c6bf';
 
@@ -275,7 +280,7 @@ function lightUp(
 
 /**
  * The ground: the set's plane (material 0) and around it a ring out to the horizon, 2 cm lower
- * (material 1; rideo draws it 6 × the set's size + 60 m away).
+ * (material GROUND_BEYOND_SLOT; rideo draws it 6 × the set's size + 60 m away).
  */
 function groundMesh(width: number, depth: number): ReturnType<typeof createMesh> {
   const w = width / 2;
@@ -329,7 +334,8 @@ function groundMesh(width: number, depth: number): ReturnType<typeof createMesh>
     [10, 11, 7, 6],
     [11, 8, 4, 7],
   ];
-  return createMesh({ positions, faces, faceMaterials: [0, 1, 1, 1, 1] });
+  const beyond = GROUND_BEYOND_SLOT;
+  return createMesh({ positions, faces, faceMaterials: [0, beyond, beyond, beyond, beyond] });
 }
 
 function wallMesh(quad: Vec3[]): ReturnType<typeof createMesh> {

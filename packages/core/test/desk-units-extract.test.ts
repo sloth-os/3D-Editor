@@ -24,6 +24,7 @@ import {
   PIP,
   actorOf,
   dress,
+  openBrief,
   pin,
   prop,
   propOf,
@@ -314,6 +315,39 @@ describe('extractUnit: a set', () => {
     expect(ex.from).toEqual({ set: true });
     // the set's root takes the scene's desk props only from the caller when it is inserted
     expect(Object.keys(props(root))).toEqual([]);
+  });
+
+  it("gives the set's own size: its stage and the height of its pieces, not the world beyond the set", () => {
+    // the words' meadow (20 × 10 m): its ground, and the pond 2 cm above it; the ground's ring out to
+    // the horizon (180 m each way here) is the world beyond the set, which counts for nothing
+    const meadow = extractUnit(stagedDoc(), { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
+    expect(meadow.meta.dimensionsM).toEqual([20, 10, 0.02]);
+    expect(meadow.header.bounds).toEqual({ min: [-10, -5, 0], max: [10, 5, 0.02] });
+    // a room from the words: its stage and its 3.2 m walls
+    const brief = openBrief();
+    brief.set.interior = true;
+    const room = extractUnit(stagedDoc(brief), { kind: 'set', name: 'Room' }, { deskVersion: 'test' });
+    const { width, depth } = room.header.set!;
+    expect(room.meta.dimensionsM).toEqual([width, depth, 3.2]);
+    // an edited set: a 4 m tower beyond the stage's edge and the ground tilted 3° (which lifts the
+    // ring tens of metres out by metres): the stage keeps its size, and the height is the tower's
+    // over the tilted stage's low edge
+    const doc = stagedDoc();
+    doc.addObject({
+      type: 'MESH',
+      name: 'Tower',
+      data: doc.addMesh('Tower', createCube()),
+      location: [14, 2, 2],
+      scale: [0.5, 0.5, 2],
+    });
+    const ground = doc.listObjects().find((o) => prop(o, 'desk_label') === 'ground')!;
+    const tilt = (3 * Math.PI) / 180;
+    doc.updateObject(ground.id, { rotation_euler: [tilt, 0, 0] });
+    const edited = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
+    const [w, d, h] = edited.meta.dimensionsM;
+    expect([w, d]).toEqual([20, 10]);
+    expect(h).toBeCloseTo(4 + 5 * Math.sin(tilt), 3);
+    expect(edited.header.bounds!.max[0]).toBeCloseTo(14.5, 4);
   });
 });
 

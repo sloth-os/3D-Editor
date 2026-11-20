@@ -179,7 +179,10 @@ const HEADER_FIELDS = {
   /** The desk version that wrote the unit. */
   deskVersion: z.string().max(64),
   counts: UnitCountsSchema,
-  /** The bounds of its meshes at rest, its root at identity, rounded to 1e-4 (null: no meshes). */
+  /**
+   * The bounds of its meshes at rest, its root at identity, rounded to 1e-4 (null: no meshes); a
+   * set's are its own, without the world beyond the set its ground reaches out to (set.ts groundMesh).
+   */
   bounds: z.object({ min: Vec3, max: Vec3 }).nullable(),
   credits: z.array(UnitCreditSchema).max(MAX_UNIT_CREDITS),
   set: UnitSetFactsSchema.optional(),
@@ -635,22 +638,22 @@ export interface UnitPublishMeta {
 const metaBytes = (m: UnitPublishMeta) => new TextEncoder().encode(JSON.stringify(m)).length;
 
 /**
- * The protocol `meta` of a unit file: its size, object and triangle counts, the figure's kind and
- * height, its credits (at most 32, at most 16 KiB as JSON: the longest credits are left out first,
- * and `warnings` gets a line saying so), the desk version and the body digest. `fileBytes` is the
- * file the header was read from (UNIT_BAD_SPEC when its header is another unit's).
+ * The protocol `meta` of a unit file: its size (a prop's or a figure's bounds; a set's stage, its
+ * width and depth, and the height of its own bounds, whatever stands beyond the stage's edge), object
+ * and triangle counts, the figure's kind and height, its credits (at most 32, at most 16 KiB as JSON:
+ * the longest credits are left out first, and `warnings` gets a line saying so), the desk version and
+ * the body digest. `fileBytes` is the file the header was read from (UNIT_BAD_SPEC when its header is
+ * another unit's).
  */
 export function unitMeta(header: UnitHeader, fileBytes: Uint8Array, warnings?: string[]): UnitPublishMeta {
   if (canonicalJsonStrict(readUnitHeader(fileBytes)) !== canonicalJsonStrict(header))
     throw new UnitError('UNIT_BAD_SPEC', "the header is not the file's");
   const b = header.bounds;
-  const dims: [number, number, number] = b
-    ? ([0, 1, 2].map((i) => Math.max(0, Math.round((b.max[i] - b.min[i]) * 1e4) / 1e4) || 0) as [
-        number,
-        number,
-        number,
-      ])
-    : [0, 0, 0];
+  const size = (v: number) => Math.max(0, Math.round(v * 1e4) / 1e4) || 0;
+  const extent = (i: number) => (b ? size(b.max[i] - b.min[i]) : 0);
+  const dims: [number, number, number] = header.set
+    ? [size(header.set.width), size(header.set.depth), extent(2)]
+    : [extent(0), extent(1), extent(2)];
   const credits = header.credits.map((c) => ({
     name: c.name.slice(0, 120),
     author: c.author === null ? null : c.author.slice(0, 200),

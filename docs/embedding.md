@@ -334,7 +334,7 @@ type UnitPublish = {         // desk → host: a unit the person saves to the ho
   sha256: string;            // of unit.data
   thumbnail: { mime: 'image/png'; data: ArrayBuffer } | null;   // ≤ 64 KiB, ≤ 256 px a side, transferred
   meta: {                    // ≤ 16 KiB as JSON (UTF-8)
-    dimensionsM: [number, number, number];   // its size in metres along x, y and z, each ≥ 0
+    dimensionsM: [number, number, number];   // its size in metres along x, y and z, each ≥ 0 (a set's: its stage and height)
     objects: number;         // integer ≥ 0
     triangles: number;       // integer ≥ 0
     actor: { kind: string; heightM: number } | null;   // a figure's kind (1–60) and height (> 0, ≤ 8)
@@ -451,14 +451,19 @@ its kind) and the body are the desk's own; what a host stores of a unit comes in
 
 With `options.units.publish` true the person can save the set, a prop or an actor to the host's
 library: **Save to library…** in the desk sends `unit-publish` with the unit file, its SHA-256, a
-PNG thumbnail (or `null`) and `meta`. `from` names the brief slot the unit came from (exactly one
-of `castId`, `elementId` and `set`), and `newVersionOf` the library version it is based on when the
-slot holds an instance of an item: the host saves the unit as that item's next version, keeps the
-item's name and takes `description` as the new version's note (`name` is the item's name as the
-desk knows it, from the version the slot holds; the desk offers no other). Without it the unit is
-a new item, named `name`, with `description`. A read-only open may publish too. The host answers
-`unit-ack` with the same `id`: `ok` true with the `ref` and `version` it saved and `linked`, or
-`ok` false with a `code` and a `message`:
+PNG thumbnail (or `null`) and `meta`. A prop's or a figure's `meta.dimensionsM` is the box its
+meshes fill; a set's is the set itself, as the words staged it or as the person edited it: its
+stage's width and depth, and its height from the lowest to the highest of its own pieces (its
+ground, walls, landmarks and dressing), without the world beyond the set that its ground reaches out
+to the horizon (a 12 × 10 m room with 3.2 m walls is `[12, 10, 3.2]`, whatever stands beyond the
+stage's edge). `from` names the brief slot the unit came from (exactly one of `castId`, `elementId`
+and `set`), and `newVersionOf` the library version it is based on when the slot holds an instance of
+an item: the host saves the unit as that item's next version, keeps the item's name and takes
+`description` as the new version's note (`name` is the item's name as the desk knows it, from the
+version the slot holds; the desk offers no other). Without it the unit is a new item, named `name`,
+with `description`. A read-only open may publish too. The host answers `unit-ack` with the same
+`id`: `ok` true with the `ref` and `version` it saved and `linked`, or `ok` false with a `code` and
+a `message`:
 
 | `code`        | The host                                                                            |
 | ------------- | ----------------------------------------------------------------------------------- |
