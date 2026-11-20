@@ -446,9 +446,10 @@ describe('the desk state', () => {
   it('is described in docs/embedding.md as it reads and writes', () => {
     const raw = readFileSync(resolve(__dirname, '../../../docs/embedding.md'), 'utf8');
     const doc = raw.replace(/\s+/g, ' ');
-    // the container table's header row: the keys state.ts writes, in its order, then the one earlier
-    // desks also wrote (it still reads)
-    const row = raw.split('\n').find((l) => l.startsWith('| header '))!;
+    // the container table's header row (in "The desk state": the unit file's table has one too): the
+    // keys state.ts writes, in its order, then the one earlier desks also wrote (it still reads)
+    const state = raw.slice(raw.indexOf('\n### The desk state\n'));
+    const row = state.split('\n').find((l) => l.startsWith('| header '))!;
     const [written, earlier] = row.split(', in order');
     expect([...written.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual([...STATE_HEADER_KEYS]);
     expect([...earlier.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual(['savedAt']);
