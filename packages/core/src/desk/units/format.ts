@@ -639,11 +639,11 @@ const metaBytes = (m: UnitPublishMeta) => new TextEncoder().encode(JSON.stringif
 
 /**
  * The protocol `meta` of a unit file: its size (a prop's or a figure's bounds; a set's stage, its
- * width and depth, and the height of its own bounds, whatever stands beyond the stage's edge), object
- * and triangle counts, the figure's kind and height, its credits (at most 32, at most 16 KiB as JSON:
- * the longest credits are left out first, and `warnings` gets a line saying so), the desk version and
- * the body digest. `fileBytes` is the file the header was read from (UNIT_BAD_SPEC when its header is
- * another unit's).
+ * width and depth whatever stands beyond the stage's edge, and the height of its own bounds, which a
+ * piece beyond the edge raises too), object and triangle counts, the figure's kind and height, its
+ * credits (at most 32, at most 16 KiB as JSON: the longest credits are left out first, and `warnings`
+ * gets a line saying so), the desk version and the body digest. `fileBytes` is the file the header
+ * was read from (UNIT_BAD_SPEC when its header is another unit's).
  */
 export function unitMeta(header: UnitHeader, fileBytes: Uint8Array, warnings?: string[]): UnitPublishMeta {
   if (canonicalJsonStrict(readUnitHeader(fileBytes)) !== canonicalJsonStrict(header))

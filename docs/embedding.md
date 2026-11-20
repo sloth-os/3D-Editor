@@ -453,11 +453,12 @@ With `options.units.publish` true the person can save the set, a prop or an acto
 library: **Save to library…** in the desk sends `unit-publish` with the unit file, its SHA-256, a
 PNG thumbnail (or `null`) and `meta`. A prop's or a figure's `meta.dimensionsM` is the box its
 meshes fill; a set's is the set itself, as the words staged it or as the person edited it: its
-stage's width and depth, and its height from the lowest to the highest of its own pieces (its
-ground, walls, landmarks and dressing), without the world beyond the set that its ground reaches out
-to the horizon (a 12 × 10 m room with 3.2 m walls is `[12, 10, 3.2]`, whatever stands beyond the
-stage's edge). `from` names the brief slot the unit came from (exactly one of `castId`, `elementId`
-and `set`), and `newVersionOf` the library version it is based on when the slot holds an instance of
+stage's width and depth, whatever stands beyond the stage's edge, and its height from the lowest to
+the highest of its own pieces (its ground, walls, landmarks and dressing, beyond the edge too),
+without the world beyond the set that its ground reaches out to the horizon (a 12 × 10 m room with
+3.2 m walls is `[12, 10, 3.2]`; a 4 m tower standing beyond its edge makes it `[12, 10, 4]`).
+`from` names the brief slot the unit came from (exactly one of `castId`, `elementId` and `set`),
+and `newVersionOf` the library version it is based on when the slot holds an instance of
 an item: the host saves the unit as that item's next version, keeps the item's name and takes
 `description` as the new version's note (`name` is the item's name as the desk knows it, from the
 version the slot holds; the desk offers no other). Without it the unit is a new item, named `name`,
