@@ -767,9 +767,10 @@ runs, and when nothing in the scene can be saved. The dialog has:
   start with) and **Description** (at most 2000).
 - **Save as a new version of Harbor v3**, ticked, when the target is an instance of a library unit
   (also right after a save the host linked: chosen again, its target is an instance of what was
-  saved); unticked, it is a new item and the scene keeps the version it holds. For a target that is
-  no instance it is a new item, which the host links (and the scene adopts) when the slot pins
-  nothing.
+  saved). A new version is saved under its item's name, which the host keeps: Name shows it and
+  cannot be changed, and Description is the new version's note. Unticked, it is a new item under
+  the name typed, and the scene keeps the version it holds. For a target that is no instance it is
+  a new item, which the host links (and the scene adopts) when the slot pins nothing.
 - The unit as it would be saved, made in the staging worker without changing the scene: its
   thumbnail, its objects, triangles, size and dimensions (a figure's kind and height), and its
   warnings; a unit that cannot be made says why, and Save stays off.

@@ -326,8 +326,8 @@ type UnitPublish = {         // desk → host: a unit the person saves to the ho
   type: 'unit-publish';
   id: string;                // 'pub-1', 'pub-2', …
   kind: 'set' | 'prop' | 'figure';
-  name: string;              // 1–120
-  description?: string;      // ≤ 2000
+  name: string;              // 1–120; with newVersionOf the item's name, which the host keeps
+  description?: string;      // ≤ 2000; with newVersionOf the new version's note
   newVersionOf?: { ref: Id; version: number };   // the item's version it is based on: save its next version
   from?: { castId: Id | null; elementId: Id | null; set: boolean };   // the brief slot: exactly one of the three
   unit: { format: '3d-editor.desk-unit'; version: 1; data: ArrayBuffer };   // 1 B–32 MiB, transferred
@@ -450,10 +450,12 @@ With `options.units.publish` true the person can save the set, a prop or an acto
 library: **Save to library…** in the desk sends `unit-publish` with the unit file, its SHA-256, a
 PNG thumbnail (or `null`) and `meta`. `from` names the brief slot the unit came from (exactly one
 of `castId`, `elementId` and `set`), and `newVersionOf` the library version it is based on when the
-slot holds an instance of an item (the host saves the unit as that item's next version); without
-it the unit is a new item. A read-only open may publish too. The host answers `unit-ack` with the
-same `id`: `ok` true with the `ref` and `version` it saved and `linked`, or `ok` false with a
-`code` and a `message`:
+slot holds an instance of an item: the host saves the unit as that item's next version, keeps the
+item's name and takes `description` as the new version's note (`name` is the item's name as the
+desk knows it, from the version the slot holds; the desk offers no other). Without it the unit is
+a new item, named `name`, with `description`. A read-only open may publish too. The host answers
+`unit-ack` with the same `id`: `ok` true with the `ref` and `version` it saved and `linked`, or
+`ok` false with a `code` and a `message`:
 
 | `code`        | The host                                                                            |
 | ------------- | ----------------------------------------------------------------------------------- |

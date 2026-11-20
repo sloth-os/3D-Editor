@@ -272,6 +272,21 @@ describe('docs/embedding.md', () => {
     expect(linking).toContain('Update shots is off while the scene adopts a unit');
   });
 
+  it("says a new version keeps its item's name and takes the description as its note", () => {
+    const fields = section(doc, '### Fields and messages');
+    expect(fields).toMatch(
+      / name: string; +\/\/ 1–120; with newVersionOf the item's name, which the host keeps\n/,
+    );
+    expect(fields).toMatch(
+      / description\?: string; +\/\/ ≤ 2000; with newVersionOf the new version's note\n/,
+    );
+    const linking = flat(section(doc, '### Publishing and linking'));
+    expect(linking).toContain(
+      "the host saves the unit as that item's next version, keeps the item's name and takes `description` as the new version's note",
+    );
+    expect(linking).toContain('Without it the unit is a new item, named `name`, with `description`.');
+  });
+
   it('describes the desk state container as state.ts writes it', () => {
     const rows = tables(section(doc, '### The desk state'))[0].rows;
     const magic = /`([^`]+)`/

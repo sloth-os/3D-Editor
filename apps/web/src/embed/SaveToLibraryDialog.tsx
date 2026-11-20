@@ -16,10 +16,12 @@ import {
  * Save to library (docs/director-desk.md "Save to library"): saves the set, an actor's figure or a
  * prop of the scene to the host's library. What (the set, each actor by its cast member's name, each
  * prop; first the selected actor or prop, else the set), Name and Description, and, when the target
- * is an instance of a library unit, "Save as a new version of <item> vN" (else a new item). The
- * dialog shows the unit as it would be saved (its thumbnail, counts, size and warnings: made in the
- * staging worker, nothing changes in the scene), then the progress while the host saves it, then
- * what came of it: "Saved 'Harbor' v3 to <host>; linked to the scene's place", "Saved … ; not linked:
+ * is an instance of a library unit, "Save as a new version of <item> vN" (else a new item): a new
+ * version keeps its item's name (the host keeps its own), so Name shows it and cannot be changed,
+ * and the Description is the new version's note. The dialog shows the unit as it would be saved
+ * (its thumbnail, counts, size and warnings: made in the staging worker, nothing changes in the
+ * scene), then the progress while the host saves it, then what came of it, under the name it was
+ * saved with: "Saved 'Harbor' v3 to <host>; linked to the scene's place", "Saved … ; not linked:
  * <reason>" or "Not saved: <reason>". Closing it while the host saves lets the save go on: the
  * Library tab says how it ends. A read-only open may save too; the scene stays as it is.
  *
@@ -156,7 +158,13 @@ export function SaveToLibraryDialog(p: {
   useEffect(() => {
     if (!target) return;
     const k = targetKey(target);
-    const asked = name.trim() && name.trim().length <= MAX_NAME ? name.trim() : target.name;
+    const typed = name.trim();
+    const asked =
+      target.basedOn && asNewVersion
+        ? target.basedOn.name
+        : typed && typed.length <= MAX_NAME
+          ? typed
+          : target.name;
     setPreview({ key: k, status: 'busy' });
     c.previewUnit(target.what, asked).then(
       (preview) => alive.current && setPreview({ key: k, status: 'ok', preview }),
@@ -188,7 +196,10 @@ export function SaveToLibraryDialog(p: {
     setOutcome(null);
   };
 
-  const trimmed = name.trim();
+  const based = target?.basedOn ?? null;
+  // a new version is saved under its item's name, which the host keeps: Name shows it, read-only
+  const itemName = based && asNewVersion ? based.name : null;
+  const trimmed = itemName ?? name.trim();
   const nameProblem = !trimmed
     ? 'A unit needs a name.'
     : trimmed.length > MAX_NAME
@@ -214,7 +225,7 @@ export function SaveToLibraryDialog(p: {
       what: target.what,
       name: trimmed,
       ...(description.trim() ? { description: description.trim() } : {}),
-      ...(target.basedOn && asNewVersion ? { asNewVersion: true } : {}),
+      ...(itemName !== null ? { asNewVersion: true } : {}),
     });
     if (!alive.current) return;
     setSaving(false);
@@ -222,7 +233,6 @@ export function SaveToLibraryDialog(p: {
     setOutcome(c.lastPublish.peek() ?? { result, kind: target.kind, name: trimmed, at: Date.now() });
   };
 
-  const based = target?.basedOn ?? null;
   const done = outcome !== null;
   return (
     <div class="desk-modal-back" data-testid="desk-save" {...CHROME}>
@@ -265,8 +275,10 @@ export function SaveToLibraryDialog(p: {
           <input
             class="textfield"
             data-testid="desk-save-name"
-            value={name}
+            value={itemName ?? name}
             maxLength={MAX_NAME}
+            readOnly={itemName !== null}
+            title={itemName !== null ? `A new version keeps the name of ${itemName}` : undefined}
             disabled={saving}
             onInput={(e) => {
               setName((e.currentTarget as HTMLInputElement).value);

@@ -600,16 +600,23 @@ describe('the Save to library dialog', () => {
     expect(name(v).value).toBe('Mira');
     expect(q(v, 'desk-save-new-item')!.textContent).toBe('A new item in rideo’s library (figure).');
     expect(q(v, 'desk-save-new-version')).toBeNull();
-    // an instance of a library unit: a new version of it, ticked
+    // an instance of a library unit: a new version of it, ticked, under its item's name (read-only)
     await choose(v, 'root:kite-root');
-    expect(name(v).value).toBe(kiteName);
+    expect([name(v).value, name(v).readOnly]).toEqual([kiteName, true]);
     const box = q(v, 'desk-save-new-version') as HTMLInputElement;
     expect(box.checked).toBe(true);
     expect(box.parentElement!.textContent).toBe(`Save as a new version of ${kiteName} v2`);
     // a typed name stays when the target changes
-    await act(async () => void fireEvent.input(name(v), { target: { value: 'Harbor' } }));
     await choose(v, 'set');
+    expect(name(v).readOnly).toBe(false);
+    await act(async () => void fireEvent.input(name(v), { target: { value: 'Harbor' } }));
+    await choose(v, 'root:mira-root');
     expect(name(v).value).toBe('Harbor');
+    // and comes back when a new version, which keeps its item's name, is unticked: a new item
+    await choose(v, 'root:kite-root');
+    expect([name(v).value, name(v).readOnly]).toEqual([kiteName, true]);
+    await act(async () => void fireEvent.click(q(v, 'desk-save-new-version')!));
+    expect([name(v).value, name(v).readOnly]).toEqual(['Harbor', false]);
     cleanup();
     expect(what(dialog(c, null)).value).toBe('set');
     cleanup();
@@ -684,6 +691,41 @@ describe('the Save to library dialog', () => {
     expect(q(v, 'desk-save-submit')).toBeNull();
     expect(q(v, 'desk-save-cancel')!.textContent).toBe('Close');
     // the Library tab says so too
+    const tab = render(<LibraryTab c={c} onSave={() => {}} />);
+    expect(q(tab, 'desk-library-last')!.textContent).toBe(result.textContent);
+  });
+
+  it("saves a new version under its item's name, not one typed for another target; the description is its note", async () => {
+    const { c, published } = await openDesk();
+    const v = dialog(c, 'mira-root');
+    await settle();
+    await act(async () => void fireEvent.input(name(v), { target: { value: 'Harbor' } }));
+    await choose(v, 'root:kite-root');
+    // the host keeps its item's name for a new version: the dialog shows it, and sends it
+    expect([name(v).value, name(v).readOnly]).toEqual([kiteName, true]);
+    expect(name(v).title).toBe(`A new version keeps the name of ${kiteName}`);
+    await act(
+      async () =>
+        void fireEvent.input(q(v, 'desk-save-description')!, { target: { value: 'A longer tail' } }),
+    );
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await settle();
+    expect(published()).toHaveLength(1);
+    const m = published()[0];
+    expect(m).toMatchObject({
+      name: kiteName,
+      description: 'A longer tail',
+      newVersionOf: { ref: 'lib_0123456789kite', version: 2 },
+    });
+    expect(q(v, 'desk-save-progress')!.textContent).toMatch(
+      new RegExp(`^Waiting for rideo to save '${kiteName}'… \\d+ s$`),
+    );
+    c.message({ type: 'unit-ack', id: m.id, ok: true, ref: 'lib_0123456789kite', version: 3, linked: true });
+    await settle();
+    await settle();
+    // the notice names the item, as the Library tab does
+    const result = q(v, 'desk-save-result')!;
+    expect(result.textContent).toBe(`Saved '${kiteName}' v3 to rideo; linked to ${kiteName}`);
     const tab = render(<LibraryTab c={c} onSave={() => {}} />);
     expect(q(tab, 'desk-library-last')!.textContent).toBe(result.textContent);
   });
@@ -1041,6 +1083,10 @@ describe('the words of a Save to library', () => {
       expect(doc).toContain(said);
     expect(doc).toContain('"Not saved: …"');
     expect(doc).toContain('"not linked here"');
+    // the name a new version is saved under
+    expect(doc).toContain(
+      "A new version is saved under its item's name, which the host keeps: Name shows it and cannot be changed, and Description is the new version's note.",
+    );
   });
 });
 

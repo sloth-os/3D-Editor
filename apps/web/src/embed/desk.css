@@ -399,6 +399,9 @@
 .desk-save-field .select {
   width: 100%;
 }
+.desk-save-field .textfield[readonly] {
+  color: var(--text-dim);
+}
 .desk-save-description {
   height: auto;
   min-height: 44px;
