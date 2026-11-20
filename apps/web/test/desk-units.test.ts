@@ -1495,6 +1495,89 @@ describe('a save the host linked after the desk stopped waiting', () => {
     expect(pendingPublishes(s.doc)).toMatchObject([{ slot: 'set', sha256: m.sha256 }]);
     expect(await bannerWords(t.c.changes.value!)).toBe('the set from the library');
   });
+
+  /**
+   * A desk whose set was saved and timed out (the host links it later), then `again` (its second
+   * save, answered as it says); reopened with the brief that pins the first file, sent, and Update
+   * shots run. The objects it added and took out, its instances and the saves it still keeps.
+   */
+  async function savedTwice(again: (t: Awaited<ReturnType<typeof realDesk>>) => Promise<void>) {
+    const host = origin();
+    const first = await realDesk({ scene: exampleBrief(), options: UNITS_ON, host });
+    const ids = (t: Awaited<ReturnType<typeof realDesk>>) => t.ws.session!.doc.listObjects().map((o) => o.id);
+    const p = first.c.publish({ what: { set: true }, name: 'Meadow' });
+    await waitUntil(() => expect(first.ofType('unit-publish')).toHaveLength(1));
+    const [m] = first.ofType('unit-publish');
+    first.timers.advance(publishAckTimeoutMs(m.unit.data.byteLength));
+    expect(await p).toMatchObject({ ok: false, code: 'timeout' });
+    await again(first);
+    const before = ids(first);
+    first.c.dispose();
+    first.ws.close();
+    // the host linked the first save after the desk stopped waiting: its next brief pins that file
+    const meadow = lib('lib_0123456789set1', 1, new Uint8Array(m.unit.data));
+    const t = await realDesk({
+      scene: withPins(exampleBrief(), { set: meadow }),
+      options: UNITS_ON,
+      units: [openUnit(meadow)],
+      host,
+    });
+    await t.c.updateShots();
+    const doc = t.ws.session!.doc;
+    return {
+      added: ids(t).filter((id) => !before.includes(id)).length,
+      removed: before.filter((id) => !ids(t).includes(id)).length,
+      instances: listUnits(doc).map((i) => [i.key, i.ref, i.version, unitStatus(doc, i.root).missing.length]),
+      kept: pendingPublishes(doc),
+      banner: t.c.changes.value,
+    };
+  }
+  /** The set adopted: only its root is new, every piece the first save was made from is its part. */
+  const ADOPTED = {
+    added: 1,
+    removed: 0,
+    instances: [['set', 'lib_0123456789set1', 1, 0]],
+    kept: [],
+    banner: null,
+  };
+
+  it('a second save of the same file that the host refuses forgets only itself: the next brief still adopts the first', async () => {
+    const r = await savedTwice(async (t) => {
+      const p = t.c.publish({ what: { set: true }, name: 'Meadow' });
+      await waitUntil(() => expect(t.ofType('unit-publish')).toHaveLength(2));
+      const [first, second] = t.ofType('unit-publish');
+      expect(second.sha256).toBe(first.sha256);
+      t.c.message({ type: 'unit-ack', id: second.id, ok: false, code: 'conflict', message: 'It has it.' });
+      expect(await p).toMatchObject({ ok: false, code: 'conflict' });
+      // the first save is still kept: the host may have linked it
+      expect(pendingPublishes(t.ws.session!.doc)).toMatchObject([{ slot: 'set', sha256: first.sha256 }]);
+    });
+    expect(r).toEqual(ADOPTED);
+  });
+
+  it('an edited save the host keeps without linking waits beside the first: the next brief pinning the first still adopts it', async () => {
+    const r = await savedTwice(async (t) => {
+      const s = t.ws.session!;
+      const piece = s.doc.listObjects().find((o) => role(o) === 'landmark')!;
+      s.doc.transact(() => s.doc.updateObject(piece.id, { location: [3, 4, 0] }), s.doc.origin);
+      const p = t.c.publish({ what: { set: true }, name: 'Meadow' });
+      await waitUntil(() => expect(t.ofType('unit-publish')).toHaveLength(2));
+      const [first, second] = t.ofType('unit-publish');
+      expect(second.sha256).not.toBe(first.sha256);
+      t.c.message({
+        type: 'unit-ack',
+        id: second.id,
+        ok: true,
+        ref: 'lib_0123456789set1',
+        version: 2,
+        linked: false,
+        message: 'The scene keeps its pin.',
+      });
+      expect(await p).toMatchObject({ ok: true, linked: false, adopted: false });
+      expect(pendingPublishes(s.doc).map((x) => x.sha256)).toEqual([first.sha256, second.sha256]);
+    });
+    expect(r).toEqual(ADOPTED);
+  });
 });
 
 describe('Save to library', () => {
@@ -1748,9 +1831,14 @@ describe('Save to library', () => {
     expect(t.ws.adoptUnit).not.toHaveBeenCalled();
   });
 
-  it('keeps in the scene what it sent from a slot until the host refuses it: a link the host makes later comes with its next brief', async () => {
+  it('keeps in the scene each save it sent from a slot until the host refuses that save: a link the host makes later comes with its next brief', async () => {
     let delivers = true;
-    const t = await fakeDesk({ options: UNITS_ON, delivers: (m) => m.type !== 'unit-publish' || delivers });
+    let saves = 0;
+    const t = await fakeDesk({
+      options: UNITS_ON,
+      delivers: (m) => m.type !== 'unit-publish' || delivers,
+      ws: { recordPublish: vi.fn(() => `save-${++saves}`) },
+    });
     const kept = expect.objectContaining({ from: t.unit.from, sha256: t.unit.sha256, link: t.unit.link });
     const answer = async (id: string, ack: Record<string, unknown> | null) => {
       const p = t.c.publish({ what: KITE_ROOT, name: 'Red kite' });
@@ -1769,10 +1857,10 @@ describe('Save to library', () => {
     t.c.invalidReply('unit-ack', 'pub-3', 'ref: required when ok is true');
     expect(await p3).toMatchObject({ ok: false, code: 'bad_reply' });
     expect(t.ws.forgetPublish).not.toHaveBeenCalled();
-    // refused: no brief pins it
+    // refused: no brief pins it from this save; the same file's earlier saves stay kept
     expect(await answer('pub-4', { ok: false, code: 'conflict' })).toMatchObject({ code: 'conflict' });
     expect(t.ws.forgetPublish).toHaveBeenCalledTimes(1);
-    expect(t.ws.forgetPublish).toHaveBeenLastCalledWith(t.unit.sha256);
+    expect(t.ws.forgetPublish).toHaveBeenLastCalledWith('save-4');
     // not sent at all
     delivers = false;
     expect(await t.c.publish({ what: KITE_ROOT, name: 'Red kite' })).toEqual({
@@ -1782,7 +1870,7 @@ describe('Save to library', () => {
     });
     expect(t.ws.recordPublish).toHaveBeenCalledTimes(5);
     expect(t.ws.forgetPublish).toHaveBeenCalledTimes(2);
-    expect(t.ws.forgetPublish).toHaveBeenLastCalledWith(t.unit.sha256);
+    expect(t.ws.forgetPublish).toHaveBeenLastCalledWith('save-5');
     expect(t.ws.adoptUnit).not.toHaveBeenCalled();
     // a read-only open keeps nothing (its scene is never written)
     const ro = await fakeDesk({ options: { ...UNITS_ON, readOnly: true } });

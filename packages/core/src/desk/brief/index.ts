@@ -65,6 +65,7 @@ export {
   type UnitSource,
 } from './units';
 export {
+  MAX_PUBLISHES_PER_SLOT,
   PUBLISH_KEY_PREFIX,
   adoptPublished,
   forgetPublish,

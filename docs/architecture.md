@@ -951,10 +951,11 @@ telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested o
   with its thumbnail (`unit-extract`, read only; the thumbnail shows the unit alone in colour, the
   material look rather than the clay of the model store's thumbnails), links the scene to a
   version the host saved (`unit-adopt`) and cuts an instance's link (`unit-local`), the last two
-  answered with a Yjs diff. A unit sent from a slot stays in the scene document until the scene
-  takes it in (core `recordPublish`), so that the Update shots of a brief that pins it after the
-  desk stopped waiting adopts the scene's own objects (`adoptLinkedPublishes`) rather than adding
-  a copy. `units.ts` also gives `state.units` from the scene's record, the
+  answered with a Yjs diff. Each save sent from a slot stays in the scene document, one record per
+  save, until the host refuses that save or the scene takes a unit of the slot in (core
+  `recordPublish`), so that the Update shots of a brief that pins one of them after the desk
+  stopped waiting adopts the scene's own objects (`adoptLinkedPublishes`) rather than adding a
+  copy. `units.ts` also gives `state.units` from the scene's record, the
   Library tab's rows (`libraryRows`) and what Save to library can save (`saveTargets`).
   `LibraryTab.tsx` and `SaveToLibraryDialog.tsx` are their UI: a tab the desk adds to the editor's
   bottom area (`ExtraBottomTab` in `ui/App.tsx`; the editor adds none) and a modal dialog over the

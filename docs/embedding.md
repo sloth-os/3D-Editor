@@ -493,18 +493,23 @@ comes later is not applied. A `unit-ack` that does not validate but has a valid 
 with `error` `bad_message` with that `id`, as for any message, and fails the publish waiting on it
 at once.
 
-**A link the desk did not take in.** An editable open keeps in the scene each unit it sends from a
-slot (the file's SHA-256 and the objects it was made from; one per slot, a later save from the slot
-replacing it), not as an undo step, so that it travels with the local copy and the desk state. The
-desk lets go of it when the host answers `ok` false or the message cannot be sent, and when the
-scene takes the unit in. A unit the host saved and linked without the desk adopting it (its ack
-came after the wait, was not valid, or the desk closed first) comes with a later brief that pins
-that very file (`sha256` the one sent) in that slot, and the open sends the file as for any pin.
-Update shots then makes the scene's own objects the instance of `ref@version`, as the ack would have
-(one undo step with the rest of the update), and adds no copy of them. When those objects are no
-longer in the scene (a set's every piece; another unit's root, or the slot holds another instance),
-it puts the unit in as for any pin, with a warning. A unit the host saved without linking it stays
-kept as well, so that a link the person makes later in the host is taken in the same way.
+**A link the desk did not take in.** An editable open keeps in the scene each save it sends from a
+slot, one record per `unit-publish` (the file's SHA-256 and the objects it was made from; at most 8
+per slot, a ninth letting go of the slot's oldest), not as an undo step, so that it travels with the
+local copy and the desk state. The desk lets go of a save when the host answers that very save
+`ok` false, whatever its `code`, or the message cannot be sent; an earlier save of the same file
+stays. A save whose end the desk does not know (its ack came after the wait, was not valid, or the
+desk closed first) stays, and so does one the host saved without linking it, so that a link the
+person makes later in the host is taken in the same way. A unit the host saved and linked without
+the desk adopting it comes with a later brief that pins that very file (`sha256` the one sent) in
+that slot, and the open sends the file as for any pin. Update shots then matches the pin against
+every save kept for the slot and makes the scene's own objects (those of the latest save of that
+file that are still in the scene) the instance of `ref@version`, as the ack would have (one undo
+step with the rest of the update), and adds no copy of them. When those objects are no longer in the
+scene (a set's every piece; another unit's root, or the slot holds another instance), it puts the
+unit in as for any pin, with a warning. Either way the slot's other saves go, as they do when the
+scene adopts a unit of the slot on a linked ack, or when the slot holds the pinned version already;
+a brief that pins none of the slot's saves leaves them kept.
 
 ### When a unit is not used
 

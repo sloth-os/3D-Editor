@@ -1,4 +1,5 @@
 import type { SceneDoc } from '../../doc/scene-doc';
+import { newId } from '../../util/id';
 import { cloneJson } from '../../util/json';
 import { DESK_PROPS } from '../props';
 import { RIDEO_PROPS } from '../rideo/import';
@@ -36,9 +37,10 @@ import {
  *   become an instance of the new version (adoptUnit: no id changes); when the host linked it to the
  *   brief's slot (`linked`, it pins the version in its next brief), the record says the slot holds it,
  *   so that the next brief, which pins it, changes nothing;
- * - pending publishes: a unit sent to the host from a slot is kept in the document (recordPublish)
- *   until the scene takes it in, so that a brief pinning that very file later (the host linked it
- *   after the desk stopped waiting for its answer) has an update adopt the scene's own objects
+ * - pending publishes: each unit sent to the host from a slot is kept in the document, one record per
+ *   save (recordPublish), until the host refuses that save (forgetPublish) or the scene takes a unit
+ *   of the slot in, so that a brief pinning one of those very files later (the host linked it after
+ *   the desk stopped waiting for its answer) has an update adopt the scene's own objects
  *   (adoptLinkedPublishes) rather than put a copy of them in beside them.
  *
  * Pure core: no DOM, no Node API.
@@ -108,8 +110,8 @@ export interface AdoptPublishedOptions {
  * comment), in one transaction: inside the caller's own `doc.transact(…, origin)` when it chooses the
  * origin (the desk applies it with its storage origin: not undoable). A set's root is stamped as the
  * scene's set (desk_role 'set', the scene, its ground's name and planning facts from `o.header`), a
- * prop's root with its planning facts. The publish of the file kept for its slot (recordPublish) is
- * let go: the scene holds it now. Only when `o.linked`, `o.slot` names a slot and the document is
+ * prop's root with its planning facts. The saves kept for its slot (recordPublish) are let go: the
+ * slot holds an instance now (of this file). Only when `o.linked`, `o.slot` names a slot and the document is
  * staged from `brief`'s scene: the record's pin of the slot becomes `o.pin` staged 'unit' (a set's
  * record digest that of a set planned from it), so that the next brief pinning it is no change.
  * Returns the root, adoptUnit's warnings and whether the record was written. Throws adoptUnit's
@@ -123,7 +125,7 @@ export function adoptPublished(
   const b = parseBrief(brief);
   return doc.transact(() => {
     const r = adoptUnit(doc, o.link, o.pin);
-    forgetPublish(doc, o.pin.sha256);
+    if (o.slot) forgetSlot(doc, slotKey(o.slot));
     const info = o.header ? planInfoOf(o.header) : null;
     const root = doc.getObject(r.root)!;
     if (o.link.kind === 'set')
@@ -172,12 +174,21 @@ export function adoptPublished(
 
 /**
  * The scene settings keys of the units sent to the host's library and not taken in yet
- * (recordPublish): `unit_publish:<slot>` (slotKey), one per slot, each `{sha256, link}`.
+ * (recordPublish): `unit_publish:<id>`, one per save (its id recordPublish's), each
+ * `{slot, sha256, link, seq}`.
  */
 export const PUBLISH_KEY_PREFIX = 'unit_publish:';
 
+/**
+ * The saves of one slot the document keeps at most: a save past them lets go of the slot's oldest
+ * (one whose end the desk does not know waits for a brief, which may never come).
+ */
+export const MAX_PUBLISHES_PER_SLOT = 8;
+
 /** A unit sent to the host's library from a brief slot (unit-publish) that the scene has not taken in. */
 export interface PendingPublish {
+  /** The save (recordPublish's id): forgetPublish lets go of it alone. */
+  id: string;
   /** The slot it was made from (slotKey). */
   slot: string;
   /** The SHA-256 of the file sent: what a brief pins once the host linked it. */
@@ -188,38 +199,69 @@ export interface PendingPublish {
 
 const SHA256 = /^[0-9a-f]{64}$/;
 
-/** The units sent to the host's library and not taken in yet (recordPublish), by slot key. */
-export function pendingPublishes(doc: SceneDoc): PendingPublish[] {
-  const out: PendingPublish[] = [];
+/** The saves kept in `doc` with their order (`seq`: later saves have higher ones). */
+function readPublishes(doc: SceneDoc): (PendingPublish & { seq: number })[] {
+  const out: (PendingPublish & { seq: number })[] = [];
   for (const [key, value] of doc.map('scene').entries()) {
     if (!key.startsWith(PUBLISH_KEY_PREFIX)) continue;
-    const slot = key.slice(PUBLISH_KEY_PREFIX.length);
-    const v = value as { sha256?: unknown; link?: unknown } | null;
-    if (!parseSlotKey(slot) || !v || typeof v !== 'object') continue;
+    const id = key.slice(PUBLISH_KEY_PREFIX.length);
+    const v = value as { slot?: unknown; sha256?: unknown; link?: unknown; seq?: unknown } | null;
+    if (!id || !v || typeof v !== 'object') continue;
+    if (typeof v.slot !== 'string' || !parseSlotKey(v.slot)) continue;
     if (typeof v.sha256 !== 'string' || !SHA256.test(v.sha256) || !v.link || typeof v.link !== 'object')
       continue;
-    out.push({ slot, sha256: v.sha256, link: cloneJson(v.link) as UnitLinkPlan });
+    const seq = typeof v.seq === 'number' && Number.isFinite(v.seq) ? v.seq : 0;
+    out.push({ id, slot: v.slot, sha256: v.sha256, link: cloneJson(v.link) as UnitLinkPlan, seq });
   }
-  return out.sort((a, b) => (a.slot < b.slot ? -1 : a.slot > b.slot ? 1 : 0));
+  return out.sort((a, b) =>
+    a.slot !== b.slot ? (a.slot < b.slot ? -1 : 1) : a.seq !== b.seq ? a.seq - b.seq : a.id < b.id ? -1 : 1,
+  );
 }
 
 /**
- * Keeps in `doc` the unit sent to the host's library from `slot`: the SHA-256 of its file and
- * extractUnit's link plan, in place of one sent from the slot before, until the scene takes it in
- * (adoptPublished, adoptLinkedPublishes) or the host refuses it (forgetPublish). One transaction (the
- * caller's when inside one: the desk writes it with its storage origin, no undo step).
+ * The units sent to the host's library and not taken in yet (recordPublish): one per save, by slot
+ * key, each slot's in the order they were sent.
  */
-export function recordPublish(doc: SceneDoc, slot: UnitSlot, sha256: string, link: UnitLinkPlan): void {
-  const key = PUBLISH_KEY_PREFIX + slotKey(slot);
-  doc.transact(() => doc.map('scene').set(key, cloneJson({ sha256, link })));
+export function pendingPublishes(doc: SceneDoc): PendingPublish[] {
+  return readPublishes(doc).map(({ id, slot, sha256, link }) => ({ id, slot, sha256, link }));
 }
 
-/** Lets go of the unit sent with file SHA-256 `sha256` (the host refused it, or the scene took it in). */
-export function forgetPublish(doc: SceneDoc, sha256: string): void {
-  const gone = pendingPublishes(doc).filter((p) => p.sha256 === sha256);
+/**
+ * Keeps in `doc` the unit sent to the host's library from `slot` (one save: the SHA-256 of its file
+ * and extractUnit's link plan) beside those sent from the slot before, until the host refuses that
+ * save (forgetPublish) or the scene takes a unit of the slot in (adoptPublished,
+ * adoptLinkedPublishes); past MAX_PUBLISHES_PER_SLOT the slot's oldest goes. One transaction (the
+ * caller's when inside one: the desk writes it with its storage origin, no undo step). Returns the
+ * save's id (a new random one: two saves of the same file are two saves).
+ */
+export function recordPublish(doc: SceneDoc, slot: UnitSlot, sha256: string, link: UnitLinkPlan): string {
+  const key = slotKey(slot);
+  const all = readPublishes(doc);
+  const seq = all.reduce((m, p) => Math.max(m, p.seq), 0) + 1;
+  const mine = all.filter((p) => p.slot === key);
+  const id = newId();
+  doc.transact(() => {
+    const scene = doc.map('scene');
+    for (const p of mine.slice(0, Math.max(0, mine.length - MAX_PUBLISHES_PER_SLOT + 1)))
+      scene.delete(PUBLISH_KEY_PREFIX + p.id);
+    scene.set(PUBLISH_KEY_PREFIX + id, cloneJson({ slot: key, sha256, link, seq }));
+  });
+  return id;
+}
+
+/** Lets go of the save `id` alone (the host refused it, or it could not be sent); nothing when none. */
+export function forgetPublish(doc: SceneDoc, id: string): void {
+  const key = PUBLISH_KEY_PREFIX + id;
+  if (!id || !doc.map('scene').has(key)) return;
+  doc.transact(() => doc.map('scene').delete(key));
+}
+
+/** Lets go of every save of slot `slot` (slotKey): the scene took a unit of the slot in. */
+function forgetSlot(doc: SceneDoc, slot: string): void {
+  const gone = readPublishes(doc).filter((p) => p.slot === slot);
   if (!gone.length) return;
   doc.transact(() => {
-    for (const p of gone) doc.map('scene').delete(PUBLISH_KEY_PREFIX + p.slot);
+    for (const p of gone) doc.map('scene').delete(PUBLISH_KEY_PREFIX + p.id);
   });
 }
 
@@ -242,17 +284,19 @@ function objectsLeft(doc: SceneDoc, link: UnitLinkPlan, s: SlotUnit): boolean {
 }
 
 /**
- * Before an update of `doc` (staged from `brief`'s scene) to `brief`: a unit sent to the host's
- * library from a slot (pendingPublishes) that the brief now pins there, that very file, was linked by
- * the host after the desk stopped waiting for its answer. Where the update would place, update or
- * replace the slot with that file (it is held: `source`), the scene's objects it was made from
- * become the instance instead, as the host's answer would have made them (adoptPublished, linked:
- * the record pins it), so that no copy of them goes in beside them. When those objects are gone (a
- * set's every piece; any other unit's root, or the slot holds another instance), the update puts the
- * unit in as usual. Either way the publish is let go, and so is one whose version the slot holds
- * already; one the brief does not pin yet, or whose file is not here, stays. Inside the caller's
- * transaction (an update's undo step). Staging needs none of it: it starts from an empty document,
- * which holds no publish. Returns the slots adopted and the warnings.
+ * Before an update of `doc` (staged from `brief`'s scene) to `brief`: units saved to the host's
+ * library from a slot (pendingPublishes), one of which the brief now pins there, that very file,
+ * which the host linked after the desk stopped waiting for its answer. Every save of the slot is
+ * matched against the pin. Where the update would place, update or replace the slot with that file
+ * (it is held: `source`), the scene's objects a save of it was made from (the latest whose objects
+ * are still there) become the instance instead, as the host's answer would have made them
+ * (adoptPublished, linked: the record pins it), so that no copy of them goes in beside them. When
+ * those objects are gone (a set's every piece; any other unit's root, or the slot holds another
+ * instance), the update puts the unit in as usual. Either way the slot's saves are let go, and so
+ * are those of a slot that holds the pinned version already; saves the brief pins none of yet, or
+ * whose file is not here, stay (their end is not known: a later brief may pin one). Inside the
+ * caller's transaction (an update's undo step). Staging needs none of it: it starts from an empty
+ * document, which holds no publish. Returns the slots adopted and the warnings.
  */
 export function adoptLinkedPublishes(
   doc: SceneDoc,
@@ -265,36 +309,43 @@ export function adoptLinkedPublishes(
   const slots = new Map(
     resolveBriefUnits(doc, brief, readBriefRecord(doc), source).all.map((s) => [s.key, s] as const),
   );
-  for (const p of pending) {
-    const s = slots.get(p.slot);
-    if (!s?.pin || s.pin.sha256 !== p.sha256) continue;
-    if (s.inst && samePin(s.inst, s.pin)) {
-      forgetPublish(doc, p.sha256);
+  const bySlot = new Map<string, PendingPublish[]>();
+  for (const p of pending) bySlot.set(p.slot, [...(bySlot.get(p.slot) ?? []), p]);
+  for (const [key, saves] of bySlot) {
+    const s = slots.get(key);
+    const pin = s?.pin;
+    // the saves of the file the brief pins in the slot, the latest first
+    const pinned = pin ? saves.filter((p) => p.sha256 === pin.sha256).reverse() : [];
+    if (!s || !pin || !pinned.length) continue;
+    if (s.inst && samePin(s.inst, pin)) {
+      forgetSlot(doc, key);
       continue;
     }
     if (s.action !== 'place' && s.action !== 'update' && s.action !== 'replace') continue;
     let adopted = false;
-    if (objectsLeft(doc, p.link, s))
+    for (const p of pinned) {
+      if (!objectsLeft(doc, p.link, s)) continue;
       try {
         const r = adoptPublished(doc, brief, {
           slot: s.slot,
           link: p.link,
-          pin: s.pin,
+          pin,
           linked: true,
           header: s.held!.header,
         });
         out.warnings.push(...r.warnings.map((w) => `${s.name}: ${w}`));
         adopted = true;
+        break;
       } catch (err) {
         if (!(err instanceof UnitError)) throw err;
       }
-    if (adopted) out.adopted.push(s.key);
-    else {
-      forgetPublish(doc, p.sha256);
-      out.warnings.push(
-        `${s.name}: the objects '${p.link.name}' was saved to the library from are no longer in the scene: its library unit ${pinKey(s.pin)} is put in instead`,
-      );
     }
+    forgetSlot(doc, key);
+    if (adopted) out.adopted.push(s.key);
+    else
+      out.warnings.push(
+        `${s.name}: the objects '${pinned[0].link.name}' was saved to the library from are no longer in the scene: its library unit ${pinKey(pin)} is put in instead`,
+      );
   }
   return out;
 }

@@ -1363,18 +1363,19 @@ describe('a unit saved to the library whose answer came too late (the host linke
     BUILTIN_CATALOG.find((e) => e.id === 'park_bench')!.build(doc, { location: [4, 6, 0] });
     const ex = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
     // the desk keeps what it sent until the answer is taken in (the host's never came)
-    recordPublish(doc, ex.from!, ex.sha256, ex.link);
-    return { doc, ex };
+    const id = recordPublish(doc, ex.from!, ex.sha256, ex.link);
+    return { doc, ex, id };
   }
   const pinned = (b: SceneBrief, pin: BriefUnitPin) => {
     const next = structuredClone(b);
     next.set.unit = pin;
     return next;
   };
+  const MEADOW_PIN = (sha256: string) => ({ ref: 'lib_0123456789mead', version: 1, sha256 });
 
   it('adopts a set saved from the words’ set when the brief pins its file: no copy of the bench', () => {
-    const { doc, ex } = savedSet();
-    expect(pendingPublishes(doc)).toEqual([{ slot: 'set', sha256: ex.sha256, link: ex.link }]);
+    const { doc, ex, id } = savedSet();
+    expect(pendingPublishes(doc)).toEqual([{ id, slot: 'set', sha256: ex.sha256, link: ex.link }]);
     const objects = doc.listObjects().length;
     const bench = benches(doc).map((o) => o.id);
     expect(bench).toHaveLength(2);
@@ -1499,16 +1500,100 @@ describe('a unit saved to the library whose answer came too late (the host linke
     );
   });
 
-  it('is let go when the answer adopts it, and a later save from the slot takes its place', () => {
-    const { doc, ex } = savedSet();
-    recordPublish(doc, ex.from!, 'f'.repeat(64), ex.link);
-    expect(pendingPublishes(doc).map((p) => p.sha256)).toEqual(['f'.repeat(64)]);
-    forgetPublish(doc, 'f'.repeat(64));
+  it('keeps each save of a slot until the host refuses that save, and lets the slot’s go once an answer adopts one', () => {
+    const { doc, ex, id } = savedSet();
+    const other = recordPublish(doc, ex.from!, 'f'.repeat(64), ex.link);
+    expect(other).not.toBe(id);
+    // in the order they were sent
+    expect(pendingPublishes(doc).map((p) => [p.id, p.sha256])).toEqual([
+      [id, ex.sha256],
+      [other, 'f'.repeat(64)],
+    ]);
+    // the host refused the second: the first stays
+    forgetPublish(doc, other);
+    forgetPublish(doc, 'not-a-save');
+    expect(pendingPublishes(doc).map((p) => p.id)).toEqual([id]);
+    const again = recordPublish(doc, ex.from!, ex.sha256, ex.link);
+    expect(pendingPublishes(doc).map((p) => p.id)).toEqual([id, again]);
+    adoptPublished(doc, openBrief(), {
+      slot: ex.from,
+      link: ex.link,
+      pin: MEADOW_PIN(ex.sha256),
+      linked: true,
+      header: ex.header,
+    });
     expect(pendingPublishes(doc)).toEqual([]);
-    recordPublish(doc, ex.from!, ex.sha256, ex.link);
-    const pin = { ref: 'lib_0123456789mead', version: 1, sha256: ex.sha256 };
+  });
+
+  it('a save of the same file that the host refused after the first was linked late forgets only itself: the brief pinning it adopts the first', () => {
+    const { doc, ex, id } = savedSet();
+    // saved again, unchanged: the same file, a save of its own
+    const again = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
+    expect(again.sha256).toBe(ex.sha256);
+    const second = recordPublish(doc, again.from!, again.sha256, again.link);
+    expect(pendingPublishes(doc).map((p) => p.id)).toEqual([id, second]);
+    // the host refused the second save (it holds the first, linked after the desk stopped waiting)
+    forgetPublish(doc, second);
+    expect(pendingPublishes(doc).map((p) => [p.id, p.sha256])).toEqual([[id, ex.sha256]]);
+    const objects = doc.listObjects().length;
+    const bench = benches(doc).map((o) => o.id);
+    const pin = MEADOW_PIN(ex.sha256);
+    const { r } = update(doc, pinned(openBrief(), pin), unitSourceOf([{ ...pin, data: ex.data }]));
+    expect(rowsOf(r)).toEqual(['set unit']);
+    // adopted: the bench stays the scene's own, only the set's root is new
+    expect(benches(doc).map((o) => o.id)).toEqual(bench);
+    expect(doc.listObjects().length).toBe(objects + 1);
+    expect(listUnits(doc).map((i) => [i.key, i.version])).toEqual([['set', 1]]);
+    expect(pendingPublishes(doc)).toEqual([]);
+  });
+
+  it('an edited save the host kept without linking waits beside the first: the brief pinning the first adopts it and lets both go', () => {
+    const { doc, ex, id } = savedSet();
+    // the person moves the bench and saves again; the host saves it as another version, unlinked
+    const bench = benches(doc).map((o) => o.id);
+    doc.transact(() => doc.updateObject(bench[0], { location: [5, 7, 0] }));
+    const edited = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
+    expect(edited.sha256).not.toBe(ex.sha256);
+    const second = recordPublish(doc, edited.from!, edited.sha256, edited.link);
+    expect(pendingPublishes(doc).map((p) => [p.id, p.sha256])).toEqual([
+      [id, ex.sha256],
+      [second, edited.sha256],
+    ]);
+    // a brief that pins neither yet leaves both waiting
+    expect(update(doc, openBrief()).changes).toBeNull();
+    expect(pendingPublishes(doc).map((p) => p.id)).toEqual([id, second]);
+    // the host linked the first after the desk stopped waiting: its next brief pins it
+    const objects = doc.listObjects().length;
+    const pin = MEADOW_PIN(ex.sha256);
+    update(doc, pinned(openBrief(), pin), unitSourceOf([{ ...pin, data: ex.data }]));
+    expect(benches(doc).map((o) => o.id)).toEqual(bench);
+    expect(doc.listObjects().length).toBe(objects + 1);
+    expect(listUnits(doc).map((i) => [i.key, i.version, i.sha256])).toEqual([['set', 1, ex.sha256]]);
+    expect(pendingPublishes(doc)).toEqual([]);
+  });
+
+  it('lets the saves of a slot that holds the pinned version already go, and keeps at most 8 saves of a slot', () => {
+    const { doc, ex, id } = savedSet();
+    const pin = MEADOW_PIN(ex.sha256);
     adoptPublished(doc, openBrief(), { slot: ex.from, link: ex.link, pin, linked: true, header: ex.header });
+    // a save of the version the slot holds, still waiting (Ctrl+Z of an update can bring one back)
+    const kept = recordPublish(doc, ex.from!, ex.sha256, ex.link);
+    expect(kept).not.toBe(id);
+    const objects = doc.listObjects().length;
+    // nothing to bring in (briefChanges null); an Update shots run all the same lets the save go
+    expect(briefChanges(doc, pinned(openBrief(), pin))).toBeNull();
+    updateFromBrief(doc, pinned(openBrief(), pin), { units: unitSourceOf([{ ...pin, data: ex.data }]) });
+    expect(doc.listObjects().length).toBe(objects);
     expect(pendingPublishes(doc)).toEqual([]);
+    // nine saves of the slot whose ends are not known: the oldest goes
+    const ids = Array.from({ length: 9 }, (_, i) =>
+      recordPublish(doc, ex.from!, i.toString(16).repeat(64), ex.link),
+    );
+    expect(new Set(ids).size).toBe(9);
+    expect(pendingPublishes(doc).map((p) => p.id)).toEqual(ids.slice(1));
+    // another slot's saves are its own
+    const kite = recordPublish(doc, { elementId: KITE }, ex.sha256, ex.link);
+    expect(pendingPublishes(doc).map((p) => p.id)).toEqual([`${kite}`, ...ids.slice(1)]);
   });
 });
 

@@ -111,10 +111,10 @@ import {
  *   instances of units is container version 2. Save to library makes the unit in the worker (read
  *   only); the version the host saved and linked is adopted with the storage origin (not an undo
  *   step: it records what the host did), and Ctrl+Z does not go back past it (Yjs cannot undo an
- *   older write of the record it rewrote). What was sent from a slot stays in the scene until the
- *   scene takes it in or the host refuses it (recordPublish, with the storage origin): a brief that
- *   pins it later has Update shots adopt the scene's own objects (core adoptLinkedPublishes). Make
- *   local is one undo step.
+ *   older write of the record it rewrote). Each save sent from a slot stays in the scene until the
+ *   host refuses that save or the scene takes a unit of the slot in (recordPublish, with the storage
+ *   origin): a brief that pins one of their files later has Update shots adopt the scene's own
+ *   objects (core adoptLinkedPublishes). Make local is one undo step.
  */
 
 /**
@@ -1005,23 +1005,25 @@ export class DeskWorkspace {
   }
 
   /**
-   * Keeps in the scene the unit sent to the host's library from its slot (core recordPublish), in
-   * place of one sent from the slot before, until the scene takes it in (an adoption, or the Update
-   * shots of a brief that pins its file: core adoptLinkedPublishes) or the host refuses it
-   * (forgetPublish). Written at once with the storage origin: not an undo step, and Ctrl+Z keeps it.
-   * Nothing without a scene or a slot.
+   * Keeps in the scene the unit sent to the host's library from its slot (core recordPublish), one
+   * save of it beside those sent from the slot before, until the scene takes a unit of the slot in (an
+   * adoption, or the Update shots of a brief that pins one of their files: core
+   * adoptLinkedPublishes) or the host refuses that save (forgetPublish). Written at once with the
+   * storage origin: not an undo step, and Ctrl+Z keeps it; no worker write of the scene writes these
+   * keys (an update or an adoption may only let go of saves it read), so none is lost to one running.
+   * Returns the save's id; null without a scene or a slot (nothing kept).
    */
-  recordPublish(unit: Pick<UnitExtract, 'from' | 'sha256' | 'link'>): void {
+  recordPublish(unit: Pick<UnitExtract, 'from' | 'sha256' | 'link'>): string | null {
     const s = this.session;
     const slot = unit.from;
-    if (!s || !slot) return;
-    s.doc.transact(() => recordPublish(s.doc, slot, unit.sha256, unit.link), s.storageOrigin);
+    if (!s || !slot) return null;
+    return s.doc.transact(() => recordPublish(s.doc, slot, unit.sha256, unit.link), s.storageOrigin);
   }
 
-  /** Lets go of the unit sent with file SHA-256 `sha256` (core forgetPublish): the host did not save it. */
-  forgetPublish(sha256: string): void {
+  /** Lets go of the save `id` (core forgetPublish): the host did not save it, or it was not sent. */
+  forgetPublish(id: string): void {
     const s = this.session;
-    if (s) s.doc.transact(() => forgetPublish(s.doc, sha256), s.storageOrigin);
+    if (s) s.doc.transact(() => forgetPublish(s.doc, id), s.storageOrigin);
   }
 
   /**

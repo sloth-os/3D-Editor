@@ -152,13 +152,14 @@ export interface SceneWorkspace {
     follow?: SceneBrief | null,
   ): Promise<{ root: string; recorded: boolean; warnings: string[] }>;
   /**
-   * Keeps in the scene a unit sent to the host's library from its slot until the scene takes it in
-   * (not an undo step): a brief that pins its file later (the host linked it after the desk stopped
-   * waiting for its answer) has Update shots adopt the scene's own objects.
+   * Keeps in the scene a unit sent to the host's library from its slot, one save beside those sent
+   * from the slot before, until the scene takes a unit of the slot in (not an undo step): a brief
+   * that pins its file later (the host linked it after the desk stopped waiting for its answer) has
+   * Update shots adopt the scene's own objects. Returns the save's id (null: nothing kept).
    */
-  recordPublish?(unit: Pick<UnitExtract, 'from' | 'sha256' | 'link'>): void;
-  /** Lets go of the unit sent with file SHA-256 `sha256` (the host did not save it). */
-  forgetPublish?(sha256: string): void;
+  recordPublish?(unit: Pick<UnitExtract, 'from' | 'sha256' | 'link'>): string | null;
+  /** Lets go of save `id` alone (the host refused it, or it was not sent). */
+  forgetPublish?(id: string): void;
   /** Make local (one undo step). */
   makeLocal?(root: string): Promise<{ root: string; parts: number }>;
   /** Sets the brief the scene follows. */
@@ -952,9 +953,11 @@ export class DeskController {
    * the file (an invalid ack ends the wait at once; a later one is not applied). When the host saved
    * and linked it and the open is editable and still open, the scene becomes an instance of the
    * version (not an undo step) and the brief follows the pin the host moved. An editable open keeps
-   * the unit sent from a slot in the scene (recordPublish) until the scene takes it in or the host
-   * refuses it: a link the host makes after the desk stopped waiting comes with a later brief, and
-   * Update shots adopts the scene's own objects then. Only with units on and `publish`; a read-only
+   * each save from a slot in the scene (recordPublish) until the scene takes a unit of the slot in or
+   * the host refuses that save; one whose end the desk does not know (no answer in time, an invalid
+   * one, the desk closed first) or that the host kept unlinked stays: a link the host makes after the
+   * desk stopped waiting comes with a later brief, and Update shots adopts the scene's own objects
+   * then. Only with units on and `publish`; a read-only
    * open publishes but never links. Resolves with what came of it (also kept in lastPublish); never
    * rejects.
    */
@@ -1011,10 +1014,10 @@ export class DeskController {
       const problem = deskMessageProblems(message);
       if (problem) return fail('invalid', `The unit could not be sent: ${problem}`);
       const ws = this.deps.workspace;
-      // the scene keeps what it sends until it takes it in: a link the host makes after the desk
-      // stopped waiting comes with a later brief, whose Update shots adopts it (no copy of it goes in)
-      const kept = !this.options.peek().readOnly && !!unit.from;
-      if (kept) ws.recordPublish?.(unit);
+      // the scene keeps this save until it takes a unit of the slot in: a link the host makes after
+      // the desk stopped waiting comes with a later brief, whose Update shots adopts it (no copy of
+      // it goes in); only the host's refusal of this very save lets it go
+      const kept = !this.options.peek().readOnly && unit.from ? (ws.recordPublish?.(unit) ?? null) : null;
       const wait = this.waitForAck(id, publishAckTimeoutMs(message.unit.data.byteLength));
       const transfer: Transferable[] = [
         message.unit.data,
@@ -1022,7 +1025,7 @@ export class DeskController {
       ];
       if (!this.deps.send(message, transfer)) {
         wait.cancel();
-        if (kept) ws.forgetPublish?.(unit.sha256);
+        if (kept) ws.forgetPublish?.(kept);
         return fail('unavailable', 'No host is connected.');
       }
       this.publishing.value = { ...this.publishing.peek()!, kind, phase: 'waiting', id };
@@ -1034,8 +1037,9 @@ export class DeskController {
         return fail('bad_reply', `${host}'s answer was not valid: ${answer.problems}`);
       const ack = answer.message;
       if (!ack.ok) {
-        // not saved: no later brief pins this file
-        if (kept) ws.forgetPublish?.(unit.sha256);
+        // not saved: no later brief pins this file from this save (an earlier save of it, whose end
+        // the desk does not know, stays kept)
+        if (kept) ws.forgetPublish?.(kept);
         return fail(ack.code ?? 'failed', ack.message ?? `${host} did not save '${unit.header.name}'.`);
       }
       const pin = { ref: ack.ref!, version: ack.version!, sha256: unit.sha256 };
