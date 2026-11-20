@@ -61,6 +61,7 @@ import {
   propHook,
   recordOf,
   recordPinsOf,
+  slotFailed,
   stagedActors,
   stagedBy,
   type StageBriefReport,
@@ -383,7 +384,7 @@ export function updateFromBriefIn(
       continue;
     const slot = units.cast.get(cid);
     const figure = figureHook(slot);
-    const id = addActor(
+    const added = addActor(
       doc,
       cid,
       brief,
@@ -394,8 +395,9 @@ export function updateFromBriefIn(
       figure,
       pinnedFigureHeight(brief, slot),
     );
-    if (figure) done.add(figure.key);
-    actors.set(cid, doc.getObject(id)!);
+    if (figure && added.failed === undefined) done.add(figure.key);
+    else if (slot && figure) warnings.push(...slotFailed(slot, added.failed, done));
+    actors.set(cid, doc.getObject(added.id)!);
     created.add(cid);
   }
   // the name each actor has as the desk staged it, for the record: what a later update tells a name
@@ -434,19 +436,24 @@ export function updateFromBriefIn(
       );
     }
   }
-  // library figures on the actors the update keeps: a new look in place, or the mannequin again
+  // library figures on the actors the update keeps: a new look in place, or the mannequin again (a
+  // figure that does not go in leaves the actor's look as it is, its slot saying why)
   for (const [cid, slot] of units.cast) {
     const actor = actors.get(cid);
     if (!actor || created.has(cid) || slot.action === 'none') continue;
     const name = castById.get(cid)?.name ?? actor.name;
-    if (slot.action === 'remove') {
-      const color = ACTOR_PALETTE[Math.max(0, plan.order.indexOf(cid)) % ACTOR_PALETTE.length];
-      const r = restyleActor(doc, actor.id, { mannequin: { color } });
-      warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
-    } else if (slot.payload) {
-      const r = restyleActor(doc, actor.id, { figure: slot.payload, pin: slot.pin!, key: slot.key });
-      warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
-      done.add(slot.key);
+    try {
+      if (slot.action === 'remove') {
+        const color = ACTOR_PALETTE[Math.max(0, plan.order.indexOf(cid)) % ACTOR_PALETTE.length];
+        const r = restyleActor(doc, actor.id, { mannequin: { color } });
+        warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
+      } else if (slot.payload) {
+        const r = restyleActor(doc, actor.id, { figure: slot.payload, pin: slot.pin!, key: slot.key });
+        warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
+        done.add(slot.key);
+      }
+    } catch (err) {
+      warnings.push(...slotFailed(slot, err, done));
     }
     actors.set(cid, doc.getObject(actor.id)!);
   }
@@ -643,27 +650,35 @@ export function updateFromBriefIn(
   const setSlot = units.set;
   const setAction = setSlot?.action ?? 'none';
   if (setSlot && (setAction === 'place' || setAction === 'replace' || setAction === 'update')) {
-    if (setAction === 'update') {
-      const root = setSlot.inst!.root;
-      const rep = updateUnit(doc, root, setSlot.payload!, setSlot.pin!);
-      warnings.push(...rep.warnings.map((w) => `the library set: ${w}`));
-      const info = setSlot.held!.info as SetPlanInfo;
-      const o = doc.getObject(root)!;
-      doc.updateObject(root, {
-        custom_props: {
-          ...o.custom_props,
-          [RIDEO_PROPS.ground]: info.ground,
-          [UNIT_FACTS_PROP]: JSON.stringify(info),
-        },
-      });
-    } else {
-      // the words' set (or the library set before) goes: the library set is the place
-      if (setAction === 'replace') removeTrees(doc, [setSlot.inst!.root]);
-      removeWordSet(doc, sceneId);
-      insertSetUnit(doc, sceneId, setSlot);
+    // a set that does not go in (its update or insert throws before writing anything) leaves the
+    // slot as it was, saying why; the rest of the update goes on
+    try {
+      if (setAction === 'update') {
+        const root = setSlot.inst!.root;
+        const rep = updateUnit(doc, root, setSlot.payload!, setSlot.pin!);
+        warnings.push(...rep.warnings.map((w) => `the library set: ${w}`));
+        const info = setSlot.held!.info as SetPlanInfo;
+        const o = doc.getObject(root)!;
+        doc.updateObject(root, {
+          custom_props: {
+            ...o.custom_props,
+            [RIDEO_PROPS.ground]: info.ground,
+            [UNIT_FACTS_PROP]: JSON.stringify(info),
+          },
+        });
+      } else {
+        // the words' set (or the library set before) goes, in the insert's own transaction: the
+        // library set is the place
+        insertSetUnit(doc, sceneId, setSlot, [
+          ...(setAction === 'replace' ? [setSlot.inst!.root] : []),
+          ...wordSet(doc, sceneId),
+        ]);
+      }
+      relightSet(doc, blocking);
+      done.add(setSlot.key);
+    } catch (err) {
+      warnings.push(...slotFailed(setSlot, err, done));
     }
-    relightSet(doc, blocking);
-    done.add(setSlot.key);
   } else if (setSlot && setAction === 'remove') {
     removeTrees(doc, [setSlot.inst!.root]);
     restageSet(doc, blocking, brief, castNames, stamp, sceneId);
@@ -710,10 +725,12 @@ export function updateFromBriefIn(
     const current = old && doc.getObject(old.id) ? old : undefined;
     const slot = units.elements.get(eid);
     // the element's library prop: placed, updated or replaced; kept (another version not held, made
-    // local); none any more (the words' prop again)
+    // local); none any more (the words' prop again); one that does not go in leaves the prop as it
+    // was (or the words' prop), its slot saying why
     const unit = slot?.action === 'remove' ? null : propHook(doc, slot, current?.id ?? null);
     if (unit?.unit) done.add(unit.key);
     const made = buildProp(doc, p, e.name, castNames, stamp, flies, current, unit);
+    if (slot && made.failed !== undefined) warnings.push(...slotFailed(slot, made.failed, done));
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     const rest = { ...doc.getObject(made.root)!.custom_props };
     delete rest[RIDEO_PROPS.heldBy];
@@ -871,7 +888,9 @@ function layoutOf(s: BriefShot, actorId: (cid: string) => string | null): DeskLa
 /**
  * Adds the actor of cast member `cid` on its planned mark (a free spot when an actor stands there):
  * its library figure (`figure`), else a mannequin of the figure's height when its figure is pinned
- * but not placed (`pinnedHeight`, the desk's own), else one of the brief's height.
+ * but not placed (`pinnedHeight`, the desk's own), else one of the brief's height. A figure that does
+ * not go in (`failed`: the error; nothing of it is left) stands as the mannequin of its own kind,
+ * height and colour.
  */
 function addActor(
   doc: SceneDoc,
@@ -883,7 +902,7 @@ function addActor(
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   figure?: ReturnType<typeof figureHook>,
   pinnedHeight?: number,
-): string {
+): { id: string; failed?: unknown } {
   const c = brief.cast.find((x) => x.id === cid)!;
   const taken: RideoBlockingMark[] = [...actors.values()].map((o) => {
     const loc = doc.getObject(o.id)?.location ?? o.location;
@@ -896,8 +915,11 @@ function addActor(
     pinnedHeight ??
     (c.heightM && c.heightM > 0 ? c.heightM / rideoHeightRatio(kind) : defaultActorHeight(kind));
   // a library figure is the member: its own kind, height and colour
-  const r = figure
-    ? createFigureActor(doc, figure.unit, {
+  let failed: unknown;
+  let r: { actor: string } | null = null;
+  if (figure)
+    try {
+      r = createFigureActor(doc, figure.unit, {
         pin: figure.pin,
         key: figure.key,
         name: c.name,
@@ -905,17 +927,20 @@ function addActor(
         facing_deg: want.facingDeg,
         pose: editorPose('stand', figure.kind),
         character_id: cid,
-      })
-    : createActor(doc, {
-        kind,
-        name: c.name,
-        color: nextActorColor(doc),
-        height_m: heightM,
-        location: [at.x, -at.z, 0],
-        facing_deg: want.facingDeg,
-        pose: editorPose('stand', kind),
-        character_id: cid,
       });
+    } catch (err) {
+      failed = err;
+    }
+  r ??= createActor(doc, {
+    kind: figure ? figure.kind : kind,
+    name: c.name,
+    color: figure ? figure.color : nextActorColor(doc),
+    height_m: figure ? figure.heightM : heightM,
+    location: [at.x, -at.z, 0],
+    facing_deg: want.facingDeg,
+    pose: editorPose('stand', figure ? figure.kind : kind),
+    character_id: cid,
+  });
   const used = new Set(
     doc
       .listObjects()
@@ -928,7 +953,7 @@ function addActor(
   doc.updateObject(r.actor, {
     custom_props: stamp({ ...o.custom_props, [RIDEO_PROPS.id]: `a${n}`, [DESK_PROPS.characterId]: cid }),
   });
-  return r.actor;
+  return { id: r.actor, ...(failed === undefined ? {} : { failed }) };
 }
 
 /** Holds (or flies) prop `root` by its holder over the shots the holder is in; hidden in the others. */
@@ -1026,10 +1051,11 @@ function relightSet(doc: SceneDoc, blocking: ReturnType<typeof parseRideoBlockin
 }
 
 /**
- * Removes the words' set of scene `sceneId` (its ground and walls, its landmarks, and the materials
- * only they used), never an object inside a library unit instance.
+ * The words' set of scene `sceneId`: its ground and walls and its landmarks, never an object inside
+ * a library unit instance. A library set placed takes them out with what only they used (insertUnit's
+ * `remove`: their meshes and materials).
  */
-function removeWordSet(doc: SceneDoc, sceneId: string): void {
+function wordSet(doc: SceneDoc, sceneId: string): string[] {
   const ground = doc
     .listObjects()
     .filter(
@@ -1041,13 +1067,7 @@ function removeWordSet(doc: SceneDoc, sceneId: string): void {
   const landmarks = [
     ...stagedBy(doc, 'landmark', sceneId, (o) => o.custom_props?.[RIDEO_PROPS.id]).values(),
   ].filter((o) => unitOf(doc, o.id) === null);
-  const materials = new Set(ground.flatMap((o) => o.material_slots.filter((m): m is string => !!m)));
-  removeTrees(
-    doc,
-    [...ground, ...landmarks].map((o) => o.id),
-  );
-  const used = new Set(doc.listObjects().flatMap((o) => o.material_slots));
-  for (const m of materials) if (!used.has(m)) doc.removeMaterial(m);
+  return [...ground, ...landmarks].map((o) => o.id);
 }
 
 /**

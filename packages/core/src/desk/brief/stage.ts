@@ -28,6 +28,7 @@ import {
 } from './record';
 import { SceneBriefSchema, briefProblems, type BriefChanges, type SceneBrief } from './schema';
 import {
+  KIND_WORD,
   UNIT_FACTS_PROP,
   afterOf,
   decodeHeld,
@@ -292,14 +293,22 @@ export function stagedCast(brief: SceneBrief): Set<string> {
 /**
  * Puts the set unit of slot `s` (placing, its unit decoded) in as the scene's set: the instance with
  * key 'set', its root an EMPTY at the origin stamped with desk_role 'set', the scene (desk_rideo_clip),
- * the ground's name and its planning facts. Returns its root.
+ * the ground's name and its planning facts. `remove`: what it takes the place of (the words' set, the
+ * library set before), taken out in the same transaction once it is sure to go in (insertUnit's
+ * `remove`): a set that does not go in throws and leaves them as they are. Returns its root.
  */
-export function insertSetUnit(doc: SceneDoc, sceneId: string, s: SlotUnit): string {
+export function insertSetUnit(
+  doc: SceneDoc,
+  sceneId: string,
+  s: SlotUnit,
+  remove: readonly string[] = [],
+): string {
   const info = s.held!.info as SetPlanInfo;
   return insertUnit(doc, s.payload!, {
     ...s.pin!,
     key: s.key,
     name: info.name,
+    ...(remove.length ? { remove } : {}),
     rootProps: {
       [DESK_PROPS.role]: 'set',
       [RIDEO_PROPS.clip]: sceneId,
@@ -307,6 +316,22 @@ export function insertSetUnit(doc: SceneDoc, sceneId: string, s: SlotUnit): stri
       [UNIT_FACTS_PROP]: JSON.stringify(info),
     },
   }).root;
+}
+
+/**
+ * Slot `s` (of a staging or an update) whose unit did not go in: it keeps what it has, staged from
+ * the words, with why (failSlot), and is no longer done. Returns the warning naming why (a slot
+ * the brief pins nothing in, whose instance was to go, says that it stays until the next update).
+ */
+export function slotFailed(s: SlotUnit, err: unknown, done: Set<string>): string[] {
+  failSlot(s, err);
+  done.delete(s.key);
+  const said = unitWarnings({ set: null, cast: new Map(), elements: new Map(), all: [s] });
+  if (said.length || s.pin) return said;
+  const whose = s.name === 'the set' ? 'The set' : s.name;
+  return [
+    `${whose}'s library ${KIND_WORD[s.kind]} could not be taken out this time (${s.problem!.message}): it stays until the next update`,
+  ];
 }
 
 /** The import's figure for slot `s` when it places one (its unit decoded), else undefined. */
@@ -421,6 +446,9 @@ export function stageBriefIn(
   }
   const plan = planBrief(brief, { preRollFrames: opts.preRollFrames, units: planUnitsOf(doc, resolved) });
   const warnings = [...plan.warnings, ...unitWarnings(resolved)];
+  // a figure or prop that does not go in is staged from the words, its slot saying why (the others
+  // and the shots stage as planned)
+  const failed: string[] = [];
   const r = importRideoBlocking(briefContext(ctx, warnings), plan.input, solveShotCameras, {
     ...(plan.units.set ? { marks: plan.marks } : {}),
     figure: (cid) => {
@@ -434,8 +462,12 @@ export function stageBriefIn(
       if (u) done.add(u.key);
       return u;
     },
+    failed: (key, err) => {
+      const s = resolved.all.find((x) => x.key === key);
+      if (s) failed.push(...slotFailed(s, err, done));
+    },
   });
-  warnings.push(...r.warnings);
+  warnings.push(...failed, ...r.warnings);
   for (const s of plan.skipped) {
     const e = brief.elements.find((x) => x.id === s.id)!;
     warnings.push(`${e.name} ${s.why}`);

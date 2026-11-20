@@ -524,7 +524,7 @@ desk, and its record says why. The record's state is the row's `staged` and `why
 | none, `local` true | `unit`                   | The person made the slot local: its pieces stay, unlinked, whatever later briefs pin             | —                                   | made local                                                         |
 | `missing`          | `pending`                | No entry for the pin in `open.units`, or one left out                                            | at the next open                    | waiting for the unit                                               |
 | `mismatch`         | `pending`                | An entry for the pin's `ref` and `version` with another SHA-256, or bytes that do not hash to it | at the next open                    | waiting for the unit                                               |
-| `unavailable`      | `pending`                | Sent and matching, but not usable this time: earlier slots spent the budget, or reading failed   | at the next open                    | waiting for the unit                                               |
+| `unavailable`      | `pending`                | Sent and matching, not usable this time: the budget spent, reading failed, the scene in its way  | at the next open                    | waiting for the unit                                               |
 | `unreadable`       | `refused`                | Not a unit file the desk reads, or a damaged one                                                 | when the brief pins another version | cannot use the unit, with the reason                               |
 | `too_new`          | `refused`                | A unit of a newer format version than the desk reads                                             | when the brief pins another version | cannot use the unit, with the reason                               |
 | `too_large`        | `refused`                | Larger than the desk takes for one unit                                                          | when the brief pins another version | cannot use the unit, with the reason                               |
@@ -544,11 +544,14 @@ shots again and again.
 
 `unavailable` means the host sent matching bytes but the desk could not use them this time, for a
 reason that may pass: the open's unit budget (48 MiB of files and 160 MiB unpacked, counted in slot
-order: the set, the cast, the elements) was already spent by earlier slots, or the staging worker
-failed while reading the unit (out of memory, a worker restart). The next open tries again. A
-version pinned in several slots counts as one file and one decoded body, and the scene's copy of it
-in each slot that places it, so a slot past the budget is `unavailable` although the same version
-went into the slots before it: the next open places it there, as those slots hold theirs already.
+order: the set, the cast, the elements) was already spent by earlier slots, the staging worker
+failed while reading the unit (out of memory, a worker restart), or the scene was in the unit's way
+as it went in (an object of the person's own at the id the unit's root takes; the warning names
+it), in which case the slot stays as it was or staged from the words and the other slots go in. The
+next open tries again. A version pinned in several slots counts as one file and one decoded body,
+and the scene's copy of it in each slot that places it, so a slot past the budget is `unavailable`
+although the same version went into the slots before it: the next open places it there, as those
+slots hold theirs already.
 `over_budget` is only for a unit a single instance of which can never fit the staging's budget: its
 body, and the scene's copy of it with each byte array written out at every reference (a file may
 share one array among many records, and inserting copies it for each), which the desk counts again

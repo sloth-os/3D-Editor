@@ -37,8 +37,9 @@ import type { BriefUnitPin, SceneBrief } from './schema';
  *   same item: 'update') or replaced by it (another item: 'replace');
  * - otherwise nothing is placed: the slot keeps what it has (an earlier version stays placed), else
  *   it is staged from the words, and the record says why: 'pending' (missing: not sent; mismatch:
- *   bytes that are not the pin's; unavailable: the staging's budget was spent by earlier slots, or
- *   the unit could not be read this time), tried again at the next open, or 'refused' (unreadable,
+ *   bytes that are not the pin's; unavailable: the staging's budget was spent by earlier slots, the
+ *   unit could not be read this time, or the scene was in its way as it went in), tried again at the
+ *   next open or update, or 'refused' (unreadable,
  *   too_new, too_large, wrong_kind, figure_kind, figure_rig, over_budget, set_ground), tried again
  *   only when the brief pins another version.
  *
@@ -159,7 +160,13 @@ export interface GivenProblem {
   message?: string;
 }
 
-/** The refusal (or, for an error that is not the unit's, 'unavailable') a failed read of a unit gives. */
+/**
+ * Why a unit that failed to read or to go in is not used: refused for the file's own faults
+ * (unreadable, too_new, too_large), else pending 'unavailable', tried again at the next open or
+ * update: an error that is not the unit's (out of memory, a worker restart), or the scene in the
+ * unit's way as it goes in (an id it takes that something of the scene holds, an instance or object
+ * it needs: UNIT_ID_TAKEN, UNIT_INSTANCE_EXISTS, UNIT_NOT_FOUND), which the message names.
+ */
 export function unitReadProblem(err: unknown): UnitProblem {
   const message = err instanceof Error ? err.message : String(err);
   if (!(err instanceof UnitError)) return { staged: 'pending', why: 'unavailable', message };
@@ -169,6 +176,11 @@ export function unitReadProblem(err: unknown): UnitProblem {
       return { staged: 'refused', why: 'too_new', message };
     case 'UNIT_TOO_LARGE':
       return { staged: 'refused', why: 'too_large', message };
+    case 'UNIT_ID_TAKEN':
+    case 'UNIT_INSTANCE_EXISTS':
+      return { staged: 'pending', why: 'unavailable', message: `the scene is in its way: ${message}` };
+    case 'UNIT_NOT_FOUND':
+      return { staged: 'pending', why: 'unavailable', message };
     default:
       return { staged: 'refused', why: 'unreadable', message };
   }
@@ -738,7 +750,8 @@ export function decodeHeld(resolved: ResolvedUnits, source: UnitSource | null): 
 
 /**
  * Slot `s`'s unit is not used after all (it did not decode, or did not go in): the slot keeps what it
- * has, with the problem (refused, or pending 'unavailable' for an error that is not the unit's).
+ * has, with the problem (refused, or pending 'unavailable' for an error that is not the unit's file's:
+ * unitReadProblem).
  */
 export function failSlot(s: SlotUnit, err: unknown): void {
   s.payload = null;
@@ -888,7 +901,8 @@ export function planUnitsOf(
   return { set, figures, props };
 }
 
-const KIND_WORD = { set: 'set', figure: 'figure', prop: 'prop' } as const;
+/** A unit kind in words. */
+export const KIND_WORD = { set: 'set', figure: 'figure', prop: 'prop' } as const;
 const STAND_IN = {
   set: 'the set from the words',
   figure: 'a mannequin from the words',

@@ -290,13 +290,17 @@ export interface StagedFigure extends StagedUnit {
  * whose figure is pinned but not placed (not here, or refused), which the host gives as the
  * figure's own: the desk's height of its kind (an animal's withers), used as it is rather than as
  * rideo's height, so that the mannequin standing in has the figure's rig and its arrival is a look
- * swap (undefined: rideo's height, as for any member).
+ * swap (undefined: rideo's height, as for any member). `failed`: a unit handed to the import that
+ * did not go in (by its key, with the error), which leaves nothing of it behind: its member stands
+ * as the mannequin of the figure's kind, height and colour, its element as the prop of the words
+ * (or the prop it had, kept as it is), and the rest of the import goes on.
  */
 export interface ImportUnits {
   marks?: ReadonlyMap<string, RideoBlockingMark>;
   prop?(p: RideoBlockingProp): StagedProp | null | undefined;
   figure?(characterId: string): StagedFigure | undefined;
   figureHeight?(characterId: string): number | undefined;
+  failed?(key: string, err: unknown): void;
 }
 
 // ---------------------------------------------------------------- small helpers
@@ -899,19 +903,26 @@ export function importRideoBlocking(
       }
     }
     if (!actorId && figure) {
-      const r = createFigureActor(doc, figure.unit, {
-        pin: figure.pin,
-        key: figure.key,
-        name: nameOf(id),
-        location: floor(first.x, first.z),
-        facing_deg: first.facingDeg,
-        pose: editorPose(first.pose, kind),
-        character_id: id,
-      });
-      for (const w of r.warnings) warnings.push(`${nameOf(id)}: ${w}`);
-      actorId = r.actor;
-      created = true;
-    } else if (!actorId) {
+      try {
+        const r = createFigureActor(doc, figure.unit, {
+          pin: figure.pin,
+          key: figure.key,
+          name: nameOf(id),
+          location: floor(first.x, first.z),
+          facing_deg: first.facingDeg,
+          pose: editorPose(first.pose, kind),
+          character_id: id,
+        });
+        for (const w of r.warnings) warnings.push(`${nameOf(id)}: ${w}`);
+        actorId = r.actor;
+        created = true;
+      } catch (err) {
+        // the figure does not go in (nothing of it is left): the mannequin of its kind, height and
+        // colour stands in, which the figure restyles in place once it goes in
+        units.failed?.(figure.key, err);
+      }
+    }
+    if (!actorId) {
       const r = createActor(doc, {
         kind,
         name: nameOf(id),
@@ -982,7 +993,9 @@ export function importRideoBlocking(
       for (const x of tetherPartsOf(doc, old.id)) removeTrees(doc, [x]);
       keptProps.add(p.id);
     }
-    const made = buildProp(doc, p, elementName, castNames, stamp, flies, old, units.prop?.(p));
+    const unit = units.prop?.(p);
+    const made = buildProp(doc, p, elementName, castNames, stamp, flies, old, unit);
+    if (unit && made.failed !== undefined) units.failed?.(unit.key, made.failed);
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     props.set(p.id, { ...made, plan: p, flies });
     // rideo's holder, for the export to write back while the desk has no hold of theirs
@@ -1908,12 +1921,14 @@ function buildUnitProp(
     const unitRoot = unit.unit.body.blocks.objects?.['@root'];
     const swap =
       cur && !inst && unitRoot && doc.getObject(cur.id)?.type === unitRoot.type ? cur.id : undefined;
-    if (cur && !swap) removeTrees(doc, [cur.id]);
+    // the prop it takes the place of goes in the insert's own transaction: a unit that does not go
+    // in leaves it as it is
     const r = insertUnit(doc, unit.unit, {
       ...unit.pin,
       key: unit.key,
       name: label,
       ...(swap ? { replace: swap } : {}),
+      ...(cur && !swap ? { remove: [cur.id] } : {}),
       rootProps: own,
     });
     root = r.root;
@@ -1942,7 +1957,9 @@ const stampFacts = (
  * Adds a prop: the built-in model its element or label names, fitted to `size`, else a cube of edge
  * `size`; an earlier import's prop built the same way is kept (with what was added to it since),
  * cleared of its animation and of the import's holds, which the import keys anew, and put back on
- * its mark.
+ * its mark. With `unit`, the library prop (buildUnitProp); one that does not go in (its update or
+ * insert throws before writing anything) leaves the prop the element had as it was and is staged as
+ * without a unit (the words' prop, or that prop kept): `failed` holds the error.
  */
 export function buildProp(
   doc: SceneDoc,
@@ -1953,24 +1970,35 @@ export function buildProp(
   flies: 'kite' | 'balloon' | null,
   old?: ObjectData,
   unit?: StagedProp | null,
-): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings?: string[] } {
+): {
+  root: string;
+  baseScale: Vec3;
+  model: string | null;
+  created: boolean;
+  warnings?: string[];
+  failed?: unknown;
+} {
   const label = p.label || elementName || p.id;
   if (unit)
-    return buildUnitProp(
-      doc,
-      p,
-      label,
-      stamp({
-        [DESK_PROPS.role]: 'prop',
-        [DESK_PROPS.label]: label,
-        [RIDEO_PROPS.id]: p.id,
-        [DESK_PROPS.color]: p.color,
-        ...(p.elementId ? { [DESK_PROPS.elementId]: p.elementId } : {}),
-      }),
-      flies,
-      old,
-      unit,
-    );
+    try {
+      return buildUnitProp(
+        doc,
+        p,
+        label,
+        stamp({
+          [DESK_PROPS.role]: 'prop',
+          [DESK_PROPS.label]: label,
+          [RIDEO_PROPS.id]: p.id,
+          [DESK_PROPS.color]: p.color,
+          ...(p.elementId ? { [DESK_PROPS.elementId]: p.elementId } : {}),
+        }),
+        flies,
+        old,
+        unit,
+      );
+    } catch (err) {
+      return { ...buildProp(doc, p, elementName, castNames, stamp, flies, old), failed: err };
+    }
   // null: the element has no unit (any more): an instance of one goes, for the words' prop (the
   // shots that named it name the new prop)
   let replaced: string | null = null;

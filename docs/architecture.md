@@ -999,21 +999,39 @@ so one that fails leaves the scene as it was.
 
 An instance is a root object with `unit_*` custom props: the library item, its version, the file's
 SHA-256, the body digest, the kind, the key, the name, `unit_parts` (each source id's scene id and a
-16-digit stamp of the fields the unit owns) and `unit_drivers` (each driver the unit gave, by its
-target's source id, path and index, with its stamp). glTF node extras and `get_object` give the two
-tables as how many entries they hold (`unit_parts_count`, `unit_drivers_count`, about 56 bytes a
-part saved). Insertion derives every id from the instance key and the source id (`deriveUnitId`), so
-two replicas inserting the same unit agree. Taking an instance out removes all of it (`remove.ts`):
-its objects and the datablocks its part table lists that nothing left in the scene uses, so a unit
+16-digit stamp of the fields the unit owns), `unit_drivers` (each driver the unit gave, by its
+target's source id, path and index, with its stamp) and, for an instance whose parts took ids of a
+later generation (below), `unit_gen`. glTF node extras and `get_object` give the two tables as how
+many entries they hold (`unit_parts_count`, `unit_drivers_count`, about 56 bytes a part saved).
+Insertion derives every id from the instance key and the source id (`deriveUnitId`), so two
+replicas inserting the same unit agree. Taking an instance out removes all of it (`remove.ts`): its
+objects and the datablocks its part table lists that nothing left in the scene uses, so a unit
 placed in the slot again finds its ids free. A datablock at a derived id that nothing uses counts as
-free and goes in the insert's transaction; one something uses refuses the insert (`UNIT_ID_TAKEN`).
-An update replaces the parts the scene left untouched in place, ids kept, so shots, holds and
-F-curves keep resolving; it keeps parts edited or deleted in the scene, adds new parts and removes
-dropped untouched ones that nothing staying uses (a record that stays refers to it, such as another
-object, a camera's focus or a part the update keeps, or a key, driver, shot or the scene camera
-names it; then it stays with what it uses), and treats the unit's drivers the same way by their own
-table. What an update writes is stamped as written: a reference to a part that is not in the scene
-is cut, and the part still reads as left as it was. Linking a saved set (adoption) stamps the
+free and goes in the insert's transaction. A part the scene still uses keeps its id when its
+instance goes (the person gave its material to an object of their own, or moved one of its objects
+out from under it), so a slot's ids come in generations (`derivePartId`): generation 0 is
+`deriveUnitId(key, sourceId)`, generation n hashes the key as `<key>#<n>`, which no key can be, and
+an insert takes the first of the 65 generations (0 to 64) whose ids are all free and keeps it in
+`unit_gen`. The root's id is the same in every generation, so shots, holds and the set's root keep
+finding it; only an object of the scene's own at the root's id, or a part whose ids are taken in
+every generation, refuses the insert (`UNIT_ID_TAKEN`). The choice depends on the document alone,
+so replicas agree. An insert that takes the place of what was there (a library set over the words'
+set, a prop's new look) removes the old objects in its own transaction, and a staging or an update
+puts each slot in on its own: a unit that does not go in (the scene in its way, a body that does
+not read) leaves its slot as it was or staged from the words, with its reason in the record, and
+the other slots, the shots and the rest of an update go on; one the scene was in the way of is
+pending `unavailable`, tried again at the next open or update. An update replaces the parts the
+scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts
+edited or deleted in the scene, adds new parts at ids of the instance's generation (or of the next
+free one) and removes dropped untouched ones that nothing staying uses (a record that stays refers
+to it, such as another object, a camera's focus or a part the update keeps, or a key, driver, shot
+or the scene camera names it; then it stays with what it uses), and treats the unit's drivers the
+same way by their own table: a driver the new version drops together with the part it drives goes
+with that part, or stays on it when the part stays, and what it reads stays too. `unitStatus` names
+the parts and the drivers the scene edited or deleted. Extraction carries an instance's generation
+in its link plan, so linking the saved unit (adoption) keeps it; Make local drops it with the other
+`unit_*` props. What an update writes is stamped as written: a reference to a part that is not in
+the scene is cut, and the part still reads as left as it was. Linking a saved set (adoption) stamps the
 scene's set root, also one made local before: the root a new set would take is that one. A unit's
 driver writes only the unit's own datablocks (it may read the world or the scene), and drivers count
 toward the 20,000 records. Scene-owned fields (names, the collection and rigid body of every object,
