@@ -552,6 +552,84 @@ describe('a slot that held an instance before (its ids are derived from the slot
   );
 });
 
+describe('what the person put on an actor or a prop stays when its look changes', () => {
+  /** A backpack built in the scene and put on `parent` (on its bone `bone` when given): its objects. */
+  function backpack(doc: SceneDoc, parent: string, bone?: string): { root: string; objects: string[] } {
+    const r = BUILTIN_CATALOG.find((e) => e.id === 'backpack')!.build(doc, { location: [0, 0, 1] });
+    doc.updateObject(r.root, {
+      parent,
+      ...(bone ? { parent_type: 'BONE' as const, parent_bone: bone } : {}),
+    });
+    return { root: r.root, objects: r.objects };
+  }
+  const below = (
+    doc: SceneDoc,
+    root: string,
+    keep: (o: ReturnType<SceneDoc['listObjects']>[number]) => boolean,
+  ) =>
+    doc
+      .listObjects()
+      .filter((o) => o.parent === root && keep(o))
+      .map((o) => o.id);
+
+  it('a figure pinned for a mannequin takes only its parts; back to the mannequin takes only the figure', () => {
+    const L = library();
+    const { doc } = staged(openBrief());
+    const mira = actorOf(doc, MIRA).id;
+    const pack = backpack(doc, mira, 'head');
+    const mannequin = below(doc, mira, (o) => o.custom_props.desk_actor === mira);
+    expect(mannequin).toHaveLength(21);
+    const kept = "Mira: keeps 'Backpack', which is not part of the look the library figure replaces";
+
+    const on = update(doc, withPins(openBrief(), { cast: { [MIRA]: L.mira } }), source(L.mira));
+    expect(rowsOf(on.r)).toContain(`cast:${MIRA} unit`);
+    expect(readInstance(doc, mira)?.ref).toBe(L.mira.pin.ref);
+    for (const id of mannequin) expect(doc.has('objects', id)).toBe(false);
+    for (const id of pack.objects) expect(doc.has('objects', id)).toBe(true);
+    expect(doc.getObject(pack.root)).toMatchObject({
+      parent: mira,
+      parent_type: 'BONE',
+      parent_bone: 'head',
+    });
+    expect(on.r.warnings).toContain(kept);
+    expect(unitStatus(doc, mira)).toEqual({ edited: [], missing: [] });
+
+    const figure = [...readInstance(doc, mira)!.parts.values()].map((p) => p.id).filter((id) => id !== mira);
+    const off = update(doc, openBrief(), source(L.mira));
+    expect(listUnits(doc)).toEqual([]);
+    for (const id of figure) expect(doc.has('objects', id)).toBe(false);
+    expect(below(doc, mira, (o) => o.custom_props.desk_actor === mira)).toHaveLength(21);
+    for (const id of pack.objects) expect(doc.has('objects', id)).toBe(true);
+    expect(doc.getObject(pack.root)).toMatchObject({
+      parent: mira,
+      parent_type: 'BONE',
+      parent_bone: 'head',
+    });
+    expect(off.r.warnings).toContain(
+      "Mira: keeps 'Backpack', which is not part of the library figure's look",
+    );
+  });
+
+  it("a library prop pinned for a prop built from the words takes only the built model's parts", () => {
+    const L = library();
+    const { doc } = staged(openBrief());
+    const kite = propOf(doc, KITE);
+    const pack = backpack(doc, kite.id);
+    const built = below(doc, kite.id, (o) => o.custom_props.store_part !== undefined);
+    expect(built.length).toBeGreaterThan(3);
+    const on = update(doc, withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    expect(rowsOf(on.r)).toContain(`el:${KITE} unit`);
+    expect(propOf(doc, KITE).id).toBe(kite.id);
+    for (const id of built) expect(doc.has('objects', id)).toBe(false);
+    for (const id of pack.objects) expect(doc.has('objects', id)).toBe(true);
+    expect(doc.getObject(pack.root)?.parent).toBe(kite.id);
+    expect(on.r.warnings).toContain(
+      `${kite.name}: keeps 'Backpack', which is not part of the look the library prop replaces`,
+    );
+    expect(unitStatus(doc, kite.id)).toEqual({ edited: [], missing: [] });
+  });
+});
+
 describe('a unit that cannot be used is refused, with its reason', () => {
   /** The A1 fixture's open: its unit bytes are text, not unit files. */
   const fixture = (name: string) => {

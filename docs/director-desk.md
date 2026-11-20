@@ -729,7 +729,10 @@ Another item pinned to the slot replaces the instance: its objects, edits and al
 new unit's, at the set's place or the prop's spot. A figure, a new version or another item,
 restyles its member's actor in place (the same armature, keys, holds and shots) when its kind and
 height are the actor's, and is refused otherwise. A brief that drops the pin brings back the
-words' set, the mannequin or the words' prop. A slot made local takes none of it;
+words' set, the mannequin or the words' prop. A new look in place of an old one (a figure or a
+library prop where the words built the mannequin or the prop, the mannequin again where a figure
+was) takes away only the old look: what the person put on the actor or the prop in the desk stays
+where it is, and the update's warnings name it. A slot made local takes none of it;
 [Updating from a later brief](#updating-from-a-later-brief) says the rest.
 
 #### Save to library

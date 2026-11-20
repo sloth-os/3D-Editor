@@ -5,7 +5,7 @@ import { DESK_PROPS } from '../props';
 import { rigDigest, type UnitHeader, type UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance } from '../units/list';
-import { dataKey, deleteData, instanceData, unusedData } from '../units/remove';
+import { dataKey, deleteData, instanceData, keptWarning, oldLook, unusedData } from '../units/remove';
 import { makeLocal, updateUnit } from '../units/update';
 import { actorMaterials, buildActorParts, keyPose } from './actor';
 import { refreshAttached } from './index';
@@ -23,9 +23,11 @@ import type { ActorKind } from './types';
  * - restyleActor swaps the look of an actor in place, keeping its armature object and with it its id,
  *   its location and pose keys, holds, rides and the shots that name it: to a figure (the actor is
  *   made the unit's root, or its instance updated to another version), or back to the mannequin of
- *   its kind and height. It does so only when the figure's kind and height are the actor's
- *   (figureFits: the same kind, heights within 5 mm): a figure of another kind or height would need
- *   the actor rebuilt, which an update leaves to staging the brief in a new project.
+ *   its kind and height. Only the old look goes (units/remove.ts oldLook): what the person put on
+ *   the actor stays and is named in a warning. It does so only when the figure's kind and height
+ *   are the actor's (figureFits: the same kind, heights within 5 mm): a figure of another kind or
+ *   height would need the actor rebuilt, which an update leaves to staging the brief in a new
+ *   project.
  */
 
 /** Heights (m) closer than this are the same rig: a figure restyles an actor in place. */
@@ -57,22 +59,6 @@ export function figureFits(doc: SceneDoc, actorId: string, f: Pick<FigureLook, '
   return (
     kind === f.kind && Number.isFinite(height) && Math.abs(height - f.heightM) < FIGURE_HEIGHT_TOLERANCE_M
   );
-}
-
-/** The actor's mesh parts (desk_actor) and attachments: its children but cameras and other actors, deep. */
-function lookParts(doc: SceneDoc, actorId: string): string[] {
-  const index = doc.childrenIndex();
-  const out: string[] = [];
-  const walk = (id: string) => {
-    for (const child of index.get(id) ?? []) {
-      const o = doc.getObject(child);
-      if (!o || o.type === 'CAMERA' || o.custom_props?.[DESK_PROPS.role] === 'actor') continue;
-      out.push(child);
-      walk(child);
-    }
-  };
-  walk(actorId);
-  return out;
 }
 
 /** The actor's parts (desk_actor = it), as the rig knows them. */
@@ -132,7 +118,8 @@ export type ActorLook = { figure: UnitPayload; pin: UnitPin; key: string } | { m
  * Swaps the look of actor `actorId` in place (see the module comment), in one transaction: to a
  * figure whose kind and height are the actor's (INVALID_PARAMS otherwise), or back to the mannequin
  * of the actor's kind and height in `color` (a figure instance is made local first). The armature
- * object, its id, keys, holds and rides stay. Returns the actor's parts and warnings.
+ * object, its id, keys, holds and rides stay, and so does what the person put on the actor (only
+ * the old look goes; the warnings name what stays). Returns the actor's parts and warnings.
  */
 export function restyleActor(
   doc: SceneDoc,
@@ -156,15 +143,18 @@ export function restyleActor(
           ...insertUnit(doc, look.figure, { ...look.pin, key: look.key, replace: actorId }).warnings,
         );
     } else {
-      // the figure's datablocks (its part table, read before Make local clears it) and the old
-      // parts' materials go once nothing else uses them: a figure pinned again derives their ids
+      // only the old look goes (the figure's parts and datablocks, read before Make local clears
+      // its table), with the materials only it used: a figure pinned again derives their ids
+      const figure = readInstance(doc, actorId);
+      const old = oldLook(doc, actorId);
       const data = instanceData(doc, actorId);
-      if (readInstance(doc, actorId)) makeLocal(doc, actorId);
-      const old = lookParts(doc, actorId);
-      for (const id of old)
+      if (figure) makeLocal(doc, actorId);
+      for (const id of old.look)
         for (const m of doc.getObject(id)?.material_slots ?? []) if (m) data.push(dataKey('materials', m));
-      doc.removeObjects(old);
+      doc.removeObjects(old.look);
       deleteData(doc, unusedData(doc, data));
+      if (old.named.length)
+        warnings.push(keptWarning(old.named, figure ? "the library figure's look" : 'its old look'));
       const kind = meta.kind as ActorKind;
       const bp = blueprintFor(kind, meta.height);
       const color = look.mannequin.color.toLowerCase();

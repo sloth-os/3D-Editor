@@ -2,7 +2,6 @@ import { dataKindOf, type SceneDoc } from '../../doc/scene-doc';
 import { ROOT_COLLECTION_ID, type DatablockKind, type DriverData, type ObjectData } from '../../doc/types';
 import type { Vec3 } from '../../math/types';
 import { cloneJson } from '../../util/json';
-import { DESK_PROPS } from '../props';
 import { UnitError } from './errors';
 import type { UnitBody, UnitHeader, UnitPayload } from './format';
 import { UNIT_ROOT, deriveUnitId, requireUnitKey } from './ids';
@@ -10,7 +9,7 @@ import { UNIT_BLOCK_KINDS, type UnitKind } from './kinds';
 import { provenanceProps, readInstance, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, splitProps } from './ownership';
 import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
-import { dataKey, deleteData, unusedData } from './remove';
+import { dataKey, deleteData, keptWarning, oldLook, unusedData } from './remove';
 
 /*
  * Inserting a unit: its records are copied into the scene, each datablock under the id
@@ -26,10 +25,10 @@ import { dataKey, deleteData, unusedData } from './remove';
  *
  * `replace` makes an existing object the root (a procedural actor or prop swapped for a library
  * one): its id, name, placement, parent, constraints, physics, pose, F-curves and scene-owned props
- * stay; its old parts (children that are not cameras or actors) go, and its own data and materials
- * and those of its old parts go when nothing else uses them (they are free for the unit's even when
- * the unit derives their ids). Bones the scene's animation or attachments name that the unit's rig
- * lacks are reported in `warnings`.
+ * stay; its old look goes (remove.ts oldLook: the parts the desk built for it), and its own data and
+ * materials and those of the old look go when nothing else uses them (they are free for the unit's
+ * even when the unit derives their ids). What the person put on the object stays and is named in
+ * `warnings`, with the bones the scene's animation or attachments name that the unit's rig lacks.
  */
 
 /** A library version: the host's item id, its version number and the SHA-256 of its unit file. */
@@ -128,27 +127,6 @@ function missingBones(doc: SceneDoc, root: string, bones: Set<string>, keep: Set
     .map((b) => `the library figure has no bone '${b}' that the scene's animation, holds or attachments use`);
 }
 
-/** `root`'s old parts (children but cameras and actors, deep) and the children it keeps. */
-function oldParts(doc: SceneDoc, root: string): { doomed: string[]; kept: Set<string> } {
-  const index = doc.childrenIndex();
-  const doomed: string[] = [];
-  const kept = new Set<string>();
-  const walk = (id: string) => {
-    for (const child of index.get(id) ?? []) {
-      const o = doc.getObject(child);
-      if (!o) continue;
-      if (o.type === 'CAMERA' || o.custom_props?.[DESK_PROPS.role] === 'actor') {
-        kept.add(child);
-        continue;
-      }
-      doomed.push(child);
-      walk(child);
-    }
-  };
-  walk(root);
-  return { doomed, kept };
-}
-
 /** The data and materials an object record refers to, as '<kind>:<id>'. */
 function dataOf(rec: UnitRecord | null): string[] {
   if (!rec) return [];
@@ -187,6 +165,7 @@ export function writeUnitRecords(
   let old: UnitRecord | null = null;
   let doomed: string[] = [];
   let kept = new Set<string>();
+  let named: string[] = [];
   if (o.replace) {
     old = doc.readRecord('objects', o.replace);
     if (!old) throw new UnitError('UNIT_NOT_FOUND', `object '${o.replace}' is not in the scene`);
@@ -197,7 +176,10 @@ export function writeUnitRecords(
       );
     if (readInstance(doc, o.replace))
       throw new UnitError('UNIT_INSTANCE_EXISTS', `'${o.replace}' is already an instance: update it instead`);
-    ({ doomed, kept } = oldParts(doc, o.replace));
+    const look = oldLook(doc, o.replace);
+    doomed = look.look;
+    kept = new Set(look.kept);
+    named = look.named;
   } else if (doc.has('objects', rootId)) {
     const props = doc.readRecord('objects', rootId)?.custom_props as Record<string, unknown> | undefined;
     if (props?.unit_key === key)
@@ -277,6 +259,7 @@ export function writeUnitRecords(
         custom_props: { ...(cur.custom_props as ObjectData['custom_props']), ...provenance(stamps) },
       });
     }
+    if (named.length) warnings.push(keptWarning(named, `the look the library ${kind} replaces`));
     const bones = o.replace ? unitBones(body) : null;
     if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
   });

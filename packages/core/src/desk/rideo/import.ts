@@ -975,6 +975,7 @@ export function importRideoBlocking(
       keptProps.add(p.id);
     }
     const made = buildProp(doc, p, elementName, castNames, stamp, flies, old, units.prop?.(p));
+    for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     props.set(p.id, { ...made, plan: p, flies });
     // rideo's holder, for the export to write back while the desk has no hold of theirs
     const rest = { ...doc.getObject(made.root)!.custom_props };
@@ -1877,7 +1878,7 @@ function buildUnitProp(
   flies: 'kite' | 'balloon' | null,
   old: ObjectData | undefined,
   unit: StagedProp,
-): { root: string; baseScale: Vec3; model: string | null; created: boolean } {
+): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings: string[] } {
   const model = `unit:${unit.pin.ref}@${unit.pin.version}`;
   const build = JSON.stringify(['prop', model, label, flies]);
   const own = stampFacts({ ...props, [RIDEO_PROPS.build]: build }, unit.facts);
@@ -1887,6 +1888,7 @@ function buildUnitProp(
   const sameItem = cur && (inst ? inst.ref === unit.pin.ref : unitBuildOf(doc, cur.id)?.ref === unit.pin.ref);
   let root: string;
   let created = false;
+  const warnings: string[] = [];
   if (cur && sameItem) {
     root = cur.id;
     if (inst && unit.unit && (inst.version !== unit.pin.version || inst.sha256 !== unit.pin.sha256))
@@ -1899,13 +1901,16 @@ function buildUnitProp(
     const swap =
       cur && !inst && unitRoot && doc.getObject(cur.id)?.type === unitRoot.type ? cur.id : undefined;
     if (cur && !swap) removeTrees(doc, [cur.id]);
-    root = insertUnit(doc, unit.unit, {
+    const r = insertUnit(doc, unit.unit, {
       ...unit.pin,
       key: unit.key,
       name: label,
       ...(swap ? { replace: swap } : {}),
       rootProps: own,
-    }).root;
+    });
+    root = r.root;
+    // what the person put on the prop the unit replaces stays, named here
+    warnings.push(...r.warnings);
     if (cur && !swap) remapShotRefs(doc, cur.id, root);
     created = !swap;
   }
@@ -1916,7 +1921,7 @@ function buildUnitProp(
     custom_props: { ...o.custom_props, ...own },
   });
   const s = doc.getObject(root)!.scale;
-  return { root, baseScale: [s[0], s[1], s[2]], model, created };
+  return { root, baseScale: [s[0], s[1], s[2]], model, created, warnings };
 }
 
 /** `props` with the planning facts a unit's root keeps (desk_unit_facts), when there are any. */
@@ -1940,7 +1945,7 @@ export function buildProp(
   flies: 'kite' | 'balloon' | null,
   old?: ObjectData,
   unit?: StagedProp | null,
-): { root: string; baseScale: Vec3; model: string | null; created: boolean } {
+): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings?: string[] } {
   const label = p.label || elementName || p.id;
   if (unit)
     return buildUnitProp(

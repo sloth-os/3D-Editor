@@ -702,6 +702,7 @@ export function updateFromBriefIn(
     const unit = slot?.action === 'remove' ? null : propHook(doc, slot, current?.id ?? null);
     if (unit?.unit) done.add(unit.key);
     const made = buildProp(doc, p, e.name, castNames, stamp, flies, current, unit);
+    for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     const rest = { ...doc.getObject(made.root)!.custom_props };
     delete rest[RIDEO_PROPS.heldBy];
     doc.updateObject(made.root, {

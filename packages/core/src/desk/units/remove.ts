@@ -1,5 +1,7 @@
 import type { SceneDoc } from '../../doc/scene-doc';
-import type { AnimTargetType, DatablockKind } from '../../doc/types';
+import type { AnimTargetType, DatablockKind, ObjectData } from '../../doc/types';
+import { STORE_PART_PROP } from '../layout';
+import { DESK_PROPS } from '../props';
 import { readInstance, splitPartKey } from './list';
 import {
   ANIM_TARGET_KINDS,
@@ -20,6 +22,10 @@ import {
  * id a unit derives that nothing uses (left behind by an older desk, or by a part deleted by hand)
  * counts as free when a unit is put in: it is deleted in the same transaction. The choice depends
  * on the document alone, so every replica makes the same one.
+ *
+ * A new look in place of an old one (a library figure or prop replacing what the words built, an
+ * actor back to its mannequin) takes away only the old look (oldLook); what the person put on the
+ * object stays, and the caller names it in a warning.
  */
 
 /** The '<kind>:<id>' key of a datablock. */
@@ -165,4 +171,60 @@ export function removeObjectTrees(doc: SceneDoc, ids: readonly string[]): void {
     doc.removeObjects([...all]);
     if (data.length) deleteData(doc, unusedData(doc, data));
   });
+}
+
+/** An object's old look, and what stays below it (see oldLook). */
+export interface OldLook {
+  /** The objects of the look, which go. */
+  look: string[];
+  /** The tops of what stays below the object: what the person put there, cameras, other actors. */
+  kept: string[];
+  /** The names of the kept objects that are not cameras or actors, for a warning. */
+  named: string[];
+}
+
+/**
+ * The look of `root` that a new look takes the place of (insertUnit's `replace`, the way back to
+ * the mannequin): an instance's own parts (the objects its part table lists), else the parts the
+ * desk built for it, an actor's (desk_actor = root) or a built-in model's (store_part, below the
+ * root or below such a part). Nothing else goes: what the person put on the object stays (below a
+ * part that goes, it moves up with its world placement kept).
+ */
+export function oldLook(doc: SceneDoc, root: string): OldLook {
+  const inst = readInstance(doc, root);
+  const actor = doc.getObject(root)?.custom_props?.[DESK_PROPS.role] === 'actor';
+  const look = new Set<string>();
+  for (const [pk, p] of inst?.parts ?? [])
+    if (splitPartKey(pk)?.kind === 'objects' && p.id !== root && doc.has('objects', p.id)) look.add(p.id);
+  const ofLook = (o: ObjectData) =>
+    inst
+      ? look.has(o.id)
+      : actor
+        ? o.custom_props?.[DESK_PROPS.actor] === root
+        : typeof o.custom_props?.[STORE_PART_PROP] === 'string';
+  const index = doc.childrenIndex();
+  const kept: string[] = [];
+  const named: string[] = [];
+  const walk = (id: string) => {
+    for (const child of index.get(id) ?? []) {
+      const o = doc.getObject(child);
+      if (!o) continue;
+      if (ofLook(o)) {
+        look.add(child);
+        walk(child);
+        continue;
+      }
+      kept.push(child);
+      if (o.type !== 'CAMERA' && o.custom_props?.[DESK_PROPS.role] !== 'actor') named.push(o.name);
+    }
+  };
+  walk(root);
+  return { look: [...look], kept, named };
+}
+
+/** The warning naming what stays (oldLook's `named`): "keeps 'A' and 'B', which are not part of `of`". */
+export function keptWarning(named: readonly string[], of: string): string {
+  const q = named.map((n) => `'${n}'`);
+  const list = q.length > 1 ? `${q.slice(0, -1).join(', ')} and ${q[q.length - 1]}` : q[0];
+  return `keeps ${list}, which ${q.length > 1 ? 'are' : 'is'} not part of ${of}`;
 }

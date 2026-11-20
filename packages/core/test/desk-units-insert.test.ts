@@ -259,6 +259,32 @@ describe('replace: a procedural actor swapped for a library figure', () => {
     expect(unitStatus(doc, mira.id)).toEqual({ edited: [], missing: [] });
   });
 
+  it('takes only the old look: what the person put on the actor stays, named in the warnings', () => {
+    const unit = miraUnit();
+    const doc = stagedDoc();
+    const mira = actorOf(doc, MIRA);
+    const hat = doc.addObject({
+      type: 'MESH',
+      name: 'Hat',
+      data: doc.addMesh('Hat', createCube()),
+      parent: mira.id,
+      parent_type: 'BONE',
+      parent_bone: 'head',
+    });
+    const brim = doc.addObject({
+      type: 'MESH',
+      name: 'Brim',
+      data: doc.addMesh('Brim', createCube()),
+      parent: hat,
+    });
+    const r = insertUnit(doc, unit, { ...pin(), key: `cast:${MIRA}`, replace: mira.id });
+    expect(doc.getObject(hat)).toMatchObject({ parent: mira.id, parent_type: 'BONE', parent_bone: 'head' });
+    expect(doc.getObject(brim)?.parent).toBe(hat);
+    expect(r.warnings).toEqual(["keeps 'Hat', which is not part of the look the library figure replaces"]);
+    expect(actorParts(doc, mira.id).size).toBe(21);
+    expect(unitStatus(doc, mira.id)).toEqual({ edited: [], missing: [] });
+  });
+
   it('warns of bones the scene animates that the library rig lacks, and refuses another object type', () => {
     const src = stagedDoc();
     const dog = unitFrom(src, { kind: 'figure', actor: actorOf(src, PIP).id }).unit;
