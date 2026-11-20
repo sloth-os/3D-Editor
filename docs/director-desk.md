@@ -742,9 +742,11 @@ runs, and when nothing in the scene can be saved. The dialog has:
   prop, else the set.
 - **Name** (1–120 characters; the instance's, the place's, the cast member's or the prop's name to
   start with) and **Description** (at most 2000).
-- **Save as a new version of Harbor v3**, ticked, when the target is an instance of a library unit;
-  unticked, or for any other target, the unit is a new item of the host's library and the scene
-  keeps what it holds.
+- **Save as a new version of Harbor v3**, ticked, when the target is an instance of a library unit
+  (also right after a save the host linked: chosen again, its target is an instance of what was
+  saved); unticked, it is a new item and the scene keeps the version it holds. For a target that is
+  no instance it is a new item, which the host links (and the scene adopts) when the slot pins
+  nothing.
 - The unit as it would be saved, made in the staging worker without changing the scene: its
   thumbnail, its objects, triangles, size and dimensions (a figure's kind and height), and its
   warnings; a unit that cannot be made says why, and Save stays off.
@@ -756,12 +758,21 @@ waiting for the host with the seconds counted, linking the scene), then what cam
   from): the host linked it, and the scene adopts it at once (not an undo step): the slot's pieces
   are an instance of that version, the tab shows it up to date, and the next state pins it;
 - "Saved 'Harbor' v1 to rideo; not linked: …", with the host's reason: saved in the library, and
-  the scene stays as it is (a read-only open, which may save too, says "not linked here");
+  the scene stays as it is. From a read-only open, which may save too, the host saves it but does
+  not link it and says why: "Saved 'Harbor' v1 to rideo; not linked: the scene is read-only" from
+  rideo. "not linked here" shows only when a host links it all the same: the scene stays as it is;
 - "Not saved: …", with the host's reason (refused, a conflict with a newer version, too large,
-  unavailable …) or the desk's (the host did not answer in time).
+  unavailable …) or the desk's (a name or a unit it cannot send);
+- "Not known whether rideo saved 'Harbor': it did not answer in time. Look in its library before
+  saving again." when the host did not answer in time (or the desk closed first, or the answer was
+  not valid): the host may have saved it, and linked it, all the same. An answer that comes later is
+  not applied; a link the host made comes with its next brief, through Update shots.
 
 Closing the dialog while the host saves lets the save go on: the tab says how far it is and how it
-ended. One save runs at a time.
+ended. One save runs at a time. The dialog is modal: it takes the keyboard focus, Tab goes round its
+own controls, Space and Enter press its buttons, and no key of the editor (Ctrl+Z, Space, the
+arrows) acts on the scene behind it; Escape closes it, but not the Escape that ends an IME
+composition in the Name or Description. Closed, it gives the focus back to Save to library….
 
 ## Over MCP
 

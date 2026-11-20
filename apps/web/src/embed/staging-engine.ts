@@ -6,6 +6,7 @@ import {
   SCHEMA_VERSION,
   SceneDoc,
   SceneEvaluator,
+  THUMBNAIL_LOOK,
   adoptPublished,
   checkShots,
   createExportRenderDocument,
@@ -23,6 +24,7 @@ import {
   updateFromBrief,
   type BriefIssue,
   type DeskCheckResult,
+  type DeskFrameOptions,
   type DeskIssue,
   type GivenProblem,
   type GivenUnit,
@@ -250,9 +252,18 @@ export function unitThumbnailFraming(probe: SceneDoc, header: UnitHeader): Thumb
 }
 
 /**
- * The thumbnail of a unit (its probe document): a PNG in the built-in thumbnails' look on a
- * transparent background, at the first of UNIT_THUMBNAIL_SIZES whose PNG is at most
- * MAX_THUMBNAIL_BYTES (null when none is, or the render fails: a unit may be published without one).
+ * The look of a unit's thumbnail: the built-in thumbnails' light, shadows and ambient occlusion, in
+ * the unit's own colours (the material look) rather than their clay grey, in which a flat set (its
+ * ground, its stage and its pond level with each other) is one grey square and a kite one grey
+ * shape: the host's library could not tell one set or prop from another.
+ */
+const UNIT_THUMBNAIL_LOOK: DeskFrameOptions = { ...THUMBNAIL_LOOK, look: 'material' };
+
+/**
+ * The thumbnail of a unit (its probe document): a PNG framed as the built-in thumbnails are, in the
+ * unit's colours (UNIT_THUMBNAIL_LOOK), on a transparent background, at the first of
+ * UNIT_THUMBNAIL_SIZES whose PNG is at most MAX_THUMBNAIL_BYTES (null when none is, or the render
+ * fails: a unit may be published without one).
  */
 export function renderUnitThumbnail(
   probe: SceneDoc,
@@ -263,7 +274,11 @@ export function renderUnitThumbnail(
     const framing = unitThumbnailFraming(probe, header);
     const doc = createExportRenderDocument(probe);
     for (const size of sizes) {
-      const img = renderExportFrame(doc, thumbnailFrameOptions(framing, size), true);
+      const img = renderExportFrame(
+        doc,
+        { ...thumbnailFrameOptions(framing, size), desk: UNIT_THUMBNAIL_LOOK },
+        true,
+      );
       if (img.png && img.png.byteLength <= MAX_THUMBNAIL_BYTES) return { png: img.png, size };
     }
   } catch {

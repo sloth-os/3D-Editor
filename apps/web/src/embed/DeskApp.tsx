@@ -1,5 +1,6 @@
 import type { ComponentChildren } from 'preact';
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { signal } from '@preact/signals';
 import { getShots, type BriefChanges } from '@3d-editor/core';
 import { session } from '../app/store';
 import { hoveredArea, type AreaKind } from '../editor/editor';
@@ -21,7 +22,7 @@ import type { DeskController } from './controller';
 import { exportSizeProblem, type LengthCheck } from './export';
 import { LibraryTab } from './LibraryTab';
 import type { Mode } from './protocol';
-import { SaveToLibraryDialog } from './SaveToLibraryDialog';
+import { SaveToLibraryDialog, useModalFocus } from './SaveToLibraryDialog';
 import type { WorkProgress } from './workspace';
 import './desk.css';
 
@@ -46,6 +47,10 @@ import './desk.css';
  * After an open whose host turned library units on (controller.units), the bottom area has a Library
  * tab as well (LibraryTab.tsx: the scene's library units, Make local, Save to library…), and Save to
  * library opens its dialog (SaveToLibraryDialog.tsx) over the desk. Without units neither shows.
+ *
+ * The desk's modal windows (the Save dialog, the Send check) take the keyboard focus while they are
+ * open, keep Tab inside and give the focus back when they close; the editor's keys act on nothing
+ * behind them meanwhile (deskModals).
  */
 
 /** The bottom area's tabs in the desk ("Shots" is the phone layout's Director panel). */
@@ -60,6 +65,22 @@ export function deskExtraTabs(c: DeskController, onSave: () => void): ExtraBotto
   return [
     { id: 'library', label: 'Library', panel: true, render: () => <LibraryTab c={c} onSave={onSave} /> },
   ];
+}
+
+/**
+ * How many of the desk's modal windows are open (the Save to library dialog, the Send check): while
+ * one is, the editor's keys act on nothing behind it (main.tsx: installKeymap's `blocked`), so Space
+ * and Enter press the window's focused button, and Ctrl+Z or the arrows leave the scene alone.
+ */
+export const deskModals = signal(0);
+
+/** Counts the calling component as one of the desk's open modal windows while it is mounted. */
+function useDeskModal(): void {
+  // in the commit that shows the window: a key pressed as soon as it appears is the window's
+  useLayoutEffect(() => {
+    deskModals.value += 1;
+    return () => void (deskModals.value -= 1);
+  }, []);
 }
 
 const MODE_LABEL: Record<Mode, string> = { camera: 'Camera', motion: 'Motion', pose: 'Pose' };
@@ -269,12 +290,16 @@ function SendCheck(p: {
   onSend: () => void;
   onCancel: () => void;
 }) {
+  useDeskModal();
+  const box = useRef<HTMLDivElement>(null);
+  useModalFocus(box);
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        p.onCancel();
-      }
+      // not a held Escape's repeats, nor the Escape that ends an IME composition (Safari sends it
+      // after the composition, with key code 229), as in the editor's windows (Dialogs.tsx Modal)
+      if (e.key !== 'Escape' || e.repeat || e.defaultPrevented || e.isComposing || e.keyCode === 229) return;
+      e.preventDefault();
+      p.onCancel();
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
@@ -288,7 +313,14 @@ function SendCheck(p: {
   );
   return (
     <div class="desk-modal-back" data-testid="desk-send-check" {...CHROME}>
-      <div class="desk-modal" role="dialog" aria-modal="true" aria-label="Shots of another length">
+      <div
+        class="desk-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Shots of another length"
+        tabIndex={-1}
+        ref={box}
+      >
         <h3>{plural(p.checks.length, 'shot')} differ from the brief</h3>
         <p>{p.host} takes a clip only when it has the shot&rsquo;s length in the brief.</p>
         {byBrief.length > 0 && (
@@ -498,6 +530,12 @@ function DeskEditor({ s, c, onSave }: { s: ProjectSession; c: DeskController; on
   );
 }
 
+/** The Save to library dialog, one of the desk's modal windows while it is open. */
+function SaveDialog(p: Parameters<typeof SaveToLibraryDialog>[0]) {
+  useDeskModal();
+  return <SaveToLibraryDialog {...p} />;
+}
+
 /**
  * What the desk is busy with, over the desk (and its header). While the scene opens (staging, a
  * wait for another desk of this browser) it offers Close, as the header would: it cancels the open
@@ -575,7 +613,7 @@ export function DeskApp(p: DeskAppProps) {
       )}
       {/* under the closed panel when the desk closes while it is open (Back to the desk shows it again) */}
       {saving && c.units.value && (
-        <SaveToLibraryDialog c={c} selected={saving.selected} onClose={() => setSaving(null)} />
+        <SaveDialog c={c} selected={saving.selected} onClose={() => setSaving(null)} />
       )}
       {status === 'closed' && (
         <div class="desk-work" data-testid="desk-closed" {...CHROME}>

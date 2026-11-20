@@ -1,20 +1,47 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, cleanup, fireEvent, render } from '@testing-library/preact';
 import * as Y from 'yjs';
 import { signal } from '@preact/signals';
-import { SceneDoc, SceneEvaluator } from '@3d-editor/core';
-import { session as sessionSignal } from '../src/app/store';
+import {
+  SceneDoc,
+  SceneEvaluator,
+  adoptPublished,
+  decodePNG,
+  extractUnit,
+  stageBrief,
+  unitSourceOf,
+  type BriefUnitPin,
+  type SceneBrief,
+  type UnitSpec,
+} from '@3d-editor/core';
+import { session as sessionSignal, toasts } from '../src/app/store';
+import { installKeymap } from '../src/editor/keymap';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import { BottomPane, NARROW_PANEL_SHARE, NARROW_SCREEN, type ExtraBottomTab } from '../src/ui/App';
 import { DeskController, type PublishOutcome, type SceneWorkspace } from '../src/embed/controller';
-import { deskExtraTabs } from '../src/embed/DeskApp';
-import { LibraryTab, linkedWords, publishResultText } from '../src/embed/LibraryTab';
+import { DeskApp, deskExtraTabs, deskModals } from '../src/embed/DeskApp';
+import type { LengthCheck } from '../src/embed/export';
+import { DESK_IGNORED_KEYS } from '../src/embed/guards';
+import { LibraryTab, linkedWords, publishOutcome, publishResultText } from '../src/embed/LibraryTab';
 import { SaveToLibraryDialog } from '../src/embed/SaveToLibraryDialog';
-import { deskMessageProblems, type DeskMessage, type UnitPublishMessage } from '../src/embed/protocol';
-import type { UnitExtract } from '../src/embed/staging-engine';
-import type { LibraryRow, SaveTarget } from '../src/embed/units';
-import { KITE, MIRA, exampleBrief } from './desk-units-helpers';
+import {
+  PUBLISH_ACK_BASE_MS,
+  deskMessageProblems,
+  type DeskMessage,
+  type UnitPublishMessage,
+} from '../src/embed/protocol';
+import { renderUnitThumbnail, type UnitExtract } from '../src/embed/staging-engine';
+import {
+  defaultSaveTarget as unitDefaultTarget,
+  libraryRows as unitLibraryRows,
+  saveTargets as unitSaveTargets,
+  type LibraryRow,
+  type SaveTarget,
+} from '../src/embed/units';
+import { KITE, MIRA, exampleBrief, library, stagedDoc, withPins, type Lib } from './desk-units-helpers';
 
 // (the service worker's registration is a module of the production build)
 vi.mock('../src/pwa/register', () => ({ pwaUpdate: { value: false }, applyPwaUpdate: () => undefined }));
@@ -135,7 +162,10 @@ function extraction(t: SaveTarget, name: string, warnings: string[] = []): UnitE
   };
 }
 
-/** Timers that never fire on their own (the controller's: no ack wait outlives a test). */
+/**
+ * Timers that never fire on their own (the controller's: no ack wait outlives a test); `fire(ms)`
+ * runs those set for at least `ms` (the wait for a host's answer) as if their time had come.
+ */
 function handTimers() {
   const now = 0;
   let seq = 0;
@@ -147,15 +177,47 @@ function handTimers() {
       return seq;
     },
     clearTimeout: (h: unknown) => void due.delete(h as number),
+    fire(ms: number) {
+      for (const [k, t] of [...due])
+        if (t.at >= ms) {
+          due.delete(k);
+          t.fn();
+        }
+    },
   };
+}
+
+/** The real controller over the workspace `ws`, opened with `options` (the messages it sent). */
+async function connect(
+  ws: SceneWorkspace,
+  options: Record<string, unknown> = UNITS_ON,
+  timers = handTimers(),
+  brief: SceneBrief = BRIEF,
+) {
+  const sent: DeskMessage[] = [];
+  const c = new DeskController({
+    send: (m) => (sent.push(m), true),
+    workspace: ws,
+    exportSupport: async () => ({ available: false, reason: 'not in this test' }),
+    deskVersion: 'test',
+    timers,
+    log: () => {},
+  });
+  await c.connected('https://host.example');
+  c.message({ type: 'open', scene: brief, state: null, options: { hostName: 'rideo', ...options } } as never);
+  await vi.waitFor(() => expect(sent.some((m) => m.type === 'state')).toBe(true));
+  const published = () => sent.filter((m) => m.type === 'unit-publish') as UnitPublishMessage[];
+  return { c, sent, published, timers };
 }
 
 /** The real controller over a fake scene with library units, opened with `options`. */
 async function openDesk(
   options: Record<string, unknown> = UNITS_ON,
   extract?: (t: SaveTarget) => UnitExtract,
+  timers = handTimers(),
 ) {
-  const sent: DeskMessage[] = [];
+  // the instances made local: their rows say so and name no root (as units.ts libraryRows)
+  const local = new Set<string>();
   const ws = {
     open: vi.fn(async () => ({
       source: 'brief' as const,
@@ -179,7 +241,12 @@ async function openDesk(
     updateFromBrief: vi.fn(async () => null),
     results: vi.fn(async () => []),
     projectId: 'desk-ui',
-    libraryRows: () => ROWS,
+    libraryRows: () =>
+      ROWS.map((r) =>
+        r.root && local.has(r.root)
+          ? { ...r, root: null, status: 'local' as const, edited: 0, text: 'made local: it stays as it is' }
+          : r,
+      ),
     saveTargets: () => TARGETS,
     defaultSaveTarget: (selected: string | null) =>
       TARGETS.find((t) => 'root' in t.what && t.what.root === selected) ?? SET,
@@ -188,23 +255,116 @@ async function openDesk(
       return extract ? extract(t) : extraction(t, name);
     }),
     adoptUnit: vi.fn(async () => ({ root: 'kite-root', recorded: true, warnings: [] })),
-    makeLocal: vi.fn(async (root: string) => ({ root, parts: 3 })),
+    makeLocal: vi.fn(async (root: string) => (local.add(root), { root, parts: 3 })),
     setBrief: vi.fn(),
     revision: () => 7,
   } satisfies SceneWorkspace;
-  const c = new DeskController({
-    send: (m) => (sent.push(m), true),
-    workspace: ws,
-    exportSupport: async () => ({ available: false, reason: 'not in this test' }),
-    deskVersion: 'test',
-    timers: handTimers(),
-    log: () => {},
-  });
-  await c.connected('https://host.example');
-  c.message({ type: 'open', scene: BRIEF, state: null, options: { hostName: 'rideo', ...options } } as never);
-  await vi.waitFor(() => expect(sent.some((m) => m.type === 'state')).toBe(true));
-  const published = () => sent.filter((m) => m.type === 'unit-publish') as UnitPublishMessage[];
-  return { c, ws, sent, published };
+  const opened = await connect(ws, options, timers);
+  /** Ctrl+Z of a Make local: the instance is linked again (as the controller refreshes after an edit). */
+  const undoLocal = (root: string) => {
+    local.delete(root);
+    opened.c.libraryRows.value = ws.libraryRows();
+  };
+  return { ...opened, ws, undoLocal };
+}
+
+/**
+ * A SceneWorkspace over a real core document staged from `brief0` (with the files of `units`): the
+ * Library tab's rows, the targets and the unit made of the scene as units.ts and core make them,
+ * and a linked save adopted by core (no worker, no thumbnail).
+ */
+function realWorkspace(brief0: SceneBrief, units: Lib[] = []) {
+  const doc = SceneDoc.create({ empty: true });
+  const given = units.map((u) => ({ ...u.pin, data: u.data }));
+  stageBrief(doc, brief0, given.length ? { units: unitSourceOf(given) } : {});
+  let brief = brief0;
+  let revision = 0;
+  doc.ydoc.on('update', () => revision++);
+  const spec = (what: SaveTarget['what'], name: string): UnitSpec => {
+    if ('set' in what) return { kind: 'set', name };
+    const role = String(doc.getObject(what.root)?.custom_props?.desk_role ?? '');
+    return role === 'actor'
+      ? { kind: 'figure', actor: what.root, name }
+      : { kind: 'prop', root: what.root, name };
+  };
+  const ws = {
+    open: vi.fn(async () => ({
+      source: 'brief' as const,
+      changes: null,
+      unreadable: null,
+      plan: 'stage' as const,
+      stageMs: 1,
+      persistent: true,
+      units: [],
+    })),
+    encodeState: vi.fn(async () => ({
+      state: { format: '3d-editor.desk-state' as const, version: 1 as const, data: new ArrayBuffer(16) },
+      shots: 2,
+      units: [],
+    })),
+    onEdit: () => () => {},
+    snapshot: () => new Uint8Array([1]),
+    stagedShots: () => [],
+    lengthMismatches: () => [],
+    changes: () => null,
+    updateFromBrief: vi.fn(async () => null),
+    results: vi.fn(async () => []),
+    projectId: 'desk-ui-real',
+    libraryRows: () => unitLibraryRows(doc, brief, () => false),
+    saveTargets: () => unitSaveTargets(doc, brief),
+    defaultSaveTarget: (selected: string | null) =>
+      unitDefaultTarget(doc, unitSaveTargets(doc, brief), selected),
+    extractUnit: vi.fn(async (what: SaveTarget['what'], name: string): Promise<UnitExtract> => {
+      const ex = extractUnit(doc, spec(what, name), { deskVersion: 'test' });
+      ex.probe.destroy();
+      const { data, sha256, header, meta, link, from, basedOn, warnings } = ex;
+      return {
+        data,
+        sha256,
+        header,
+        meta,
+        link,
+        from,
+        basedOn,
+        warnings,
+        thumbnail: null,
+        thumbnailSize: null,
+      };
+    }),
+    adoptUnit: vi.fn(
+      async (unit: Pick<UnitExtract, 'link' | 'from' | 'header'>, pin: BriefUnitPin, linked: boolean) =>
+        adoptPublished(doc, brief, { slot: unit.from, link: unit.link, pin, linked, header: unit.header }),
+    ),
+    makeLocal: vi.fn(async (root: string) => ({ root, parts: 0 })),
+    setBrief: (b: SceneBrief) => void (brief = b),
+    revision: () => revision,
+  } satisfies SceneWorkspace;
+  return { ws, doc };
+}
+
+/**
+ * The share of an RGBA image's drawn pixels (alpha above 0) within 12 of its most common drawn colour
+ * in each channel: near 1 for a blank, one-colour square.
+ */
+function dominantShare(px: Uint8Array | Uint8ClampedArray): number {
+  const counts = new Map<number, number>();
+  for (let i = 0; i < px.length; i += 4)
+    if (px[i + 3] > 0) {
+      const k = (px[i] << 16) | (px[i + 1] << 8) | px[i + 2];
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+  let top = 0;
+  let most = -1;
+  for (const [k, n] of counts) if (n > most) [top, most] = [k, n];
+  const rgb = [top >> 16, (top >> 8) & 255, top & 255];
+  let drawn = 0;
+  let near = 0;
+  for (let i = 0; i < px.length; i += 4)
+    if (px[i + 3] > 0) {
+      drawn++;
+      if (rgb.every((v, c) => Math.abs(px[i + c] - v) <= 12)) near++;
+    }
+  return drawn ? near / drawn : 1;
 }
 
 const q = (root: { container: Element }, id: string) =>
@@ -266,6 +426,25 @@ describe('the Library bottom tab', () => {
     expect(q(v, 'desk-library-note')!.textContent).toBe(
       'Mira is local now: it stays as it is (Ctrl+Z undoes it).',
     );
+  });
+
+  it('takes back "is local now" once Ctrl+Z links the instance again', async () => {
+    const { c, undoLocal } = await openDesk();
+    const v = render(<LibraryTab c={c} onSave={() => {}} />);
+    const mira = () => v.container.querySelector<HTMLElement>(`[data-key="cast:${MIRA}"]`)!;
+    await act(async () => void fireEvent.click(q({ container: mira() }, 'desk-library-make-local')!));
+    await settle();
+    expect(mira().dataset.status).toBe('local');
+    expect(q(v, 'desk-library-note')!.textContent).toBe(
+      'Mira is local now: it stays as it is (Ctrl+Z undoes it).',
+    );
+    // other rows changing leave it as it is
+    await act(async () => void (c.libraryRows.value = c.libraryRows.value.slice()));
+    expect(q(v, 'desk-library-note')).not.toBeNull();
+    // Ctrl+Z: the row is Mira's instance again
+    await act(async () => undoLocal('mira-root'));
+    expect(mira().dataset.status).toBe('edited');
+    expect(q(v, 'desk-library-note')).toBeNull();
   });
 
   it('says when nothing of the library is in the scene', async () => {
@@ -589,6 +768,182 @@ describe('the Save to library dialog', () => {
     );
   });
 
+  it('after a save the host linked, offers the same target as a new version of what it saved', async () => {
+    const { ws, doc } = realWorkspace(exampleBrief());
+    const { c, published } = await connect(ws);
+    const v = dialog(c, null);
+    await settle();
+    expect(q(v, 'desk-save-new-item')!.textContent).toBe('A new item in rideo’s library (set).');
+    await act(async () => void fireEvent.input(name(v), { target: { value: 'Harbor' } }));
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await vi.waitFor(() => expect(published()).toHaveLength(1));
+    expect(published()[0].newVersionOf).toBeUndefined();
+    c.message({
+      type: 'unit-ack',
+      id: published()[0].id,
+      ok: true,
+      ref: 'lib_harbor000001',
+      version: 1,
+      linked: true,
+    });
+    await vi.waitFor(() =>
+      expect(q(v, 'desk-save-result')?.textContent).toBe(
+        "Saved 'Harbor' v1 to rideo; linked to the scene's place",
+      ),
+    );
+    // the set is an instance of Harbor v1 now: chosen again, it is offered as a new version of it
+    await choose(v, [...what(v).options].find((o) => o.textContent === 'Mira (actor)')!.value);
+    await choose(v, 'set');
+    const box = q(v, 'desk-save-new-version') as HTMLInputElement | null;
+    expect(box?.parentElement?.textContent).toBe('Save as a new version of Harbor v1');
+    expect(box!.checked).toBe(true);
+    expect(q(v, 'desk-save-new-item')).toBeNull();
+    expect(name(v).value).toBe('Harbor');
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await vi.waitFor(() => expect(published()).toHaveLength(2));
+    expect(published()[1].newVersionOf).toEqual({ ref: 'lib_harbor000001', version: 1 });
+    doc.destroy();
+  }, 60_000);
+
+  it('after a new version the host linked, names that version when the target is chosen again', async () => {
+    const lib = library();
+    const brief = withPins(exampleBrief(), { set: lib.set });
+    const { ws, doc } = realWorkspace(brief, [lib.set]);
+    const { c, published } = await connect(ws, UNITS_ON, handTimers(), brief);
+    const v = dialog(c, null);
+    await settle();
+    expect(q(v, 'desk-save-new-version')!.parentElement!.textContent).toBe(
+      'Save as a new version of Meadow v1',
+    );
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await vi.waitFor(() => expect(published()).toHaveLength(1));
+    expect(published()[0].newVersionOf).toEqual({ ref: lib.set.pin.ref, version: 1 });
+    c.message({
+      type: 'unit-ack',
+      id: published()[0].id,
+      ok: true,
+      ref: lib.set.pin.ref,
+      version: 2,
+      linked: true,
+    });
+    await vi.waitFor(() =>
+      expect(q(v, 'desk-save-result')?.textContent).toBe(
+        "Saved 'Meadow' v2 to rideo; linked to the scene's place",
+      ),
+    );
+    await choose(v, [...what(v).options].find((o) => o.textContent === 'Mira (actor)')!.value);
+    await choose(v, 'set');
+    expect(q(v, 'desk-save-new-version')!.parentElement!.textContent).toBe(
+      'Save as a new version of Meadow v2',
+    );
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await vi.waitFor(() => expect(published()).toHaveLength(2));
+    expect(published()[1].newVersionOf).toEqual({ ref: lib.set.pin.ref, version: 2 });
+    doc.destroy();
+  }, 60_000);
+
+  it('says it is not known whether the host saved a unit it did not answer for in time', async () => {
+    const timers = handTimers();
+    const { c, published } = await openDesk(UNITS_ON, undefined, timers);
+    const v = dialog(c, null);
+    await settle();
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await settle();
+    expect(published()).toHaveLength(1);
+    // the wait for rideo's answer ends (120 s and more): rideo may still save and link it
+    await act(async () => timers.fire(PUBLISH_ACK_BASE_MS));
+    await settle();
+    const result = q(v, 'desk-save-result')!;
+    const words =
+      "Not known whether rideo saved 'Meadow': it did not answer in time. Look in its library before saving again.";
+    expect([result.dataset.outcome, result.dataset.code, result.textContent]).toEqual([
+      'unknown',
+      'timeout',
+      words,
+    ]);
+    const tab = render(<LibraryTab c={c} onSave={() => {}} />);
+    expect(q(tab, 'desk-library-last')!.dataset.outcome).toBe('unknown');
+    expect(q(tab, 'desk-library-last')!.textContent).toBe(words);
+  });
+
+  it('leaves the Escape that ends an IME composition, and a held Escape’s repeats, to the field', async () => {
+    const onClose = vi.fn();
+    const { c } = await openDesk();
+    const v = dialog(c, null, onClose);
+    await settle();
+    const field = name(v);
+    field.focus();
+    const escape = (init: KeyboardEventInit & { keyCode?: number }) =>
+      field.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, ...init }),
+      );
+    // Chrome and Firefox: the Escape that cancels a candidate; Safari: the one after the composition
+    escape({ isComposing: true, keyCode: 229 });
+    escape({ keyCode: 229 });
+    escape({ repeat: true });
+    expect(onClose).not.toHaveBeenCalled();
+    escape({});
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('takes the focus, keeps Tab inside, and gives the focus back to what opened it', async () => {
+    const { c } = await openDesk();
+    const opener = document.createElement('button');
+    opener.textContent = 'Save to library…';
+    const behind = document.createElement('button');
+    behind.textContent = 'Make local';
+    document.body.append(opener, behind);
+    opener.focus();
+    const v = dialog(c, null);
+    await settle();
+    const box = v.container.querySelector<HTMLElement>('[role="dialog"]')!;
+    const inside = () => box.contains(document.activeElement);
+    expect(inside()).toBe(true);
+    const tab = (shift = false) =>
+      act(() => {
+        const e = new KeyboardEvent('keydown', {
+          key: 'Tab',
+          shiftKey: shift,
+          bubbles: true,
+          cancelable: true,
+        });
+        (document.activeElement ?? document.body).dispatchEvent(e);
+      });
+    // from the dialog itself: Shift+Tab goes to its last control, not to what is behind it
+    await tab(true);
+    expect(document.activeElement).toBe(q(v, 'desk-save-submit'));
+    // from the last control Tab wraps to the first, and Shift+Tab back
+    await tab();
+    expect(document.activeElement).toBe(what(v));
+    await tab(true);
+    expect(document.activeElement).toBe(q(v, 'desk-save-submit'));
+    // the focus taken away (behind the dialog): Tab brings it back
+    behind.focus();
+    await tab();
+    expect(document.activeElement).toBe(what(v));
+    v.unmount();
+    expect(document.activeElement).toBe(opener);
+    opener.remove();
+    behind.remove();
+  });
+
+  it('shows a set’s colours, not a grey square: no one colour covers 97% of its thumbnail', () => {
+    const doc = stagedDoc();
+    const kite = doc
+      .listObjects()
+      .find((o) => o.custom_props?.desk_element_id === KITE && o.custom_props?.desk_role === 'prop')!;
+    for (const spec of [
+      { kind: 'set' as const, name: 'Meadow' },
+      { kind: 'prop' as const, root: kite.id, name: 'Kite' },
+    ]) {
+      const ex = extractUnit(doc, spec, { deskVersion: 'test' });
+      const img = decodePNG(renderUnitThumbnail(ex.probe, ex.header)!.png);
+      ex.probe.destroy();
+      expect(dominantShare(img.data), spec.kind).toBeLessThan(0.97);
+    }
+    doc.destroy();
+  }, 60_000);
+
   it('closes with Escape; a save under way goes on and the Library tab shows how far it is', async () => {
     const onClose = vi.fn();
     const { c, published } = await openDesk();
@@ -642,7 +997,136 @@ describe('the words of a Save to library', () => {
       "Saved 'Harbor' v3 to rideo; not linked: rideo keeps the scene's pin as it was",
     );
     expect(
-      publishResultText(outcome({ ok: false, code: 'timeout', message: 'No answer.' }), 'rideo', 'x'),
-    ).toBe('Not saved: No answer.');
+      publishResultText(outcome({ ok: false, code: 'refused', message: 'Only editors.' }), 'rideo', 'x'),
+    ).toBe('Not saved: Only editors.');
+  });
+
+  it('do not say "Not saved" when the host may have saved it after all: no answer in time, the desk closed, an invalid answer', () => {
+    const unknown = (code: string, message: string) => {
+      const o = outcome({ ok: false, code, message });
+      return [publishOutcome(o), publishResultText(o, 'rideo', 'x')];
+    };
+    const look = 'Look in its library before saving again.';
+    expect(unknown('timeout', "rideo did not say whether it saved 'Harbor'.")).toEqual([
+      'unknown',
+      `Not known whether rideo saved 'Harbor': it did not answer in time. ${look}`,
+    ]);
+    expect(unknown('closed', 'The desk closed before the host answered.')).toEqual([
+      'unknown',
+      `Not known whether rideo saved 'Harbor': the desk closed before it answered. ${look}`,
+    ]);
+    expect(unknown('bad_reply', "rideo's answer was not valid: version: Required")).toEqual([
+      'unknown',
+      `Not known whether rideo saved 'Harbor': its answer was not valid. ${look}`,
+    ]);
+    // the host's refusals, and the desk's own before anything was sent, are not saved
+    for (const code of ['refused', 'conflict', 'too_large', 'unavailable', 'failed', 'busy', 'invalid'])
+      expect(unknown(code, 'Why.')).toEqual(['failed', 'Not saved: Why.']);
+  });
+
+  it('are those docs/director-desk.md gives', () => {
+    const doc = readFileSync(resolve(__dirname, '../../../docs/director-desk.md'), 'utf8').replace(
+      /\s+/g,
+      ' ',
+    );
+    const ok = { ok: true as const, ref: 'lib_1' };
+    const words = (r: PublishOutcome['result'], version = 3) =>
+      publishResultText(outcome(r.ok ? { ...r, version } : r), 'rideo', "the scene's place");
+    for (const said of [
+      words({ ...ok, version: 3, linked: true, adopted: true }),
+      // a read-only open: rideo saves it and says why it does not link it
+      words({ ...ok, version: 1, linked: false, adopted: false, message: 'the scene is read-only' }, 1),
+      words({ ok: false, code: 'timeout', message: 'x' }),
+    ])
+      expect(doc).toContain(said);
+    expect(doc).toContain('"Not saved: …"');
+    expect(doc).toContain('"not linked here"');
+  });
+});
+
+describe('the desk’s modal windows', () => {
+  afterEach(() => void (sessionSignal.value = null));
+
+  it('the editor’s keys act on nothing while one is open (installKeymap blocked), and on the scene again after', () => {
+    let blocked = true;
+    const off = installKeymap({ ignore: DESK_IGNORED_KEYS, blocked: () => blocked });
+    // without a scene, a key that runs an operator says so in a toast: none while blocked
+    const press = (init: KeyboardEventInit) => {
+      const e = new KeyboardEvent('keydown', { bubbles: true, cancelable: true, ...init });
+      window.dispatchEvent(e);
+      return e;
+    };
+    const n = toasts.value.length;
+    for (const k of [
+      { key: ' ', code: 'Space' },
+      { key: 'z', code: 'KeyZ', ctrlKey: true },
+      { key: 'Z', code: 'KeyZ', ctrlKey: true, shiftKey: true },
+      { key: 'ArrowRight', code: 'ArrowRight' },
+      { key: 'R', code: 'KeyR', shiftKey: true },
+    ])
+      expect(press(k).defaultPrevented, k.code).toBe(false);
+    expect(toasts.value.length).toBe(n);
+    blocked = false;
+    press({ key: ' ', code: 'Space' });
+    expect(toasts.value.length).toBe(n + 1);
+    off();
+  });
+
+  it('the Send check counts as one while open, takes the focus and gives it back, and leaves IME and repeated Escapes alone', async () => {
+    const ws: SceneWorkspace = {
+      open: async () => ({
+        source: 'brief',
+        changes: null,
+        unreadable: null,
+        plan: 'stage',
+        stageMs: 1,
+        persistent: true,
+      }),
+      encodeState: async () => ({
+        state: { format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(4) },
+        shots: 2,
+      }),
+      onEdit: () => () => {},
+      snapshot: () => new Uint8Array([1]),
+      stagedShots: () => [],
+      lengthMismatches: () => [],
+      changes: () => null,
+      updateFromBrief: async () => null,
+      results: async () => [],
+      projectId: 'desk-modal',
+    };
+    const { c } = await connect(ws, {});
+    const checks: LengthCheck[] = [
+      { shotId: 'sht_a', name: 'Opening', frames: 72, briefFrames: 84, byBrief: false },
+    ];
+    const v = render(<DeskApp c={c} work={null} lengthChecks={() => checks} />);
+    const send = q(v, 'desk-send') as HTMLButtonElement;
+    send.focus();
+    expect(deskModals.value).toBe(0);
+    await act(async () => void fireEvent.click(send));
+    const box = q(v, 'desk-send-check')!.querySelector<HTMLElement>('[role="dialog"]')!;
+    expect(deskModals.value).toBe(1);
+    expect(box.contains(document.activeElement)).toBe(true);
+    // Shift+Tab from the window itself goes to its last button, not behind it
+    await act(() => {
+      document.activeElement!.dispatchEvent(
+        new KeyboardEvent('keydown', { key: 'Tab', shiftKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+    expect(document.activeElement).toBe(q(v, 'desk-send-check-send'));
+    const escape = (init: KeyboardEventInit & { keyCode?: number }) =>
+      act(() => {
+        document.activeElement!.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true, ...init }),
+        );
+      });
+    await escape({ isComposing: true, keyCode: 229 });
+    await escape({ keyCode: 229 });
+    await escape({ repeat: true });
+    expect(q(v, 'desk-send-check')).not.toBeNull();
+    await escape({});
+    expect(q(v, 'desk-send-check')).toBeNull();
+    expect(deskModals.value).toBe(0);
+    expect(document.activeElement).toBe(send);
   });
 });

@@ -218,6 +218,10 @@
 .desk-work-time {
   color: var(--text-faint);
 }
+/* a modal window takes the focus itself when it opens (useModalFocus): no ring around all of it */
+.desk-modal:focus {
+  outline: none;
+}
 .desk-modal h3 {
   margin: 0;
   font-size: 14px;
@@ -307,6 +311,9 @@
 }
 .desk-lib-line.failed {
   color: #ff8d8d;
+}
+.desk-lib-line.unknown {
+  color: var(--text);
 }
 .desk-lib-list {
   list-style: none;
@@ -461,6 +468,9 @@
 }
 .desk-save-result.failed {
   border-left-color: var(--danger);
+}
+.desk-save-result.unknown {
+  border-left-color: var(--text-faint);
 }
 .desk-modal .desk-save-error {
   color: #ff8d8d;

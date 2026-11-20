@@ -219,9 +219,15 @@ function keptCombo(e: KeyboardEvent): string {
  * Installs the window-level keymap. `ignore`: key combinations (as combo() names them, e.g.
  * 'Ctrl+N', 'F3') the page leaves alone: the embeddable desk ignores the keys that open chrome it
  * hides (embed/guards.ts DESK_IGNORED_KEYS). The browser keeps what it does with them, except for
- * those of KEPT_FROM_BROWSER, which do nothing at all.
+ * those of KEPT_FROM_BROWSER, which do nothing at all. `blocked`: while it says so, no key acts, as
+ * while one of the editor's own windows is open (`dialog`): the embeddable desk blocks the keymap
+ * while a modal window of its own is open (embed/DeskApp.tsx deskModals), so Space and Enter press
+ * the window's focused button and Ctrl+Z or the arrows change nothing behind it. The editor passes
+ * none.
  */
-export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () => void {
+export function installKeymap(
+  opts: { ignore?: ReadonlySet<string>; blocked?: () => boolean } = {},
+): () => void {
   // in the capture phase, before any field: fields stop many of the keys typed into them, and the
   // listener below leaves keys typed into a field alone, so it would not keep a Ctrl+S typed into one
   const kept = [...KEPT_FROM_BROWSER].filter((k) => opts.ignore?.has(k));
@@ -291,7 +297,7 @@ export function installKeymap(opts: { ignore?: ReadonlySet<string> } = {}): () =
     }
     // other keys do nothing while a popup menu or the search is open
     if (paletteOpen.value || popupMenu.value) return;
-    if (dialog.value) return;
+    if (dialog.value || opts.blocked?.()) return;
     const key = combo(e);
     if (opts.ignore?.has(key)) return;
     if (handle(GLOBAL, key, e)) {

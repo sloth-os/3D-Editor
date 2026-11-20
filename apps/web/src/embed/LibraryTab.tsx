@@ -82,21 +82,40 @@ export function pinnedSlot(brief: SceneBrief | null, ref: string, version: numbe
   return el ? `el:${el.id}` : null;
 }
 
-/** How a Save to library ended: 'linked' (the scene is the version now), 'unlinked' (saved only) or 'failed'. */
-export function publishOutcome(o: PublishOutcome): 'linked' | 'unlinked' | 'failed' {
-  if (!o.result.ok) return 'failed';
+/**
+ * The desk's own codes of a save whose end it does not know (controller.ts publish), each with why:
+ * the host did not answer in time, the desk closed first, or the host's answer was not valid. The
+ * host may have saved the unit, and linked it, all the same (a later answer is not applied; its next
+ * brief brings the link), so the person looks in its library before saving it again.
+ */
+const UNKNOWN_END: Record<string, string> = {
+  timeout: 'it did not answer in time',
+  closed: 'the desk closed before it answered',
+  bad_reply: 'its answer was not valid',
+};
+
+/**
+ * How a Save to library ended: 'linked' (the scene is the version now), 'unlinked' (saved only),
+ * 'failed' (not saved), or 'unknown' (the host may have saved it: UNKNOWN_END).
+ */
+export function publishOutcome(o: PublishOutcome): 'linked' | 'unlinked' | 'failed' | 'unknown' {
+  if (!o.result.ok) return Object.hasOwn(UNKNOWN_END, o.result.code) ? 'unknown' : 'failed';
   return o.result.linked && o.result.adopted ? 'linked' : 'unlinked';
 }
 
 /**
  * How a Save to library ended, in words: "Saved 'Harbor' v3 to rideo; linked to the scene's place",
  * "Saved 'Harbor' v1 to rideo; not linked: <reason>" (also "not linked here" when the host linked it
- * but the scene stays as it is), or "Not saved: <reason>". `linkedTo`: where it was linked
- * (linkedWords).
+ * but the scene stays as it is), "Not saved: <reason>", or "Not known whether rideo saved 'Harbor':
+ * it did not answer in time. Look in its library before saving again." `linkedTo`: where it was
+ * linked (linkedWords).
  */
 export function publishResultText(o: PublishOutcome, host: string, linkedTo: string): string {
   const r = o.result;
-  if (!r.ok) return `Not saved: ${r.message}`;
+  if (!r.ok)
+    return Object.hasOwn(UNKNOWN_END, r.code)
+      ? `Not known whether ${host} saved '${o.name}': ${UNKNOWN_END[r.code]}. Look in its library before saving again.`
+      : `Not saved: ${r.message}`;
   const saved = `Saved '${o.name}' v${r.version} to ${host}`;
   if (r.linked && r.adopted) return `${saved}; linked to ${linkedTo}`;
   if (r.linked) return `${saved}; not linked here: ${r.message ?? `the scene stays as it is`}`;
@@ -167,7 +186,13 @@ export function LibraryTab({ c, onSave }: { c: DeskController; onSave: () => voi
   const updating = c.updating.value;
   useTick(!!publishing);
   const [busy, setBusy] = useState<string | null>(null);
-  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+  // what came of the last Make local; `root`: the instance made local
+  const [note, setNote] = useState<{ ok: boolean; text: string; root: string } | null>(null);
+  // "X is local now" holds until the objects are an instance again (Ctrl+Z, or a save the host
+  // linked): a row names their root then
+  useEffect(() => {
+    if (note?.ok && rows.some((r) => r.root === note.root)) setNote(null);
+  }, [rows]);
   const saveOff = saveBlocker(c);
   const localOff = options.readOnly
     ? 'The scene is read-only here.'
@@ -177,15 +202,16 @@ export function LibraryTab({ c, onSave }: { c: DeskController; onSave: () => voi
         ? 'The shots are being updated.'
         : null;
   const makeLocal = async (row: LibraryRow) => {
-    if (!row.root) return;
-    setBusy(row.root);
+    const root = row.root;
+    if (!root) return;
+    setBusy(root);
     setNote(null);
-    const r = await c.makeLocal(row.root);
+    const r = await c.makeLocal(root);
     setBusy(null);
     setNote(
       r.ok
-        ? { ok: true, text: `${row.name} is local now: it stays as it is (Ctrl+Z undoes it).` }
-        : { ok: false, text: `${row.name} could not be made local: ${r.message}` },
+        ? { ok: true, root, text: `${row.name} is local now: it stays as it is (Ctrl+Z undoes it).` }
+        : { ok: false, root, text: `${row.name} could not be made local: ${r.message}` },
     );
   };
   const lastSlot = last?.result.ok ? pinnedSlot(c.brief.value, last.result.ref, last.result.version) : null;

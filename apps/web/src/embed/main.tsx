@@ -11,7 +11,7 @@ import { selectedShot } from '../ui/director/state';
 import { showShot } from '../ui/director/playback';
 import { DeskBridge } from './bridge';
 import { DeskController } from './controller';
-import { DeskApp, SampleBar, StandalonePage } from './DeskApp';
+import { DeskApp, SampleBar, StandalonePage, deskModals } from './DeskApp';
 import { lengthChecks } from './export';
 import { DESK_IGNORED_KEYS, guardRegistry } from './guards';
 import type { DeskMessage } from './protocol';
@@ -34,7 +34,9 @@ registerUiOperators(registry);
 workspaceSignal.value = 'Director';
 let readOnly = false;
 guardRegistry(registry, () => readOnly);
-installKeymap({ ignore: DESK_IGNORED_KEYS });
+// no key acts on the scene while one of the desk's modal windows is open (Save to library, the Send
+// check): Space and Enter press its focused button, and Ctrl+Z or the arrows change nothing behind it
+installKeymap({ ignore: DESK_IGNORED_KEYS, blocked: () => deskModals.peek() > 0 });
 // the viewport's keys act once the pointer or the focus is in the viewport (DeskApp.tsx), not before
 hoveredArea.value = 'other';
 void registerDeskServiceWorker();
