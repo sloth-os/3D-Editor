@@ -475,10 +475,12 @@ the desk cannot use never offers Update shots again and again.
 reason that may pass: the open's unit budget (48 MiB of files and 160 MiB unpacked, counted in slot
 order: the set, the cast, the elements) was already spent by earlier slots, or the staging worker
 failed while reading the unit (out of memory, a worker restart). The next open tries again.
-`over_budget` is only for a unit whose own unpacked bound (twice its body) can never fit the
-staging's budget. `figure_kind` and `figure_rig` are also how an update answers a figure that does
-not fit the actor staged for its member (another kind, or a height more than 5 mm off): the actor
-stays as it is, and staging the brief in a new project uses the figure.
+`over_budget` is only for a unit whose own unpacked bound can never fit the staging's budget: its
+body, and the scene's copy of it with each byte array written out at every reference (a file may
+share one array among many records, and inserting copies it for each), which the desk counts again
+once the unit is decoded. `figure_kind` and `figure_rig` are also how an update answers a figure
+that does not fit the actor staged for its member (another kind, or a height more than 5 mm off):
+the actor stays as it is, and staging the brief in a new project uses the figure.
 
 ### The three hashes
 

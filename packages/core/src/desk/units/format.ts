@@ -32,6 +32,8 @@ import { DESK_PROPS } from '../props';
  * gate: what decodes inserts. The manifest nests at most MAX_UNIT_DEPTH deep, holds only finite
  * numbers and no key '__proto__', 'constructor' or 'prototype', references are looked up as own
  * properties only, and a figure's body is the actor its header describes (role, kind, height, rig).
+ * A byte array shared in the file is copied at each reference when inserted, so the body counted
+ * with every reference written out (expandedBytes) is held to the body's limit too.
  */
 
 /** The `format` of a unit file (the protocol's UNIT_DATA_FORMAT). */
@@ -223,6 +225,12 @@ export interface UnitPayload {
   header: UnitHeader;
   body: UnitBody;
   bytes: Uint8Array;
+  /**
+   * The body's size with every blob reference written out: what inserting the unit copies into a
+   * scene (byte arrays shared in the file are copied at each reference). It is header.bodyBytes when
+   * each blob is referred to once, and at most MAX_UNIT_BODY_BYTES.
+   */
+  expandedBytes: number;
 }
 
 // ---------------------------------------------------------------- body checks
@@ -333,6 +341,13 @@ export function encodeUnitBody(body: UnitBody): { bytes: Uint8Array; blobBytes: 
       'UNIT_TOO_LARGE',
       `the unit's body would be ${total} bytes, over ${MAX_UNIT_BODY_BYTES}`,
     );
+  // what decoding allows: the body with its shared blobs written out at every reference
+  const expanded = 4 + text.length + blobs.refBytes;
+  if (expanded > MAX_UNIT_BODY_BYTES)
+    throw new UnitError(
+      'UNIT_TOO_LARGE',
+      `the unit would be ${expanded} bytes in a scene (its shared byte arrays copied at each use), over ${MAX_UNIT_BODY_BYTES}`,
+    );
   const out = new Uint8Array(total);
   new DataView(out.buffer).setUint32(0, text.length, true);
   out.set(text, 4);
@@ -346,6 +361,15 @@ export function encodeUnitBody(body: UnitBody): { bytes: Uint8Array; blobBytes: 
 
 /** A body from its bytes (byte arrays are views into `bytes`). UNIT_CORRUPT when the manifest does not read. */
 export function decodeUnitBody(bytes: Uint8Array): UnitBody {
+  return readUnitBody(bytes).body;
+}
+
+/**
+ * A body from its bytes and its size with every blob reference written out (UnitPayload's
+ * expandedBytes): UNIT_TOO_LARGE past MAX_UNIT_BODY_BYTES, as a file of a few KiB could refer to one
+ * large blob any number of times and each reference is a copy in the scene.
+ */
+function readUnitBody(bytes: Uint8Array): { body: UnitBody; expandedBytes: number } {
   if (bytes.length < 4) throw new UnitError('UNIT_CORRUPT', 'the body is cut short');
   const n = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, true);
   if (4 + n > bytes.length) throw new UnitError('UNIT_CORRUPT', "the body's manifest is cut short");
@@ -371,6 +395,7 @@ export function decodeUnitBody(bytes: Uint8Array): UnitBody {
     at += len as number;
   }
   if (at !== bytes.length) throw new UnitError('UNIT_CORRUPT', 'the body has bytes after its blobs');
+  let expandedBytes = 4 + n;
   // recursion is bounded by the depth limit, so a deep manifest is refused, not a stack overflow
   const thaw = (v: unknown, depth: number): unknown => {
     if (depth > MAX_UNIT_DEPTH)
@@ -388,6 +413,12 @@ export function decodeUnitBody(bytes: Uint8Array): UnitBody {
           'UNIT_BAD_RECORD',
           `a record refers to blob ${String(i)}, which the body does not hold`,
         );
+      expandedBytes += blobs[i].length;
+      if (expandedBytes > MAX_UNIT_BODY_BYTES)
+        throw new UnitError(
+          'UNIT_TOO_LARGE',
+          `its records refer to its byte arrays for over ${MAX_UNIT_BODY_BYTES} bytes, each reference a copy in the scene`,
+        );
       return blobs[i];
     }
     if (isRecord(v)) {
@@ -400,11 +431,12 @@ export function decodeUnitBody(bytes: Uint8Array): UnitBody {
     }
     return v;
   };
-  return {
+  const body: UnitBody = {
     root: manifest.root as typeof UNIT_ROOT,
     blocks: thaw(manifest.blocks, 0) as UnitBody['blocks'],
     drivers: Array.isArray(manifest.drivers) ? (thaw(manifest.drivers, 0) as UnitRecord[]) : (null as never),
   };
+  return { body, expandedBytes };
 }
 
 /**
@@ -558,8 +590,9 @@ export function decodeUnit(bytes: Uint8Array): UnitPayload {
   if (sha256Hex(body) !== header.digest)
     throw new UnitError('UNIT_CORRUPT', 'its body does not match its digest');
   let decoded: UnitBody;
+  let expandedBytes: number;
   try {
-    decoded = decodeUnitBody(body);
+    ({ body: decoded, expandedBytes } = readUnitBody(body));
     checkUnitBody(decoded, header.kind, true);
     if (header.figure) checkFigureBody(decoded, header.figure);
   } catch (err) {
@@ -568,7 +601,7 @@ export function decodeUnit(bytes: Uint8Array): UnitPayload {
       throw new UnitError('UNIT_BAD_RECORD', `its records do not read (${err.message})`);
     throw err;
   }
-  return { header, body: decoded, bytes };
+  return { header, body: decoded, bytes, expandedBytes };
 }
 
 // ---------------------------------------------------------------- meta and rig

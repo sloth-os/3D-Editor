@@ -417,7 +417,11 @@ export function unitRefusal(kind: UnitKind, header: UnitHeader): UnitProblem | n
 /** The units one staging or update places at most: 48 MiB of files, 160 MiB unpacked. */
 export const UNIT_BUDGET = { packedBytes: 48 * 2 ** 20, unpackedBytes: 160 * 2 ** 20 } as const;
 
-/** A unit's size for the budget: its file, and its unpacked bound (the decoded body and the scene's copy of it). */
+/**
+ * A unit's size for the budget: its file, and its unpacked bound (the decoded body and the scene's
+ * copy of it; from the header, twice the body: decodeHeld counts the copy again once it is decoded,
+ * with every blob reference written out).
+ */
 export interface UnitSize {
   packed: number;
   unpacked: number;
@@ -626,21 +630,25 @@ export function resolveUnits(
     const verdict = budget.verdicts.get(pinKey(s.pin));
     if (verdict === 'fits') continue;
     s.held = null;
-    s.problem =
-      verdict === 'over_budget'
-        ? {
-            staged: 'refused',
-            why: 'over_budget',
-            message: `${s.name}'s library unit ${pinKey(s.pin)} is larger than one staging takes (${UNIT_BUDGET.packedBytes / 2 ** 20} MiB of files, ${UNIT_BUDGET.unpackedBytes / 2 ** 20} MiB unpacked)`,
-          }
-        : {
-            staged: 'pending',
-            why: 'unavailable',
-            message: `${s.name}'s library unit ${pinKey(s.pin)} does not fit what the units before it left of this staging's budget: it is tried again at the next open`,
-          };
+    s.problem = budgetProblem(s, verdict ?? 'unavailable');
   }
   for (const s of out.all) s.action = actionOf(s);
   return out;
+}
+
+/** Why slot `s`'s unit is not used when it does not fit the budget (see unitBudget). */
+function budgetProblem(s: SlotUnit, verdict: 'unavailable' | 'over_budget'): UnitProblem {
+  return verdict === 'over_budget'
+    ? {
+        staged: 'refused',
+        why: 'over_budget',
+        message: `${s.name}'s library unit ${pinKey(s.pin!)} is larger than one staging takes (${UNIT_BUDGET.packedBytes / 2 ** 20} MiB of files, ${UNIT_BUDGET.unpackedBytes / 2 ** 20} MiB unpacked)`,
+      }
+    : {
+        staged: 'pending',
+        why: 'unavailable',
+        message: `${s.name}'s library unit ${pinKey(s.pin!)} does not fit what the units before it left of this staging's budget: it is tried again at the next open`,
+      };
 }
 
 /** Whether a slot with a pin may place, update or replace (its unit is worth reading). */
@@ -663,15 +671,41 @@ function actionOf(s: SlotUnit): UnitAction {
 /**
  * Decodes the units of the slots that place, update or replace, in slot order. A unit that does not
  * decode is not used: its slot keeps what it has, with the problem (refused, or 'unavailable' for an
- * error that is not the unit's).
+ * error that is not the unit's). The unpacked budget is counted again from what each decoded version
+ * holds (its body, and the scene's copy of it with every blob reference written out: a file can
+ * share one large byte array among many references, which the header's estimate cannot see): a
+ * version that no longer fits what the ones before it left is 'unavailable', one that never can is
+ * 'over_budget', as unitBudget says.
  */
 export function decodeHeld(resolved: ResolvedUnits, source: UnitSource | null): void {
+  const verdicts = new Map<string, UnitBudgetVerdict>();
+  let unpacked = 0;
   for (const s of resolved.all) {
     if (!s.held || !s.pin || (s.action !== 'place' && s.action !== 'update' && s.action !== 'replace'))
       continue;
     try {
       if (!source) throw new UnitError('UNIT_NOT_FOUND', 'no units are held');
-      s.payload = source.unit(s.pin);
+      const payload = source.unit(s.pin);
+      const key = pinKey(s.pin);
+      let verdict = verdicts.get(key);
+      if (!verdict) {
+        const size = payload.header.bodyBytes + payload.expandedBytes;
+        verdict =
+          size > UNIT_BUDGET.unpackedBytes
+            ? 'over_budget'
+            : unpacked + size > UNIT_BUDGET.unpackedBytes
+              ? 'unavailable'
+              : 'fits';
+        if (verdict === 'fits') unpacked += size;
+        verdicts.set(key, verdict);
+      }
+      if (verdict === 'fits') s.payload = payload;
+      else {
+        s.payload = null;
+        s.held = null;
+        s.problem = budgetProblem(s, verdict);
+        s.action = 'none';
+      }
     } catch (err) {
       failSlot(s, err);
     }

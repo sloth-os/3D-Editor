@@ -15,10 +15,14 @@ import { UnitError } from './errors';
 export class BlobTable {
   readonly list: Uint8Array[] = [];
   private readonly index = new Map<string, number>();
+  /** The bytes of the distinct blobs. */
   bytes = 0;
+  /** The bytes of every reference (a blob referred to twice counts twice): what a scene copies. */
+  refBytes = 0;
 
   /** The index of `bytes` (added when new). */
   add(bytes: Uint8Array): number {
+    this.refBytes += bytes.length;
     const key = `${bytes.length}:${bytesToHexLower(sha256Bytes(bytes))}`;
     let i = this.index.get(key);
     if (i === undefined) {

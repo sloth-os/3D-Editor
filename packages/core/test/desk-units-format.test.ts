@@ -390,6 +390,41 @@ describe('decoding is the gate: what decodes, inserts', () => {
     expect(code(() => decodeUnit(at(10_000)))).toBe('UNIT_CORRUPT');
   });
 
+  it('counts blob references as written out: a 1 MiB blob referred to 200 times is UNIT_TOO_LARGE', () => {
+    const big = fill(2 ** 20, 5);
+    /** The box with a 1 MiB blob that its root's custom prop `big` refers to `n` times. */
+    const referred = (n: number) => {
+      const { text, blobs } = boxManifest();
+      const table = /"blobs":\[([0-9,]+)\]/.exec(text)!;
+      const k = table[1].split(',').length;
+      const refs = Array.from({ length: n }, () => `{"$blob":${k}}`).join(',');
+      const all = new Uint8Array(blobs.length + big.length);
+      all.set(blobs);
+      all.set(big, blobs.length);
+      const t = text
+        .replace(table[0], `"blobs":[${table[1]},${big.length}]`)
+        .replace('"custom_props":{"license"', `"custom_props":{"big":[${refs}],"license"`);
+      return fromManifest(t, all);
+    };
+    // each blob referred to once: what inserting it copies is its body
+    const once = decodeUnit(referred(1));
+    expect(once.expandedBytes).toBe(once.header.bodyBytes);
+    const many = decodeUnit(referred(100));
+    expect(many.expandedBytes).toBe(many.header.bodyBytes + 99 * big.length);
+    expect(code(() => decodeUnit(referred(200)))).toBe('UNIT_TOO_LARGE');
+  });
+
+  it('writes no unit whose blob references written out pass the body limit (UNIT_TOO_LARGE)', () => {
+    const body = boxBody();
+    const big = fill(2 ** 20, 5);
+    const root = body.blocks.objects!['@root'];
+    root.custom_props = { ...(root.custom_props as object), big: Array.from({ length: 129 }, () => big) };
+    expect(code(() => encodeUnit(body, propHeader()))).toBe('UNIT_TOO_LARGE');
+    root.custom_props = { ...(root.custom_props as object), big: Array.from({ length: 3 }, () => big) };
+    const u = decodeUnit(encodeUnit(body, propHeader()));
+    expect(u.expandedBytes).toBe(u.header.bodyBytes + 2 * big.length);
+  });
+
   it("an id named like a member of Object.prototype ('valueOf', 'constructor') names nothing: UNIT_BAD_RECORD", () => {
     expect(code(() => decodeUnit(edited('"parent":"@root"', '"parent":"valueOf"')))).toBe('UNIT_BAD_RECORD');
     expect(

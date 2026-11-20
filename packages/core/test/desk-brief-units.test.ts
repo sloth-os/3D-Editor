@@ -859,6 +859,38 @@ describe('the units one staging takes (48 MiB of files)', () => {
     expect(recordElement(full.doc, KITE).unit).toMatchObject({ staged: 'pending', why: 'unavailable' });
     expect(pinsWanted(full.doc, b)).toEqual([L.kite.pin]);
   });
+
+  it('counts a decoded unit with its blob references written out: pending when it no longer fits, refused when it never can', () => {
+    const L = library();
+    const b = withPins(openBrief(), { set: L.set, el: { [KITE]: L.kite } });
+    const real = source(L.set, L.kite);
+    // what each unit copies into the scene: a crafted unit's shared blobs can make it far more than its body
+    const expanded = (n: (ref: string) => number): UnitSource => ({
+      ...real,
+      unit: (pin) => ({ ...real.unit(pin), expandedBytes: n(pin.ref) }),
+    });
+    const full = staged(
+      b,
+      expanded(() => 100 * MiB),
+    );
+    expect(rowsOf(full.r)).toEqual(['set unit', `el:${KITE} words unavailable`]);
+    expect(recordElement(full.doc, KITE).unit).toMatchObject({ staged: 'pending', why: 'unavailable' });
+    expect(propOf(full.doc, KITE).custom_props.unit_ref).toBeUndefined();
+    const huge = staged(
+      b,
+      expanded((ref) => (ref === L.set.pin.ref ? UNIT_BUDGET.unpackedBytes : 1000)),
+    );
+    expect(rowsOf(huge.r)).toEqual(['set words over_budget', `el:${KITE} unit`]);
+    expect(readBriefRecord(huge.doc)!.setUnit).toMatchObject({ staged: 'refused', why: 'over_budget' });
+    // the next update places only the kite, which fits on its own
+    const u = update(
+      full.doc,
+      b,
+      expanded(() => 100 * MiB),
+    );
+    expect(u.changes).not.toBeNull();
+    expect(rowsOf(u.r)).toEqual(['set unit', `el:${KITE} unit`]);
+  });
 });
 
 describe('a pin on a location', () => {
