@@ -1237,4 +1237,26 @@ describe('the banner of the brief’s changes', () => {
     await phase(null);
     expect(update().disabled).toBe(false);
   });
+
+  it('turns the Send check’s Update shots off while the scene links a unit the host saved, as the banner’s', async () => {
+    const { c } = await openDesk();
+    const checks: LengthCheck[] = [
+      { shotId: 'sht_a', name: 'Opening', frames: 72, briefFrames: 84, byBrief: true },
+    ];
+    const v = render(<DeskApp c={c} work={null} lengthChecks={() => checks} />);
+    await act(async () => void fireEvent.click(q(v, 'desk-send')!));
+    const update = () => q(v, 'desk-send-check-update') as HTMLButtonElement;
+    const phase = (p: 'waiting' | 'linking' | null) =>
+      act(() => {
+        c.publishing.value = p && { kind: 'set', name: 'Meadow', phase: p, startedAt: 0, id: 'pub-1' };
+      });
+    expect(update().disabled).toBe(false);
+    await phase('waiting');
+    expect(update().disabled).toBe(false);
+    await phase('linking');
+    expect(update().disabled).toBe(true);
+    expect(update().title).toBe('The scene is being linked to a unit saved to the library');
+    await phase(null);
+    expect(update().disabled).toBe(false);
+  });
 });

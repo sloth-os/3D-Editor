@@ -371,6 +371,13 @@ type AckOutcome =
   | { kind: 'timeout' }
   | { kind: 'closed' };
 
+/**
+ * Whether a write of the scene failed only because the scene closed meanwhile (workspace.ts
+ * SceneClosedError, read by its flag: the controller does not load the workspace).
+ */
+const sceneClosed = (err: unknown): boolean =>
+  typeof err === 'object' && err !== null && (err as { sceneClosed?: unknown }).sceneClosed === true;
+
 /** An ArrayBuffer holding exactly `bytes` (the view's own buffer when it is all of it). */
 const exactBuffer = (bytes: Uint8Array): ArrayBuffer =>
   bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
@@ -841,10 +848,10 @@ export class DeskController {
       if (missed) this.tell('warning', `The shots were updated to the brief (Ctrl+Z undoes it). ${missed}`);
       else this.tell('info', 'The shots were updated to the brief (Ctrl+Z undoes it).');
     } catch (err) {
-      this.tell(
-        'error',
-        `The shots could not be updated: ${err instanceof Error ? err.message : String(err)}`,
-      );
+      const why = err instanceof Error ? err.message : String(err);
+      // the scene closed while the update waited for its turn or ran: it ends quietly
+      if (sceneClosed(err)) this.log('info', `Update shots ended: ${why}`);
+      else this.tell('error', `The shots could not be updated: ${why}`);
     } finally {
       this.updating.value = false;
       this.refreshLibrary();

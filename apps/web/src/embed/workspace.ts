@@ -95,7 +95,8 @@ import {
  * - The worker's writes of the open scene (Update shots, the adoption of a saved unit, Make local)
  *   run one at a time (queueWrite), each reading the document and the brief when its turn starts:
  *   two changes worked out from the same document could each rewrite one record (the brief's
- *   record of what was staged), and only one of the two would stay.
+ *   record of what was staged), and only one of the two would stay. A write the scene's close ends
+ *   (waiting for its turn or running) rejects with SceneClosedError, which the desk does not report.
  * - Checks shown in the shot list carry the document's revision when they were asked for (an edit
  *   made while the worker checks shows them as out of date); after the scene opens and after
  *   Update shots the full checks (blocking lines, layouts) run in the background, behind the
@@ -313,6 +314,20 @@ export interface WorkspaceOptions {
   locks?: SceneLocks | null;
   /** How long storage may take before the desk keeps the scene in memory (STORAGE_TIMEOUT_MS). */
   storageTimeoutMs?: number;
+}
+
+/**
+ * A write of the scene (queueWrite) that the scene's close ended, while it waited for its turn or
+ * ran: nothing went wrong that anyone needs to hear of (DeskController ends it quietly). `cause` is
+ * what failed once the scene was let go, if anything did (its worker stops with it).
+ * `sceneClosed` lets the controller tell it apart without loading this module.
+ */
+export class SceneClosedError extends Error {
+  readonly sceneClosed = true;
+  constructor(cause?: unknown) {
+    super('the scene was closed', cause === undefined ? undefined : { cause });
+    this.name = 'SceneClosedError';
+  }
 }
 
 export class DeskWorkspace {
@@ -584,16 +599,21 @@ export class DeskWorkspace {
    * two changes worked out from the same document would each rewrite the brief's record (one
    * Yjs map key), and only one of them would stay. `write` gets the session it was queued for and
    * applies its change to it before it resolves; the next write starts after that. Rejects as
-   * `write` does (the queue goes on), and without running it when no scene is open or the scene it
-   * was queued for was let go before its turn ('the scene was closed').
+   * `write` does (the queue goes on), and without running it when no scene is open. Once the scene
+   * it was queued for is let go (closed, or another opened) it rejects with SceneClosedError, before
+   * its turn or after, whatever ended it then (the worker it ran in is stopped with the scene).
    */
   queueWrite<T>(write: (s: ProjectSession) => Promise<T>): Promise<T> {
     const s = this.session;
     if (!s) return Promise.reject(new Error('no scene is open'));
-    const turn = this.writes.then(() => {
-      if (this.session !== s) throw new Error('the scene was closed');
-      return write(s);
-    });
+    const turn = this.writes
+      .then(() => {
+        if (this.session !== s) throw new SceneClosedError();
+        return write(s);
+      })
+      .catch((err: unknown) => {
+        throw this.session !== s && !(err instanceof SceneClosedError) ? new SceneClosedError(err) : err;
+      });
     this.writes = turn.then(
       () => undefined,
       () => undefined,
@@ -888,7 +908,7 @@ export class DeskWorkspace {
         r = await run();
       }
       // the scene was let go meanwhile: nothing is applied
-      if (this.session !== s) throw new Error('the scene was closed');
+      if (this.session !== s) throw new SceneClosedError();
       // the worker's checks are of the document it got plus its change: current only when nothing
       // else changed the scene meanwhile (else shown as out of date until the next check)
       const edited = s.revision.peek() !== asked;
@@ -994,7 +1014,7 @@ export class DeskWorkspace {
         header: unit.header,
       });
       // the scene was let go meanwhile: nothing is applied
-      if (this.session !== s) throw new Error('the scene was closed');
+      if (this.session !== s) throw new SceneClosedError();
       Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
       s.undo.clear();
       // the editor's undo state (Edit menu, redo panel) follows the stacks

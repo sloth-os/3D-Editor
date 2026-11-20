@@ -288,6 +288,8 @@ function SendCheck(p: {
   host: string;
   /** Update shots, when the brief retimed some and the open is not read-only. */
   onUpdate: (() => void) | null;
+  /** Why Update shots is off now (as the banner's: controller.updateShots refuses then); null: on. */
+  updateOff: string | null;
   onSend: () => void;
   onCancel: () => void;
 }) {
@@ -351,7 +353,13 @@ function SendCheck(p: {
             Cancel
           </button>
           {p.onUpdate && (
-            <button class="btn" data-testid="desk-send-check-update" onClick={p.onUpdate}>
+            <button
+              class="btn"
+              data-testid="desk-send-check-update"
+              disabled={p.updateOff !== null}
+              title={p.updateOff ?? undefined}
+              onClick={p.onUpdate}
+            >
               Update shots
             </button>
           )}
@@ -471,6 +479,15 @@ function DeskHeader(p: { c: DeskController; lengthChecks: () => LengthCheck[] })
         <SendCheck
           checks={check}
           host={options.hostName}
+          updateOff={
+            c.updating.value
+              ? 'The shots are being updated'
+              : run
+                ? 'An export is running'
+                : c.publishing.value?.phase === 'linking'
+                  ? 'The scene is being linked to a unit saved to the library'
+                  : null
+          }
           onCancel={() => setCheck(null)}
           onUpdate={
             !options.readOnly && check.some((x) => x.byBrief)

@@ -437,6 +437,9 @@ describe("the Send check's lengths on a staged scene", () => {
     JSON.parse(readFileSync(resolve(__dirname, 'fixtures/desk-protocol', name), 'utf8'));
   const EXAMPLE = (): SceneBrief => structuredClone(fixture('open.json').scene);
 
+  // A test that stages the example brief takes 30 s (its last argument): up to 1.1 s in the whole web
+  // suite and 2 s beside core's suite, near half of vitest's 5 s default.
+
   /** The example brief staged into an empty document. */
   function staged(): SceneDoc {
     const doc = SceneDoc.create({ empty: true });
@@ -457,7 +460,7 @@ describe("the Send check's lengths on a staged scene", () => {
     expect(lengthChecks(doc, EXAMPLE())).toEqual([]);
     // 24 → 30 fps: the clips are resampled to the brief's rate (72 → 90 frames), as the brief has them
     expect(lengthChecks(doc, { ...EXAMPLE(), fps: 30 })).toEqual([]);
-  });
+  }, 30_000);
 
   it('names a shot the brief retimed (Update shots) apart from one made longer in the desk', () => {
     const doc = staged();

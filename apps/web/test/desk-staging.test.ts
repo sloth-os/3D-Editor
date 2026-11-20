@@ -40,6 +40,11 @@ function changedBrief(): SceneBrief {
 
 const empty = () => Y.encodeStateAsUpdate(SceneDoc.create({ empty: true }).ydoc);
 
+/*
+ * A test that stages the example brief and updates it takes 30 s (its last argument): up to 1.3 s in
+ * the whole web suite and 2.4 s beside core's suite, near half of vitest's 5 s default.
+ */
+
 /** The example brief staged into an empty document (the change applied to that same document). */
 function staged() {
   const doc = SceneDoc.create({ empty: true });
@@ -69,7 +74,7 @@ describe('the staging engine', () => {
     expect(shots.map((s) => s.frame_end - s.frame_start + 1)).toEqual([72, 60]);
     expect(r.check.summary).toMatch(/^2 shots checked/);
     expect(r.check.issues.every((i) => shots.some((s) => s.id === i.shot))).toBe(true);
-  });
+  }, 30_000);
 
   it('updates the staging to a later brief and reports the shot results of the shots asked', () => {
     const { doc } = staged();
@@ -93,7 +98,7 @@ describe('the staging engine', () => {
     expect(all.ok && all.kind === 'results' && all.results.length).toBe(3);
     const check = runStaging({ kind: 'check', update: Y.encodeStateAsUpdate(doc.ydoc) });
     expect(check.ok && check.kind === 'check' && check.check.summary).toMatch(/^3 shots checked/);
-  });
+  }, 30_000);
 
   it('answers a failure with its message and code', () => {
     const r = runStaging({ kind: 'update', update: empty(), brief: EXAMPLE() });

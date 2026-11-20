@@ -119,6 +119,12 @@ class FakeLocks implements SceneLocks {
 }
 
 let n = 0;
+/*
+ * A test that stages or reopens the scene more than once takes 30 s (its last argument): up to 1.8 s
+ * with this file alone, 4.1 s in the whole web suite and 2.8 s beside core's suite, close to
+ * vitest's 5 s default.
+ */
+
 /** A host origin of its own per test (its projects do not meet another test's). */
 const origin = () => `https://host-${++n}-${Date.now()}.example`;
 
@@ -231,7 +237,7 @@ describe('the desk workspace', () => {
     const r2 = await again.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
     expect(r2).toMatchObject({ source: 'local', changes: null, plan: 'local', stageMs: null });
     expect(hostShots(again)).toEqual([SHOT_A, SHOT_B]);
-  });
+  }, 30_000);
 
   it("opens a host's state where there is no copy, and merges it with a copy of the same staging", async () => {
     const host = origin();
@@ -289,7 +295,7 @@ describe('the desk workspace', () => {
     expect(readLineage(back.session!.doc)).not.toBe(localLineage);
     expect(back.session!.doc.map('meta').get('local_only')).toBeUndefined();
     expect(hostShots(back)).toEqual([SHOT_A, SHOT_B]);
-  });
+  }, 30_000);
 
   it('does not apply a state it cannot read, says why, and opens as without one: the local copy, else the brief', async () => {
     const other = { ...EXAMPLE(), id: 'clp_other0000000001' };
@@ -321,7 +327,7 @@ describe('the desk workspace', () => {
     expect(b.unreadable).toMatch(/belongs to scene 'clp_other0000000001'/);
     expect(back.session!.doc.map('meta').get('work')).toBe('kept');
     expect(readLineage(back.session!.doc)).toBe(lineage);
-  });
+  }, 30_000);
 
   it('never deletes the local copy for a state of the scene that holds no staging', async () => {
     const host = origin();
@@ -488,7 +494,7 @@ describe('the desk workspace', () => {
     await new Promise((r) => setTimeout(r, 20));
     third.close();
     await expect(waiting).rejects.toThrow(/abort/i);
-  });
+  }, 30_000);
 
   it('ends an open cancelled while its state unpacks: it never waits for the other desk, and that desk keeps its scene', async () => {
     const host = origin();
@@ -606,7 +612,7 @@ describe('the desk workspace', () => {
     });
     expect(readLineage(again.session!.doc)).not.toBe(elsewhereLineage);
     expect(again.session!.doc.map('meta').get('local_only')).toBeUndefined();
-  });
+  }, 30_000);
 
   it('stamps a background check with the revision it checked, and shows the blocking line after staging and Update shots', async () => {
     const host = origin();
@@ -633,7 +639,7 @@ describe('the desk workspace', () => {
     expect(lastCheck.value!.revision).toBe(b.revision.peek());
     const lined = new Set(lastCheck.value!.result.lines.filter((l) => l.line).map((l) => l.shot));
     expect(getShots(b.doc).every((x) => lined.has(x.id))).toBe(true);
-  });
+  }, 30_000);
 
   it("asks for its full checks in the background, behind the person's requests to the worker", async () => {
     const ws = workspace();
@@ -665,7 +671,7 @@ describe('the desk workspace', () => {
     // the full check that follows is of the scene as it is
     await ws.backgroundCheck;
     expect(lastCheck.value!.revision).toBe(s.revision.peek());
-  });
+  }, 30_000);
 
   it('lists how a later brief differs and updates the shots to it in one undo step', async () => {
     const host = origin();

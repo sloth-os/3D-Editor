@@ -171,6 +171,11 @@ const copyOf = (u: UnitExtract): UnitExtract => ({
 
 /** vi.waitFor with room for a busy machine. */
 const waitUntil = <T>(fn: () => T | Promise<T>) => vi.waitFor(fn, { timeout: 20_000, interval: 20 });
+/*
+ * A test that stages a scene and then updates its shots or saves to the library, in the staging's
+ * own code, takes 60 s (its last argument): 1–2.4 s with this file alone, up to 5.8 s in the whole
+ * web suite and 4.5 s beside core's suite, past vitest's 5 s default.
+ */
 const flush = async () => {
   for (let i = 0; i < 10; i++) await Promise.resolve();
 };
@@ -471,7 +476,7 @@ describe("the open's library units", () => {
     expect(stateUnits(ws.session!.doc).map((u) => [u.slot, u.staged, u.why])).toEqual([
       [`el:${KITE}`, 'pending', 'mismatch'],
     ]);
-  });
+  }, 60_000);
 
   it('gives the worker copies of the files, each a buffer of its own to hand over', () => {
     const intake: UnitIntake = {
@@ -646,7 +651,7 @@ describe("the staging worker's unit requests", () => {
     });
     expect(missing.ok).toBe(false);
     expect(replyTransfer(missing)).toEqual([]);
-  });
+  }, 60_000);
 
   it('frames a set’s thumbnail on its stage, not on its ground hundreds of metres wide', () => {
     const doc = stagedDoc();
@@ -760,7 +765,7 @@ describe("the staging worker's unit requests", () => {
     expect(posted[3]).toMatchObject({ request: { kind: 'unit-extract', name: 'Meadow' }, transfer: [] });
     expect(ex.header.kind).toBe('set');
     client.dispose();
-  });
+  }, 60_000);
 });
 
 // ---------------------------------------------------------------- the workspace
@@ -868,7 +873,7 @@ describe('the desk workspace with library units', () => {
     expect(update).toHaveBeenCalledTimes(1);
     expect(update.mock.calls[0][2]?.units).toEqual([]);
     expect(listUnits(s.doc).map((i) => i.key)).toEqual([`el:${KITE}`]);
-  });
+  }, 60_000);
 
   it('shows a version the brief pins but the staging cannot use as refused, with why, before and after the Update shots that records it', async () => {
     const host = origin();
@@ -912,7 +917,7 @@ describe('the desk workspace with library units', () => {
     ]);
     expect(ws.changes()).toBeNull();
     expect(ws.libraryRows()).toMatchObject([refused]);
-  });
+  }, 60_000);
 
   it('shows a version pinned in a slot staged from the words that the staging cannot use as refused, not as one Update shots places', async () => {
     const host = origin();
@@ -1145,7 +1150,7 @@ describe('the desk controller with library units', () => {
       message: 'The shots were updated to the brief (Ctrl+Z undoes it).',
     });
     expect(t.c.changes.value).toBeNull();
-  });
+  }, 60_000);
 
   it("without options.units: the brief's pins are staged as though never sent, open.units is not read, and the host sees today's messages", async () => {
     const pinned = await realDesk({ scene: pinnedBrief(), units: pinnedUnits() });
@@ -1184,7 +1189,7 @@ describe('the desk controller with library units', () => {
       code: 'unavailable',
     });
     expect(pinned.sent.map((s) => s.message.type)).toEqual(['ready', 'opened', 'state']);
-  });
+  }, 60_000);
 
   it('reopened with units off, a scene that holds units offers taking them out, as a host from before units would', async () => {
     const host = origin();
@@ -1409,7 +1414,7 @@ describe("the scene's writes, one at a time", () => {
     expect(t.c.changes.value?.added).toEqual([NEW_SHOT]);
     await t.c.updateShots();
     expect(sceneOf(t)).toEqual(BOTH);
-  });
+  }, 60_000);
 
   it('does not link a saved set whose pieces Update shots replaced meanwhile: no instance is left without its parts', async () => {
     const brief = withNewShot(exampleBrief());
@@ -1432,7 +1437,7 @@ describe("the scene's writes, one at a time", () => {
         'the host saved and linked it, but the scene could not be linked to it here: the objects it was made from are no longer in the scene',
     });
     expect(sceneOf(t)).toEqual({ shots: 3, instances: [], rows: [], banner: null, changes: null });
-  });
+  }, 60_000);
 
   it('Ctrl+Z does not go back past a linked save: the scene keeps what its record says', async () => {
     const t = await laterBrief();
@@ -1447,7 +1452,48 @@ describe("the scene's writes, one at a time", () => {
     t.timers.advance(CHANGES_QUIET_MS);
     expect(sceneOf(t)).toEqual(BOTH);
     expect(t.ws.stagedShots()).toContain(NEW_SHOT);
-  });
+  }, 60_000);
+
+  it('ends an Update shots quietly when the scene closes while it runs or waits for its turn: no error notice', async () => {
+    // runs: the worker answers once the scene was closed
+    const t = await laterBrief();
+    const st = t.ws.staging;
+    const update = st.update.bind(st);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    vi.spyOn(st, 'update').mockImplementation(async (u, b, units) => {
+      await gate;
+      return update(u, b, units);
+    });
+    const runs = t.c.updateShots();
+    await waitUntil(() => expect(st.update).toHaveBeenCalledTimes(1));
+    t.ws.close();
+    release();
+    await runs;
+    expect(t.c.updating.value).toBe(false);
+    expect(t.c.notice.value?.level ?? null).not.toBe('error');
+    expect(t.logs).toContain('Update shots ended: the scene was closed');
+
+    // waits: another write of the scene holds the queue when the scene closes
+    const w = await laterBrief();
+    let free!: () => void;
+    const blocker = new Promise<void>((r) => (free = r));
+    let holding = false;
+    const held = w.ws.queueWrite(async () => {
+      holding = true;
+      await blocker;
+    });
+    const waits = w.c.updateShots();
+    await waitUntil(() => expect(holding).toBe(true));
+    expect(w.c.updating.value).toBe(true);
+    w.ws.close();
+    free();
+    await held;
+    await waits;
+    expect(w.c.updating.value).toBe(false);
+    expect(w.c.notice.value?.level ?? null).not.toBe('error');
+    expect(w.logs).toContain('Update shots ended: the scene was closed');
+  }, 60_000);
 
   describe('in the workspace itself, with no controller to hold one back', () => {
     /** The scene staged from `first` (with the files `units`), opened again with `brief`: its local copy kept. */
@@ -1629,7 +1675,7 @@ describe('a save the host linked after the desk stopped waiting', () => {
     expect(ids(t).sort()).toEqual([...before].sort());
     expect(pendingPublishes(s.doc)).toMatchObject([{ slot: 'set', sha256: m.sha256 }]);
     expect(await bannerWords(t.c.changes.value!)).toBe('the set from the library');
-  });
+  }, 60_000);
 
   /**
    * A desk whose set was saved and timed out (the host links it later), then `again` (its second
@@ -1688,7 +1734,7 @@ describe('a save the host linked after the desk stopped waiting', () => {
       expect(pendingPublishes(t.ws.session!.doc)).toMatchObject([{ slot: 'set', sha256: first.sha256 }]);
     });
     expect(r).toEqual(ADOPTED);
-  });
+  }, 60_000);
 
   it('an edited save the host keeps without linking waits beside the first: the next brief pinning the first still adopts it', async () => {
     const r = await savedTwice(async (t) => {
@@ -1712,7 +1758,7 @@ describe('a save the host linked after the desk stopped waiting', () => {
       expect(pendingPublishes(s.doc).map((x) => x.sha256)).toEqual([first.sha256, second.sha256]);
     });
     expect(r).toEqual(ADOPTED);
-  });
+  }, 60_000);
 });
 
 describe('Save to library', () => {
@@ -2139,7 +2185,7 @@ describe('the desk state container with library units', () => {
     );
     expect(doc).toContain('It keeps them while the scene is open, also once an Update shots has placed them');
     expect(doc).toContain(
-      'or the staging worker failed while reading the unit (out of memory, a worker restart)',
+      'the staging worker failed while reading the unit (out of memory, a worker restart)',
     );
   });
 });
