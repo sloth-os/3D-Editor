@@ -268,15 +268,23 @@ with the new ones.
 | ------------------------- | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
 | from before library units | with units                          | Its `ready` has no `capabilities.units`, so the host sends no pins, no `options.units` and no `units`: the scene opens as before          |
 | with units                | from before library units           | The host ignores `capabilities.units` and its `open` has no `options.units`: the desk sends no `units` in `state` and no `unit-publish`   |
-| with units                | with units, units off for this open | The host leaves out `options.units` (the person may not use the library, the host is offline): as with a host from before units           |
+| with units                | with units, units off for this open | The host leaves out `options.units` (it, or the person, never uses the library): as with a host from before units                         |
 | with units                | with units, `options.units` given   | The brief's pins and `open.units` count, every `state` carries `units`, and with `publish` true the person can save to the host's library |
 
 The desk reads `options.units` leniently: an absent or malformed one, or one of another `version`,
-turns units off for that open (logged); it never fails the open. A host reads `capabilities.units`
+turns units off for that open; it never fails the open. It logs one it does not read, with the
+shape it reads (`{version: 1, publish: boolean}`), and an absent one when the brief has pins or
+`open.units` comes (a host from before units sends neither). A host reads `capabilities.units`
 leniently too: kinds it does not know are dropped, and a malformed one or one without version 1 in
 `versions` means no units; it never fails the `ready`. With units off the desk takes no
 `open.units` and sends no `units` in `state` and no `unit-publish`; a pin in the brief is staged
 from the words.
+
+Units off is for a host, or a person, that never uses the library. A host that uses it keeps
+`options.units` on while it is offline, and sends no file it cannot get: those pins wait
+(`pending`, `missing`) and nothing the scene holds is taken out. A scene that holds units, opened
+with units off, is what a host from before units would see: the desk reads the brief as pinning
+nothing, so its banner offers to take the units out (back to the brief's words) with Update shots.
 
 ### Fields and messages
 
@@ -393,9 +401,13 @@ type StateUnit = {           // state.units[]: one row per brief slot whose reco
   element's prop and a figure unit as the cast member's actor. Each is an _instance_ of
   `ref@version` that the person can edit in the desk; **Make local** cuts a slot's link to its unit
   (it keeps the pieces, and its row says `staged` `unit` with `local` true).
-- It keeps the files it may still need for **Update shots** in memory while the scene is open, and
-  none after: it has no cache of units, so a later open needs the files again unless the scene
-  already holds their versions.
+- After the open it keeps in memory the files an **Update shots** could place (those of slots that
+  do not hold their pinned version yet, within one staging's budget), and only a file whose SHA-256
+  is its pin's: another one is let go, and its pin waits as `mismatch`. It keeps them while the
+  scene is open, also once an Update shots has placed them (Ctrl+Z may take that back, and Update
+  shots places them again), and each Update shots gets copies of those the scene wants then. None
+  stay after: the desk has no cache of units, so a later open needs the files again unless the
+  scene already holds their versions.
 - A later brief that moves a pin (a new version, another item, or none) is a change the desk offers
   to bring in with **Update shots**, as one undo step that keeps the parts the person edited by
   hand; it never moves a pin by itself. `opened.changes` lists shots and cast only, so it is `null`
@@ -435,9 +447,14 @@ pins the same `ref` (the unit is a new version of its own item). Otherwise it an
 **What `linked` means for the desk.** With `linked` true the host's project pins the slot to
 `ref@version`, and its next brief says so. The desk adopts the unit at once: the slot's pieces
 become an instance of `ref@version` (their ids unchanged, and not an undo step: it records what the
-host did) and the slot's record takes the pin with `staged` `unit`, so the next brief brings no
-change for the slot and needs no file. With `linked` false, or `ok` false, the desk changes nothing
-in the scene; a read-only open never adopts.
+host did, and Ctrl+Z does not go back past it, as the undo history before it is cleared) and the
+slot's record takes the pin with `staged` `unit`, so the next brief brings no change for the slot
+and needs no file. With `linked` false, or `ok` false, the desk changes nothing in the scene; a
+read-only open never adopts. The desk changes the scene one step at a time: Update shots is off
+while the scene adopts a unit, and an ack that comes while Update shots runs is adopted once the
+update has ended, in the scene the update left. A unit whose object is no longer in the scene (for
+a set: none of its pieces is), as when that update replaced it, is not adopted, and the person is
+told why; the link comes with the next open's brief, through Update shots.
 
 The desk waits for the `unit-ack` 120 s plus 10 s per MiB of the file (counted up: 440 s for
 32 MiB), then tells the person that the host did not say whether it saved the unit; an ack that
@@ -857,8 +874,9 @@ lists, with Update shots as for the others. It never changes the person's
 staging by itself: a banner lists the changes with **Update shots**, which brings the staging up to
 the brief (core's `updateFromBrief`, in the worker: new shots staged, dropped ones removed, changed
 ones changed, hand edits of the others kept) as **one undo step** (Ctrl+Z takes it back, and the
-banner with it: the desk compares the brief with the scene again once edits pause), and **Not
-now**, which hides the banner. A read-only open shows the changes without the button. How a
+banner with it: the desk compares the brief with the scene again once edits pause; not once a unit
+was linked since, see [publishing and linking](#publishing-and-linking)), and **Not now**, which
+hides the banner. A read-only open shows the changes without the button. How a
 brief becomes a scene, and what an update keeps, is in
 [director-desk.md](director-desk.md#staging-from-a-brief).
 

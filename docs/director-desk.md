@@ -758,8 +758,9 @@ Save sends it to the host (`unit-publish`); the dialog shows the progress (makin
 waiting for the host with the seconds counted, linking the scene), then what came of it:
 
 - "Saved 'Harbor' v3 to rideo; linked to the scene's place" (or to the actor or prop it came
-  from): the host linked it, and the scene adopts it at once (not an undo step): the slot's pieces
-  are an instance of that version, the tab shows it up to date, and the next state pins it;
+  from): the host linked it, and the scene adopts it at once (not an undo step, and Ctrl+Z does not
+  go back past it): the slot's pieces are an instance of that version, the tab shows it up to date,
+  and the next state pins it;
 - "Saved 'Harbor' v1 to rideo; not linked: …", with the host's reason: saved in the library, and
   the scene stays as it is. From a read-only open, which may save too, the host saves it but does
   not link it and says why: "Saved 'Harbor' v1 to rideo; not linked: the scene is read-only" from
@@ -772,10 +773,12 @@ waiting for the host with the seconds counted, linking the scene), then what cam
   not applied; a link the host made comes with its next brief, through Update shots.
 
 Closing the dialog while the host saves lets the save go on: the tab says how far it is and how it
-ended. One save runs at a time. The dialog is modal: it takes the keyboard focus, Tab goes round its
-own controls, Space and Enter press its buttons, and no key of the editor (Ctrl+Z, Space, the
-arrows) acts on the scene behind it; Escape closes it, but not the Escape that ends an IME
-composition in the Name or Description. Closed, it gives the focus back to Save to library….
+ended. One save runs at a time, and Update shots is off while one links the scene; a link the host
+answers while Update shots runs is made once the update has ended. The dialog is modal: it takes
+the keyboard focus, Tab goes round its own controls, Space and Enter press its buttons, and no key
+of the editor (Ctrl+Z, Space, the arrows) acts on the scene behind it; Escape closes it, but not the
+Escape that ends an IME composition in the Name or Description. Closed, it gives the focus back to
+Save to library….
 
 ## Over MCP
 

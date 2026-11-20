@@ -239,6 +239,28 @@ describe('docs/embedding.md', () => {
     expect(failures.filter((r) => r[1] === '`unit`')).toHaveLength(2);
   });
 
+  it('keeps units off for hosts that never use the library, and says what a link does to Ctrl+Z', () => {
+    // offline, a host keeps options.units on (its pins wait); units off, as a host from before
+    // units, offers to take out the units a scene holds
+    const negotiation = section(doc, '### Negotiation');
+    const off = tables(negotiation)[0].rows.find((r) => r[1].includes('units off for this open'))!;
+    expect(off[2]).not.toMatch(/offline/);
+    expect(off[2]).toContain('never uses the library');
+    const text = flat(negotiation);
+    expect(text).toContain('keeps `options.units` on while it is offline');
+    expect(text).toContain('offers to take the units out');
+    // an options.units the desk does not read is logged with the shape it reads
+    expect(text).toContain('`{version: 1, publish: boolean}`');
+    // the files kept for Update shots stay after it placed them; another SHA-256's file goes
+    const desk = flat(section(doc, "### The desk's part"));
+    expect(desk).toContain('also once an Update shots has placed them');
+    expect(desk).toContain('its pin waits as `mismatch`');
+    // an adoption is not undone, nor anything before it; no Update shots while it runs
+    const linking = flat(section(doc, '### Publishing and linking'));
+    expect(linking).toContain('Ctrl+Z does not go back past it');
+    expect(linking).toContain('Update shots is off while the scene adopts a unit');
+  });
+
   it('describes the desk state container as state.ts writes it', () => {
     const rows = tables(section(doc, '### The desk state'))[0].rows;
     const magic = /`([^`]+)`/

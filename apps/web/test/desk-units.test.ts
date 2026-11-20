@@ -1730,8 +1730,9 @@ describe('the desk state container with library units', () => {
     expect(doc).toContain('a PNG of at most 64 KiB and at most 256 px a side');
     expect(UNIT_THUMBNAIL_SIZES[0]).toBe(256);
     expect(doc).toContain(
-      'It keeps the files it may still need for **Update shots** in memory while the scene is open, and none after',
+      'After the open it keeps in memory the files an **Update shots** could place (those of slots that do not hold their pinned version yet, within one staging',
     );
+    expect(doc).toContain('It keeps them while the scene is open, also once an Update shots has placed them');
     expect(doc).toContain(
       'or the staging worker failed while reading the unit (out of memory, a worker restart)',
     );
