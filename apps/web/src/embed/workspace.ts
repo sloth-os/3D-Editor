@@ -2,6 +2,7 @@ import * as Y from 'yjs';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { bytesToHex } from '@noble/hashes/utils.js';
 import {
+  UNIT_ROOT,
   briefChanges,
   briefRecord,
   docHasUnitInstances,
@@ -9,10 +10,13 @@ import {
   pinKey,
   pinsWanted,
   type BriefChanges,
+  type BriefUnitPin,
   type DeskCheckResult,
   type SceneBrief,
+  type SceneDoc,
   type ShotResultMeta,
   type StageUnitRow,
+  type UnitLinkPlan,
   type UnitSource,
 } from '@3d-editor/core';
 import { session as sessionSignal } from '../app/store';
@@ -85,21 +89,41 @@ import {
  *   what the document held then (Y.snapshot), and sent again as they are.
  * - The staging is applied to the session's document in one transaction that undo does not track
  *   (it is where the scene starts); an update from a later brief is one undo step.
+ * - The worker's writes of the open scene (Update shots, the adoption of a saved unit, Make local)
+ *   run one at a time (queueWrite), each reading the document and the brief when its turn starts:
+ *   two changes worked out from the same document could each rewrite one record (the brief's
+ *   record of what was staged), and only one of the two would stay.
  * - Checks shown in the shot list carry the document's revision when they were asked for (an edit
  *   made while the worker checks shows them as out of date); after the scene opens and after
  *   Update shots the full checks (blocking lines, layouts) run in the background, behind the
  *   person's requests to the worker while they wait.
  * - Library units (docs/embedding.md "Library units"), only when the host turned them on for the
- *   open: the files that count for the brief's pins (units.ts readOpenUnits) go to the staging and
- *   to Update shots (copies, handed over to the worker); after the open and after each Update shots
- *   only those an Update shots could still place are kept (core pinsWanted, within one staging's
- *   budget), none after the scene closes. A worker that fails with the files (it stops, runs out of
- *   memory) gets the staging or the update again without them: their pins wait (`unavailable`). The brief's changes are read with their headers (nothing
- *   decoded on the page). A state of a document holding instances of units is container version 2.
- *   Save to library makes the unit in the worker (read only); the version the host saved and linked
- *   is adopted with the storage origin (not an undo step: it records what the host did), and Make
- *   local is one undo step.
+ *   open: the files that count for the brief's pins (units.ts readOpenUnits) go to the staging
+ *   (copies, handed over to the worker). After the open only those an Update shots could place are
+ *   kept (core pinsWanted, within one staging's budget), until the scene closes: Ctrl+Z may take
+ *   back an Update shots that placed one. Each Update shots gets copies of those the scene wants
+ *   when its turn starts. A worker that fails with the files (it stops, runs out of memory) gets the
+ *   staging or the update again without them: their pins wait (`unavailable`). The brief's changes
+ *   are read with their headers (nothing decoded on the page). A state of a document holding
+ *   instances of units is container version 2. Save to library makes the unit in the worker (read
+ *   only); the version the host saved and linked is adopted with the storage origin (not an undo
+ *   step: it records what the host did), and Ctrl+Z does not go back past it (Yjs cannot undo an
+ *   older write of the record it rewrote). Make local is one undo step.
  */
+
+/**
+ * Whether the scene still holds an object a set unit was made from, when adopting it would make the
+ * set's root (a set saved from the scene's own pieces); always true for any other unit (core checks
+ * that its root is there). Without any of them the root would be an instance of nothing, every part
+ * missing (Update shots replaced the pieces while the host saved them).
+ */
+function setPiecesLeft(doc: SceneDoc, link: UnitLinkPlan): boolean {
+  if (!link.synthesizeSetRoot) return true;
+  return Object.entries(link.parts).some(
+    ([key, part]) =>
+      key.startsWith('objects:') && key !== `objects:${UNIT_ROOT}` && doc.has('objects', part.sceneId),
+  );
+}
 
 /** The local project id of a host's scene: a digest of the host's origin and the scene id. */
 export function deskProjectId(hostOrigin: string, sceneId: string): string {
@@ -304,6 +328,8 @@ export class DeskWorkspace {
   private unitSourceCache: UnitSource | null = null;
   /** The brief's pins as the last staging or Update shots left them (report.units). */
   private lastUnitRows: StageUnitRow[] | null = null;
+  /** The end of the last write of the scene queued (queueWrite); settles, never rejects. */
+  private writes: Promise<void> = Promise.resolve();
   private readonly locks: SceneLocks | null;
   private readonly storageTimeoutMs: number;
 
@@ -515,9 +541,10 @@ export class DeskWorkspace {
   }
 
   /**
-   * Keeps of the units held only those an Update shots of `doc` could still place (core
-   * pinsWanted), within one staging's budget: the files of slots that hold their version, were
-   * refused or made local are let go.
+   * After the open: keeps of the units held only those an Update shots of `doc` could place (core
+   * pinsWanted), within one staging's budget, whose SHA-256 is the pin's (units.ts keepWanted): the
+   * files of slots that hold their version, were refused or made local are let go. The ones kept
+   * stay until the scene closes (an Update shots that placed one may be undone).
    */
   private keepWantedUnits(s: ProjectSession, brief: SceneBrief): void {
     if (!this.units) return;
@@ -527,6 +554,45 @@ export class DeskWorkspace {
       // a brief core does not take (the protocol checked it): the units stay as they are
     }
     this.unitSourceCache = null;
+  }
+
+  /**
+   * Copies of the files held that the scene wants now (core pinsWanted of `s` and `brief`), for an
+   * Update shots: one whose version the scene holds goes to no worker. Undefined with units off.
+   */
+  private unitCopies(s: ProjectSession, brief: SceneBrief): ReturnType<typeof intakeCopy> | undefined {
+    if (!this.units) return undefined;
+    let wanted: BriefUnitPin[] | undefined;
+    try {
+      wanted = pinsWanted(s.doc, brief);
+    } catch {
+      // a brief core does not take: the update says so, with every file it could have had
+    }
+    return intakeCopy(this.units, wanted);
+  }
+
+  /**
+   * Queues a write of the open scene that runs in the worker: `write` starts once every write
+   * queued before it has ended (applied or failed), and reads the document and the brief then, not
+   * when it was queued. Update shots, the adoption of a saved unit and Make local go through here:
+   * two changes worked out from the same document would each rewrite the brief's record (one
+   * Yjs map key), and only one of them would stay. `write` gets the session it was queued for and
+   * applies its change to it before it resolves; the next write starts after that. Rejects as
+   * `write` does (the queue goes on), and without running it when no scene is open or the scene it
+   * was queued for was let go before its turn ('the scene was closed').
+   */
+  queueWrite<T>(write: (s: ProjectSession) => Promise<T>): Promise<T> {
+    const s = this.session;
+    if (!s) return Promise.reject(new Error('no scene is open'));
+    const turn = this.writes.then(() => {
+      if (this.session !== s) throw new Error('the scene was closed');
+      return write(s);
+    });
+    this.writes = turn.then(
+      () => undefined,
+      () => undefined,
+    );
+    return turn;
   }
 
   /**
@@ -547,6 +613,9 @@ export class DeskWorkspace {
     this.units = null;
     this.unitSourceCache = null;
     this.lastUnitRows = null;
+    // a write of this scene still queued or running is not applied (queueWrite): the next scene's
+    // writes do not wait for it
+    this.writes = Promise.resolve();
     if (s && sessionSignal.peek() === s) sessionSignal.value = null;
     void s?.close(false);
     this.release?.();
@@ -788,17 +857,22 @@ export class DeskWorkspace {
 
   /**
    * Updates the staging to the brief (desk.update_from_brief in the worker), applied as one undo
-   * step; the changes left (null when the scene agrees with the brief now).
+   * step; the changes left (null when the scene agrees with the brief now). A write of the scene
+   * (queueWrite): the document and the brief are those of its turn.
    */
-  async updateFromBrief(): Promise<BriefChanges | null> {
-    const s = this.session;
+  updateFromBrief(): Promise<BriefChanges | null> {
+    return this.queueWrite((s) => this.runUpdate(s));
+  }
+
+  private async runUpdate(s: ProjectSession): Promise<BriefChanges | null> {
     const brief = this.brief;
-    if (!s || !brief) throw new Error('no scene is open');
+    if (!brief) throw new Error('no scene is open');
     this.onWork({ label: `Updating ${brief.shots.length} shots from the brief…`, startedAt: Date.now() });
     try {
       const asked = s.revision.peek();
       const update = Y.encodeStateAsUpdate(s.doc.ydoc);
-      const run = () => this.staging.update(update, brief, this.units ? intakeCopy(this.units) : undefined);
+      // copies of the files the scene wants now (again after a retry: none once given up)
+      const run = () => this.staging.update(update, brief, this.unitCopies(s, brief));
       let r: Staged;
       try {
         r = await run();
@@ -807,6 +881,8 @@ export class DeskWorkspace {
         if (!this.giveUpFiles(err)) throw err;
         r = await run();
       }
+      // the scene was let go meanwhile: nothing is applied
+      if (this.session !== s) throw new Error('the scene was closed');
       // the worker's checks are of the document it got plus its change: current only when nothing
       // else changed the scene meanwhile (else shown as out of date until the next check)
       const edited = s.revision.peek() !== asked;
@@ -814,11 +890,8 @@ export class DeskWorkspace {
       Y.applyUpdate(s.doc.ydoc, r.diff, s.doc.origin);
       s.undo.stopCapturing();
       this.keepCheck(s, r.check, edited ? asked : s.revision.peek());
-      if (this.units) {
-        this.lastUnitRows = r.summary.units ?? [];
-        // a unit the update placed is in the scene now: its file is let go
-        this.keepWantedUnits(s, brief);
-      }
+      // the files stay held: Ctrl+Z may take a unit the update placed out again
+      if (this.units) this.lastUnitRows = r.summary.units ?? [];
       // the full checks (blocking lines, layouts) of the updated scene, in the background
       void this.refreshCheck();
       return briefChanges(s.doc, brief, this.unitOptions());
@@ -879,46 +952,60 @@ export class DeskWorkspace {
 
   /**
    * Makes the scene's objects published as `pin` an instance of it (core adoptPublished, in the
-   * worker), with the record's pin of the unit's slot when `linked`. Applied with the storage origin:
-   * not an undo step (it records what the host did). Throws when no scene is open or the scene's
-   * published objects are gone.
+   * worker), with the record's pin of the unit's slot when `linked`. A write of the scene
+   * (queueWrite): the document and the brief are those of its turn. Applied with the storage origin:
+   * not an undo step (it records what the host did), and the undo and redo stacks are cleared, as
+   * Yjs cannot undo an older write of the record the adoption rewrote (Ctrl+Z does not go back past
+   * it). `follow`, the brief that pins the version (the host moved the pin), becomes the brief the
+   * scene follows in the same turn once the record pins it: a write queued after this one reads it.
+   * Throws when no scene is open, or the objects the unit was made from are gone (a set's every
+   * piece, or the root of any other unit).
    */
-  async adoptUnit(
+  adoptUnit(
     unit: Pick<UnitExtract, 'link' | 'from' | 'header'>,
     pin: { ref: string; version: number; sha256: string },
     linked: boolean,
+    follow?: SceneBrief | null,
   ): Promise<{ root: string; recorded: boolean; warnings: string[] }> {
-    const s = this.session;
-    const brief = this.brief;
-    if (!s || !brief) throw new Error('no scene is open');
-    const r = await this.staging.adoptUnit(Y.encodeStateAsUpdate(s.doc.ydoc), brief, {
-      slot: unit.from,
-      link: unit.link,
-      pin,
-      linked,
-      header: unit.header,
+    return this.queueWrite(async (s) => {
+      const brief = this.brief;
+      if (!brief) throw new Error('no scene is open');
+      if (!setPiecesLeft(s.doc, unit.link))
+        throw new Error('the objects it was made from are no longer in the scene');
+      const r = await this.staging.adoptUnit(Y.encodeStateAsUpdate(s.doc.ydoc), brief, {
+        slot: unit.from,
+        link: unit.link,
+        pin,
+        linked,
+        header: unit.header,
+      });
+      // the scene was let go meanwhile: nothing is applied
+      if (this.session !== s) throw new Error('the scene was closed');
+      Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
+      s.undo.clear();
+      // the editor's undo state (Edit menu, redo panel) follows the stacks
+      s.undoRevision.value++;
+      if (follow && r.recorded) this.brief = follow;
+      return { root: r.root, recorded: r.recorded, warnings: r.warnings };
     });
-    // the scene was let go meanwhile: nothing is applied
-    if (this.session !== s) throw new Error('the scene was closed');
-    Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
-    return { root: r.root, recorded: r.recorded, warnings: r.warnings };
   }
 
   /**
    * Make local: instance `root` keeps its objects as plain ones of the scene (core makeLocal, in the
-   * worker), as one undo step. Throws when no scene is open, or the instance is gone.
+   * worker), as one undo step. A write of the scene (queueWrite). Throws when no scene is open, or
+   * the instance is gone.
    */
-  async makeLocal(root: string): Promise<{ root: string; parts: number }> {
-    const s = this.session;
-    if (!s) throw new Error('no scene is open');
-    const r = await this.staging.makeLocal(Y.encodeStateAsUpdate(s.doc.ydoc), root);
-    // deleted while the worker ran, or the scene let go: nothing is applied
-    if (this.session !== s || !s.doc.getObject(root))
-      throw new Error('the library unit is no longer in the scene');
-    s.undo.stopCapturing();
-    Y.applyUpdate(s.doc.ydoc, r.diff, s.doc.origin);
-    s.undo.stopCapturing();
-    return { root: r.root, parts: r.parts };
+  makeLocal(root: string): Promise<{ root: string; parts: number }> {
+    return this.queueWrite(async (s) => {
+      const r = await this.staging.makeLocal(Y.encodeStateAsUpdate(s.doc.ydoc), root);
+      // deleted while the worker ran, or the scene let go: nothing is applied
+      if (this.session !== s || !s.doc.getObject(root))
+        throw new Error('the library unit is no longer in the scene');
+      s.undo.stopCapturing();
+      Y.applyUpdate(s.doc.ydoc, r.diff, s.doc.origin);
+      s.undo.stopCapturing();
+      return { root: r.root, parts: r.parts };
+    });
   }
 
   /** The shot results of a snapshot (host shot ids, brief order), from the worker. */

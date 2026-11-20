@@ -92,15 +92,18 @@ import type { LengthMismatch, OpenOutcome } from './workspace';
  *
  * Library units (docs/embedding.md "Library units"): ready always says what the desk does with them
  * (capabilities.units). The host turns them on for one open with options.units (acceptUnits; absent
- * or unreadable: off). With units off nothing of them happens: the brief's pins are stripped before
- * staging (briefWithoutPins), `open.units` is not read, no state carries `units` and no unit-publish
- * goes: the host sees today's traffic. With units on the open's files are checked (units.ts
- * readOpenUnits) and staged, every state carries `units` (the record's pins, per slot), the Library
- * tab's rows follow the scene (libraryRows), and with `publish` the person can save the set, an
- * actor's figure or a prop to the host's library (publish): unit-publish, then the wait for its
- * unit-ack (120 s plus 10 s per MiB; an invalid ack ends it at once), then, when the host linked it
- * and the open is editable, the scene adopts the version (not an undo step) and follows the pin the
- * host moved.
+ * or unreadable: off, logged when it was given or the brief has pins or open.units came, an
+ * unreadable one with the shape the desk reads). With units off nothing of them happens: the
+ * brief's pins are stripped before staging (briefWithoutPins), `open.units` is not read, no state
+ * carries `units` and no unit-publish goes: the host sees today's traffic. With units on the open's
+ * files are checked (units.ts readOpenUnits) and staged, every state carries `units` (the record's
+ * pins, per slot), the Library tab's rows follow the scene (libraryRows), and with `publish` the
+ * person can save the set, an actor's figure or a prop to the host's library (publish):
+ * unit-publish, then the wait for its unit-ack (120 s plus 10 s per MiB; an invalid ack ends it at
+ * once), then, when the host linked it and the open is editable, the scene adopts the version (not
+ * an undo step, and Ctrl+Z does not go back past it) and follows the pin the host moved. The
+ * adoption waits for an Update shots running (each is a write of the scene, one at a time:
+ * workspace.ts queueWrite), and no Update shots starts while the scene links.
  */
 
 /** What the controller needs of the scene (DeskWorkspace; tests give a fake one). */
@@ -137,11 +140,16 @@ export interface SceneWorkspace {
   defaultSaveTarget?(selected: string | null): SaveTarget | null;
   /** A unit of the scene with its thumbnail (read only). */
   extractUnit?(what: UnitTarget, name: string): Promise<UnitExtract>;
-  /** Links the scene to the version the host saved (not an undo step). */
+  /**
+   * Links the scene to the version the host saved (not an undo step; Ctrl+Z does not go back past
+   * it), after the scene's writes queued before it; `follow` becomes the brief the scene follows in
+   * the same turn when the record pins the version.
+   */
   adoptUnit?(
     unit: Pick<UnitExtract, 'link' | 'from' | 'header'>,
     pin: BriefUnitPin,
     linked: boolean,
+    follow?: SceneBrief | null,
   ): Promise<{ root: string; recorded: boolean; warnings: string[] }>;
   /** Make local (one undo step). */
   makeLocal?(root: string): Promise<{ root: string; parts: number }>;
@@ -332,6 +340,9 @@ export interface UnitPreview {
   warnings: string[];
 }
 
+/** The options.units this desk reads (protocol.ts UnitsOptionSchema), as the log names it. */
+const UNITS_OPTION_SHAPE = '{version: 1, publish: boolean}';
+
 /** The library pins a brief carries (its set's, its cast members' and its elements'). */
 const pinCount = (b: SceneBrief): number =>
   (b.set?.unit ? 1 : 0) +
@@ -402,6 +413,8 @@ export class DeskController {
   private cancelledOpen: Promise<void> | null = null;
   /** The running export (settles, never rejects). */
   private exporting: Promise<void> | null = null;
+  /** The running Update shots (settles, never rejects): a linked save waits for it before linking. */
+  private updateRun: Promise<void> | null = null;
   /** Done or Close is sending its last state. */
   private closing = false;
   private progressTimer: unknown = null;
@@ -577,10 +590,13 @@ export class DeskController {
     const pinned = pinCount(m.scene);
     // a brief without pins stays the very brief the host sent (units on or off)
     const brief = units || !pinned ? m.scene : briefWithoutPins(m.scene);
-    if (!units && (pinned || m.units !== undefined))
+    // logged when the host sent an options.units this desk does not read, or left it out with pins
+    // or open.units (a host from before units with neither: nothing to say)
+    const given = m.options?.units !== undefined;
+    if (!units && (given || pinned || m.units !== undefined))
       this.log(
         'info',
-        `library units are off for this open (no options.units the desk reads): ${pinned} pin(s) staged from the words, open.units not read`,
+        `library units are off for this open (${given ? `an options.units this desk does not read: it reads ${UNITS_OPTION_SHAPE}` : 'no options.units'}): ${pinned} pin(s) staged from the words, open.units not read`,
       );
     this.brief.value = brief;
     let intake: UnitIntake | null = null;
@@ -783,10 +799,24 @@ export class DeskController {
 
   // ---------------------------------------------------------------- update from the brief
 
-  /** Updates the shots to the brief (Update shots): one undo step. */
-  async updateShots(): Promise<void> {
-    if (this.status.peek() !== 'open' || this.updating.peek() || this.exportRun.peek()) return;
-    if (this.options.peek().readOnly) return;
+  /**
+   * Updates the shots to the brief (Update shots): one undo step. Not while a saved unit is being
+   * linked (the banner's button is off then): the update would have to wait for it anyway.
+   */
+  updateShots(): Promise<void> {
+    if (this.status.peek() !== 'open' || this.updating.peek() || this.exportRun.peek())
+      return Promise.resolve();
+    if (this.options.peek().readOnly || this.publishing.peek()?.phase === 'linking') return Promise.resolve();
+    const run = this.runUpdateShots();
+    this.updateRun = run;
+    const settled = () => {
+      if (this.updateRun === run) this.updateRun = null;
+    };
+    run.then(settled, settled);
+    return run;
+  }
+
+  private async runUpdateShots(): Promise<void> {
     this.updating.value = true;
     try {
       this.changes.value = await this.deps.workspace.updateFromBrief();
@@ -994,21 +1024,26 @@ export class DeskController {
       let note = ack.message;
       const ws = this.deps.workspace;
       if (linked) {
+        // an Update shots running ends first (no other starts while the scene links): the adoption
+        // is of the scene it leaves, and the open may have closed meanwhile
+        if (!this.options.peek().readOnly && this.status.peek() === 'open' && ws.adoptUnit) {
+          this.publishing.value = { ...this.publishing.peek()!, phase: 'linking' };
+          await this.updateRun;
+        }
         if (this.options.peek().readOnly) note = 'The scene is read-only here: it stays as it is.';
         else if (this.status.peek() !== 'open' || !ws.adoptUnit)
           note = 'The desk was closed: the next open brings the link.';
         else {
-          this.publishing.value = { ...this.publishing.peek()!, phase: 'linking' };
           try {
-            const r = await ws.adoptUnit(unit, pin, true);
-            adopted = true;
-            // the host pins the version from now on (its next brief says so): the desk follows
+            // the host pins the version from now on (its next brief says so): the scene follows,
+            // in the adoption's turn, so that no write queued after it reads the brief without it
             const brief = this.brief.peek();
-            const next =
-              r.recorded && brief && unit.from ? DeskController.briefWithPin(brief, unit.from, pin) : null;
-            if (next) {
-              this.brief.value = next;
-              ws.setBrief?.(next);
+            const follow = brief && unit.from ? DeskController.briefWithPin(brief, unit.from, pin) : null;
+            const r = await ws.adoptUnit(unit, pin, true, follow);
+            adopted = true;
+            if (r.recorded && follow) {
+              this.brief.value = follow;
+              ws.setBrief?.(follow);
             }
           } catch (err) {
             note = `${host} saved and linked it, but the scene could not be linked to it here: ${err instanceof Error ? err.message : String(err)}`;

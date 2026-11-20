@@ -197,7 +197,8 @@ function ChangesBanner({ c }: { c: DeskController }) {
   const [hidden, setHidden] = useState<BriefChanges | null>(null);
   if (!changes || hidden === changes) return null;
   const readOnly = c.options.value.readOnly;
-  const busy = c.updating.value || !!c.exportRun.value;
+  // off while the scene links a unit saved to the library too (controller.updateShots refuses then)
+  const busy = c.updating.value || !!c.exportRun.value || c.publishing.value?.phase === 'linking';
   return (
     <div class="desk-banner" data-testid="desk-changes" role="status" {...CHROME}>
       <Icon name="info" size={13} />

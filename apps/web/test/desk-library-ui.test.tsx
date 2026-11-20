@@ -1130,3 +1130,31 @@ describe('the desk’s modal windows', () => {
     expect(document.activeElement).toBe(send);
   });
 });
+
+describe('the banner of the brief’s changes', () => {
+  it('turns Update shots off while the scene links a unit the host saved, and on again after', async () => {
+    const { c } = await openDesk();
+    c.changes.value = {
+      added: ['sht_0123456789zzzz'],
+      removed: [],
+      retimed: [],
+      recast: [],
+      cast: { added: [], removed: [] },
+    };
+    const v = render(<DeskApp c={c} work={null} lengthChecks={() => []} />);
+    const update = () => q(v, 'desk-update-shots') as HTMLButtonElement;
+    const phase = (p: 'waiting' | 'linking' | null) =>
+      act(() => {
+        c.publishing.value = p && { kind: 'set', name: 'Meadow', phase: p, startedAt: 0, id: 'pub-1' };
+      });
+    expect(update().disabled).toBe(false);
+    // the host has not answered yet: the update could go first
+    await phase('waiting');
+    expect(update().disabled).toBe(false);
+    // the scene links the version the host saved: no update until it has
+    await phase('linking');
+    expect(update().disabled).toBe(true);
+    await phase(null);
+    expect(update().disabled).toBe(false);
+  });
+});

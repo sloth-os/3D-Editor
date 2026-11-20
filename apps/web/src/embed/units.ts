@@ -48,9 +48,13 @@ import {
  * - An entry left out records why for its pin: bytes that do not hash to their SHA-256 are pending
  *   `mismatch`; another format is refused `unreadable`, a newer format version `too_new`; an entry
  *   dropped for being over 32 MiB whose `ref` and `version` are a pin's is refused `too_large`;
- *   entries past 48 MiB in all (a host over its limit) are pending `unavailable`.
- * - The units kept after the open are those an Update shots could still place (core pinsWanted),
- *   within one staging's budget (core unitBudget): the desk has no cache of units.
+ *   entries past 48 MiB in all (a host over its limit), counted in slot order (the set, the cast,
+ *   the elements) whatever order the host sent them in, are pending `unavailable`.
+ * - The units kept after the open are those an Update shots could place (core pinsWanted), within
+ *   one staging's budget (core unitBudget), and only files whose SHA-256 is the pin's (another one
+ *   goes, its pin waiting as `mismatch`). They stay while the scene is open, also once an Update
+ *   shots placed them (Ctrl+Z may take that back); each Update shots gets copies of those the
+ *   scene wants then (intakeCopy with pinsWanted). The desk has no cache of units.
  * - A staging or an Update shots whose worker fails with the files (it stops, runs out of memory)
  *   runs again without them (withoutFiles): their pins wait, pending `unavailable`.
  */
@@ -73,7 +77,7 @@ export async function sha256Hex(bytes: Uint8Array): Promise<string> {
 
 /** The library units an open brought: the files that count for the brief's pins, and why the others do not. */
 export interface UnitIntake {
-  /** Files that count for a pin (their SHA-256 checked), in the order the host sent them. */
+  /** Files that count for a pin (their SHA-256 checked), in slot order (the set, the cast, the elements). */
   units: GivenUnit[];
   /** Why a pinned `ref@version` the host sent cannot be used (core's GivenProblem). */
   problems: GivenProblem[];
@@ -104,7 +108,11 @@ export async function readOpenUnits(
   o: { hash?: (bytes: Uint8Array) => Promise<string> } = {},
 ): Promise<UnitIntake> {
   const hash = o.hash ?? sha256Hex;
-  const pinned = new Set(briefPins(brief).map((p) => pinKey(p.pin)));
+  // each pinned ref@version with the first slot that pins it (slot order: the set, the cast, the elements)
+  const pinned = new Map<string, number>();
+  briefPins(brief).forEach((p, slot) => {
+    if (!pinned.has(pinKey(p.pin))) pinned.set(pinKey(p.pin), slot);
+  });
   const out = emptyIntake();
   const problem = (ref: string, version: number, p: Omit<GivenProblem, 'ref' | 'version'>) =>
     out.problems.push({ ref, version, ...p });
@@ -132,12 +140,16 @@ export async function readOpenUnits(
   const droppedAt = new Set(dropped.map((d) => d.index));
   const indexes: number[] = [];
   if (Array.isArray(raw)) for (let k = 0; k < raw.length; k++) if (!droppedAt.has(k)) indexes.push(k);
+  // the 48 MiB go to the slots in slot order, whatever order the host sent the files in (a stable
+  // sort: of two entries of one ref@version the first the host sent still counts)
+  const last = pinned.size;
+  const entries = units
+    .map((u, i) => ({ u, index: indexes[i] ?? i }))
+    .sort((a, b) => (pinned.get(pinKey(a.u)) ?? last) - (pinned.get(pinKey(b.u)) ?? last));
   const seen = new Set<string>();
   let total = 0;
-  for (let i = 0; i < units.length; i++) {
-    const u = units[i];
+  for (const { u, index } of entries) {
     const key = pinKey(u);
-    const index = indexes[i] ?? i;
     if (!pinned.has(key)) {
       out.ignored.push({ index, reason: `${key} is pinned by no slot of the brief` });
       continue;
@@ -184,16 +196,28 @@ export async function readOpenUnits(
     total += data.byteLength;
     out.units.push({ ref: u.ref, version: u.version, sha256: u.sha256, data });
   }
+  // logged in the host's order
+  out.ignored.sort((a, b) => a.index - b.index);
   return out;
 }
 
 /** The page's source of the units held (headers read now, nothing decoded): for briefChanges. */
 export const intakeSource = (intake: UnitIntake): UnitSource => unitSourceOf(intake.units, intake.problems);
 
-/** The units an intake holds, copied for a worker request (the copies' buffers can be transferred). */
-export function intakeCopy(intake: UnitIntake): { units: GivenUnit[]; problems: GivenProblem[] } {
+/**
+ * The units an intake holds, copied for a worker request (the copies' buffers can be transferred);
+ * with `wanted` (core pinsWanted of the scene now), only the files of those pins: one whose version
+ * the scene holds already goes to no Update shots.
+ */
+export function intakeCopy(
+  intake: UnitIntake,
+  wanted?: readonly BriefUnitPin[],
+): { units: GivenUnit[]; problems: GivenProblem[] } {
+  const want = wanted && new Map(wanted.map((p) => [pinKey(p), p.sha256]));
   return {
-    units: intake.units.map((u) => ({ ...u, data: u.data.slice() })),
+    units: intake.units
+      .filter((u) => !want || want.get(pinKey(u)) === u.sha256)
+      .map((u) => ({ ...u, data: u.data.slice() })),
     problems: intake.problems.map((p) => ({ ...p })),
   };
 }
@@ -203,16 +227,31 @@ export const intakeTransfer = (copy: { units: GivenUnit[] }): Transferable[] =>
   copy.units.map((u) => u.data.buffer as ArrayBuffer);
 
 /**
- * The intake kept after an open or an update: only the units `wanted` (core pinsWanted: those an
- * Update shots could still place), within one staging's budget (core unitBudget, in the order of
- * `wanted`); a wanted unit past the budget waits for another open (pending `unavailable`). Problems
+ * The intake kept after an open: only the units `wanted` (core pinsWanted: those an Update shots
+ * could place), within one staging's budget (core unitBudget, in the order of `wanted`); a wanted
+ * unit past the budget waits for another open (pending `unavailable`). A file whose SHA-256 is not
+ * the wanted pin's can never be placed: it goes, and its pin waits (pending `mismatch`). Problems
  * are kept for the wanted pins only.
  */
 export function keepWanted(intake: UnitIntake, wanted: readonly BriefUnitPin[]): UnitIntake {
-  const want = new Set(wanted.map(pinKey));
-  const held = new Map(intake.units.filter((u) => want.has(pinKey(u))).map((u) => [pinKey(u), u]));
+  const want = new Map(wanted.map((p) => [pinKey(p), p]));
+  const problems = intake.problems.filter((p) => want.has(pinKey(p)));
+  const held = new Map<string, GivenUnit>();
+  for (const u of intake.units) {
+    const pin = want.get(pinKey(u));
+    if (!pin) continue;
+    if (u.sha256 === pin.sha256) held.set(pinKey(u), u);
+    else
+      problems.push({
+        ref: u.ref,
+        version: u.version,
+        staged: 'pending',
+        why: 'mismatch',
+        message: `${pinKey(u)}: the file sent is not the pinned one (its SHA-256 is another)`,
+      });
+  }
   const budget = unitBudget(
-    wanted.filter((p) => held.get(pinKey(p))?.sha256 === p.sha256),
+    wanted.filter((p) => held.has(pinKey(p))),
     (p) => {
       const u = held.get(pinKey(p))!;
       try {
@@ -224,7 +263,6 @@ export function keepWanted(intake: UnitIntake, wanted: readonly BriefUnitPin[]):
     },
   );
   const units: GivenUnit[] = [];
-  const problems = intake.problems.filter((p) => want.has(pinKey(p)));
   for (const u of held.values()) {
     const verdict = budget.verdicts.get(pinKey(u));
     if (verdict === undefined || verdict === 'fits') units.push(u);

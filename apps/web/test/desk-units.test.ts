@@ -9,16 +9,18 @@ import {
   decodePNG,
   evaluatedBounds,
   extractUnit,
+  getShots,
   listUnits,
   readUnitHeader,
   renderItems,
   sha256Hex as coreSha256Hex,
   stateUnitRows,
   threeQuarterView,
+  unitStatus,
   type BriefChanges,
   type SceneBrief,
 } from '@3d-editor/core';
-import { DeskController, type SceneWorkspace } from '../src/embed/controller';
+import { CHANGES_QUIET_MS, DeskController, type SceneWorkspace } from '../src/embed/controller';
 import {
   MAX_THUMBNAIL_BYTES,
   deskMessageProblems,
@@ -102,6 +104,15 @@ const pinnedBrief = () =>
   withPins(exampleBrief(), { set: L().set, cast: { [MIRA]: L().mira }, elements: { [KITE]: L().kite } });
 /** open.units for pinnedBrief. */
 const pinnedUnits = () => [openUnit(L().set), openUnit(L().mira), openUnit(L().kite)];
+/** A shot the example brief does not have (a later brief adds it). */
+const NEW_SHOT = 'sht_0123456789zzzz';
+/** `b` with one shot more at its end (its last shot again, under an id of its own). */
+function withNewShot(b: SceneBrief): SceneBrief {
+  const next = structuredClone(b);
+  const last = next.shots[next.shots.length - 1];
+  next.shots.push({ ...structuredClone(last), id: NEW_SHOT, index: next.shots.length });
+  return next;
+}
 
 type Staged = Extract<StagingReply, { summary: unknown }>;
 type Extracted = Extract<StagingReply, { kind: 'unit-extract' }>;
@@ -208,6 +219,8 @@ async function realDesk(o: {
   units?: unknown;
   host?: string;
   ws?: DeskWorkspace;
+  /** The host's state of the scene (default none). */
+  state?: unknown;
 }) {
   const ws = o.ws ?? workspace();
   const sent: { message: DeskMessage; transfer?: Transferable[] }[] = [];
@@ -230,7 +243,7 @@ async function realDesk(o: {
   c.message({
     type: 'open',
     scene: o.scene,
-    state: null,
+    state: o.state ?? null,
     ...(o.options ? { options: o.options } : {}),
     ...(o.units !== undefined ? { units: o.units } : {}),
   } as never);
@@ -243,22 +256,23 @@ async function realDesk(o: {
 // ---------------------------------------------------------------- the open's files
 
 describe("the open's library units", () => {
-  it("takes the files of the brief's pins whose bytes hash to their SHA-256, in the order sent", async () => {
+  it("takes the files of the brief's pins whose bytes hash to their SHA-256, in slot order", async () => {
     const intake = await readOpenUnits(
       [openUnit(L().kite), openUnit(L().set), openUnit(L().mira)],
       pinnedBrief(),
     );
+    // the set, the cast, the elements, whatever order the host sent them in
     expect(intake.units.map((u) => `${u.ref}@${u.version}`)).toEqual([
-      key(L().kite),
       key(L().set),
       key(L().mira),
+      key(L().kite),
     ]);
     expect(intake.units.map((u) => u.sha256)).toEqual([
-      L().kite.pin.sha256,
       L().set.pin.sha256,
       L().mira.pin.sha256,
+      L().kite.pin.sha256,
     ]);
-    expect(intake.units[0].data).toEqual(L().kite.data);
+    expect(intake.units[2].data).toEqual(L().kite.data);
     expect(intake.problems).toEqual([]);
     expect(intake.ignored).toEqual([]);
   });
@@ -331,6 +345,40 @@ describe("the open's library units", () => {
     expect(intake.ignored).toEqual([{ index: 3, reason: 'over 32 MiB' }]);
   });
 
+  it('spends the 48 MiB of an open in slot order (the set, the cast, the elements), whatever order the host sent the files in', async () => {
+    const MiB = 1024 * 1024;
+    const big = (ref: string, mib: number, mark: number): Lib => {
+      const data = new Uint8Array(mib * MiB);
+      data[0] = mark;
+      return { pin: { ref, version: 1, sha256: String(mark).repeat(64) }, data };
+    };
+    const entry = (l: Lib) => ({
+      ...l.pin,
+      unit: { format: '3d-editor.desk-unit', version: 1, data: l.data.buffer },
+    });
+    const set = big('lib_0123456789mead', 20, 1);
+    const kite = big('lib_0123456789kite', 30, 2);
+    const brief = withPins(exampleBrief(), { set, elements: { [KITE]: kite } });
+    const hash = async (d: Uint8Array) => String(d[0]).repeat(64);
+    const read = async (sent: Lib[]) => {
+      const intake = await readOpenUnits(sent.map(entry), brief, { hash });
+      return {
+        units: intake.units.map((u) => u.ref),
+        problems: intake.problems.map((p) => [p.ref, p.staged, p.why]),
+      };
+    };
+    // the set, the first slot, gets the budget; the prop past 48 MiB waits for another open
+    const slotOrder = { units: [set.pin.ref], problems: [[kite.pin.ref, 'pending', 'unavailable']] };
+    expect(await read([kite, set])).toEqual(slotOrder);
+    expect(await read([set, kite])).toEqual(slotOrder);
+    // of two files of one ref@version the first the host sent counts, as before
+    const copy: Lib = { pin: set.pin, data: new Uint8Array(16).fill(9) };
+    const dup = await readOpenUnits([kite, copy, set].map(entry), brief, { hash });
+    expect(dup.problems.map((p) => [p.ref, p.why])).toEqual([[set.pin.ref, 'mismatch']]);
+    expect(dup.units.map((u) => u.ref)).toEqual([kite.pin.ref]);
+    expect(dup.ignored).toEqual([{ index: 2, reason: `${key(set)} was sent before: the first one counts` }]);
+  });
+
   it("reads the contract's open-units.json: its files count for their pins, and staging refuses their text bytes as unreadable", async () => {
     const fixture = JSON.parse(
       readFileSync(resolve(__dirname, 'fixtures/desk-protocol/open-units.json'), 'utf8'),
@@ -390,6 +438,36 @@ describe("the open's library units", () => {
     const over = keepWanted({ units: [a, b], problems: [], ignored: [] }, [a, b]);
     expect(over.units.map((u) => u.ref)).toEqual([a.ref]);
     expect(over.problems).toEqual([{ ref: b.ref, version: 1, staged: 'pending', why: 'unavailable' }]);
+  });
+
+  it('lets go of a file whose SHA-256 is not the pin’s, and its pin keeps waiting as mismatch', async () => {
+    const brief = withPins(exampleBrief(), { elements: { [KITE]: L().kite } });
+    // a file for the kite's ref@version that hashes to its own SHA-256, not to the pin's
+    const other = lib(L().kite.pin.ref, 1, L().set.data);
+    const intake = await readOpenUnits([openUnit(other)], brief);
+    expect(intake.units.map((u) => u.sha256)).toEqual([other.pin.sha256]);
+    const kept = keepWanted(intake, [L().kite.pin]);
+    expect(kept.units).toEqual([]);
+    expect(kept.problems).toEqual([
+      {
+        ref: L().kite.pin.ref,
+        version: 1,
+        staged: 'pending',
+        why: 'mismatch',
+        message: `${key(L().kite)}: the file sent is not the pinned one (its SHA-256 is another)`,
+      },
+    ]);
+    // the workspace holds nothing of it after the open, and an Update shots still says mismatch
+    const ws = workspace();
+    const r = await ws.open({ hostOrigin: origin(), brief, state: null, units: intake });
+    expect(rowsOf(r.units!)).toEqual([[`el:${KITE}`, 'words', 'mismatch']]);
+    expect(ws.heldUnits()).toEqual([]);
+    ws.setBrief(withNewShot(brief));
+    await ws.updateFromBrief();
+    expect(rowsOf(ws.unitRows()!)).toEqual([[`el:${KITE}`, 'words', 'mismatch']]);
+    expect(stateUnits(ws.session!.doc).map((u) => [u.slot, u.staged, u.why])).toEqual([
+      [`el:${KITE}`, 'pending', 'mismatch'],
+    ]);
   });
 
   it('gives the worker copies of the files, each a buffer of its own to hand over', () => {
@@ -728,7 +806,7 @@ describe('the desk workspace with library units', () => {
     expect(ws.libraryRows()).toEqual([]);
   });
 
-  it('keeps the file of a pin the scene does not hold yet for Update shots, which places it in one undo step and lets it go', async () => {
+  it('keeps the file of a pin the scene does not hold yet for Update shots, which places it in one undo step; after Ctrl+Z it offers and places it again', async () => {
     const host = origin();
     const first = workspace();
     await first.open({ hostOrigin: host, brief: exampleBrief(), state: null, units: emptyIntake() });
@@ -763,11 +841,30 @@ describe('the desk workspace with library units', () => {
     ]);
     expect(s.undo.undoStack.length).toBe(1);
     expect(ws.unitRows()).toEqual([expect.objectContaining({ slot: `el:${KITE}`, staged: 'unit' })]);
-    expect(ws.heldUnits()).toEqual([]);
+    // the open's files stay while the scene is open: Ctrl+Z may need this one again
+    expect(ws.heldUnits()).toEqual([key(L().kite)]);
     expect(ws.changes()).toBeNull();
     expect(ws.libraryRows()).toMatchObject([{ key: `el:${KITE}`, status: 'current' }]);
     s.undo.undo();
     expect(listUnits(s.doc)).toEqual([]);
+    // the banner and the tab offer it again, and Update shots places it again
+    expect(ws.changes()?.other).toContain('1 prop from the library');
+    expect(ws.libraryRows()).toMatchObject([
+      { key: `el:${KITE}`, status: 'update', text: 'v1 is here: Update shots places it' },
+    ]);
+    await ws.updateFromBrief();
+    expect(listUnits(s.doc).map((i) => i.key)).toEqual([`el:${KITE}`]);
+    expect(ws.unitRows()).toEqual([expect.objectContaining({ slot: `el:${KITE}`, staged: 'unit' })]);
+    expect(stateUnits(s.doc)).toEqual([
+      { slot: `el:${KITE}`, ...L().kite.pin, staged: 'unit', local: false },
+    ]);
+    // a later Update shots gets no copy of a file whose version the scene holds
+    const update = vi.spyOn(ws.staging, 'update');
+    ws.setBrief(withNewShot(brief));
+    await ws.updateFromBrief();
+    expect(update).toHaveBeenCalledTimes(1);
+    expect(update.mock.calls[0][2]?.units).toEqual([]);
+    expect(listUnits(s.doc).map((i) => i.key)).toEqual([`el:${KITE}`]);
   });
 
   it('makes an instance local as one undo step: the record keeps its pin as local, and the next state is version 1', async () => {
@@ -825,8 +922,18 @@ describe('the desk workspace with library units', () => {
     expect(ws.revision()).toBe(before);
     expect(new Uint8Array((await ws.encodeState()).state.data)[8]).toBe(1);
     const pin = { ref: 'lib_0123456789kite', version: 7, sha256: unit.sha256 };
+    // an edit made before the link is one undo step until the adoption, which Ctrl+Z does not go
+    // back past: the steps before it go (the record it rewrote could not be undone any more)
+    s.doc.addObject({ type: 'EMPTY', name: 'Marker' });
+    s.undo.stopCapturing();
+    s.doc.addObject({ type: 'EMPTY', name: 'Marker 2' });
+    s.undo.undo();
+    expect([s.undo.undoStack.length, s.undo.redoStack.length]).toEqual([1, 1]);
+    const steps = s.undoRevision.peek();
     expect(await ws.adoptUnit(unit, pin, true)).toMatchObject({ root: kiteRoot, recorded: true });
-    expect(s.undo.undoStack.length).toBe(0);
+    expect([s.undo.undoStack.length, s.undo.redoStack.length]).toEqual([0, 0]);
+    // the editor's undo state (the redo panel) follows
+    expect(s.undoRevision.peek()).toBeGreaterThan(steps);
     expect(listUnits(s.doc).map((i) => [i.key, i.ref, i.version])).toEqual([[`el:${KITE}`, pin.ref, 7]]);
     expect(new Uint8Array((await ws.encodeState()).state.data)[8]).toBe(UNITS_CONTAINER_VERSION);
     // the brief the scene was opened with pins nothing there: an update would take the unit away
@@ -945,6 +1052,22 @@ describe('the desk controller with library units', () => {
     await waitUntil(() =>
       expect(t.c.libraryRows.value).toMatchObject([{ key: `el:${KITE}`, status: 'current' }]),
     );
+    // Ctrl+Z takes the Update shots back, and the banner with it once the edits pause
+    const s = t.ws.session!;
+    s.undo.undo();
+    t.timers.advance(CHANGES_QUIET_MS);
+    expect(listUnits(s.doc)).toEqual([]);
+    expect(t.c.changes.value).not.toBeNull();
+    expect(await bannerWords(t.c.changes.value!)).toBe('1 prop from the library');
+    expect(t.c.libraryRows.value).toMatchObject([{ key: `el:${KITE}`, status: 'update' }]);
+    // and Update shots places it again with the file the open brought
+    await t.c.updateShots();
+    expect(listUnits(s.doc).map((i) => i.key)).toEqual([`el:${KITE}`]);
+    expect(t.c.notice.value).toMatchObject({
+      level: 'info',
+      message: 'The shots were updated to the brief (Ctrl+Z undoes it).',
+    });
+    expect(t.c.changes.value).toBeNull();
   });
 
   it("without options.units: the brief's pins are staged as though never sent, open.units is not read, and the host sees today's messages", async () => {
@@ -984,6 +1107,87 @@ describe('the desk controller with library units', () => {
       code: 'unavailable',
     });
     expect(pinned.sent.map((s) => s.message.type)).toEqual(['ready', 'opened', 'state']);
+  });
+
+  it('reopened with units off, a scene that holds units offers taking them out, as a host from before units would', async () => {
+    const host = origin();
+    const brief = withPins(exampleBrief(), { set: L().set, elements: { [KITE]: L().kite } });
+    const on = await realDesk({
+      scene: brief,
+      options: UNITS_ON,
+      units: [openUnit(L().set), openUnit(L().kite)],
+      host,
+    });
+    const [state] = on.ofType('state');
+    expect(state.units?.map((u) => [u.slot, u.staged])).toEqual([
+      [`el:${KITE}`, 'unit'],
+      ['set', 'unit'],
+    ]);
+    on.c.dispose();
+    on.ws.close();
+    // the same scene with its state, from a host that leaves options.units out (docs/embedding.md:
+    // a host keeps options.units on while offline, so that this does not happen)
+    const off = await realDesk({ scene: brief, host, state: state.state });
+    expect(off.c.units.value).toBeNull();
+    expect(off.c.source.value).toBe('state');
+    expect(off.c.changes.value?.other).toEqual([
+      'the set from the words (no library set)',
+      '1 prop back to the words',
+    ]);
+    expect(off.logs).toContainEqual(
+      'library units are off for this open (no options.units): 2 pin(s) staged from the words, open.units not read',
+    );
+  });
+
+  it('logs an options.units it cannot read, with the shape it reads, and nothing for an open without one', async () => {
+    const open = async (options: Record<string, unknown>) => {
+      const logs: string[] = [];
+      const sent: DeskMessage[] = [];
+      const ws: SceneWorkspace = {
+        open: vi.fn(async () => ({
+          source: 'brief' as const,
+          changes: null,
+          unreadable: null,
+          plan: 'stage' as const,
+          stageMs: 1,
+          persistent: true,
+        })),
+        encodeState: vi.fn(async () => ({
+          state: { format: '3d-editor.desk-state' as const, version: 1 as const, data: new ArrayBuffer(16) },
+          shots: 2,
+        })),
+        onEdit: () => () => {},
+        snapshot: () => new Uint8Array([1]),
+        stagedShots: () => [],
+        lengthMismatches: () => [],
+        changes: () => null,
+        updateFromBrief: vi.fn(async () => null),
+        results: vi.fn(async () => []),
+        projectId: 'desk-0123',
+      };
+      const c = new DeskController({
+        send: (m) => {
+          sent.push(m);
+          return true;
+        },
+        workspace: ws,
+        exportSupport: () => Promise.resolve({ available: false, reason: 'not in this test' }),
+        deskVersion: 'test',
+        timers: handTimers(),
+        log: (_level, m) => logs.push(m),
+      });
+      await c.connected('https://host.example');
+      c.message({ type: 'open', scene: exampleBrief(), state: null, options } as never);
+      await waitUntil(() => expect(sent.some((m) => m.type === 'state')).toBe(true));
+      expect(c.units.value).toBeNull();
+      return logs.filter((l) => l.includes('library units'));
+    };
+    const unread =
+      'library units are off for this open (an options.units this desk does not read: it reads {version: 1, publish: boolean}): 0 pin(s) staged from the words, open.units not read';
+    expect(await open({ units: { version: 2, publish: true } })).toEqual([unread]);
+    expect(await open({ units: { version: 1, publish: 'yes' } })).toEqual([unread]);
+    // a host from before units, with a brief without pins: nothing to say
+    expect(await open({ hostName: 'rideo' })).toEqual([]);
   });
 
   it('saves a part of the real scene to the library: the linked ack makes it an instance of the version, the brief follows its pin, and the next state says so', async () => {
@@ -1049,6 +1253,123 @@ describe('the desk controller with library units', () => {
     expect(s.undo.undoStack.length).toBe(1);
     expect(t.c.libraryRows.value).toMatchObject([{ key: `el:${KITE}`, status: 'local' }]);
     expect(await t.c.makeLocal('nope')).toMatchObject({ ok: false });
+  });
+});
+
+describe("the scene's writes, one at a time", () => {
+  /** A desk whose scene was staged from the example brief, opened again with `brief` (one shot more). */
+  async function laterBrief(brief = withNewShot(exampleBrief())) {
+    const host = origin();
+    const first = await realDesk({ scene: exampleBrief(), options: UNITS_ON, host });
+    first.c.dispose();
+    first.ws.close();
+    const t = await realDesk({ scene: brief, options: UNITS_ON, host });
+    expect(t.c.changes.value?.added).toEqual([NEW_SHOT]);
+    return t;
+  }
+  /** Saves the set: its unit-publish sent, `ack` answers that the host saved and linked it. */
+  async function saveSet(t: Awaited<ReturnType<typeof realDesk>>) {
+    const done = t.c.publish({ what: { set: true }, name: 'Meadow' });
+    await waitUntil(() => expect(t.ofType('unit-publish')).toHaveLength(1));
+    const [m] = t.ofType('unit-publish');
+    const ack = () =>
+      t.c.message({
+        type: 'unit-ack',
+        id: m.id,
+        ok: true,
+        ref: 'lib_0123456789set1',
+        version: 1,
+        linked: true,
+      });
+    return { done, ack };
+  }
+  /** The scene: its shots, its instances with their parts missing, the record's rows, the brief's changes. */
+  function sceneOf(t: Awaited<ReturnType<typeof realDesk>>) {
+    const doc = t.ws.session!.doc;
+    return {
+      shots: getShots(doc).length,
+      instances: listUnits(doc).map((i) => [i.key, unitStatus(doc, i.root).missing.length]),
+      rows: stateUnitRows(doc).map((r) => [r.slot, r.staged]),
+      banner: t.c.changes.value,
+      changes: t.ws.changes(),
+    };
+  }
+  const BOTH = { shots: 3, instances: [['set', 0]], rows: [['set', 'unit']], banner: null, changes: null };
+
+  it('a linked save answered while Update shots runs keeps both: the new shot recorded and the set linked', async () => {
+    const t = await laterBrief();
+    const save = await saveSet(t);
+    expect(t.c.publishing.value?.phase).toBe('waiting');
+    // the person closed the Save dialog and pressed Update shots; the host answers meanwhile
+    const update = t.c.updateShots();
+    expect(t.c.updating.value).toBe(true);
+    save.ack();
+    const [r] = await Promise.all([save.done, update]);
+    expect(r).toMatchObject({ ok: true, linked: true, adopted: true });
+    expect(sceneOf(t)).toEqual(BOTH);
+  });
+
+  it('takes no Update shots while the scene links a saved unit; pressed after, it keeps the link', async () => {
+    const t = await laterBrief();
+    const st = t.ws.staging;
+    const adopt = st.adoptUnit.bind(st);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    vi.spyOn(st, 'adoptUnit').mockImplementation(async (u, b, o) => {
+      await gate;
+      return adopt(u, b, o);
+    });
+    const update = vi.spyOn(st, 'update');
+    const save = await saveSet(t);
+    save.ack();
+    await waitUntil(() => expect(t.c.publishing.value?.phase).toBe('linking'));
+    await t.c.updateShots();
+    expect(update).not.toHaveBeenCalled();
+    expect(t.c.updating.value).toBe(false);
+    release();
+    expect(await save.done).toMatchObject({ ok: true, linked: true, adopted: true });
+    expect(sceneOf(t)).toMatchObject({ shots: 2, instances: [['set', 0]], rows: [['set', 'unit']] });
+    expect(t.c.changes.value?.added).toEqual([NEW_SHOT]);
+    await t.c.updateShots();
+    expect(sceneOf(t)).toEqual(BOTH);
+  });
+
+  it('does not link a saved set whose pieces Update shots replaced meanwhile: no instance is left without its parts', async () => {
+    const brief = withNewShot(exampleBrief());
+    brief.set = {
+      ...brief.set,
+      description: 'A cobbled harbour at dusk, fishing boats moored along the quay, a lighthouse.',
+    };
+    const t = await laterBrief(brief);
+    const save = await saveSet(t);
+    const update = t.c.updateShots();
+    save.ack();
+    const [r] = await Promise.all([save.done, update]);
+    expect(r).toEqual({
+      ok: true,
+      ref: 'lib_0123456789set1',
+      version: 1,
+      linked: true,
+      adopted: false,
+      message:
+        'the host saved and linked it, but the scene could not be linked to it here: the objects it was made from are no longer in the scene',
+    });
+    expect(sceneOf(t)).toEqual({ shots: 3, instances: [], rows: [], banner: null, changes: null });
+  });
+
+  it('Ctrl+Z does not go back past a linked save: the scene keeps what its record says', async () => {
+    const t = await laterBrief();
+    await t.c.updateShots();
+    const s = t.ws.session!;
+    expect(s.undo.canUndo()).toBe(true);
+    const save = await saveSet(t);
+    save.ack();
+    expect(await save.done).toMatchObject({ ok: true, adopted: true });
+    expect(s.undo.canUndo()).toBe(false);
+    s.undo.undo();
+    t.timers.advance(CHANGES_QUIET_MS);
+    expect(sceneOf(t)).toEqual(BOTH);
+    expect(t.ws.stagedShots()).toContain(NEW_SHOT);
   });
 });
 
@@ -1162,10 +1483,12 @@ describe('Save to library', () => {
       adopted: true,
       message: 'Saved.',
     });
+    // with the brief that pins the version, which the scene follows in the adoption's own turn
     expect(t.ws.adoptUnit).toHaveBeenCalledWith(
       expect.objectContaining({ link: t.unit.link, from: t.unit.from }),
       pinOf(t, 3),
       true,
+      t.c.brief.value,
     );
     expect(t.c.brief.value!.elements.find((e) => e.id === KITE)!.unit).toEqual(pinOf(t, 3));
     expect(t.ws.setBrief).toHaveBeenCalledWith(t.c.brief.value);
