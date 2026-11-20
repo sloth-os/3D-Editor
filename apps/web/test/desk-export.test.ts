@@ -438,7 +438,8 @@ describe("the Send check's lengths on a staged scene", () => {
   const EXAMPLE = (): SceneBrief => structuredClone(fixture('open.json').scene);
 
   // A test that stages the example brief takes 30 s (its last argument): up to 1.1 s in the whole web
-  // suite and 2 s beside core's suite, near half of vitest's 5 s default.
+  // suite and 2 s beside core's suite, near half of vitest's 5 s default; under coverage, as CI runs
+  // the suites, up to 1.3 s, alone or beside core's suite.
 
   /** The example brief staged into an empty document. */
   function staged(): SceneDoc {
@@ -479,7 +480,7 @@ describe("the Send check's lengths on a staged scene", () => {
     expect(lengthChecks(doc, EXAMPLE())).toEqual([
       { shotId: a, name: shots[0].name, frames: 84, briefFrames: 72, byBrief: false },
     ]);
-  });
+  }, 30_000);
 });
 
 describe('a failing progress listener', () => {

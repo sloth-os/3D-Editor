@@ -120,9 +120,9 @@ class FakeLocks implements SceneLocks {
 
 let n = 0;
 /*
- * A test that stages or reopens the scene more than once takes 30 s (its last argument): up to 1.8 s
- * with this file alone, 4.1 s in the whole web suite and 2.8 s beside core's suite, close to
- * vitest's 5 s default.
+ * The describes below give each test 30 s: a test that stages, opens or reopens the scene took up to
+ * 2.5 s under coverage, as CI runs the suites, and up to 7.7 s beside core's suite, where one on
+ * vitest's 5 s default that opens it twice took 4.97 s and one that opens it once 3.1 s.
  */
 
 /** A host origin of its own per test (its projects do not meet another test's). */
@@ -197,7 +197,7 @@ async function stateOf(host: string, brief = EXAMPLE()) {
   return state;
 }
 
-describe('the desk workspace', () => {
+describe('the desk workspace', { timeout: 30_000 }, () => {
   it('keeps a project per host origin and scene', () => {
     const a = deskProjectId('https://a.example', 'clp_1');
     expect(a).toMatch(/^desk-[0-9a-f]{32}$/);
@@ -237,7 +237,7 @@ describe('the desk workspace', () => {
     const r2 = await again.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
     expect(r2).toMatchObject({ source: 'local', changes: null, plan: 'local', stageMs: null });
     expect(hostShots(again)).toEqual([SHOT_A, SHOT_B]);
-  }, 30_000);
+  });
 
   it("opens a host's state where there is no copy, and merges it with a copy of the same staging", async () => {
     const host = origin();
@@ -295,7 +295,7 @@ describe('the desk workspace', () => {
     expect(readLineage(back.session!.doc)).not.toBe(localLineage);
     expect(back.session!.doc.map('meta').get('local_only')).toBeUndefined();
     expect(hostShots(back)).toEqual([SHOT_A, SHOT_B]);
-  }, 30_000);
+  });
 
   it('does not apply a state it cannot read, says why, and opens as without one: the local copy, else the brief', async () => {
     const other = { ...EXAMPLE(), id: 'clp_other0000000001' };
@@ -327,7 +327,7 @@ describe('the desk workspace', () => {
     expect(b.unreadable).toMatch(/belongs to scene 'clp_other0000000001'/);
     expect(back.session!.doc.map('meta').get('work')).toBe('kept');
     expect(readLineage(back.session!.doc)).toBe(lineage);
-  }, 30_000);
+  });
 
   it('never deletes the local copy for a state of the scene that holds no staging', async () => {
     const host = origin();
@@ -494,7 +494,7 @@ describe('the desk workspace', () => {
     await new Promise((r) => setTimeout(r, 20));
     third.close();
     await expect(waiting).rejects.toThrow(/abort/i);
-  }, 30_000);
+  });
 
   it('ends an open cancelled while its state unpacks: it never waits for the other desk, and that desk keeps its scene', async () => {
     const host = origin();
@@ -612,7 +612,7 @@ describe('the desk workspace', () => {
     });
     expect(readLineage(again.session!.doc)).not.toBe(elsewhereLineage);
     expect(again.session!.doc.map('meta').get('local_only')).toBeUndefined();
-  }, 30_000);
+  });
 
   it('stamps a background check with the revision it checked, and shows the blocking line after staging and Update shots', async () => {
     const host = origin();
@@ -639,7 +639,7 @@ describe('the desk workspace', () => {
     expect(lastCheck.value!.revision).toBe(b.revision.peek());
     const lined = new Set(lastCheck.value!.result.lines.filter((l) => l.line).map((l) => l.shot));
     expect(getShots(b.doc).every((x) => lined.has(x.id))).toBe(true);
-  }, 30_000);
+  });
 
   it("asks for its full checks in the background, behind the person's requests to the worker", async () => {
     const ws = workspace();
@@ -671,7 +671,7 @@ describe('the desk workspace', () => {
     // the full check that follows is of the scene as it is
     await ws.backgroundCheck;
     expect(lastCheck.value!.revision).toBe(s.revision.peek());
-  }, 30_000);
+  });
 
   it('lists how a later brief differs and updates the shots to it in one undo step', async () => {
     const host = origin();
@@ -791,7 +791,7 @@ const echoExport = () =>
     release: async () => {},
   }));
 
-describe('the desk workspace with the controller', () => {
+describe('the desk workspace with the controller', { timeout: 30_000 }, () => {
   it('sends no state on its own after one it could not read, until an edit', async () => {
     const ws = workspace();
     const encode = vi.spyOn(ws, 'encodeState');
@@ -832,7 +832,7 @@ describe('the desk workspace with the controller', () => {
     expect(ofType('error')).toEqual([]);
     expect(first.session).not.toBeNull();
     c.dispose();
-  }, 20_000);
+  });
 
   it('ends an open that Close cancelled while the state unpacked, though another desk has the scene', async () => {
     const host = origin();
@@ -855,7 +855,7 @@ describe('the desk workspace with the controller', () => {
     expect(ofType('opened')[0]).toMatchObject({ sceneId: 'clp_fedcba9876543211' });
     expect(first.session).not.toBeNull();
     c.dispose();
-  }, 20_000);
+  });
 
   it('stops the staging worker when Close cancels the open while it stages; a later open stages the scene anew', async () => {
     // the first staging worker never answers (a long brief); the workers made after it answer
@@ -895,7 +895,7 @@ describe('the desk workspace with the controller', () => {
     expect(ofType('opened')[0]).toMatchObject({ source: 'brief' });
     expect(workers[1].posted[0]).toBe('stage');
     c.dispose();
-  }, 20_000);
+  });
 
   it("sends the host's own bytes as the first state when it opened from them unchanged", async () => {
     const given = await stateOf(origin());
@@ -941,7 +941,7 @@ describe('the desk workspace with the controller', () => {
     expect(resultShots(1)).toEqual([SHOT_B, SHOT_A]);
     expect(ofType('error')).toEqual([]);
     c.dispose();
-  }, 30_000);
+  });
 
   it('tells the person when storage failed and the scene is in memory only', async () => {
     vi.spyOn(localIndex, 'put').mockRejectedValue(

@@ -42,7 +42,8 @@ const empty = () => Y.encodeStateAsUpdate(SceneDoc.create({ empty: true }).ydoc)
 
 /*
  * A test that stages the example brief and updates it takes 30 s (its last argument): up to 1.3 s in
- * the whole web suite and 2.4 s beside core's suite, near half of vitest's 5 s default.
+ * the whole web suite and 2.4 s beside core's suite, near half of vitest's 5 s default; under
+ * coverage, as CI runs the suites, up to 2.1 s, and 3.5 s beside core's suite.
  */
 
 /** The example brief staged into an empty document (the change applied to that same document). */
@@ -197,7 +198,7 @@ describe('the staging client', () => {
     answer(4);
     await c;
     client.dispose();
-  });
+  }, 30_000);
 
   it("stops a staging when its signal aborts (the open's Close): out of the queue, or its worker stopped", async () => {
     // workers that answer only when the test says so

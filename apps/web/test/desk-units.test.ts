@@ -177,7 +177,10 @@ const waitUntil = <T>(fn: () => T | Promise<T>) => vi.waitFor(fn, { timeout: 20_
 /*
  * A test that stages a scene and then updates its shots or saves to the library, in the staging's
  * own code, takes 60 s (its last argument): 1–2.4 s with this file alone, up to 5.8 s in the whole
- * web suite and 4.5 s beside core's suite, past vitest's 5 s default.
+ * web suite and 4.5 s beside core's suite, past vitest's 5 s default; under coverage, as CI runs the
+ * suites, up to 4.2 s, and 11 s beside core's suite. The describes whose other tests stage a scene,
+ * read the open's files or save through the controller give those 30 s: under coverage up to 2 s,
+ * and 5.2 s beside core's suite.
  */
 const flush = async () => {
   for (let i = 0; i < 10; i++) await Promise.resolve();
@@ -266,7 +269,7 @@ async function realDesk(o: {
 
 // ---------------------------------------------------------------- the open's files
 
-describe("the open's library units", () => {
+describe("the open's library units", { timeout: 30_000 }, () => {
   it("takes the files of the brief's pins whose bytes hash to their SHA-256, in slot order", async () => {
     const intake = await readOpenUnits(
       [openUnit(L().kite), openUnit(L().set), openUnit(L().mira)],
@@ -543,7 +546,7 @@ describe("the open's library units", () => {
 
 // ---------------------------------------------------------------- the staging worker's unit work
 
-describe("the staging worker's unit requests", () => {
+describe("the staging worker's unit requests", { timeout: 30_000 }, () => {
   it('stages the pinned set, figure and prop from their files; without them every pin is staged from the words', async () => {
     const brief = pinnedBrief();
     const intake = await readOpenUnits(pinnedUnits(), brief);
@@ -733,7 +736,7 @@ describe("the staging worker's unit requests", () => {
     expect(stateUnits(doc)).toEqual([{ slot: `el:${KITE}`, ...pin, staged: 'unit', local: true }]);
     // an object that is no instance
     expect(runStaging({ kind: 'unit-local', update: snap(doc), root: kite }).ok).toBe(false);
-  });
+  }, 60_000);
 
   it("hands the units' files over to the worker, each buffer once, and only to staging and Update shots", async () => {
     const posted: { request: StagingRequest; transfer?: Transferable[] }[] = [];
@@ -773,7 +776,7 @@ describe("the staging worker's unit requests", () => {
 
 // ---------------------------------------------------------------- the workspace
 
-describe('the desk workspace with library units', () => {
+describe('the desk workspace with library units', { timeout: 30_000 }, () => {
   it('stages the open’s units, keeps none it placed, and writes container version 2 with the record’s rows', async () => {
     const ws = workspace();
     const brief = pinnedBrief();
@@ -950,7 +953,7 @@ describe('the desk workspace with library units', () => {
     await ws.updateFromBrief();
     expect(ws.changes()).toBeNull();
     expect(ws.libraryRows()).toMatchObject([refused]);
-  });
+  }, 60_000);
 
   it('makes an instance local as one undo step: the record keeps its pin as local, and the next state is version 1', async () => {
     const ws = workspace();
@@ -1026,7 +1029,7 @@ describe('the desk workspace with library units', () => {
     ws.setBrief(withPins(brief, { elements: { [KITE]: { pin, data: unit.data } } }));
     expect(ws.changes()).toBeNull();
     expect(ws.saveTargets()[3]).toMatchObject({ basedOn: { ref: pin.ref, version: 7, name: 'Red kite' } });
-  });
+  }, 60_000);
 
   it('stages again without the files when the worker fails with them: their slots wait (pending unavailable)', async () => {
     // a worker that dies on a request carrying unit files
@@ -1073,7 +1076,7 @@ describe('the desk workspace with library units', () => {
 
 // ---------------------------------------------------------------- the controller
 
-describe('the desk controller with library units', () => {
+describe('the desk controller with library units', { timeout: 30_000 }, () => {
   it("with options.units: stages the open's files, sends the record's rows with every state and offers Save to library", async () => {
     const t = await realDesk({ scene: pinnedBrief(), options: UNITS_ON, units: pinnedUnits() });
     expect(t.c.units.value).toEqual({ version: 1, publish: true });
@@ -1338,7 +1341,7 @@ describe('the desk controller with library units', () => {
     expect(s.undo.undoStack.length).toBe(1);
     expect(t.c.libraryRows.value).toMatchObject([{ key: `el:${KITE}`, status: 'local' }]);
     expect(await t.c.makeLocal('nope')).toMatchObject({ ok: false });
-  });
+  }, 60_000);
 });
 
 describe("the scene's writes, one at a time", () => {
@@ -1392,7 +1395,7 @@ describe("the scene's writes, one at a time", () => {
     const [r] = await Promise.all([save.done, update]);
     expect(r).toMatchObject({ ok: true, linked: true, adopted: true });
     expect(sceneOf(t)).toEqual(BOTH);
-  });
+  }, 60_000);
 
   it('takes no Update shots while the scene links a saved unit; pressed after, it keeps the link', async () => {
     const t = await laterBrief();
@@ -1764,7 +1767,7 @@ describe('a save the host linked after the desk stopped waiting', () => {
   }, 60_000);
 });
 
-describe('Save to library', () => {
+describe('Save to library', { timeout: 30_000 }, () => {
   /** The controller over a fake scene whose units are the kite's; opened with `options`. */
   async function fakeDesk(
     o: {

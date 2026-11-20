@@ -129,7 +129,9 @@ describe('brief memory estimates', () => {
     expect(update.bytes).toBeGreaterThanOrEqual(check.bytes);
     // the brief as staged changes nothing, but the update still checks every shot
     expect(estimate('desk.update_from_brief', { brief })!.bytes).toBeGreaterThanOrEqual(check.bytes);
-  });
+    // 7.8 s beside core's suite; under coverage, as CI runs the suites, 7.7 s, and 16 s beside
+    // core's suite, more than half the project's 30 s
+  }, 60_000);
 });
 
 describe('the pre-roll before a cut where a rider gets on or off', () => {

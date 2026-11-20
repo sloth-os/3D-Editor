@@ -474,7 +474,9 @@ describe('decoding is the gate: what decodes, inserts', () => {
     root.custom_props = { ...(root.custom_props as object), big: Array.from({ length: 3 }, () => big) };
     const u = decodeUnit(encodeUnit(body, propHeader()));
     expect(u.expandedBytes).toBe(u.header.bodyBytes + 2 * big.length);
-  });
+    // 2.5 s beside core's suite; under coverage, as CI runs the suites, 19 s, and 36 s beside core's
+    // suite: past the project's 30 s
+  }, 120_000);
 
   it("an id named like a member of Object.prototype ('valueOf', 'constructor') names nothing: UNIT_BAD_RECORD", () => {
     expect(code(() => decodeUnit(edited('"parent":"@root"', '"parent":"valueOf"')))).toBe('UNIT_BAD_RECORD');

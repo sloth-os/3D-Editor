@@ -99,7 +99,13 @@ function bomb(mib: number): Uint8Array {
   return b;
 }
 
-describe('the desk state', () => {
+/*
+ * Each test of the desk state takes 30 s, from its describe: writing and reading states (gzip, and
+ * the JS inflate where the browser has none) took up to 0.8 s under coverage, as CI runs the suites,
+ * and 3.5 s beside core's suite, past half of vitest's 5 s default. The gzip bomb's takes 60 s (its
+ * last argument).
+ */
+describe('the desk state', { timeout: 30_000 }, () => {
   it('writes gzip where the browser has CompressionStream', () => {
     expect(compressesStates()).toBe(true);
   });
