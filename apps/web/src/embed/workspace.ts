@@ -96,7 +96,8 @@ import {
  *   run one at a time (queueWrite), each reading the document and the brief when its turn starts:
  *   two changes worked out from the same document could each rewrite one record (the brief's
  *   record of what was staged), and only one of the two would stay. A write the scene's close ends
- *   (waiting for its turn or running) rejects with SceneClosedError, which the desk does not report.
+ *   (waiting for its turn or running) rejects with SceneClosedError: an Update shots so ended
+ *   shows no error notice.
  * - Checks shown in the shot list carry the document's revision when they were asked for (an edit
  *   made while the worker checks shows them as out of date); after the scene opens and after
  *   Update shots the full checks (blocking lines, layouts) run in the background, behind the
@@ -318,7 +319,8 @@ export interface WorkspaceOptions {
 
 /**
  * A write of the scene (queueWrite) that the scene's close ended, while it waited for its turn or
- * ran: nothing went wrong that anyone needs to hear of (DeskController ends it quietly). `cause` is
+ * ran: the write itself did not go wrong. DeskController ends an Update shots so with a log line,
+ * not an error notice; a save's adoption says that the scene could not be linked here. `cause` is
  * what failed once the scene was let go, if anything did (its worker stops with it).
  * `sceneClosed` lets the controller tell it apart without loading this module.
  */
