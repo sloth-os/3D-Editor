@@ -314,6 +314,63 @@ describe('a part whose source id is named like a member of Object.prototype', ()
   });
 });
 
+describe('what an update writes is what it stamps', () => {
+  it('a part whose new reference points at a part deleted here reads untouched after the update', () => {
+    const src = stagedDoc();
+    const kite = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id }).unit;
+    const tail5 = srcNamed(kite.body, 'tail.5');
+    const bridle = srcNamed(kite.body, 'bridle');
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, kite, { ...pin(1, SHA1), key: `el:${KITE}` });
+    doc.removeObjects([r.ids[`objects:${tail5}`]]);
+    // v2 has the bridle follow tail.5, which is no longer in this scene: the reference is cut here
+    const v2 = editedUnit(kite, (b) => {
+      b.blocks.objects![bridle].constraints = [createConstraint('COPY_LOCATION', { target: tail5 })];
+    });
+    const rep = updateUnit(doc, r.root, v2, pin(2, SHA2));
+    const id = r.ids[`objects:${bridle}`];
+    expect(rep.updated.map((p) => p.id)).toContain(id);
+    expect(doc.getObject(id)!.constraints).toEqual([]);
+    expect(unitStatus(doc, r.root).edited).toEqual([]);
+  });
+});
+
+describe('a part the new version drops is kept while the scene still uses it', () => {
+  it("by a camera's focus or a part the update keeps", () => {
+    const src = stagedDoc();
+    const kite = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id }).unit;
+    const [tail2, tail3, sail] = ['tail.2', 'tail.3', 'sail'].map((n) => srcNamed(kite.body, n));
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, kite, { ...pin(1, SHA1), key: `el:${KITE}` });
+    const id = (s: string) => r.ids[`objects:${s}`];
+    // a camera focuses on tail.2; the sail (edited here, so kept) follows tail.3
+    const cam = doc.addCamera({ name: 'Cam', dof_focus_object: id(tail2) });
+    doc.addObject({ type: 'CAMERA', name: 'Cam', data: cam });
+    doc.updateObject(id(sail), {
+      constraints: [createConstraint('COPY_ROTATION', { target: id(tail3) })],
+    });
+    const v2 = editedUnit(kite, (b) => {
+      for (const t of [tail2, tail3]) {
+        const mesh = b.blocks.objects![t].data as string;
+        delete b.blocks.objects![t];
+        if (!Object.values(b.blocks.objects!).some((o) => o.data === mesh)) delete b.blocks.meshes![mesh];
+      }
+    });
+    const rep = updateUnit(doc, r.root, v2, pin(2, SHA2));
+    expect(rep.kept).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: id(tail2), reason: 'dropped-but-used' }),
+        expect.objectContaining({ id: id(tail3), reason: 'dropped-but-used' }),
+      ]),
+    );
+    expect(doc.getObject(id(tail2))).toBeTruthy();
+    expect(doc.getObject(id(tail3))).toBeTruthy();
+    // and so does what they use
+    expect(rep.removed).toEqual([]);
+    for (const t of [tail2, tail3]) expect(doc.has('meshes', String(doc.getObject(id(t))!.data))).toBe(true);
+  });
+});
+
 describe("a unit's drivers in an instance", () => {
   /** The kite, a version of it whose sail is driven by `expression` (none: null), and the sail. */
   function kites() {
@@ -383,6 +440,37 @@ describe("a unit's drivers in an instance", () => {
     // and a version dropping it leaves it (it is the scene's now)
     updateUnit(doc, root, version(null), pin(3, '3'.repeat(64)));
     expect(expressions(doc, id)).toEqual(['frame / 5']);
+  });
+
+  it('a part the next version drops goes, and the driver the unit gave it is no use of it', () => {
+    const { kite } = kites();
+    const tail2 = srcNamed(kite.body, 'tail.2');
+    const v1 = editedUnit(kite, (b) => {
+      b.drivers = [
+        {
+          target_type: 'object',
+          target_id: tail2,
+          path: 'rotation_euler',
+          index: 0,
+          expression: 'frame / 10',
+          variables: [],
+          mute: false,
+        },
+      ];
+    });
+    const v2 = editedUnit(kite, (b) => {
+      const mesh = b.blocks.objects![tail2].data as string;
+      delete b.blocks.objects![tail2];
+      if (!Object.values(b.blocks.objects!).some((o) => o.data === mesh)) delete b.blocks.meshes![mesh];
+    });
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, v1, { ...pin(1, SHA1), key: `el:${KITE}` });
+    const id = r.ids[`objects:${tail2}`];
+    expect(doc.listDrivers(id)).toHaveLength(1);
+    const rep = updateUnit(doc, r.root, v2, pin(2, SHA2));
+    expect(rep.removed.map((p) => p.id)).toContain(id);
+    expect(doc.getObject(id)).toBeFalsy();
+    expect(doc.listDrivers()).toEqual([]);
   });
 
   it('a published scene adopts its drivers: the next version updates them', () => {
@@ -498,6 +586,21 @@ describe('adoptUnit', () => {
       expect(again.basedOn).toEqual({ ref: 'lib_new', version: 1 });
       expect(again.link.key).toBe(ex.link.key);
     });
+
+  it("adopts a set made local: the made-local root takes the provenance (a new root's id is that one)", () => {
+    const src = stagedDoc();
+    const meadow = unitFrom(src, { kind: 'set', name: 'Meadow' }).unit;
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, meadow, { ...pin(1, SHA1), key: 'set', rootProps: { desk_role: 'set' } });
+    makeLocal(doc, r.root);
+    expect(listUnits(doc)).toEqual([]);
+    const ex = extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' });
+    expect(ex.link).toMatchObject({ synthesizeSetRoot: false, rootSceneId: r.root });
+    const res = adoptUnit(doc, ex.link, pin(2, ex.sha256));
+    expect(res.root).toBe(r.root);
+    expect(listUnits(doc).map((u) => [u.key, u.root, u.version])).toEqual([['set', r.root, 2]]);
+    expect(unitStatus(doc, r.root)).toEqual({ edited: [], missing: [] });
+  });
 
   it('refuses a plan it did not make, a set root whose id is taken, and a root no longer there', () => {
     const doc = stagedDoc();

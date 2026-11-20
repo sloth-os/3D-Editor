@@ -206,11 +206,20 @@ function members(doc: SceneDoc, spec: UnitSpec): Members {
       for (const child of index.get(id) ?? []) visit(child, why ? (under ?? why) : null);
     };
     for (const top of index.get(null) ?? []) visit(top, null);
-    if (!out.length || (inst && out.length === 1 && out[0] === inst.root))
+    // a set made local keeps its root at the id the slot's instance derives: that root is the set's
+    // again (a root made for the set would need its id)
+    const local = inst ? null : deriveUnitId(slotKey({ set: true }), UNIT_ROOT);
+    const kept = local ? doc.getObject(local) : null;
+    const root =
+      inst?.root ??
+      (kept && kept.parent == null && kept.type === 'EMPTY' && role(kept) === 'set' && out.includes(kept.id)
+        ? kept.id
+        : null);
+    if (!out.length || (root && out.length === 1 && out[0] === root))
       throw new UnitError('UNIT_EMPTY', 'the scene has no set to save (everything in it is its action)');
     return {
       kind: 'set',
-      root: inst?.root ?? null,
+      root,
       instance: inst,
       objects: out,
       excluded,

@@ -1003,8 +1003,13 @@ that nothing left in the scene uses, so a unit placed in the slot again finds it
 datablock at a derived id that nothing uses counts as free and goes in the insert's transaction; one
 something uses refuses the insert (`UNIT_ID_TAKEN`). An update replaces the parts the scene left
 untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts edited or
-deleted in the scene, adds new parts and removes dropped untouched ones, and treats the unit's
-drivers the same way by their own table. A unit's driver writes only the unit's own datablocks (it
+deleted in the scene, adds new parts and removes dropped untouched ones that nothing staying uses (a
+record that stays refers to it, such as another object, a camera's focus or a part the update
+keeps, or a key, driver, shot or the scene camera names it; then it stays with what it uses), and
+treats the unit's drivers the same way by their own table. What an update writes is stamped as
+written: a reference to a part that is not in the scene is cut, and the part still reads as left as
+it was. Linking a saved set (adoption) stamps the scene's set root, also one made local before: the
+root a new set would take is that one. A unit's driver writes only the unit's own datablocks (it
 may read the world or the scene), and drivers count toward the 20,000 records. Scene-owned fields
 (names, the collection and rigid body of every object, the root's placement, pose and constraints,
 the scene's `desk_*` props) never count as edits, and a unit holds no rigid body: a drop preset that

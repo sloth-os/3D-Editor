@@ -8,7 +8,14 @@ import { requirePin, type UnitPin } from './insert';
 import { UNIT_BLOCK_KINDS, type UnitBlockKind } from './kinds';
 import { UNIT_PROPS, provenanceProps, requireInstance, splitPartKey, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
-import { collectDriverRefs, collectRecordRefs, mapRecordRefs, type UnitRecord } from './refs';
+import {
+  ANIM_TARGET_KINDS,
+  REF_KINDS,
+  collectDriverRefs,
+  collectRecordRefs,
+  mapRecordRefs,
+  type UnitRecord,
+} from './refs';
 import { dataKey, deleteData, unusedData } from './remove';
 import { currentSum, sourceIndex, toSourceId, toSourceMap, type UnitPartRef } from './status';
 import { updateDrivers } from './drivers';
@@ -26,12 +33,16 @@ import { cloneJson } from '../../util/json';
  *   version changed it too); a part deleted in the scene stays deleted ('deleted');
  * - a part only the new version has is added with a derived id (a datablock nothing uses at that id,
  *   left behind by an instance taken out of the slot before, is deleted for it; remove.ts);
- * - a part the new version drops is removed when the scene left it untouched and nothing outside the
- *   instance uses it (animation, drivers, shots, the scene camera, other objects' references), with
- *   the data and materials only it used; otherwise it is kept and taken out of the table
- *   ('dropped-but-edited', 'dropped-but-used').
+ * - a part the new version drops is removed when the scene left it untouched and nothing that stays
+ *   uses it (a record that stays refers to it: another object, a part the update keeps, a camera's
+ *   focus; or animation, drivers, shots, the scene camera), with the data and materials only it used;
+ *   otherwise it is kept, with what it uses, and taken out of the table ('dropped-but-edited',
+ *   'dropped-but-used').
  *
- * The unit's drivers follow the same rules, by their own table (unit_drivers, drivers.ts).
+ * A part the update writes is stamped as written: a reference to a part that is not in the scene
+ * (deleted here, taken or dropped) is cut, and the stamp is the cut record's, so the part reads
+ * untouched afterwards. The unit's drivers follow the same rules, by their own table (unit_drivers,
+ * drivers.ts); they are updated before the dropped parts go, so a driver the unit drops is not a use.
  *
  * The same content (an equal body digest) changes no part: only the provenance moves (noop).
  */
@@ -55,39 +66,43 @@ export interface UnitUpdateReport {
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Uint8Array);
 
-/** The scene ids of objects that something outside `members` uses (animation, drivers, shots, references). */
-function usedFromOutside(doc: SceneDoc, members: Set<string>): Set<string> {
-  const used = new Set<string>();
-  for (const fc of doc.listFCurves()) if (fc.target_type === 'object') used.add(fc.target_id);
-  for (const d of doc.listDrivers())
-    for (const r of collectDriverRefs(d as unknown as UnitRecord)) if (r.kind === 'objects') used.add(r.id);
-  for (const s of getShots(doc)) {
-    if (s.camera) used.add(s.camera);
-    for (const id of s.subjects) used.add(id);
-    for (const l of s.layout) used.add(l.subject);
-  }
-  const scene = doc.getScene();
-  if (scene.camera) used.add(scene.camera);
-  for (const id of scene.desk?.main_pair ?? []) used.add(id);
-  for (const id of doc.objectIds()) {
-    if (members.has(id)) continue;
-    const rec = doc.readRecord('objects', id);
-    if (rec) for (const r of collectRecordRefs('objects', rec)) if (r.kind === 'objects') used.add(r.id);
-  }
-  return used;
-}
-
-/** Every datablock some record or driver of the document refers to, as '<kind>:<id>'. */
-function referencedData(doc: SceneDoc): Set<string> {
-  const out = new Set<string>();
-  for (const k of UNIT_BLOCK_KINDS)
+/**
+ * The parts among `drops` ('<kind>:<id>') that nothing staying in the document uses: no record outside
+ * them refers to one, and no F-curve, driver, shot, the scene camera or the desk's main pair names
+ * one. A dropped part something staying uses stays, and then so does what it uses.
+ */
+function unusedDrops(doc: SceneDoc, drops: ReadonlySet<string>): Set<string> {
+  const going = new Set(drops);
+  const refsOf = new Map<string, string[]>();
+  const used: string[] = [];
+  const use = (key: string) => {
+    if (going.has(key)) used.push(key);
+  };
+  for (const k of REF_KINDS)
     for (const id of doc.map(k).keys()) {
       const rec = doc.readRecord(k, id);
-      if (rec) for (const r of collectRecordRefs(k, rec)) out.add(`${r.kind}:${r.id}`);
+      if (!rec) continue;
+      const refs = collectRecordRefs(k, rec).map((r) => dataKey(r.kind, r.id));
+      if (going.has(dataKey(k, id))) refsOf.set(dataKey(k, id), refs);
+      else refs.forEach(use);
     }
+  for (const fc of doc.listFCurves()) {
+    const kind = ANIM_TARGET_KINDS[fc.target_type];
+    if (kind) use(dataKey(kind, fc.target_id));
+  }
   for (const d of doc.listDrivers())
-    for (const r of collectDriverRefs(d as unknown as UnitRecord)) out.add(`${r.kind}:${r.id}`);
-  return out;
+    for (const r of collectDriverRefs(d as unknown as UnitRecord)) use(dataKey(r.kind, r.id));
+  for (const s of getShots(doc)) {
+    if (s.camera) use(dataKey('objects', s.camera));
+    for (const id of s.subjects) use(dataKey('objects', id));
+    for (const l of s.layout) use(dataKey('objects', l.subject));
+  }
+  const scene = doc.getScene();
+  if (scene.camera) use(dataKey('objects', scene.camera));
+  for (const id of scene.desk?.main_pair ?? []) use(dataKey('objects', id));
+  for (let key = used.pop(); key !== undefined; key = used.pop())
+    if (going.delete(key)) for (const r of refsOf.get(key) ?? []) use(r);
+  return going;
 }
 
 /**
@@ -219,9 +234,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
   const table = new Map<string, UnitPartStamp>();
   doc.transact(() => {
     deleteData(doc, free);
-    let usedOutside: Set<string> | null = null;
-    const dropObjects: string[] = [];
-    const dropData: { kind: DatablockKind; id: string; pk: string }[] = [];
+    const drops: { kind: DatablockKind; id: string; pk: string }[] = [];
     for (const k of UNIT_BLOCK_KINDS) {
       for (const pk of [...keys].filter((x) => x.startsWith(`${k}:`)).sort()) {
         const src = pk.slice(k.length + 1);
@@ -231,12 +244,14 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
         const cur = current.get(pk) ?? null;
         const f = fate.get(pk)!;
         const sum = next ? partSum16(k, next, place(k, src)) : null;
+        // what the update writes is stamped as written: references to parts not here are cut
+        const stamp = () => ({ id, sum: currentSum(k, doc.readRecord(k, id)!, src, inst, toSrc) });
         switch (f) {
           case 'add': {
             const fields = mapRecordRefs(k, withUnitProps(k, next!, place(k, src)), mapOut);
             doc.addRecord(k, id, { ...copyFields(fields), name: String(next!.name ?? 'Unit') });
             current.set(pk, doc.readRecord(k, id));
-            table.set(pk, { id, sum: sum! });
+            table.set(pk, stamp());
             report.added.push(refOf(pk));
             break;
           }
@@ -251,7 +266,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
           case 'update': {
             const fields = copyFields(mapRecordRefs(k, next!, mapOut));
             doc.replaceRecord(k, id, mergeForUpdate(k, fields, cur!, place(k, src), outside));
-            table.set(pk, { id, sum: sum! });
+            table.set(pk, stamp());
             report.updated.push(refOf(pk));
             break;
           }
@@ -267,45 +282,17 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
             table.set(pk, old!);
             report.kept.push({ ...refOf(pk), reason: 'deleted' });
             break;
-          case 'drop': {
+          case 'drop':
             if (!cur) break;
-            const untouched = currentSum(k, cur, src, inst, toSrc) === old!.sum;
-            if (!untouched) {
+            if (currentSum(k, cur, src, inst, toSrc) !== old!.sum)
               report.kept.push({ ...refOf(pk), reason: 'dropped-but-edited' });
-              break;
-            }
-            if (k === 'objects') {
-              usedOutside ??= usedFromOutside(doc, members);
-              if (usedOutside.has(id)) {
-                report.kept.push({ ...refOf(pk), reason: 'dropped-but-used' });
-                break;
-              }
-              dropObjects.push(id);
-            } else dropData.push({ kind: k, id, pk });
-            report.removed.push(refOf(pk));
+            else drops.push({ kind: k, id, pk });
             break;
-          }
         }
       }
     }
-    if (dropObjects.length) doc.removeObjects(dropObjects);
-    if (dropData.length) {
-      const refs = referencedData(doc);
-      for (const d of dropData) {
-        if (!doc.has(d.kind, d.id)) continue;
-        if (refs.has(`${d.kind}:${d.id}`)) {
-          const i = report.removed.findIndex((r) => r.kind === d.kind && r.id === d.id);
-          if (i >= 0) report.removed.splice(i, 1);
-          report.kept.push({ ...refOf(d.pk), reason: 'dropped-but-used' });
-          continue;
-        }
-        if (d.kind === 'materials') doc.removeMaterial(d.id);
-        else if (d.kind === 'images') doc.removeImage(d.id);
-        else if (d.kind === 'meshes') doc.removeMesh(d.id);
-        else doc.map(d.kind).delete(d.id);
-      }
-    }
-    // the unit's drivers, stamped as parts are (drivers.ts)
+    // the unit's drivers, stamped as parts are (drivers.ts), before the dropped parts go: a driver
+    // of the unit on a part it drops goes with it and does not keep it
     const drivers = updateDrivers(
       doc,
       inst.drivers,
@@ -314,6 +301,20 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       mapOut,
       report.warnings,
     );
+    const going = unusedDrops(doc, new Set(drops.map((d) => dataKey(d.kind, d.id))));
+    const gone = drops.filter((d) => going.has(dataKey(d.kind, d.id)));
+    for (const d of drops)
+      if (going.has(dataKey(d.kind, d.id))) report.removed.push(refOf(d.pk));
+      else report.kept.push({ ...refOf(d.pk), reason: 'dropped-but-used' });
+    const objects = gone.filter((d) => d.kind === 'objects').map((d) => d.id);
+    if (objects.length) doc.removeObjects(objects);
+    for (const d of gone) {
+      if (d.kind === 'objects' || !doc.has(d.kind, d.id)) continue;
+      if (d.kind === 'materials') doc.removeMaterial(d.id);
+      else if (d.kind === 'images') doc.removeImage(d.id);
+      else if (d.kind === 'meshes') doc.removeMesh(d.id);
+      else doc.map(d.kind).delete(d.id);
+    }
     if (inst.kind === 'figure') report.warnings.push(...figureWarnings(doc, root, curRoot, nextRoot, unit));
     writeProvenance(table, drivers);
   });

@@ -113,6 +113,15 @@ function mapConstraints(list: unknown, map: RefMap, bone: boolean): unknown {
   return out;
 }
 
+/** The kinds whose records refer to other datablocks (the cases of mapRecordRefs). */
+export const REF_KINDS = [
+  'objects',
+  'curves',
+  'cameras',
+  'materials',
+  'collections',
+] as const satisfies readonly DatablockKind[];
+
 /** The record with every reference mapped through `map` (a new object; the input is not changed). */
 export function mapRecordRefs(kind: DatablockKind, record: UnitRecord, map: RefMap): UnitRecord {
   const r: UnitRecord = { ...record };
