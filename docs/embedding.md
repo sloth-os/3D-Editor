@@ -1191,6 +1191,12 @@ Where the contract leaves room, the desk takes the most robust reading:
 
 - **Schemas.** Keep a copy of the [fixtures](#fixtures) and check the host's schemas against them:
   every valid message parses, every file under `invalid/` fails.
+- **The unit file.** `units/unit-file-prop.json` is made by core: run
+  `npx tsx packages/core/test/fixtures/desk-embed/units/generate.ts` from the repository's root,
+  when the unit format or what staging makes of the example's kite changes, and it writes both
+  copies. Staging draws the scene's ids at random, so each run writes other bytes;
+  `packages/core/test/desk-unit-fixture.test.ts` checks that the copies are what the generator
+  makes today but for those ids, the order they give a block's records and the header's `digest`.
 - **The real desk.** Build and start a 3D-Editor server (`npm run build`, then `npm start`; or the
   Docker image), point the host's desk URL at `http://127.0.0.1:8080/desk.html`, and serve the host
   from `http://localhost:<port>` (cross-origin isolated if the host is in production), so the frame
