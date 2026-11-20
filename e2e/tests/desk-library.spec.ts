@@ -19,13 +19,16 @@ import { PLAIN } from './helpers';
  *
  * - a brief with set, figure and prop pins and their files: staged as units (state.units, the
  *   state's container version 2), the Library tab's rows, Make local (the slot stays local) and
- *   its undo
+ *   its undo; the Save dialog keeps the keyboard (its focus, Tab inside it, Ctrl+Z, the arrows and
+ *   Space acting on nothing behind it)
  * - a pin whose file was not sent: staged from the words (the notice, a pending row); the next open
  *   with the file offers Update shots, which places it
  * - Save to library: the set as a new item (unit-publish checked: its SHA-256, a square RGBA PNG
  *   thumbnail, from the set), linked (the scene adopts it: the tab shows it up to date, the state
- *   pins it), then a new version of it; keys typed in the dialog never reach the viewport
- * - from a read-only open: saved, never linked here
+ *   pins it, and chosen again in the same dialog it is a new version of it), then a new version of
+ *   it; keys typed in the dialog never reach the viewport
+ * - from a read-only open: saved and not linked, with the host's reason (the link rule), and a host
+ *   that links it all the same changes nothing here
  * - the host refuses (the reason shown), or answers late (the wait shown, the dialog closed, the
  *   tab says how it ended)
  * - a host from before units (no options.units): no Library tab, no units in its states, the pins
@@ -207,8 +210,34 @@ const unitRow = (slot: string, u: { ref: string; version: number; sha256: string
 });
 
 /**
+ * The share of an RGBA image's drawn pixels (alpha above 0) within 12 of its most common drawn colour
+ * in each channel: near 1 for a blank, one-colour square.
+ */
+function dominantShare(px: Uint8Array): number {
+  const counts = new Map<number, number>();
+  for (let i = 0; i < px.length; i += 4)
+    if (px[i + 3] > 0) {
+      const k = (px[i] << 16) | (px[i + 1] << 8) | px[i + 2];
+      counts.set(k, (counts.get(k) ?? 0) + 1);
+    }
+  let top = 0;
+  let most = -1;
+  for (const [k, n] of counts) if (n > most) [top, most] = [k, n];
+  const rgb = [top >> 16, (top >> 8) & 255, top & 255];
+  let drawn = 0;
+  let near = 0;
+  for (let i = 0; i < px.length; i += 4)
+    if (px[i + 3] > 0) {
+      drawn++;
+      if (rgb.every((v, c) => Math.abs(px[i + c] - v) <= 12)) near++;
+    }
+  return drawn ? near / drawn : 1;
+}
+
+/**
  * The unit-publish messages the desk sent, each checked: its file is what its SHA-256 says, its
- * thumbnail a square RGBA PNG of 256, 192 or 128 px with something drawn on its clear ground.
+ * thumbnail a square RGBA PNG of 256, 192 or 128 px with something drawn on its clear ground, in
+ * the unit's colours (no one colour covers 97% of what is drawn: a blank grey square would).
  */
 async function publishes(page: Page): Promise<any[]> {
   const out = await ofType(page, 'unit-publish');
@@ -223,6 +252,7 @@ async function publishes(page: Page): Promise<any[]> {
     let drawn = 0;
     for (let i = 3; i < png.pixels.length; i += 4) if (png.pixels[i] > 0) drawn++;
     expect(drawn, `${m.id}: its thumbnail shows the unit`).toBeGreaterThan(png.width * png.height * 0.01);
+    expect(dominantShare(png.pixels), `${m.id}: its thumbnail's colours`).toBeLessThan(0.97);
   }
   return out;
 }
@@ -368,11 +398,70 @@ test.describe('library units in the embedded desk', () => {
       unitRow(`el:${KITE}`, lib.prop, true),
       unitRow('set', lib.set),
     ]);
+
+    // the Save dialog is modal: it takes the focus, Tab stays inside it, and no key of the editor
+    // acts behind it (Ctrl+Z would undo the Make local, the arrows step frames, Space plays)
+    const frameNow = async () =>
+      Number(/\((\d+)\)/.exec((await frame.getByTestId('viewport-info').textContent()) ?? '')?.[1] ?? NaN);
+    const focus = () =>
+      frame.evaluate(() => {
+        const a = document.activeElement as HTMLElement | null;
+        return {
+          id: a?.getAttribute('data-testid') ?? null,
+          inDialog: !!a?.closest('[data-testid="desk-save"]'),
+        };
+      });
+    await frame.getByTestId('desk-library-save').click();
+    await expect(frame.getByTestId('desk-save')).toBeVisible();
+    await expect(frame.getByTestId('desk-save-preview')).toHaveAttribute('data-status', 'ok', {
+      timeout: 90_000,
+    });
+    expect((await focus()).inDialog).toBe(true);
+    for (const key of [
+      'Tab',
+      'Tab',
+      'Tab',
+      'Tab',
+      'Tab',
+      'Tab',
+      'Tab',
+      'Shift+Tab',
+      'Shift+Tab',
+      'Shift+Tab',
+    ]) {
+      await page.keyboard.press(key);
+      expect((await focus()).inDialog, `the focus after ${key}`).toBe(true);
+    }
+    const shown = await frameNow();
+    expect(shown).toBeGreaterThanOrEqual(0);
+    await frame.getByTestId('desk-save-cancel').focus();
+    await page.keyboard.press('Control+z');
+    await page.keyboard.press('ArrowRight');
+    await page.keyboard.press('ArrowRight');
+    await page.waitForTimeout(500);
+    await expect(frame.getByTestId('desk-save')).toBeVisible();
+    expect(
+      await frame.evaluate(
+        () =>
+          (window as any).__desk.workspace.libraryRows().find((r: any) => r.slot?.startsWith('el:'))?.status,
+      ),
+    ).toBe('local');
+    expect(await frameNow()).toBe(shown);
+    // Space presses the focused Cancel (the dialog closes) and plays nothing; the focus goes back
+    await page.keyboard.press('Space');
+    await expect(frame.getByTestId('desk-save')).toHaveCount(0);
+    await page.waitForTimeout(500);
+    expect(await frameNow()).toBe(shown);
+    expect((await focus()).id).toBe('desk-library-save');
+    await expect(kite).toHaveAttribute('data-status', 'local');
+
     // one undo step: the kite is the library's again
     const undo = await frame.evaluate(() => (window as any).__desk.run('ed.undo'));
     expect(undo.ok, undo.error).toBe(true);
     await expect(kite).toHaveAttribute('data-status', 'current');
     await expect(kite.getByTestId('desk-library-make-local')).toBeVisible();
+    // and the tab no longer says it is local
+    await expect(frame.getByTestId('desk-library-note')).toHaveCount(0);
     const undone = await stateNow(page, 'save-undone');
     expect(undone.units).toEqual(state.units);
     expect(await ofType(page, 'unit-publish')).toEqual([]);
@@ -505,6 +594,11 @@ test.describe('library units in the embedded desk', () => {
     });
     expect(pub.newVersionOf).toBeUndefined();
     expect(await hostLibrary(page)).toEqual([{ key: 'lib_e2e0001@1', sha256: pub.sha256 }]);
+    // chosen again in the same dialog, the set is the instance of Harbor v1 it is now
+    await frame.getByTestId('desk-save-what').selectOption({ label: 'Mira (actor)' });
+    await frame.getByTestId('desk-save-what').selectOption('set');
+    await expect(frame.getByTestId('desk-save-new-version')).toBeChecked();
+    await expect(frame.locator('.desk-save-check')).toHaveText('Save as a new version of Harbor v1');
     await frame.getByTestId('desk-save-cancel').click();
     await expect(frame.getByTestId('desk-save')).toHaveCount(0);
     // the tab: the scene's set is the library's Harbor v1 now, up to date
@@ -571,7 +665,9 @@ test.describe('library units in the embedded desk', () => {
     await expectValidMessages(page);
   });
 
-  test('Save to library from a read-only open: saved, never linked here', async ({ page }) => {
+  test('Save to library from a read-only open: saved, not linked (the reason shown), never linked here', async ({
+    page,
+  }) => {
     test.setTimeout(240_000);
     await openHost(page);
     await waitFor(page, 'ready', 1, 30_000);
@@ -586,15 +682,33 @@ test.describe('library units in the embedded desk', () => {
     );
     await frame.getByTestId('desk-save-name').fill('Dock');
     await frame.getByTestId('desk-save-submit').click();
+    // a host keeping to the link rule saves it, does not link it from a read-only open, and says why
     const result = frame.getByTestId('desk-save-result');
+    await expect(result).toHaveText("Saved 'Dock' v1 to rideo; not linked: the scene is read-only", {
+      timeout: 90_000,
+    });
+    await expect(result).toHaveAttribute('data-outcome', 'unlinked');
+    const [pub] = await publishes(page);
+    expect(pub).toMatchObject({ kind: 'set', name: 'Dock', from: { set: true } });
+    expect(await hostLibrary(page)).toEqual([{ key: 'lib_e2e0001@1', sha256: pub.sha256 }]);
+    await frame.getByTestId('desk-save-cancel').click();
+
+    // a host that links it all the same: the scene still stays as it is here
+    await page.evaluate(() => (window as any).host.publishMode('linked-always'));
+    await openSave(frame, 'set');
+    await frame.getByTestId('desk-save-name').fill('Dock');
+    await frame.getByTestId('desk-save-submit').click();
     await expect(result).toHaveText(
       "Saved 'Dock' v1 to rideo; not linked here: The scene is read-only here: it stays as it is.",
       { timeout: 90_000 },
     );
     await expect(result).toHaveAttribute('data-outcome', 'unlinked');
-    const [pub] = await publishes(page);
-    expect(pub).toMatchObject({ kind: 'set', name: 'Dock', from: { set: true } });
-    expect(await hostLibrary(page)).toEqual([{ key: 'lib_e2e0001@1', sha256: pub.sha256 }]);
+    const pubs = await publishes(page);
+    expect(pubs).toHaveLength(2);
+    expect(await hostLibrary(page)).toEqual([
+      { key: 'lib_e2e0001@1', sha256: pub.sha256 },
+      { key: 'lib_e2e0002@1', sha256: pubs[1].sha256 },
+    ]);
     await frame.getByTestId('desk-save-cancel').click();
     // nothing adopted: no rows, no pin, no units in the state
     await expect(frame.getByTestId('desk-library-empty')).toBeVisible();

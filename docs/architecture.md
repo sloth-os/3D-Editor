@@ -948,12 +948,16 @@ telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested o
   `options.units`. It reads `open.units` entry by entry (each file's SHA-256 checked) and hands the
   files the open holds to the staging worker with each staging and update (transferred), where
   core places and updates the units. The worker also makes a unit of the scene for Save to library
-  with its thumbnail, rendered from the unit alone (`unit-extract`, read only), links the scene to
-  a version the host saved (`unit-adopt`) and cuts an instance's link (`unit-local`), the last two
+  with its thumbnail (`unit-extract`, read only; the thumbnail shows the unit alone in colour, the
+  material look rather than the clay of the model store's thumbnails), links the scene to a
+  version the host saved (`unit-adopt`) and cuts an instance's link (`unit-local`), the last two
   answered with a Yjs diff. `units.ts` also gives `state.units` from the scene's record, the
   Library tab's rows (`libraryRows`) and what Save to library can save (`saveTargets`).
   `LibraryTab.tsx` and `SaveToLibraryDialog.tsx` are their UI: a tab the desk adds to the editor's
-  bottom area (`ExtraBottomTab` in `ui/App.tsx`; the editor adds none) and a dialog over the desk.
+  bottom area (`ExtraBottomTab` in `ui/App.tsx`; the editor adds none) and a modal dialog over the
+  desk. While it or the Send check is open (`deskModals` in `DeskApp.tsx`) the desk blocks the
+  editor's keymap (`installKeymap`'s `blocked`; the editor passes none) and keeps the keyboard
+  focus in the window (`useModalFocus`).
   A desk state's container is version 1, or 2 once the scene holds library units, so a desk from
   before units refuses that state rather than drop instances it cannot keep.
 

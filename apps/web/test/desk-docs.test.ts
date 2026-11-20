@@ -257,6 +257,24 @@ describe('docs/embedding.md', () => {
       expect(header).toContain(`\`${key}\``);
   });
 
+  it("names, under Testing a host, every member of the fake host's window.host and each desk spec", () => {
+    const host = read('e2e/fixtures/desk-host/index.html');
+    const block = host.slice(host.indexOf('window.host = {'), host.indexOf('window.host.mount();'));
+    // the members of window.host: methods and properties at its first level
+    const members = [...block.matchAll(/^ {8}(\w+)(?=\(|,|:)/gm)].map((m) => m[1]);
+    expect(members).toEqual(expect.arrayContaining(['open', 'publishMode', 'ackPublish', 'library']));
+    const testing = section(doc, '## Testing a host');
+    for (const name of members) expect(testing, name).toContain(`\`${name}\``);
+    // the open's library units, and the answers publishMode gives
+    expect(flat(testing)).toContain('`units`');
+    for (const mode of ['linked', 'linked-always', 'unlinked', 'refused:<code>', 'never']) {
+      expect(host, mode).toContain(`'${mode.replace(':<code>', ':')}`);
+      expect(testing, mode).toContain(`\`${mode}\``);
+    }
+    for (const spec of readdirSync(resolve(ROOT, 'e2e/tests')).filter((f) => /^desk-.*\.spec\.ts$/.test(f)))
+      expect(testing, spec).toContain(`e2e/tests/${spec}`);
+  });
+
   it('lists the fixtures this repository keeps', () => {
     const dir = resolve(__dirname, 'fixtures/desk-protocol');
     const json = (d: string) => readdirSync(d).filter((f) => f.endsWith('.json'));

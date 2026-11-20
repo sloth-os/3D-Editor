@@ -1122,9 +1122,17 @@ Where the contract leaves room, the desk takes the most robust reading:
 - **The fake host.** `e2e/fixtures/desk-host/index.html` is a complete host of the protocol in one
   page with no dependencies: it embeds `?desk=<url>`, answers `hello` with a `connect` and a
   `MessageChannel`, records every message (binary data, a result's files too, in the fixtures'
-  `$bytes` notation) and keeps the last state and the last result's files; `window.host` drives
-  it (`open`, `send`, `mount`, `connectFromSibling`, `postToDesk`, `messages`, `state`, `file`). A
-  host's own end-to-end test can start from it.
+  `$bytes` notation) and keeps the last state and the last result's files. `window.host` drives
+  it: `mount` and `unmount` the desk's frame (`deskOrigin` is its origin, `connected` whether the
+  port is up), `open` a scene (with the last state, the open's `options`, and its library `units`:
+  entries with `{"$bytes"}` data, or `"ref@version"` of a unit it saved), `send` any message,
+  `connectFromSibling` and `postToDesk` (what a desk must refuse), and read `messages`,
+  `windowMessages`, `state`, `file`, `fileNames` and `fileSizes`. With library units it saves each
+  `unit-publish` in its own library, read with `library` (each `ref@version` and its SHA-256), and
+  answers as `publishMode` says: `linked` (by the link rule: a read-only open is answered `linked`
+  false, "the scene is read-only"), `linked-always` (linked even then, which the rule forbids: the
+  desk's own guard is tested with it), `unlinked`, `refused:<code>`, or `never` (the test answers
+  with `ackPublish`). A host's own end-to-end test can start from it.
 - **The end-to-end test.** `e2e/tests/desk-embed.spec.ts` serves the fake host with COOP
   `same-origin` and COEP `require-corp` from another site than the desk and goes through the
   protocol: the handshake, `ready`, `open` of the example brief, states, an export of camera and
@@ -1139,6 +1147,16 @@ Where the contract leaves room, the desk takes the most robust reading:
   and Close in the frame); and the page on its own. Every message the desk sends is checked against
   the schemas. Run it with
   `cd e2e && npx playwright test tests/desk-embed.spec.ts --trace off` after `npm run build`.
+- **Library units.** `e2e/tests/desk-library.spec.ts` drives the same fake host with real unit
+  files made by core in Node (`e2e/fixtures/desk-host/units.ts`): pins with their files staged as
+  units (`state.units`, the Library tab, Make local and its undo); a pin whose file was not sent,
+  placed by Update shots once a later open sends it; Save to library as a new item the host links
+  (the scene adopts it) and then as a new version of it, each `unit-publish` checked (its SHA-256,
+  a square thumbnail that shows the unit in colour); the Save dialog's keyboard (its focus, Tab
+  inside it, no key of the editor acting behind it); a read-only open (saved, not linked, and a
+  host that links it all the same); a host that refuses or answers late; a host from before units;
+  and phones of 390 and 360 px. Run it the same way:
+  `cd e2e && npx playwright test tests/desk-library.spec.ts --trace off` after `npm run build`.
 - **Storage partitioning.** The desk's specs (`e2e/tests/desk-*.spec.ts`) run in the `desk`
   Playwright project, with Chromium's third-party storage partitioning on as browsers ship it
   (Playwright turns it off by default). `e2e/tests/desk-partition.spec.ts` checks that it is on (the

@@ -32,8 +32,11 @@
        * Library units (docs/embedding.md "Library units"; e2e/tests/desk-library.spec.ts): `open`
        * takes `units`, the open's files ({"$bytes"} entries, or "ref@version" of a unit saved here),
        * sent transferred. A unit-publish is saved in this host's library (a new item lib_e2e<n> v1,
-       * or the next version of `newVersionOf`) and answered as `publishMode` says: 'linked',
-       * 'unlinked', 'refused:<code>' (not saved), or 'never' (the test answers with ackPublish).
+       * or the next version of `newVersionOf`) and answered as `publishMode` says: 'linked' (as the
+       * link rule says: never from a read-only open, which is answered linked false with its
+       * reason), 'linked-always' (linked even from a read-only open, which the rule forbids: the
+       * desk's own guard is tested with it), 'unlinked', 'refused:<code>' (not saved), or 'never'
+       * (the test answers with ackPublish).
        */
       const deskUrl = new URLSearchParams(location.search).get('desk');
       const deskOrigin = new URL(deskUrl).origin;
@@ -47,6 +50,8 @@
         version: 1,
         // library units: how unit-publish is answered, and what this host saved ('ref@version')
         publishMode: 'linked',
+        // the last open's options.readOnly (the link rule's (a): a read-only open is never linked)
+        readOnly: false,
         publishMessage: null,
         library: new Map(),
         latest: new Map(),
@@ -117,14 +122,15 @@
           return;
         }
         const { ref, version } = saveUnit(m);
+        const readOnly = mode === 'linked' && s.readOnly;
         s.port.postMessage({
           type: 'unit-ack',
           id: m.id,
           ok: true,
           ref,
           version,
-          linked: mode === 'linked',
-          ...(message ? { message } : {}),
+          linked: mode === 'linked-always' || (mode === 'linked' && !readOnly),
+          ...(message ? { message } : readOnly ? { message: 'the scene is read-only' } : {}),
         });
       }
 
@@ -195,6 +201,7 @@
         open(scene, { withState = false, options, units } = {}) {
           const state = withState && s.state ? { ...s.state, data: s.state.data.slice(0) } : null;
           const m = { type: 'open', scene, state };
+          s.readOnly = options?.readOnly === true;
           if (options) m.options = options;
           const transfer = [];
           if (units) {
@@ -214,7 +221,10 @@
           }
           s.port.postMessage(m, transfer);
         },
-        /** How the next unit-publish messages are answered ('linked', 'unlinked', 'refused:<code>', 'never'). */
+        /**
+         * How the next unit-publish messages are answered ('linked', 'linked-always', 'unlinked',
+         * 'refused:<code>', 'never'), with `message` as the answer's message.
+         */
         publishMode(mode, message = null) {
           s.publishMode = mode;
           s.publishMessage = message;
