@@ -96,12 +96,17 @@ function workerRealm(): vm.Context {
 describe('the staging worker’s import graph', () => {
   it('bundles for the browser and loads, stages, updates, reports and checks without a Node or DOM global', async () => {
     const { code, inputs } = await bundle();
-    // the whole graph: the brief, the staging engine it drives, the camera solver, the checks
+    // the whole graph: the brief, the staging engine it drives, the camera solver, the checks, the
+    // library units and their container (desk-units-worker.test.ts runs those in this realm)
     for (const f of [
       'desk/brief/stage.ts',
       'desk/rideo/import.ts',
       'operators/desk-shots.ts',
       'desk/checks.ts',
+      'desk/container/gzip.ts',
+      'desk/units/extract.ts',
+      'desk/units/insert.ts',
+      'desk/units/update.ts',
     ])
       expect(
         inputs.some((i) => i.endsWith(f)),

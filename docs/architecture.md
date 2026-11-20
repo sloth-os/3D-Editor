@@ -956,6 +956,43 @@ deployment's settings; a worker script it serves without a COEP gets `require-co
 version refuses the editor's Update while a desk page is open and tells the editor, which says
 why (`update-waits.ts`). The build drops the web app manifest's link from `desk.html`.
 
+## Library units
+
+A library unit is a set, a prop or a figure saved from a scene so that other scenes can use it
+(`packages/core/src/desk/units`; the host's library and the protocol are in
+[embedding.md](embedding.md)). A unit file is the desk's container (`desk/container`: the magic
+`3DUNIT\r\n`, a version and a codec byte, a canonical JSON header, the payload) around a body
+gzipped deterministically: a manifest of every datablock's stored fields under the unit's source
+ids, and a blob table holding each distinct byte array (meshes, shape keys, weights, images) once.
+The same content gives the same bytes in Node, the page and the staging worker; `header.digest`
+is the body's SHA-256 and the protocol pins the file's. Reading is bounded: at most 32 MiB of
+file, 64 KiB of header and 128 MiB of body, unpacked in 4 KiB slices into one buffer of exactly
+the declared size, every reference checked to stay inside the unit before anything is inserted.
+
+An instance is a root object with `unit_*` custom props: the library item, its version, the file's
+SHA-256, the body digest, the kind, the key, the name and `unit_parts` (each source id's scene id
+and a 16-digit stamp of the fields the unit owns). Insertion derives every id from the instance
+key and the source id (`deriveUnitId`), so two replicas inserting the same unit agree. An update
+replaces the parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep
+resolving; it keeps parts edited or deleted in the scene, adds new parts and removes dropped
+untouched ones. Scene-owned fields (names, the root's placement, pose, constraints and physics,
+the scene's `desk_*` props) never count as edits. Measured on the sample brief:
+
+| Unit                            | File      | Body      | Objects |
+| ------------------------------- | --------- | --------- | ------- |
+| set staged from the brief alone | 1.9 KiB   | 3.8 KiB   | 3       |
+| that set and 20 built-in models | 198.8 KiB | 772.4 KiB | 49      |
+| figure: a child                 | 23.9 KiB  | 130.7 KiB | 22      |
+| figure: a dog                   | 26.5 KiB  | 156.9 KiB | 21      |
+| prop: the red kite              | 3.3 KiB   | 12.6 KiB  | 9       |
+| prop: a park bench              | 3.4 KiB   | 8.6 KiB   | 2       |
+| prop: a house                   | 10.8 KiB  | 47.9 KiB  | 2       |
+
+The desk state (the gzipped Yjs update) grows by about what the units hold: with 2 shots from
+118.7 KiB staged to 326.8 KiB with the dressed set inserted and 342.5 KiB with both cast members
+replaced by figures; with 24 shots and 4 cast from 658.9 KiB to 867.5 KiB and 879.9 KiB.
+Extraction takes 24–117 ms, decoding the dressed set 51 ms and inserting it 11–17 ms.
+
 ## Server
 
 - **Sync rooms** (`apps/server/src/sync`): one room per open project holds a server-side replica of

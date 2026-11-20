@@ -1,0 +1,286 @@
+import { dataKindOf, type SceneDoc } from '../../doc/scene-doc';
+import { ROOT_COLLECTION_ID, type DatablockKind, type DriverData, type ObjectData } from '../../doc/types';
+import type { Vec3 } from '../../math/types';
+import { cloneJson } from '../../util/json';
+import { DESK_PROPS } from '../props';
+import { UnitError } from './errors';
+import type { UnitBody, UnitHeader, UnitPayload } from './format';
+import { UNIT_ROOT, deriveUnitId, requireUnitKey } from './ids';
+import { UNIT_BLOCK_KINDS, type UnitKind } from './kinds';
+import { provenanceProps, readInstance, type UnitPartStamp } from './list';
+import { mergeForUpdate, partSum16, splitProps } from './ownership';
+import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
+
+/*
+ * Inserting a unit: its records are copied into the scene, each datablock under the id
+ * deriveUnitId(key, sourceId), its references remapped to those ids, in one transaction (one undo
+ * step). The root takes the placement given (location, rotation, parent, collection; scale from the
+ * unit unless given) and the scene-owned props given (rootProps: the staging stamps desk_role 'set'
+ * and desk_rideo_clip on a set's root, desk_character_id on a figure's …), then the provenance
+ * (list.ts). Names are made unique as every new datablock's are. If a derived id is taken the insert
+ * is refused rather than salted, so two replicas stay identical: UNIT_INSTANCE_EXISTS when the slot
+ * already holds an instance with this key, UNIT_ID_TAKEN otherwise.
+ *
+ * `replace` makes an existing object the root (a procedural actor or prop swapped for a library
+ * one): its id, name, placement, parent, constraints, physics, pose, F-curves and scene-owned props
+ * stay; its old parts (children that are not cameras or actors) and the data and materials only they
+ * used are removed. Bones the scene's animation or attachments name that the unit's rig lacks are
+ * reported in `warnings`.
+ */
+
+/** A library version: the host's item id, its version number and the SHA-256 of its unit file. */
+export interface UnitPin {
+  ref: string;
+  version: number;
+  sha256: string;
+}
+
+export interface InsertUnitOptions extends UnitPin {
+  /** The instance key (slotKey). */
+  key: string;
+  /** The root's name (default: the unit root's). */
+  name?: string;
+  location?: Vec3;
+  rotation_euler?: Vec3;
+  /** Default: the unit root's scale. */
+  scale?: Vec3;
+  parent?: string | null;
+  /** Default: the scene collection ('root'). */
+  collection?: string;
+  /**
+   * Custom props for the root. Scene-owned keys (desk_rideo_*, desk_character_id, every desk_* on a
+   * set's or prop's root …) are the scene's from then on; a unit-owned key overrides the unit's value
+   * and makes the root count as edited.
+   */
+  rootProps?: Record<string, string | number | boolean>;
+  /** An existing object (not an instance root) that becomes the root. */
+  replace?: string;
+}
+
+export interface InsertUnitResult {
+  /** The root object's id. */
+  root: string;
+  /** The scene id of every datablock inserted, by '<kind>:<sourceId>'. */
+  ids: Record<string, string>;
+  warnings: string[];
+}
+
+const PIN_REF = /^[A-Za-z0-9_.:-]{1,100}$/;
+const SHA256 = /^[0-9a-f]{64}$/;
+
+/** `pin` when it is a library version ({ref, version, sha256}), else UNIT_BAD_SPEC. */
+export function requirePin(pin: UnitPin): UnitPin {
+  if (
+    !pin ||
+    typeof pin.ref !== 'string' ||
+    !PIN_REF.test(pin.ref) ||
+    !Number.isInteger(pin.version) ||
+    pin.version < 1 ||
+    pin.version > 1_000_000_000 ||
+    typeof pin.sha256 !== 'string' ||
+    !SHA256.test(pin.sha256)
+  )
+    throw new UnitError(
+      'UNIT_BAD_SPEC',
+      'a library version is {ref: a host id, version: an integer from 1, sha256: 64 lowercase hex digits}',
+    );
+  return { ref: pin.ref, version: pin.version, sha256: pin.sha256 };
+}
+
+/** Deep copy of a record value, byte arrays included (records of a decoded unit are views into it). */
+const copy = (v: unknown): unknown => (v instanceof Uint8Array ? v.slice() : cloneJson(v));
+
+/** The fields a record is written with (top level copied). */
+function fieldsOf(rec: UnitRecord): Record<string, unknown> & { name: string } {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(rec)) if (k !== 'id' && v !== undefined) out[k] = copy(v);
+  return { ...out, name: typeof rec.name === 'string' && rec.name ? rec.name : 'Unit' };
+}
+
+/** Bones of the unit's root armature (null: the root is not an armature or has none). */
+function unitBones(body: UnitBody): Set<string> | null {
+  const root = body.blocks.objects?.[UNIT_ROOT];
+  if (!root || root.type !== 'ARMATURE' || typeof root.data !== 'string') return null;
+  const arm = body.blocks.armatures?.[root.data];
+  const bones = Array.isArray(arm?.bones) ? (arm.bones as { name?: unknown }[]) : [];
+  return new Set(bones.map((b) => String(b?.name ?? '')));
+}
+
+/** Warnings for bones the scene uses on `root` that `bones` lacks. */
+function missingBones(doc: SceneDoc, root: string, bones: Set<string>, keep: Set<string>): string[] {
+  const missing = new Set<string>();
+  for (const fc of doc.listFCurves(root)) {
+    const m = /^pose\.bones\["(.+?)"\]/.exec(fc.path);
+    if (m && !bones.has(m[1])) missing.add(m[1]);
+  }
+  for (const o of doc.listObjects()) {
+    if (o.parent === root && o.parent_type === 'BONE' && keep.has(o.id) && !bones.has(o.parent_bone))
+      missing.add(o.parent_bone);
+    for (const c of o.constraints ?? [])
+      if (c.target === root && c.subtarget && !bones.has(c.subtarget)) missing.add(c.subtarget);
+  }
+  return [...missing]
+    .sort()
+    .map((b) => `the library figure has no bone '${b}' that the scene's animation, holds or attachments use`);
+}
+
+/** Removes `root`'s old parts (children but cameras and actors) and the data and materials only they used. */
+function removeOldParts(doc: SceneDoc, root: string): Set<string> {
+  const index = doc.childrenIndex();
+  const doomed: string[] = [];
+  const kept = new Set<string>();
+  const walk = (id: string) => {
+    for (const child of index.get(id) ?? []) {
+      const o = doc.getObject(child);
+      if (!o) continue;
+      if (o.type === 'CAMERA' || o.custom_props?.[DESK_PROPS.role] === 'actor') {
+        kept.add(child);
+        continue;
+      }
+      doomed.push(child);
+      walk(child);
+    }
+  };
+  walk(root);
+  const materials = new Set<string>();
+  for (const id of doomed) for (const m of doc.getObject(id)?.material_slots ?? []) if (m) materials.add(m);
+  doc.removeObjects(doomed);
+  if (materials.size) {
+    const used = new Set(doc.listObjects().flatMap((o) => o.material_slots));
+    for (const m of materials) if (!used.has(m)) doc.removeMaterial(m);
+  }
+  return kept;
+}
+
+/**
+ * Writes a body's records into `doc` under derived ids and returns the ids and the stamps of the
+ * parts (no provenance; the caller writes it). Shared by insertUnit and extraction's probe document.
+ */
+export function writeUnitRecords(
+  doc: SceneDoc,
+  body: UnitBody,
+  kind: UnitKind,
+  o: Omit<InsertUnitOptions, 'ref' | 'version' | 'sha256'>,
+  provenance: ((parts: Map<string, UnitPartStamp>) => Record<string, string | number>) | null,
+): InsertUnitResult {
+  const key = requireUnitKey(o.key);
+  const warnings: string[] = [];
+  const ids: Record<string, string> = {};
+  for (const k of UNIT_BLOCK_KINDS)
+    for (const src of Object.keys(body.blocks[k] ?? {}))
+      ids[`${k}:${src}`] =
+        k === 'objects' && src === UNIT_ROOT && o.replace ? o.replace : deriveUnitId(key, src);
+  const rootId = ids[`objects:${UNIT_ROOT}`];
+  const unitRoot = body.blocks.objects?.[UNIT_ROOT];
+  if (!rootId || !unitRoot) throw new UnitError('UNIT_BAD_RECORD', "the unit has no root object ('@root')");
+
+  let old: UnitRecord | null = null;
+  if (o.replace) {
+    old = doc.readRecord('objects', o.replace);
+    if (!old) throw new UnitError('UNIT_NOT_FOUND', `object '${o.replace}' is not in the scene`);
+    if (old.type !== unitRoot.type)
+      throw new UnitError(
+        'UNIT_KIND_MISMATCH',
+        `a ${String(unitRoot.type)} unit root cannot replace a ${String(old.type)} object`,
+      );
+    if (readInstance(doc, o.replace))
+      throw new UnitError('UNIT_INSTANCE_EXISTS', `'${o.replace}' is already an instance: update it instead`);
+  } else if (doc.has('objects', rootId)) {
+    const props = doc.readRecord('objects', rootId)?.custom_props as Record<string, unknown> | undefined;
+    if (props?.unit_key === key)
+      throw new UnitError('UNIT_INSTANCE_EXISTS', `the scene already holds the instance '${key}'`);
+    throw new UnitError('UNIT_ID_TAKEN', `the id ${rootId} the unit's root derives to is taken`);
+  }
+  for (const [pk, id] of Object.entries(ids)) {
+    if (id === rootId) continue;
+    const k = pk.slice(0, pk.indexOf(':')) as DatablockKind;
+    if (doc.has(k, id))
+      throw new UnitError('UNIT_ID_TAKEN', `the id ${id} a part derives to is taken (${pk})`);
+  }
+  if (o.parent && !doc.has('objects', o.parent))
+    throw new UnitError('UNIT_NOT_FOUND', `the parent '${o.parent}' is not in the scene`);
+  if (o.collection && o.collection !== ROOT_COLLECTION_ID && !doc.has('collections', o.collection))
+    throw new UnitError('UNIT_NOT_FOUND', `the collection '${o.collection}' is not in the scene`);
+
+  const map = (k: DatablockKind, src: string) => ids[`${k}:${src}`] ?? null;
+  const stamps = new Map<string, UnitPartStamp>();
+  doc.transact(() => {
+    let kept = new Set<string>();
+    let oldData: { kind: DatablockKind; id: string } | null = null;
+    if (o.replace && old) {
+      kept = removeOldParts(doc, o.replace);
+      if (typeof old.data === 'string' && old.data) {
+        const dk = dataKindOf(old.type as ObjectData['type']);
+        if (dk) oldData = { kind: dk, id: old.data };
+      }
+    }
+    for (const k of UNIT_BLOCK_KINDS) {
+      const m = body.blocks[k];
+      if (!m) continue;
+      for (const src of Object.keys(m).sort()) {
+        const rec = m[src];
+        const id = ids[`${k}:${src}`];
+        const isRoot = k === 'objects' && src === UNIT_ROOT;
+        stamps.set(`${k}:${src}`, { id, sum: partSum16(k, rec, { isRoot, unitKind: kind }) });
+        const fields = fieldsOf(mapRecordRefs(k, rec, map));
+        if (!isRoot) {
+          doc.addRecord(k, id, fields);
+          continue;
+        }
+        if (o.replace && old) {
+          const merged = mergeForUpdate('objects', fields, old, { isRoot: true, unitKind: kind }, () => true);
+          merged.custom_props = { ...(merged.custom_props as object), ...(o.rootProps ?? {}) };
+          doc.replaceRecord('objects', id, merged);
+          continue;
+        }
+        fields.location = o.location ? [...o.location] : [0, 0, 0];
+        fields.rotation_euler = o.rotation_euler ? [...o.rotation_euler] : [0, 0, 0];
+        if (o.scale) fields.scale = [...o.scale];
+        fields.parent = o.parent ?? null;
+        fields.parent_type = 'OBJECT';
+        fields.parent_bone = '';
+        fields.collection = o.collection ?? ROOT_COLLECTION_ID;
+        if (o.name) fields.name = o.name;
+        fields.custom_props = {
+          ...splitProps(fields.custom_props, { isRoot: true, unitKind: kind }).unit,
+          ...(o.rootProps ?? {}),
+        };
+        doc.addRecord('objects', id, fields);
+      }
+    }
+    for (const d of body.drivers) {
+      const mapped = mapDriverRefs(d, map);
+      if (mapped) doc.setDriver(cloneJson(mapped) as unknown as DriverData);
+    }
+    if (oldData && !doc.dataUserCounts().get(oldData.id)) doc.map(oldData.kind).delete(oldData.id);
+    if (provenance) {
+      const cur = doc.readRecord('objects', rootId)!;
+      doc.updateObject(rootId, {
+        custom_props: { ...(cur.custom_props as ObjectData['custom_props']), ...provenance(stamps) },
+      });
+    }
+    const bones = o.replace ? unitBones(body) : null;
+    if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
+  });
+  return { root: rootId, ids, warnings };
+}
+
+/**
+ * Inserts a decoded unit into the scene (one transaction): see the module comment. Throws
+ * UNIT_BAD_KEY, UNIT_BAD_SPEC (pin), UNIT_INSTANCE_EXISTS, UNIT_ID_TAKEN, UNIT_NOT_FOUND (parent,
+ * collection or `replace`) or UNIT_KIND_MISMATCH (`replace` of another object type).
+ */
+export function insertUnit(doc: SceneDoc, unit: UnitPayload, o: InsertUnitOptions): InsertUnitResult {
+  const pin = requirePin(o);
+  const header: UnitHeader = unit.header;
+  return writeUnitRecords(doc, unit.body, header.kind, o, (parts) =>
+    provenanceProps({
+      ...pin,
+      digest: header.digest,
+      kind: header.kind,
+      key: o.key,
+      name: header.name,
+      parts,
+    }),
+  );
+}
