@@ -19,7 +19,8 @@ import type { UnitRecord } from './refs';
  *   prop (the scene decides whether a library prop is an action prop or set dressing, and stamps its
  *   set's root); on a figure's root every desk_* prop but desk_role, desk_kind, desk_height_m and
  *   desk_color;
- * - the name of every part and the collection of every object;
+ * - the name of every part, and the collection and rigid body of every object (physics presets make
+ *   any object a body: a set's ground becomes the floor a dropped prop lands on);
  * - on the root: location, rotation, scale, parent (and its type and bone), constraints, rigid body,
  *   hiding and pose (scale and pose take the unit's value when it is inserted);
  * - on any other object, constraints and pose-bone constraints whose target is outside the instance.
@@ -44,7 +45,7 @@ export const FIGURE_ROOT_UNIT_PROPS = ['desk_role', 'desk_kind', 'desk_height_m'
 /** Fields every part leaves to the scene. */
 export const PART_SCENE_FIELDS = ['name'] as const;
 /** Fields every object leaves to the scene (besides PART_SCENE_FIELDS). */
-export const OBJECT_SCENE_FIELDS = ['collection'] as const;
+export const OBJECT_SCENE_FIELDS = ['collection', 'rigid_body'] as const;
 /** Fields an instance's root leaves to the scene. */
 export const ROOT_SCENE_FIELDS = [
   'location',

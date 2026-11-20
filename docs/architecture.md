@@ -1003,8 +1003,10 @@ datablock at a derived id that nothing uses counts as free and goes in the inser
 one something uses refuses the insert (`UNIT_ID_TAKEN`). An update
 replaces the parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep
 resolving; it keeps parts edited or deleted in the scene, adds new parts and removes dropped
-untouched ones. Scene-owned fields (names, the root's placement, pose, constraints and physics,
-the scene's `desk_*` props) never count as edits. Measured on the sample brief:
+untouched ones. Scene-owned fields (names, the collection and rigid body of every object, the
+root's placement, pose and constraints, the scene's `desk_*` props) never count as edits, and a unit
+holds no rigid body: a drop preset that makes a library set's ground the floor edits nothing of the
+set. Measured on the sample brief:
 
 | Unit                            | File      | Body      | Objects |
 | ------------------------------- | --------- | --------- | ------- |

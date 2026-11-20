@@ -480,6 +480,8 @@ export function extractUnit(doc: SceneDoc, spec: UnitSpec, o: { deskVersion: str
         for (const [pk, v] of Object.entries((mapped.custom_props as Record<string, unknown>) ?? {}))
           if (!isSceneProp(pk, place)) props[pk] = v;
         mapped.custom_props = props;
+        // physics is the scene's on every object: a unit holds no rigid body
+        mapped.rigid_body = null;
         if (isRoot) {
           Object.assign(mapped, {
             parent: null,
@@ -488,7 +490,6 @@ export function extractUnit(doc: SceneDoc, spec: UnitSpec, o: { deskVersion: str
             location: [0, 0, 0],
             rotation_euler: [0, 0, 0],
             constraints: [],
-            rigid_body: null,
             hide_viewport: false,
             hide_render: false,
             hide_select: false,

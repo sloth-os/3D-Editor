@@ -717,8 +717,8 @@ and the host's state says so (`staged` `unit` with `local` true).
 undo step). For a new version of the item a slot holds, the instance is updated in place:
 
 - a part left as the version made it takes the new version's shape and look and keeps its id, so
-  shots, holds, constraints and keys still find it; what the scene owns stays (names, collections,
-  the instance's placement, constraints, physics, hiding and pose);
+  shots, holds, constraints and keys still find it; what the scene owns stays (names, the
+  collection and physics of every part, the instance's placement, constraints, hiding and pose);
 - a part edited in the desk keeps the edit (with a warning when the new version changed it too),
   and a part deleted in the desk stays deleted;
 - a part only the new version has is added; one it drops goes when it was left as it was and

@@ -42,9 +42,11 @@ import {
   readInstance,
   unitOf,
   unitStatus,
+  updateUnit,
   type UnitHeaderInput,
   type UnitPayload,
 } from '../src/desk/units';
+import { deskDrop } from '../src/desk/physics/presets';
 import { unusedData } from '../src/desk/units/remove';
 import type { DatablockKind } from '../src/doc/types';
 import { BUILTIN_CATALOG } from '../src/store/catalog';
@@ -890,6 +892,43 @@ describe('the units one staging takes (48 MiB of files)', () => {
     );
     expect(u.changes).not.toBeNull();
     expect(rowsOf(u.r)).toEqual(['set unit', `el:${KITE} unit`]);
+  });
+});
+
+describe('physics on a library set', () => {
+  it("a drop on the set's ground is no edit of the set, and the next version still updates the ground", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    const set = listUnits(doc).find((i) => i.key === 'set')!;
+    const ground = doc
+      .listObjects()
+      .find((o) => prop(o, 'desk_label') === 'ground' && o.parent === set.root)!;
+    expect(ground.rigid_body).toBeNull();
+    const ball = BUILTIN_CATALOG.find((e) => e.id === 'soccer_ball')!.build(doc, {
+      location: [3, 3, 0],
+    }).root;
+    deskDrop(doc, [ball], { frame: 10, height: 2 });
+    // the drop makes the ground a passive body: physics, which the scene owns on every part
+    const body = doc.getObject(ground.id)!.rigid_body;
+    expect(body).toMatchObject({ type: 'PASSIVE' });
+    expect(unitStatus(doc, set.root)).toEqual({ edited: [], missing: [] });
+    // a version whose ground is larger updates it in place and keeps the scene's body
+    const v2 = editedUnit(L.units.set, (b) => {
+      const g = Object.values(b.blocks.objects!).find(
+        (r) => (r.custom_props as Record<string, unknown> | undefined)?.desk_label === 'ground',
+      )!;
+      g.scale = (g.scale as number[]).map((v) => v * 2);
+    });
+    const rep = updateUnit(doc, set.root, v2, {
+      ref: L.set.pin.ref,
+      version: 2,
+      sha256: sha256Hex(v2.bytes),
+    });
+    expect(rep.updated.map((p) => p.id)).toContain(ground.id);
+    expect(rep.kept.map((p) => p.id)).not.toContain(ground.id);
+    expect(doc.getObject(ground.id)!.scale).toEqual((ground.scale as number[]).map((v) => v * 2));
+    expect(doc.getObject(ground.id)!.rigid_body).toEqual(body);
+    expect(unitStatus(doc, set.root)).toEqual({ edited: [], missing: [] });
   });
 });
 
