@@ -932,8 +932,19 @@ function landmarksOf(
     else if (role(o) === 'landmark') landmarks.push({ ...piece, role: 'landmark' });
     else if (piece.width * piece.depth >= 0.25) dressing.push({ ...piece, area: piece.width * piece.depth });
   }
-  dressing.sort((x, y) => y.area - x.area || (x.label < y.label ? -1 : 1));
-  const byLabel = (x: UnitLandmark, y: UnitLandmark) => (x.label < y.label ? -1 : x.label > y.label ? 1 : 0);
+  // a total order (label, then where a piece stands, turns and how big it is), so the same pieces
+  // sort the same whatever order the scene holds them in, in any engine
+  const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0);
+  const byLabel = (x: UnitLandmark, y: UnitLandmark) =>
+    cmp(x.label, y.label) ||
+    x.x - y.x ||
+    x.y - y.y ||
+    x.rotationDeg - y.rotationDeg ||
+    x.width - y.width ||
+    x.depth - y.depth ||
+    x.height - y.height ||
+    Number(x.water) - Number(y.water);
+  dressing.sort((x, y) => y.area - x.area || byLabel(x, y));
   return [
     ...landmarks.sort(byLabel),
     ...grounds,

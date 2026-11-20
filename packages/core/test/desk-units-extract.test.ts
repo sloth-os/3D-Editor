@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { SceneDoc } from '../src/doc/scene-doc';
+import { createCube } from '../src/mesh/primitives';
 import { lookAt } from '../src/desk/characters';
 import { blueprintFor } from '../src/desk/characters/kinds';
 import { multiply4, invert4 } from '../src/math/mat4';
@@ -313,6 +314,29 @@ describe('extractUnit: a set', () => {
     expect(ex.from).toEqual({ set: true });
     // the set's root takes the scene's desk props only from the caller when it is inserted
     expect(Object.keys(props(root))).toEqual([]);
+  });
+});
+
+describe('extractUnit: set landmarks', () => {
+  it('sort the same whatever order the scene holds its pieces in (equal pieces by where they stand)', () => {
+    // two equal crates; the unit holds pieces in id order, so the ids decide which comes first
+    const marks = (leftId: string, rightId: string) => {
+      const doc = stagedDoc();
+      for (const [id, x] of [
+        [leftId, -4],
+        [rightId, 4],
+      ] as const)
+        doc.addObject(
+          { type: 'MESH', name: 'Crate', data: doc.addMesh('Crate', createCube()), location: [x, 6, 1] },
+          id,
+        );
+      return extractUnit(doc, { kind: 'set', name: 'Meadow' }, { deskVersion: 'test' }).header.set!.landmarks;
+    };
+    const a = marks('aaaaaaaa', 'zzzzzzzz');
+    const b = marks('zzzzzzzz', 'aaaaaaaa');
+    const crates = a.filter((l) => l.label === 'Crate');
+    expect(crates.map((l) => l.x)).toEqual([-4, 4]);
+    expect(b).toEqual(a);
   });
 });
 
