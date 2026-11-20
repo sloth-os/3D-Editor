@@ -70,9 +70,10 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, brief staging, SceneBlocking import and export     | `packages/core/src/desk`                                      |
 | Actors: mannequin rigs, poses, gaits, locomotion, holding and riding, keypoints                                                                                                       | `packages/core/src/desk/characters`                           |
 | Physics presets: start frames, drop, throw, push, bake, kites and balloons, vehicles                                                                                                  | `packages/core/src/desk/physics`                              |
+| Library units: the unit file, extraction, insertion, updates, adoption, Make local                                                                                                    | `packages/core/src/desk/units`                                |
 | Built-in model catalog, catalog search, store inserts, framing of the built-in thumbnails                                                                                             | `packages/core/src/store`                                     |
 | Director workspace, Asset Browser, Export Video window, Follow Shots                                                                                                                  | `apps/web/src/ui/director`, `ui/assets`, `viewport`           |
-| Embeddable desk: its page, the host protocol and bridge, the desk state, the staging worker, its export                                                                               | `apps/web/src/embed`, `apps/server/src/desk-embed.ts`         |
+| Embeddable desk: its page, the host protocol and bridge, the desk state, the staging worker, its export, library units, the Library tab                                               | `apps/web/src/embed`, `apps/server/src/desk-embed.ts`         |
 | Video export of server and browser: parameters, plan, desk frames, passes, frame loop, manifest, estimates                                                                            | `packages/core/src/export`                                    |
 | Browser video export: render workers, WebCodecs encoders, MP4/WebM muxing, files, memory plan                                                                                         | `apps/web/src/export`                                         |
 | Built-in thumbnails in the browser: thumbnail workers, queue, IndexedDB cache                                                                                                         | `apps/web/src/assets/thumbnails`                              |
@@ -943,6 +944,18 @@ telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested o
   registry's poll and told to the editor's UI through `editor/page-guard.ts` (menus grey them
   out, a slider drag writes no live value, a dropped model file is refused unread; the editor
   refuses nothing there), and the keys of the chrome it hides, which its keymap ignores.
+- `units.ts`: [library units](#library-units) in the desk, on only after an open with
+  `options.units`. It reads `open.units` entry by entry (each file's SHA-256 checked) and hands the
+  files the open holds to the staging worker with each staging and update (transferred), where
+  core places and updates the units. The worker also makes a unit of the scene for Save to library
+  with its thumbnail, rendered from the unit alone (`unit-extract`, read only), links the scene to
+  a version the host saved (`unit-adopt`) and cuts an instance's link (`unit-local`), the last two
+  answered with a Yjs diff. `units.ts` also gives `state.units` from the scene's record, the
+  Library tab's rows (`libraryRows`) and what Save to library can save (`saveTargets`).
+  `LibraryTab.tsx` and `SaveToLibraryDialog.tsx` are their UI: a tab the desk adds to the editor's
+  bottom area (`ExtraBottomTab` in `ui/App.tsx`; the editor adds none) and a dialog over the desk.
+  A desk state's container is version 1, or 2 once the scene holds library units, so a desk from
+  before units refuses that state rather than drop instances it cannot keep.
 
 The server, the Vite dev and preview servers and the PWA's service worker share
 `apps/server/src/desk-embed.ts` (no imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the

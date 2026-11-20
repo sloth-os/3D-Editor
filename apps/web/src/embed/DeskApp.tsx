@@ -6,12 +6,22 @@ import { hoveredArea, type AreaKind } from '../editor/editor';
 import { PopupMenuHost } from '../ui/Menu';
 import { Viewport } from '../ui/Viewport';
 import { DirectorPanel } from '../ui/director/DirectorPanel';
-import { Area, BottomPane, Splitter, Toasts, usePersistentSize, type BottomEditor } from '../ui/App';
+import {
+  Area,
+  BottomPane,
+  Splitter,
+  Toasts,
+  usePersistentSize,
+  type BottomEditor,
+  type ExtraBottomTab,
+} from '../ui/App';
 import { Icon } from '../ui/icons';
 import type { ProjectSession } from '../project/session';
 import type { DeskController } from './controller';
 import { exportSizeProblem, type LengthCheck } from './export';
+import { LibraryTab } from './LibraryTab';
 import type { Mode } from './protocol';
+import { SaveToLibraryDialog } from './SaveToLibraryDialog';
 import type { WorkProgress } from './workspace';
 import './desk.css';
 
@@ -32,10 +42,25 @@ import './desk.css';
  * editor's areas do, so a key pressed over the shot list never deletes the selected objects.
  *
  * Opened on its own (no host), it explains itself and offers a sample scene.
+ *
+ * After an open whose host turned library units on (controller.units), the bottom area has a Library
+ * tab as well (LibraryTab.tsx: the scene's library units, Make local, Save to library…), and Save to
+ * library opens its dialog (SaveToLibraryDialog.tsx) over the desk. Without units neither shows.
  */
 
 /** The bottom area's tabs in the desk ("Shots" is the phone layout's Director panel). */
 export const DESK_BOTTOM_TABS: readonly BottomEditor[] = ['sequence', 'timeline', 'shots', 'assets', 'info'];
+
+/**
+ * The desk's own bottom tabs: the Library, only after an open with library units (none without:
+ * a host from before units sees the desk as before). `onSave` opens the Save to library dialog.
+ */
+export function deskExtraTabs(c: DeskController, onSave: () => void): ExtraBottomTab[] {
+  if (!c.units.value) return [];
+  return [
+    { id: 'library', label: 'Library', panel: true, render: () => <LibraryTab c={c} onSave={onSave} /> },
+  ];
+}
 
 const MODE_LABEL: Record<Mode, string> = { camera: 'Camera', motion: 'Motion', pose: 'Pose' };
 
@@ -437,7 +462,7 @@ function DeskHeader(p: { c: DeskController; lengthChecks: () => LengthCheck[] })
  * editor's properties area (as in its Director workspace), so the viewport's keys do nothing over
  * it or while it has the focus; the viewport takes them back on pointer or focus.
  */
-function DeskEditor({ s }: { s: ProjectSession }) {
+function DeskEditor({ s, c, onSave }: { s: ProjectSession; c: DeskController; onSave: () => void }) {
   const [rightW, setRightW] = usePersistentSize('right', 340);
   const [bottomH, setBottomH] = usePersistentSize('bottom', 170);
   return (
@@ -446,7 +471,14 @@ function DeskEditor({ s }: { s: ProjectSession }) {
         <div class="desk-viewport" onFocusIn={() => (hoveredArea.value = 'viewport')}>
           <Viewport session={s} />
         </div>
-        <BottomPane s={s} initial="sequence" size={bottomH} setSize={setBottomH} tabs={DESK_BOTTOM_TABS} />
+        <BottomPane
+          s={s}
+          initial="sequence"
+          size={bottomH}
+          setSize={setBottomH}
+          tabs={DESK_BOTTOM_TABS}
+          extraTabs={deskExtraTabs(c, onSave)}
+        />
       </div>
       <Splitter
         dir="v"
@@ -516,6 +548,12 @@ export function DeskApp(p: DeskAppProps) {
   const { c } = p;
   const s = session.value;
   const status = c.status.value;
+  // Save to library's dialog, with the object active when it opened (its target comes first)
+  const [saving, setSaving] = useState<{ selected: string | null } | null>(null);
+  const openSave = () => setSaving({ selected: session.peek()?.state.activeId ?? null });
+  // another open (after a Close that cancelled one) starts without it
+  const opened = c.opened.value;
+  useEffect(() => setSaving(null), [opened]);
   return (
     <div class="app desk-app" data-testid="desk-app" data-status={status}>
       {p.sampleBar}
@@ -525,7 +563,7 @@ export function DeskApp(p: DeskAppProps) {
       <AckNotice c={c} />
       <NoticeLine c={c} />
       {s && status !== 'waiting' && status !== 'connected' ? (
-        <DeskEditor s={s} />
+        <DeskEditor s={s} c={c} onSave={openSave} />
       ) : (
         <div class="desk-empty" data-testid="desk-waiting" {...CHROME}>
           {status === 'waiting' || status === 'connected'
@@ -534,6 +572,10 @@ export function DeskApp(p: DeskAppProps) {
               ? 'Opening the scene…'
               : ''}
         </div>
+      )}
+      {/* under the closed panel when the desk closes while it is open (Back to the desk shows it again) */}
+      {saving && c.units.value && (
+        <SaveToLibraryDialog c={c} selected={saving.selected} onClose={() => setSaving(null)} />
       )}
       {status === 'closed' && (
         <div class="desk-work" data-testid="desk-closed" {...CHROME}>

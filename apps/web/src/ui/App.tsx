@@ -249,6 +249,18 @@ export const NARROW_PANEL_SHARE = 0.55;
 const PANEL_TABS: ReadonlySet<BottomEditor> = new Set(['shots', 'assets']);
 
 /**
+ * A tab a page adds to the bottom area after its own (the embedded desk's Library; the editor adds
+ * none): its id (no BottomEditor's), label and content; with `panel` it opens the area on a narrow
+ * screen as the Shots and Assets tabs do.
+ */
+export interface ExtraBottomTab {
+  id: string;
+  label: string;
+  render: () => ComponentChildren;
+  panel?: boolean;
+}
+
+/**
  * Tabs of the bottom area. "Shots" (the Director panel) is shown on narrow screens only, where the
  * right column is hidden; the header scrolls sideways when the tabs do not fit.
  */
@@ -269,14 +281,18 @@ function BottomArea({
   tab,
   onTab,
   tabs,
+  extra,
 }: {
   s: ProjectSession;
-  tab: BottomEditor;
-  onTab: (tab: BottomEditor) => void;
+  tab: string;
+  onTab: (tab: string) => void;
   /** The tabs offered (default: all of them); the desk offers fewer. */
   tabs?: readonly BottomEditor[];
+  /** Tabs of the page's own, after these. */
+  extra?: readonly ExtraBottomTab[];
 }) {
   const shown = tabs ? BOTTOM_TABS.filter((t) => tabs.includes(t.id)) : BOTTOM_TABS;
+  const own = extra?.find((t) => t.id === tab);
   return (
     <div class="column" style={{ height: '100%' }}>
       <div class="area-header" style={{ height: '24px', overflowX: 'auto', scrollbarWidth: 'none' }}>
@@ -291,8 +307,20 @@ function BottomArea({
             {t.label}
           </button>
         ))}
+        {extra?.map((t) => (
+          <button
+            key={t.id}
+            class={`menu-button ${tab === t.id ? 'open' : ''}`}
+            style={{ flex: 'none' }}
+            data-testid={`bottom-tab-${t.id}`}
+            onClick={() => onTab(t.id)}
+          >
+            {t.label}
+          </button>
+        ))}
       </div>
       <div style={{ flex: 1, minHeight: 0 }}>
+        {own?.render()}
         {tab === 'timeline' && <Timeline session={s} />}
         {tab === 'sequence' && <SequenceStrip s={s} />}
         {tab === 'shots' && <DirectorPanel s={s} />}
@@ -337,15 +365,22 @@ export function BottomPane(p: {
   minHeight?: number;
   /** The tabs offered (default: all); `initial` must be one of them. */
   tabs?: readonly BottomEditor[];
+  /** Tabs of the page's own after them (the desk's Library); one that goes away gives way to `initial`. */
+  extraTabs?: readonly ExtraBottomTab[];
 }) {
   const { initial } = p;
   const narrow = useNarrowScreen();
-  const [tab, setTab] = useState<BottomEditor>(initial);
+  const [tab, setTab] = useState<string>(initial);
   useEffect(() => setTab(initial), [initial]);
   useEffect(() => {
     if (!narrow && tab === 'shots') setTab(initial);
   }, [narrow, tab, initial]);
-  const panel = narrow && PANEL_TABS.has(tab);
+  const extra = p.extraTabs?.find((t) => t.id === tab);
+  const gone = !extra && !BOTTOM_TABS.some((t) => t.id === tab);
+  useEffect(() => {
+    if (gone) setTab(initial);
+  }, [gone, initial]);
+  const panel = narrow && (PANEL_TABS.has(tab as BottomEditor) || !!extra?.panel);
   // 0: NARROW_PANEL_SHARE of the window
   const [panelSize, setPanelSize] = usePersistentSize('bottom-narrow-panel', 0);
   const windowH = useWindowHeight(panel && !panelSize);
@@ -365,7 +400,7 @@ export function BottomPane(p: {
         kind={initial === 'console' ? 'console' : 'timeline'}
         style={{ height: `${height}px`, flex: 'none' }}
       >
-        <BottomArea s={p.s} tab={tab} onTab={setTab} tabs={p.tabs} />
+        <BottomArea s={p.s} tab={tab} onTab={setTab} tabs={p.tabs} extra={p.extraTabs} />
       </Area>
     </>
   );

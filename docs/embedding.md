@@ -402,6 +402,9 @@ type StateUnit = {           // state.units[]: one row per brief slot whose reco
   for a change of pins alone, while the desk's banner offers Update shots.
 - After an open with units every `state` carries `units`: one row per brief slot whose record has a
   pin, sorted by `slot` in plain string order (`cast:…`, `el:…`, `set`), at most 128.
+- The person sees it in the desk's **Library** tab, a bottom tab only after an open with units:
+  each unit the scene holds or the brief pins with its version and status, Make local, and Save to
+  library ([director-desk.md](director-desk.md#the-library-tab)).
 
 ### Publishing and linking
 

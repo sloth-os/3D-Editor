@@ -23,7 +23,8 @@ Contents:
 - [Staging from a brief](#staging-from-a-brief): what a host's brief becomes, later briefs, the
   results per shot, and the [SceneBlocking v1](#sceneblocking-v1) format underneath
 - [The agreement principle](#the-agreement-principle)
-- [In the editor](#in-the-editor): the Director workspace, the Asset Browser, Export Video
+- [In the editor](#in-the-editor): the Director workspace, the Asset Browser, Export Video, and
+  the embedded desk's [Library tab](#the-library-tab) and [Save to library](#save-to-library)
 - [Over MCP](#over-mcp): the operators and their parameters, and a
   [worked example](#worked-example-a-kite-on-a-hill)
 - [Coordinates](#coordinates)
@@ -677,7 +678,90 @@ application's frame. The host's brief is staged in the browser (in a worker), th
 it, **Update shots** brings the staging up to a later brief as one undo step, and **Send to …**
 renders every shot's reference clips in the browser and hands them to the host, which also keeps
 the scene's state; Done and Close end the session. Opened on its own, the page offers a sample
-scene. See [embedding.md](embedding.md).
+scene. See [embedding.md](embedding.md). A host that keeps a library of 3D pieces adds the
+[Library tab](#the-library-tab).
+
+### The Library tab
+
+After an open whose host turned [library units](embedding.md#library-units) on (`options.units`),
+the embedded desk has a **Library** bottom tab; on a phone it opens the bottom area as the Shots
+tab does. A host from before library units, or an open without them, gets the desk as before: no
+tab, nothing saved, no units in its states. Under **From the library** the tab lists one row per
+library unit the scene holds or its brief pins, in slot order (the set, the cast, the elements,
+then instances of no slot): the unit's name (else the slot's), its kind (set, figure or prop), the
+version, and its status in words:
+
+| The row says                                                | When                                                                                     |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| up to date                                                  | The slot holds an instance of the version its pin names                                  |
+| 3 parts edited here                                         | It does, with three of the instance's parts edited or deleted in the desk                |
+| v3 is here: Update shots places it                          | The brief pins a version the slot does not hold, and the host sent its file              |
+| the brief pins v3: Update shots brings it in                | The same over the version the slot holds: Update shots updates or replaces it            |
+| waiting: its file was not sent; staged from the words       | The pin waits (`pending`, with its reason): tried again at the next open                 |
+| the brief pins v3: waiting for its file; v2 stays           | The same over the version the slot holds, which stays                                    |
+| refused: it was made by a newer desk; staged from the words | The pin cannot be used (`refused`, with its reason) until the brief pins another version |
+| made local: it stays as it is                               | The slot was made local                                                                  |
+
+**Linked instances.** A unit that staging or Update shots places, or that the host links after a
+save, is an _instance_ of the library's `ref@version`: its objects are the scene's own, which the
+person moves, poses, re-colours or deletes as any others, and each remembers what the version made
+it, so the row counts the parts edited or deleted here and an update knows what to keep. The
+host's state says per slot which version the scene holds and how (`state.units`).
+
+**Make local** (on a row with an instance; not in a read-only open) keeps the instance's objects as
+plain objects of the scene, no longer linked to the library, as one undo step (Ctrl+Z links them
+again). The slot stays local: no later brief, version or Update shots places a unit there again,
+and the host's state says so (`staged` `unit` with `local` true).
+
+**What an update keeps and replaces.** Nothing moves until the person runs **Update shots** (one
+undo step). For a new version of the item a slot holds, the instance is updated in place:
+
+- a part left as the version made it takes the new version's shape and look and keeps its id, so
+  shots, holds, constraints and keys still find it; what the scene owns stays (names, collections,
+  the instance's placement, constraints, physics, hiding and pose);
+- a part edited in the desk keeps the edit (with a warning when the new version changed it too),
+  and a part deleted in the desk stays deleted;
+- a part only the new version has is added; one it drops goes when it was left as it was and
+  nothing outside the instance uses it (keys, drivers, shots, the scene's camera), else it stays;
+- a new version with the same content changes no part, only the version the instance names.
+
+Another item pinned to the slot replaces the instance: its objects, edits and all, give way to the
+new unit's, at the set's place or the prop's spot. A figure, a new version or another item,
+restyles its member's actor in place (the same armature, keys, holds and shots) when its kind and
+height are the actor's, and is refused otherwise. A brief that drops the pin brings back the
+words' set, the mannequin or the words' prop. A slot made local takes none of it;
+[Updating from a later brief](#updating-from-a-later-brief) says the rest.
+
+#### Save to library
+
+**Save to library…** in the tab opens a dialog over the desk. It is off, with the reason shown,
+when the host takes no units saved from this open (`publish` false), while a save or Update shots
+runs, and when nothing in the scene can be saved. The dialog has:
+
+- **What**: the set, each actor by its cast member's name, each prop; first the selected actor or
+  prop, else the set.
+- **Name** (1–120 characters; the instance's, the place's, the cast member's or the prop's name to
+  start with) and **Description** (at most 2000).
+- **Save as a new version of Harbor v3**, ticked, when the target is an instance of a library unit;
+  unticked, or for any other target, the unit is a new item of the host's library and the scene
+  keeps what it holds.
+- The unit as it would be saved, made in the staging worker without changing the scene: its
+  thumbnail, its objects, triangles, size and dimensions (a figure's kind and height), and its
+  warnings; a unit that cannot be made says why, and Save stays off.
+
+Save sends it to the host (`unit-publish`); the dialog shows the progress (making the unit,
+waiting for the host with the seconds counted, linking the scene), then what came of it:
+
+- "Saved 'Harbor' v3 to rideo; linked to the scene's place" (or to the actor or prop it came
+  from): the host linked it, and the scene adopts it at once (not an undo step): the slot's pieces
+  are an instance of that version, the tab shows it up to date, and the next state pins it;
+- "Saved 'Harbor' v1 to rideo; not linked: …", with the host's reason: saved in the library, and
+  the scene stays as it is (a read-only open, which may save too, says "not linked here");
+- "Not saved: …", with the host's reason (refused, a conflict with a newer version, too large,
+  unavailable …) or the desk's (the host did not answer in time).
+
+Closing the dialog while the host saves lets the save go on: the tab says how far it is and how it
+ended. One save runs at a time.
 
 ## Over MCP
 
