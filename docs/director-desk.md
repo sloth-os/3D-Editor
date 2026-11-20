@@ -787,14 +787,14 @@ waiting for the host with the seconds counted, linking the scene), then what cam
   the scene stays as it is. From a read-only open, which may save too, the host saves it but does
   not link it and says why: "Saved 'Harbor' v1 to rideo; not linked: the scene is read-only" from
   rideo. "not linked here" shows only when a host links it all the same: the scene stays as it is;
-- "Not saved: …", with the host's reason (refused, a conflict with a newer version, too large,
-  unavailable …) or the desk's (a name or a unit it cannot send);
+- "Not saved: …", with the host's reason whatever code it answers with (refused, a conflict with a
+  newer version, too large, unavailable …), or the desk's (a name or a unit it cannot send);
 - "Not known whether rideo saved 'Harbor': it did not answer in time. Look in its library before
   saving again." when the host did not answer in time (or the desk closed first, or the answer was
-  not valid): the host may have saved it, and linked it, all the same. An answer that comes later is
-  not applied; a link the host made comes with its next brief, and Update shots then makes the
-  scene's own pieces (or actor, or prop) the instance of that version, with no copy of them beside
-  them (where they are gone, it puts the unit in).
+  not valid), and only then: the host may have saved it, and linked it, all the same. An answer that
+  comes later is not applied; a link the host made comes with its next brief, and Update shots then
+  makes the scene's own pieces (or actor, or prop) the instance of that version, with no copy of
+  them beside them (where they are gone, it puts the unit in).
 
 Closing the dialog while the host saves lets the save go on: the tab says how far it is and how it
 ended. One save runs at a time, and Update shots is off while one links the scene; a link the host

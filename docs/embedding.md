@@ -491,7 +491,9 @@ The desk waits for the `unit-ack` 120 s plus 10 s per MiB of the file (counted u
 32 MiB), then tells the person that the host did not say whether it saved the unit; an ack that
 comes later is not applied. A `unit-ack` that does not validate but has a valid `id` is answered
 with `error` `bad_message` with that `id`, as for any message, and fails the publish waiting on it
-at once.
+at once. Only the desk's own ends (no answer in time, an answer that does not validate, the desk
+closed first) tell the person that it is not known whether the host saved the unit; an `ok` false
+tells them it was not saved, with the host's `message`, whatever its `code`.
 
 **A link the desk did not take in.** An editable open keeps in the scene each save it sends from a
 slot, one record per `unit-publish` (the file's SHA-256 and the objects it was made from; at most 8

@@ -83,10 +83,12 @@ export function pinnedSlot(brief: SceneBrief | null, ref: string, version: numbe
 }
 
 /**
- * The desk's own codes of a save whose end it does not know (controller.ts publish), each with why:
- * the host did not answer in time, the desk closed first, or the host's answer was not valid. The
- * host may have saved the unit, and linked it, all the same (a later answer is not applied; its next
- * brief brings the link), so the person looks in its library before saving it again.
+ * Why the desk does not know how a save ended, by the code of its own end (controller.ts publish
+ * marks those `unknown`): the host did not answer in time, the desk closed first, or the host's
+ * answer was not valid. The host may have saved the unit, and linked it, all the same (a later
+ * answer is not applied; its next brief brings the link), so the person looks in its library before
+ * saving it again. Read only for results marked `unknown`: a host's refusal says "Not saved"
+ * whatever its code.
  */
 const UNKNOWN_END: Record<string, string> = {
   timeout: 'it did not answer in time',
@@ -96,10 +98,11 @@ const UNKNOWN_END: Record<string, string> = {
 
 /**
  * How a Save to library ended: 'linked' (the scene is the version now), 'unlinked' (saved only),
- * 'failed' (not saved), or 'unknown' (the host may have saved it: UNKNOWN_END).
+ * 'failed' (not saved: the host refused it, whatever its code, or the desk could not send it), or
+ * 'unknown' (one of the desk's own ends, marked `unknown`: the host may have saved it).
  */
 export function publishOutcome(o: PublishOutcome): 'linked' | 'unlinked' | 'failed' | 'unknown' {
-  if (!o.result.ok) return Object.hasOwn(UNKNOWN_END, o.result.code) ? 'unknown' : 'failed';
+  if (!o.result.ok) return o.result.unknown ? 'unknown' : 'failed';
   return o.result.linked && o.result.adopted ? 'linked' : 'unlinked';
 }
 
@@ -113,8 +116,8 @@ export function publishOutcome(o: PublishOutcome): 'linked' | 'unlinked' | 'fail
 export function publishResultText(o: PublishOutcome, host: string, linkedTo: string): string {
   const r = o.result;
   if (!r.ok)
-    return Object.hasOwn(UNKNOWN_END, r.code)
-      ? `Not known whether ${host} saved '${o.name}': ${UNKNOWN_END[r.code]}. Look in its library before saving again.`
+    return r.unknown
+      ? `Not known whether ${host} saved '${o.name}': ${Object.hasOwn(UNKNOWN_END, r.code) ? UNKNOWN_END[r.code] : 'it did not say'}. Look in its library before saving again.`
       : `Not saved: ${r.message}`;
   const saved = `Saved '${o.name}' v${r.version} to ${host}`;
   if (r.linked && r.adopted) return `${saved}; linked to ${linkedTo}`;

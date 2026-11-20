@@ -1792,6 +1792,7 @@ describe('Save to library', () => {
       ok: false,
       code: 'timeout',
       message: "rideo did not say whether it saved 'Red kite'.",
+      unknown: true,
     });
     t.c.message({
       type: 'unit-ack',
@@ -1823,11 +1824,12 @@ describe('Save to library', () => {
       ok: false,
       code: 'bad_reply',
       message: "rideo's answer was not valid: ref: required when ok is true",
+      unknown: true,
     });
     const p2 = t.c.publish({ what: KITE_ROOT, name: 'Red kite' });
     await waitUntil(() => expect(t.published()).toHaveLength(2));
     t.c.dispose();
-    expect(await p2).toMatchObject({ ok: false, code: 'closed' });
+    expect(await p2).toMatchObject({ ok: false, code: 'closed', unknown: true });
     expect(t.ws.adoptUnit).not.toHaveBeenCalled();
   });
 

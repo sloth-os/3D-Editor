@@ -908,6 +908,31 @@ describe('the Save to library dialog', () => {
     expect(q(tab, 'desk-library-last')!.textContent).toBe(words);
   });
 
+  it('says "Not saved" with the host’s reason when the host refuses with a code of the desk’s own', async () => {
+    const { c, published } = await openDesk(UNITS_ON);
+    const v = dialog(c, null);
+    await settle();
+    await act(async () => void fireEvent.click(q(v, 'desk-save-submit')!));
+    await settle();
+    expect(published()).toHaveLength(1);
+    // a host may answer any code: 'closed' here is its own (its library is closed), not the desk's
+    const message = 'The library is closed for maintenance.';
+    await act(async () =>
+      c.message({ type: 'unit-ack', id: published()[0].id, ok: false, code: 'closed', message }),
+    );
+    await settle();
+    const result = q(v, 'desk-save-result')!;
+    expect([result.dataset.outcome, result.dataset.code, result.textContent]).toEqual([
+      'failed',
+      'closed',
+      `Not saved: ${message}`,
+    ]);
+    expect(c.lastPublish.value!.result).toEqual({ ok: false, code: 'closed', message });
+    const tab = render(<LibraryTab c={c} onSave={() => {}} />);
+    expect(q(tab, 'desk-library-last')!.dataset.outcome).toBe('failed');
+    expect(q(tab, 'desk-library-last')!.textContent).toBe(`Not saved: ${message}`);
+  });
+
   it('leaves the Escape that ends an IME composition, and a held Escape’s repeats, to the field', async () => {
     const onClose = vi.fn();
     const { c } = await openDesk();
@@ -1045,7 +1070,7 @@ describe('the words of a Save to library', () => {
 
   it('do not say "Not saved" when the host may have saved it after all: no answer in time, the desk closed, an invalid answer', () => {
     const unknown = (code: string, message: string) => {
-      const o = outcome({ ok: false, code, message });
+      const o = outcome({ ok: false, code, message, unknown: true });
       return [publishOutcome(o), publishResultText(o, 'rideo', 'x')];
     };
     const look = 'Look in its library before saving again.';
@@ -1061,9 +1086,18 @@ describe('the words of a Save to library', () => {
       'unknown',
       `Not known whether rideo saved 'Harbor': its answer was not valid. ${look}`,
     ]);
-    // the host's refusals, and the desk's own before anything was sent, are not saved
+  });
+
+  it('say "Not saved" with the reason for every refusal of the host, whatever its code, and for the desk’s own before anything was sent', () => {
+    const refused = (code: string) => {
+      const o = outcome({ ok: false, code, message: 'Why.' });
+      return [publishOutcome(o), publishResultText(o, 'rideo', 'x')];
+    };
+    // a host may answer any code of 1–40 characters: the desk's own words are not the host's
     for (const code of ['refused', 'conflict', 'too_large', 'unavailable', 'failed', 'busy', 'invalid'])
-      expect(unknown(code, 'Why.')).toEqual(['failed', 'Not saved: Why.']);
+      expect(refused(code)).toEqual(['failed', 'Not saved: Why.']);
+    for (const code of ['timeout', 'closed', 'bad_reply', 'constructor', 'toString'])
+      expect(refused(code)).toEqual(['failed', 'Not saved: Why.']);
   });
 
   it('are those docs/director-desk.md gives', () => {
@@ -1078,7 +1112,7 @@ describe('the words of a Save to library', () => {
       words({ ...ok, version: 3, linked: true, adopted: true }),
       // a read-only open: rideo saves it and says why it does not link it
       words({ ...ok, version: 1, linked: false, adopted: false, message: 'the scene is read-only' }, 1),
-      words({ ok: false, code: 'timeout', message: 'x' }),
+      words({ ok: false, code: 'timeout', message: 'x', unknown: true }),
     ])
       expect(doc).toContain(said);
     expect(doc).toContain('"Not saved: …"');

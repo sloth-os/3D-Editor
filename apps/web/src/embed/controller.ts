@@ -302,14 +302,20 @@ export type PublishResult =
   | {
       ok: false;
       /**
-       * The host's refusal code (PUBLISH_REFUSALS, read leniently), or the desk's own: 'timeout' (no
-       * answer in time), 'bad_reply' (an invalid unit-ack), 'closed' (the desk closed first),
-       * 'unavailable' (units or publishing are off, no host), 'not_open', 'busy' (another save runs),
-       * 'invalid' (a name or description the protocol does not take), 'failed' (the unit could not
-       * be made or sent).
+       * The host's refusal code (PUBLISH_REFUSALS, read leniently: any code it sends), or the
+       * desk's own: 'timeout' (no answer in time), 'bad_reply' (an invalid unit-ack), 'closed' (the
+       * desk closed first), 'unavailable' (units or publishing are off, no host), 'not_open', 'busy'
+       * (another save runs), 'invalid' (a name or description the protocol does not take), 'failed'
+       * (the unit could not be made or sent).
        */
       code: string;
       message: string;
+      /**
+       * Set only by the desk, on its own ends of a save it sent whose outcome it does not know (no
+       * answer in time, an invalid answer, the desk closed first): the host may have saved it, and
+       * linked it, all the same. A host's refusal never has it, whatever its code.
+       */
+      unknown?: true;
     };
 
 /** A Save to library in progress. */
@@ -1030,11 +1036,13 @@ export class DeskController {
       }
       this.publishing.value = { ...this.publishing.peek()!, kind, phase: 'waiting', id };
       const answer = await wait.done;
+      // the desk's own ends: the host may have saved (and linked) it all the same
+      const unknown = (code: string, message: string) => finish({ ok: false, code, message, unknown: true });
       if (answer.kind === 'timeout')
-        return fail('timeout', `${host} did not say whether it saved '${unit.header.name}'.`);
-      if (answer.kind === 'closed') return fail('closed', 'The desk closed before the host answered.');
+        return unknown('timeout', `${host} did not say whether it saved '${unit.header.name}'.`);
+      if (answer.kind === 'closed') return unknown('closed', 'The desk closed before the host answered.');
       if (answer.kind === 'invalid')
-        return fail('bad_reply', `${host}'s answer was not valid: ${answer.problems}`);
+        return unknown('bad_reply', `${host}'s answer was not valid: ${answer.problems}`);
       const ack = answer.message;
       if (!ack.ok) {
         // not saved: no later brief pins this file from this save (an earlier save of it, whose end
