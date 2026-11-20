@@ -2197,24 +2197,30 @@ describe('the desk state container with library units', () => {
 });
 
 describe("the Library tab's rows", () => {
-  it('shows an instance whose unit driver the desk edited or deleted as edited', () => {
-    // the kite, its sail driven, saved to the library and linked: the driver is the unit's
+  /** The kite, its sail driven by two drivers, saved to the library and linked: the drivers are the unit's. */
+  function drivenKite() {
     const doc = stagedDoc();
     const kite = roots(doc).kite;
     const sail = doc.listObjects().find((o) => o.parent === kite && o.name.startsWith('sail'))!.id;
-    doc.setDriver({
-      target_type: 'object',
-      target_id: sail,
-      path: 'rotation_euler',
-      index: 0,
-      expression: 'frame / 10',
-      variables: [],
-      mute: false,
-    });
+    for (const index of [0, 1])
+      doc.setDriver({
+        target_type: 'object',
+        target_id: sail,
+        path: 'rotation_euler',
+        index,
+        expression: `frame / ${10 + index}`,
+        variables: [],
+        mute: false,
+      });
     const ex = extractUnit(doc, { kind: 'prop', root: kite, name: 'Red kite' }, { deskVersion: 'test' });
     ex.probe.destroy();
     adoptUnit(doc, ex.link, { ref: L().kite.pin.ref, version: 1, sha256: ex.sha256 });
     const row = () => libraryRows(doc, exampleBrief(), () => false).find((r) => r.root === kite);
+    return { doc, kite, sail, row };
+  }
+
+  it('shows an instance whose unit driver the desk edited or deleted as edited', () => {
+    const { doc, kite, sail, row } = drivenKite();
     expect(row()).toMatchObject({ key: `el:${KITE}`, status: 'current', edited: 0, text: 'up to date' });
     // the driver edited here (no part is): the row counts it with the parts
     const driver = doc.listDrivers(sail)[0];
@@ -2229,5 +2235,16 @@ describe("the Library tab's rows", () => {
     doc.removeDriver(fcurveKey(driver));
     expect(unitStatus(doc, kite).drivers).toMatchObject({ edited: [], missing: [{ target: sail }] });
     expect(row()).toMatchObject({ status: 'edited', edited: 1, text: '1 part edited here' });
+  }, 60_000);
+
+  it('counts a part deleted here once, not again for the drivers that went with it', () => {
+    const { doc, kite, sail, row } = drivenKite();
+    // the sail deleted here: its object and its data are missing, and so are its two drivers
+    doc.transact(() => doc.removeObject(sail));
+    const st = unitStatus(doc, kite);
+    expect(st.missing.map((p) => p.id)).toContain(sail);
+    expect(st.drivers).toMatchObject({ edited: [], missing: [{ target: sail }, { target: sail }] });
+    const parts = st.edited.length + st.missing.length;
+    expect(row()).toMatchObject({ status: 'edited', edited: parts, text: `${parts} parts edited here` });
   }, 60_000);
 });

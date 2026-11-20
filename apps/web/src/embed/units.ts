@@ -380,7 +380,7 @@ export function stateUnits(doc: SceneDoc): StateUnit[] {
 
 /**
  * What the Library tab says of a slot or an instance: 'current' up to date; 'edited' parts (or the
- * drivers the unit gave) edited here; 'update' the brief pins another version whose file the desk
+ * drivers the unit gave parts still here) edited here; 'update' the brief pins another version whose file the desk
  * holds (Update shots places it); 'pending' the pinned version waits (not sent yet, or not usable
  * this time); 'refused' the pinned version cannot be used (the record says so, or the desk holds its
  * file and the staging refuses it); 'local' the slot was made local.
@@ -403,7 +403,8 @@ export interface LibraryRow {
   status: LibraryStatus;
   /**
    * Parts of the instance edited or deleted here, and drivers the unit gave it edited or deleted here
-   * (0 without an instance).
+   * whose part is still here (a part deleted here counts once, not again for its drivers; 0 without
+   * an instance).
    */
   edited: number;
   /** The version the brief pins for the slot when it is not the one the scene holds (else null). */
@@ -452,8 +453,13 @@ export function libraryRows(
     let edited = 0;
     try {
       const st = unitStatus(doc, inst.root);
-      // a driver the unit gave that the scene edited or deleted counts with the parts
-      const drivers = st.drivers ? st.drivers.edited.length + st.drivers.missing.length : 0;
+      // a driver the unit gave that the scene edited or deleted counts with the parts, but not one
+      // that went with the part it drives, which counts already
+      const gone = new Set(st.missing.map((p) => p.id));
+      const stays = (d: { target: string }) => d.target !== '' && !gone.has(d.target);
+      const drivers = st.drivers
+        ? st.drivers.edited.filter(stays).length + st.drivers.missing.filter(stays).length
+        : 0;
       edited = st.edited.length + st.missing.length + drivers;
     } catch {
       // an instance whose provenance stopped reading meanwhile: no parts counted
