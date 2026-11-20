@@ -1448,6 +1448,141 @@ describe("the scene's writes, one at a time", () => {
     expect(sceneOf(t)).toEqual(BOTH);
     expect(t.ws.stagedShots()).toContain(NEW_SHOT);
   });
+
+  describe('in the workspace itself, with no controller to hold one back', () => {
+    /** The scene staged from `first` (with the files `units`), opened again with `brief`: its local copy kept. */
+    async function reopened(brief: SceneBrief, first = exampleBrief(), units = emptyIntake()) {
+      const host = origin();
+      const before = workspace();
+      await before.open({ hostOrigin: host, brief: first, state: null, units });
+      before.close();
+      const ws = workspace();
+      await ws.open({ hostOrigin: host, brief, state: null, units: emptyIntake() });
+      expect(ws.changes()?.added).toEqual([NEW_SHOT]);
+      return ws;
+    }
+    /** The set of the scene saved as a unit the host linked, and the brief that pins it. */
+    async function linkedSet(ws: DeskWorkspace, brief: SceneBrief) {
+      const unit = await ws.extractUnit({ set: true }, 'Meadow');
+      const pin = { ref: 'lib_0123456789set1', version: 1, sha256: unit.sha256 };
+      const follow = structuredClone(brief);
+      follow.set = { ...follow.set, unit: pin };
+      return { unit, pin, follow };
+    }
+    /**
+     * Each write of the scene the worker is asked for, as it is asked: the document it is given (its
+     * shots, and whether its record pins the set) and the set pin of the brief it is given.
+     */
+    function watchWrites(ws: DeskWorkspace) {
+      const asked: { kind: string; shots: number; recordSet: boolean; briefSet: string | null }[] = [];
+      const note = (kind: string, update: Uint8Array, brief: SceneBrief | null) => {
+        const doc = SceneDoc.fromUpdate(update);
+        const pin = brief?.set.unit;
+        asked.push({
+          kind,
+          shots: getShots(doc).length,
+          recordSet: stateUnitRows(doc).some((r) => r.slot === 'set'),
+          briefSet: pin ? `${pin.ref}@${pin.version}` : null,
+        });
+        doc.destroy();
+      };
+      const st = ws.staging;
+      const update = st.update.bind(st);
+      const adopt = st.adoptUnit.bind(st);
+      const local = st.makeLocal.bind(st);
+      vi.spyOn(st, 'update').mockImplementation((u, b, units) => {
+        note('update', u, b);
+        return update(u, b, units);
+      });
+      vi.spyOn(st, 'adoptUnit').mockImplementation((u, b, o) => {
+        note('adopt', u, b);
+        return adopt(u, b, o);
+      });
+      vi.spyOn(st, 'makeLocal').mockImplementation((u, root) => {
+        note('local', u, null);
+        return local(u, root);
+      });
+      return asked;
+    }
+    const setOf = (ws: DeskWorkspace) => {
+      const doc = ws.session!.doc;
+      return {
+        shots: getShots(doc).length,
+        instances: listUnits(doc).map((i) => [i.key, unitStatus(doc, i.root).missing.length]),
+        rows: stateUnitRows(doc).map((r) => [r.slot, r.staged, r.local]),
+        changes: ws.changes(),
+      };
+    };
+    const LINKED = { shots: 3, instances: [['set', 0]], rows: [['set', 'unit', false]], changes: null };
+
+    it('Update shots and the adoption of a linked save asked together: the new shot and the link both stay', async () => {
+      const brief = withNewShot(exampleBrief());
+      const ws = await reopened(brief);
+      const { unit, pin, follow } = await linkedSet(ws, brief);
+      const asked = watchWrites(ws);
+      // neither waits for the other: the adoption is asked while the update runs
+      const [changes, adopted] = await Promise.all([
+        ws.updateFromBrief(),
+        ws.adoptUnit(unit, pin, true, follow),
+      ]);
+      expect(changes).toBeNull();
+      expect(adopted).toMatchObject({ recorded: true });
+      expect(setOf(ws)).toEqual(LINKED);
+      // the adoption's turn came once the update was applied: it read the scene with the new shot
+      expect(asked).toEqual([
+        { kind: 'update', shots: 2, recordSet: false, briefSet: null },
+        { kind: 'adopt', shots: 3, recordSet: false, briefSet: null },
+      ]);
+    }, 60_000);
+
+    it('Update shots and Make local asked together: the new shot and the kite made local both stay', async () => {
+      const pinned = withPins(exampleBrief(), { elements: { [KITE]: L().kite } });
+      const ws = await reopened(
+        withNewShot(pinned),
+        pinned,
+        await readOpenUnits([openUnit(L().kite)], pinned),
+      );
+      const doc = ws.session!.doc;
+      const [kite] = listUnits(doc);
+      expect(kite.key).toBe(`el:${KITE}`);
+      const asked = watchWrites(ws);
+      const [changes, local] = await Promise.all([ws.updateFromBrief(), ws.makeLocal(kite.root)]);
+      expect(changes).toBeNull();
+      expect(local.root).toBe(kite.root);
+      expect(getShots(doc)).toHaveLength(3);
+      expect(listUnits(doc)).toEqual([]);
+      expect(stateUnitRows(doc).map((r) => [r.slot, r.staged, r.local])).toEqual([
+        [`el:${KITE}`, 'unit', true],
+      ]);
+      expect(ws.changes()).toBeNull();
+      // Make local's turn came once the update was applied: it read the scene with the new shot (this
+      // update writes nothing of the kite, so the scene alone would not show an older read)
+      expect(asked.map((a) => [a.kind, a.shots])).toEqual([
+        ['update', 2],
+        ['local', 3],
+      ]);
+    }, 60_000);
+
+    it('a write asked after the adoption of a linked save reads the brief that pins it', async () => {
+      const brief = withNewShot(exampleBrief());
+      const ws = await reopened(brief);
+      const { unit, pin, follow } = await linkedSet(ws, brief);
+      const asked = watchWrites(ws);
+      // Update shots asked while the scene links the set: its turn comes after the adoption's, with
+      // the brief the adoption made the scene follow (the host moved the pin)
+      const [adopted, changes] = await Promise.all([
+        ws.adoptUnit(unit, pin, true, follow),
+        ws.updateFromBrief(),
+      ]);
+      expect(adopted).toMatchObject({ recorded: true });
+      expect(changes).toBeNull();
+      expect(setOf(ws)).toEqual(LINKED);
+      expect(asked).toEqual([
+        { kind: 'adopt', shots: 2, recordSet: false, briefSet: null },
+        { kind: 'update', shots: 2, recordSet: true, briefSet: 'lib_0123456789set1@1' },
+      ]);
+    }, 60_000);
+  });
 });
 
 describe('a save the host linked after the desk stopped waiting', () => {
