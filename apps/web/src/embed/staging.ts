@@ -1,5 +1,20 @@
-import type { DeskCheckResult, SceneBrief, ShotResultMeta } from '@3d-editor/core';
-import { runStaging, type StagingReply, type StagingRequest, type StagingSummary } from './staging-engine';
+import type {
+  DeskCheckResult,
+  SceneBrief,
+  ShotResultMeta,
+  UnitHeader,
+  UnitLinkPlan,
+  UnitSlot,
+} from '@3d-editor/core';
+import {
+  runStaging,
+  type StagingReply,
+  type StagingRequest,
+  type StagingSummary,
+  type StagingUnits,
+  type UnitExtract,
+  type UnitTarget,
+} from './staging-engine';
 
 /*
  * The page's side of the staging worker (stage.worker.ts): one worker, made when the desk starts
@@ -11,7 +26,9 @@ import { runStaging, type StagingReply, type StagingRequest, type StagingSummary
  * is made again for the next request. A staging given a signal (the open's: Close cancels it) is
  * stopped when the signal aborts: it rejects at once with the signal's reason, taken out of the
  * queue if it waits, its worker stopped (terminated, made again for the next request) if it runs
- * (in process it cannot be stopped: it rejects, and what it makes is dropped).
+ * (in process it cannot be stopped: it rejects, and what it makes is dropped). A request may hand
+ * over buffers (a transfer list: the library units' files, copies the page made for it); the worker
+ * hands back its change and a unit's file and thumbnail the same way (stage.worker.ts).
  */
 
 export class StagingError extends Error {
@@ -43,6 +60,8 @@ function stopReason(signal: AbortSignal): Error {
 /** A request waiting for the worker. */
 interface Queued {
   request: StagingRequest;
+  /** Buffers the request hands over to the worker (none in process). */
+  transfer: Transferable[];
   /** A background check: the person's requests go ahead of it. */
   background: boolean;
   resolve: (r: StagingReply) => void;
@@ -67,6 +86,10 @@ export const moduleStagingWorker: StagingWorkerFactory = () =>
         name: 'desk-staging',
       }) as unknown as WorkerLike)
     : null;
+
+/** The buffers of a request's unit files (handed over to the worker). */
+const unitBuffers = (units: StagingUnits | undefined): Transferable[] =>
+  units ? [...new Set(units.units.map((u) => u.data.buffer as ArrayBuffer))] : [];
 
 export class StagingClient {
   private worker: WorkerLike | null = null;
@@ -122,13 +145,19 @@ export class StagingClient {
    * Queues a request: a background check last, any other ahead of the background checks waiting.
    * `signal` stops it (see the module comment).
    */
-  private call(request: StagingRequest, background = false, signal?: AbortSignal): Promise<StagingReply> {
+  private call(
+    request: StagingRequest,
+    background = false,
+    signal?: AbortSignal,
+    transfer: Transferable[] = [],
+  ): Promise<StagingReply> {
     return new Promise<StagingReply>((resolve, reject) => {
       if (signal?.aborted) return reject(stopReason(signal));
       const onAbort = () => this.stop(job, stopReason(signal!));
       const settle = () => signal?.removeEventListener('abort', onAbort);
       const job: Queued = {
         request,
+        transfer,
         background,
         resolve: (r) => {
           settle();
@@ -194,7 +223,7 @@ export class StagingClient {
     const id = ++this.seq;
     return new Promise<StagingReply>((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
-      w.postMessage({ id, request });
+      w.postMessage({ id, request }, job.transfer);
     });
   }
 
@@ -211,7 +240,9 @@ export class StagingClient {
 
   /**
    * Stages `brief` in the document `update` holds (empty); the change, the checks and the time.
-   * `signal` (the open's) stops it: see the module comment.
+   * `signal` (the open's) stops it: see the module comment. `units`: the open's library units (their
+   * files handed over to the worker: give it copies); without them every pin is staged from the
+   * words, as before units.
    */
   async stage(
     update: Uint8Array,
@@ -219,16 +250,63 @@ export class StagingClient {
     lineage: string,
     generator: string,
     signal?: AbortSignal,
+    units?: StagingUnits,
   ): Promise<Staged> {
     return StagingClient.expect<Staged>(
-      await this.call({ kind: 'stage', update, brief, lineage, generator }, false, signal),
+      await this.call(
+        { kind: 'stage', update, brief, lineage, generator, ...(units ? { units } : {}) },
+        false,
+        signal,
+        unitBuffers(units),
+      ),
       ['stage'],
     );
   }
 
-  /** Updates the staging of the document `update` holds to `brief`. */
-  async update(update: Uint8Array, brief: SceneBrief): Promise<Staged> {
-    return StagingClient.expect<Staged>(await this.call({ kind: 'update', update, brief }), ['update']);
+  /** Updates the staging of the document `update` holds to `brief` (with the library units held: see stage). */
+  async update(update: Uint8Array, brief: SceneBrief, units?: StagingUnits): Promise<Staged> {
+    return StagingClient.expect<Staged>(
+      await this.call(
+        { kind: 'update', update, brief, ...(units ? { units } : {}) },
+        false,
+        undefined,
+        unitBuffers(units),
+      ),
+      ['update'],
+    );
+  }
+
+  /** A unit of the document `update` holds (the set, an actor's figure or a prop), with its thumbnail. */
+  async extractUnit(
+    update: Uint8Array,
+    what: UnitTarget,
+    name: string,
+    deskVersion: string,
+  ): Promise<UnitExtract & { ms: number }> {
+    return StagingClient.expect<Extract<StagingReply, { kind: 'unit-extract' }>>(
+      await this.call({ kind: 'unit-extract', update, what, name, deskVersion }),
+      ['unit-extract'],
+    );
+  }
+
+  /** Links the document `update` holds to the version the host saved (core adoptPublished): the change. */
+  async adoptUnit(
+    update: Uint8Array,
+    brief: SceneBrief,
+    o: {
+      slot: UnitSlot | null;
+      link: UnitLinkPlan;
+      pin: { ref: string; version: number; sha256: string };
+      linked: boolean;
+      header?: UnitHeader;
+    },
+  ): Promise<Extract<StagingReply, { kind: 'unit-adopt' }>> {
+    return StagingClient.expect(await this.call({ kind: 'unit-adopt', update, brief, ...o }), ['unit-adopt']);
+  }
+
+  /** Cuts the link of instance `root` of the document `update` holds (core makeLocal): the change. */
+  async makeLocal(update: Uint8Array, root: string): Promise<Extract<StagingReply, { kind: 'unit-local' }>> {
+    return StagingClient.expect(await this.call({ kind: 'unit-local', update, root }), ['unit-local']);
   }
 
   /** The shot results of the document `update` holds (host shot ids `shots`, default all). */

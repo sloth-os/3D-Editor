@@ -6,6 +6,7 @@ import {
   parseHostMessage,
   type DeskMessage,
   type HostMessage,
+  type HostMessageType,
 } from './protocol';
 
 /*
@@ -21,7 +22,9 @@ import {
  *
  * On the port: messages of a type the desk does not know are ignored and logged; a known type that
  * does not validate is answered with error bad_message when it carried an id (an invalid `open`,
- * which carries none, with invalid_scene or bad_message without an id) and is otherwise ignored.
+ * which carries none, with invalid_scene or bad_message without an id) and is otherwise ignored; an
+ * invalid reply to one of the desk's own requests (a unit-ack) also goes to the handler with its id,
+ * so the request waiting for it fails at once instead of waiting out its time.
  * Valid messages go to the handler. What the host sends before the desk's `ready` waits until
  * `ready` is out (ready is always the first message on the port), then is handled in order. Every
  * message the desk sends is validated first (a problem is logged; the message goes all the same,
@@ -48,6 +51,8 @@ export interface BridgeHandler {
   connected(hostOrigin: string): void;
   /** A valid message from the host. */
   message(message: HostMessage): void;
+  /** An invalid reply (a unit-ack) to one of the desk's requests, with its id: the request fails at once. */
+  invalidReply?(type: HostMessageType, id: string, problems: string): void;
 }
 
 export interface BridgeLog {
@@ -193,6 +198,9 @@ export class DeskBridge {
     if (parsed.kind === 'invalid') {
       this.log.warn(`a ${parsed.type} message is not valid: ${parsed.problems}`);
       if (parsed.reply) this.send(parsed.reply);
+      // a reply to the desk's own request: the request waiting for it fails now
+      if (parsed.type === 'unit-ack' && parsed.reply?.id)
+        this.handler.invalidReply?.(parsed.type, parsed.reply.id, parsed.problems);
       return;
     }
     this.handler.message(parsed.message);

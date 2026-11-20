@@ -16,7 +16,7 @@ import {
  * data is this desk's own container:
  *
  *   bytes 0–7    magic "3DDESK\r\n"
- *   byte  8      container version (1)
+ *   byte  8      container version: 1, or 2 when the document holds instances of library units
  *   byte  9      compression of the payload: 0 none, 1 gzip
  *   bytes 10–11  0
  *   bytes 12–15  header length (uint32, little-endian)
@@ -41,11 +41,20 @@ import {
  *   working copy of it, ≤ ~8 MiB), never the pieces of the whole document beside it.
  * - A state reads only when its document holds a staging of its scene (a probe document is made
  *   from it before anything touches the local copy).
+ * - Container version 2 is version 1's layout, written exactly when the document holds an instance
+ *   of a library unit (decision 14 of library units): a desk from before units reads only version 1
+ *   and answers such a state with state_unreadable, so it never opens a scene of units it does not
+ *   know as a plain one. This desk reads both.
  */
 
 /** The container's first bytes. */
 export const STATE_MAGIC = new Uint8Array([0x33, 0x44, 0x44, 0x45, 0x53, 0x4b, 0x0d, 0x0a]); // "3DDESK\r\n"
+/** The container version of a state whose document holds no instance of a library unit. */
 export const CONTAINER_VERSION = 1;
+/** The container version of a state whose document holds instances of library units. */
+export const UNITS_CONTAINER_VERSION = 2;
+/** The container versions this desk reads. */
+export const CONTAINER_VERSIONS: readonly number[] = [CONTAINER_VERSION, UNITS_CONTAINER_VERSION];
 const PREFIX_BYTES = 16;
 /** Largest header (JSON) a state may have. */
 export const MAX_HEADER_BYTES = 64 * 1024;
@@ -277,13 +286,14 @@ async function gunzip(payload: Uint8Array, limit: number): Promise<Uint8Array> {
 
 /**
  * Packs a document's update into a desk state (gzipped where the browser can): the same update and
- * header give the same bytes. Throws StateTooLarge when the update is over 256 MiB or the data
- * would be over 64 MiB.
+ * header give the same bytes. `units`: the document holds instances of library units (container
+ * version 2, else 1). Throws StateTooLarge when the update is over 256 MiB or the data would be
+ * over 64 MiB.
  */
 export async function encodeDeskState(
   update: Uint8Array,
   header: Omit<StateHeader, 'updateBytes'>,
-  opts: { compress?: boolean } = {},
+  opts: { compress?: boolean; units?: boolean } = {},
 ): Promise<DeskState> {
   if (update.length > MAX_UPDATE_BYTES) throw new StateTooLarge(update.length, MAX_UPDATE_BYTES);
   const codec: Codec = opts.compress === false || !compressesStates() ? null : 'gzip';
@@ -301,7 +311,7 @@ export async function encodeDeskState(
   if (total > MAX_STATE_BYTES) throw new StateTooLarge(total);
   const out = new Uint8Array(total);
   out.set(STATE_MAGIC, 0);
-  out[8] = CONTAINER_VERSION;
+  out[8] = opts.units ? UNITS_CONTAINER_VERSION : CONTAINER_VERSION;
   out[9] = codec === 'gzip' ? 1 : 0;
   new DataView(out.buffer).setUint32(12, headerBytes.length, true);
   out.set(headerBytes, PREFIX_BYTES);
@@ -323,17 +333,23 @@ function isHeader(v: unknown): v is StateHeader {
   );
 }
 
-/** The header of a state's data, without its payload; throws StateUnreadable. */
-export function readStateHeader(bytes: Uint8Array): {
+/**
+ * The header of a state's data, without its payload; throws StateUnreadable. `versions`: the
+ * container versions read (CONTAINER_VERSIONS; a desk from before library units read only 1).
+ */
+export function readStateHeader(
+  bytes: Uint8Array,
+  versions: readonly number[] = CONTAINER_VERSIONS,
+): {
   header: StateHeader;
   codec: Codec;
   payload: Uint8Array;
 } {
   if (bytes.length < PREFIX_BYTES || STATE_MAGIC.some((b, i) => bytes[i] !== b))
     throw new StateUnreadable('the desk state is not one this desk wrote');
-  if (bytes[8] !== CONTAINER_VERSION)
+  if (!versions.includes(bytes[8]))
     throw new StateUnreadable(
-      `the desk state's container is version ${bytes[8]}, this desk reads ${CONTAINER_VERSION}`,
+      `the desk state's container is version ${bytes[8]}, this desk reads ${versions.join(' and ')}`,
     );
   if (bytes[9] !== 0 && bytes[9] !== 1)
     throw new StateUnreadable('the desk state is compressed in an unknown way');

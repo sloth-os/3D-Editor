@@ -5,7 +5,8 @@ import vm from 'node:vm';
 import { build } from 'esbuild';
 import * as Y from 'yjs';
 import { describe, expect, it } from 'vitest';
-import { SceneDoc, getShots } from '@3d-editor/core';
+import { SceneDoc, decodePNG, getShots, listUnits, readUnitHeader } from '@3d-editor/core';
+import { KITE, library, stagedDoc, withPins } from './desk-units-helpers';
 
 /*
  * The desk's staging worker as the browser loads it (src/embed/stage.worker.ts): its own modules
@@ -17,7 +18,9 @@ import { SceneDoc, getShots } from '@3d-editor/core';
  * (window, document, localStorage …) are not defined there, so a read of one, at module load or
  * while the worker stages, throws as it would in the worker. Then it drives the worker as the page
  * does (staging.ts): a stage, an update, the shot results and a check, each a message carrying the
- * session's snapshot, each answered with postMessage.
+ * session's snapshot, each answered with postMessage; and the library units' work there: a staging
+ * that places a unit from its file, a unit made of the scene with its thumbnail rendered in the
+ * worker (the software renderer and the PNG encoder), and Make local.
  */
 
 const WORKER = fileURLToPath(new URL('../src/embed/stage.worker.ts', import.meta.url));
@@ -37,7 +40,14 @@ const NODE = [
 ];
 const DOM = ['window', 'document', 'localStorage', 'sessionStorage', 'XMLHttpRequest', 'HTMLElement'];
 
-async function bundle(): Promise<{ code: string; inputs: string[] }> {
+let built: Promise<{ code: string; inputs: string[] }> | null = null;
+/** The worker's bundle (built once per file). */
+function bundle(): Promise<{ code: string; inputs: string[] }> {
+  built ??= buildBundle();
+  return built;
+}
+
+async function buildBundle(): Promise<{ code: string; inputs: string[] }> {
   const r = await build({
     entryPoints: [WORKER],
     bundle: true,
@@ -182,5 +192,97 @@ describe('the staging worker as the browser loads it', () => {
     const check = send(4, { kind: 'check' }, snapshot());
     expect(Array.isArray(check.reply.check!.issues)).toBe(true);
     expect(check.reply.check!.summary).toMatch(/^2 shots checked/);
-  });
+  }, 120_000);
+
+  it("places a library unit from its file, makes a unit of the scene with its thumbnail and makes it local, in the worker's realm", async () => {
+    const { code, inputs } = await bundle();
+    for (const f of [
+      'packages/core/src/desk/units/format.ts',
+      'packages/core/src/desk/units/extract.ts',
+      'packages/core/src/desk/brief/library.ts',
+      'packages/core/src/render/png.ts',
+    ])
+      expect(
+        inputs.some((i) => i.includes(f)),
+        f,
+      ).toBe(true);
+    const realm = workerRealm();
+    vm.runInContext(code, realm, { filename: 'stage.worker.js' });
+
+    /**
+     * Sends one request as the page does, its bytes (the snapshot, the units' files) made in the
+     * worker's realm and handed over; the answer with its bytes, and how many buffers it handed back.
+     */
+    const send = (id: number, request: Record<string, unknown>) => {
+      realm.REQUEST = JSON.stringify({ id, request }, (_k, v) =>
+        v instanceof Uint8Array ? { $u8: Array.from(v) } : v,
+      );
+      const out = vm.runInContext(
+        `(() => {
+          const { id, request } = JSON.parse(REQUEST, (_k, v) => (v && v.$u8 ? new Uint8Array(v.$u8) : v));
+          self.onmessage({ data: { id, request } });
+          const { message, transfer } = answers.pop();
+          return JSON.stringify({ id: message.id, reply: message.reply, transferred: transfer.length }, (_k, v) =>
+            v instanceof Uint8Array ? { $u8: Array.from(v) } : v,
+          );
+        })()`,
+        realm,
+      ) as string;
+      const answer = JSON.parse(out, (_k, v) => (v && v.$u8 ? Uint8Array.from(v.$u8) : v));
+      expect(answer.id).toBe(id);
+      expect(answer.reply.ok, answer.reply.error).toBe(true);
+      return answer as { reply: Record<string, any>; transferred: number };
+    };
+
+    // a staging that places the kite from its file
+    const lib = library();
+    const brief = withPins(JSON.parse(readFileSync(OPEN, 'utf8')).scene, { elements: { [KITE]: lib.kite } });
+    const session = new Y.Doc();
+    const staged = send(1, {
+      kind: 'stage',
+      update: Y.encodeStateAsUpdate(session),
+      brief,
+      lineage: 'test-lineage',
+      generator: 'test',
+      units: { units: [{ ...lib.kite.pin, data: lib.kite.data }], problems: [] },
+    });
+    expect(staged.reply.summary.units).toEqual([
+      expect.objectContaining({ slot: `el:${KITE}`, staged: 'unit' }),
+    ]);
+    expect(staged.transferred).toBe(1);
+    Y.applyUpdate(session, staged.reply.diff);
+    const doc = SceneDoc.fromUpdate(Y.encodeStateAsUpdate(session));
+    const [instance] = listUnits(doc);
+    expect(instance).toMatchObject({ key: `el:${KITE}`, ref: lib.kite.pin.ref, version: 1 });
+
+    // a unit of an actor of a plain staging, with its thumbnail rendered here
+    const plain = stagedDoc();
+    const mira = plain
+      .listObjects()
+      .find(
+        (o) =>
+          o.custom_props?.desk_role === 'actor' && o.custom_props?.desk_character_id === 'chr_0123456789mira',
+      )!;
+    const made = send(2, {
+      kind: 'unit-extract',
+      update: Y.encodeStateAsUpdate(plain.ydoc),
+      what: { root: mira.id },
+      name: 'Mira',
+      deskVersion: 'test',
+    });
+    expect(readUnitHeader(made.reply.data)).toMatchObject({ kind: 'figure', name: 'Mira' });
+    expect(made.reply.thumbnail).toBeInstanceOf(Uint8Array);
+    expect(made.reply.thumbnail.byteLength).toBeLessThanOrEqual(64 * 1024);
+    expect(decodePNG(made.reply.thumbnail).width).toBe(256);
+    expect(made.transferred).toBe(2);
+
+    // Make local of the kite placed above
+    const local = send(3, {
+      kind: 'unit-local',
+      update: Y.encodeStateAsUpdate(session),
+      root: instance.root,
+    });
+    Y.applyUpdate(session, local.reply.diff);
+    expect(listUnits(SceneDoc.fromUpdate(Y.encodeStateAsUpdate(session)))).toEqual([]);
+  }, 120_000);
 });

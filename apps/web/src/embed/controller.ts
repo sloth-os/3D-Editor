@@ -1,5 +1,16 @@
-import { signal } from '@preact/signals';
-import type { BriefChanges, SceneBrief, ShotResultMeta } from '@3d-editor/core';
+import { computed, signal } from '@preact/signals';
+import {
+  briefWithoutPins,
+  type BriefChanges,
+  type BriefUnitPin,
+  type SceneBrief,
+  type ShotResultMeta,
+  type StageUnitRow,
+  type UnitHeader,
+  type UnitKind,
+  type UnitPublishMeta,
+  type UnitSlot,
+} from '@3d-editor/core';
 import {
   DeskExportError,
   exportSizeProblem,
@@ -9,7 +20,14 @@ import {
   type DeskExportRequest,
 } from './export';
 import {
+  MAX_UNIT_BYTES,
   MODES,
+  UNIT_DATA_FORMAT,
+  UNIT_DATA_VERSION,
+  UNIT_KINDS,
+  acceptUnits,
+  deskMessageProblems,
+  publishAckTimeoutMs,
   uniqueModes,
   type DeskMessage,
   type DeskState,
@@ -17,6 +35,7 @@ import {
   type ExportMessage,
   type GivenState,
   type HostMessage,
+  type HostMessageType,
   type Mode,
   type OpenMessage,
   type OpenSource,
@@ -24,8 +43,21 @@ import {
   type ProgressMessage,
   type ProtocolBriefChanges,
   type ResultAckMessage,
+  type StateUnit,
+  type UnitAckMessage,
+  type UnitPublishMessage,
+  type UnitsOption,
 } from './protocol';
+import type { UnitExtract, UnitTarget } from './staging-engine';
 import { StateTooLarge } from './state';
+import {
+  protocolFrom,
+  readOpenUnits,
+  unitNotice,
+  type LibraryRow,
+  type SaveTarget,
+  type UnitIntake,
+} from './units';
 import type { LengthMismatch, OpenOutcome } from './workspace';
 
 /*
@@ -57,12 +89,31 @@ import type { LengthMismatch, OpenOutcome } from './workspace';
  * - `result-ack` is shown to the person.
  * - Done: a final state, then close {reason: 'done'}; Close: close {reason: 'cancel'} (with a state
  *   first when edits are not sent yet: the host keeps the newest state it has).
+ *
+ * Library units (docs/embedding.md "Library units"): ready always says what the desk does with them
+ * (capabilities.units). The host turns them on for one open with options.units (acceptUnits; absent
+ * or unreadable: off). With units off nothing of them happens: the brief's pins are stripped before
+ * staging (briefWithoutPins), `open.units` is not read, no state carries `units` and no unit-publish
+ * goes: the host sees today's traffic. With units on the open's files are checked (units.ts
+ * readOpenUnits) and staged, every state carries `units` (the record's pins, per slot), the Library
+ * tab's rows follow the scene (libraryRows), and with `publish` the person can save the set, an
+ * actor's figure or a prop to the host's library (publish): unit-publish, then the wait for its
+ * unit-ack (120 s plus 10 s per MiB; an invalid ack ends it at once), then, when the host linked it
+ * and the open is editable, the scene adopts the version (not an undo step) and follows the pin the
+ * host moved.
  */
 
 /** What the controller needs of the scene (DeskWorkspace; tests give a fake one). */
 export interface SceneWorkspace {
-  open(o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null }): Promise<OpenOutcome>;
-  encodeState(): Promise<{ state: DeskState; shots: number }>;
+  open(o: {
+    hostOrigin: string;
+    brief: SceneBrief;
+    state: GivenState | null;
+    /** The open's library units (only when units are on for it). */
+    units?: UnitIntake | null;
+  }): Promise<OpenOutcome>;
+  /** The state, and the rows of state.units of the same document (sent after an open with units only). */
+  encodeState(): Promise<{ state: DeskState; shots: number; units?: StateUnit[] }>;
   onEdit(cb: () => void): () => void;
   snapshot(): Uint8Array;
   stagedShots(): string[];
@@ -75,6 +126,29 @@ export interface SceneWorkspace {
   close?(): void;
   /** Stops an open that waits for another desk to let go of the scene (Close while it opens). */
   cancelOpen?(): void;
+  // ---- library units (DeskWorkspace has them all; a workspace without them has no units work)
+  /** The brief's pins as the last staging or Update shots left them (core's report.units). */
+  unitRows?(): StageUnitRow[] | null;
+  /** The Library tab's rows (units.ts libraryRows). */
+  libraryRows?(): LibraryRow[];
+  /** What Save to library can save (units.ts saveTargets). */
+  saveTargets?(): SaveTarget[];
+  /** The target the Save dialog starts with for the selected object (units.ts defaultSaveTarget). */
+  defaultSaveTarget?(selected: string | null): SaveTarget | null;
+  /** A unit of the scene with its thumbnail (read only). */
+  extractUnit?(what: UnitTarget, name: string): Promise<UnitExtract>;
+  /** Links the scene to the version the host saved (not an undo step). */
+  adoptUnit?(
+    unit: Pick<UnitExtract, 'link' | 'from' | 'header'>,
+    pin: BriefUnitPin,
+    linked: boolean,
+  ): Promise<{ root: string; recorded: boolean; warnings: string[] }>;
+  /** Make local (one undo step). */
+  makeLocal?(root: string): Promise<{ root: string; parts: number }>;
+  /** Sets the brief the scene follows. */
+  setBrief?(brief: SceneBrief): void;
+  /** The document's revision (an extraction is of one revision). */
+  revision?(): number;
 }
 
 export interface ControllerDeps {
@@ -90,6 +164,8 @@ export interface ControllerDeps {
   /** Runs an export (export.ts runDeskExport by default). */
   runExport?: typeof runDeskExport;
   deskVersion: string;
+  /** The SHA-256 the open's unit files are checked with (units.ts sha256Hex by default). */
+  sha256?: (bytes: Uint8Array) => Promise<string>;
   log?: (level: 'info' | 'warn' | 'error', message: string) => void;
   timers?: {
     now(): number;
@@ -192,6 +268,89 @@ export interface Notice {
   at: number;
 }
 
+/** What the desk says of a library unit saved to the host's library (publish). */
+export type PublishResult =
+  | {
+      ok: true;
+      /** The host's item and the version it saved. */
+      ref: string;
+      version: number;
+      /** The host linked it to the scene's slot (it pins it from now on). */
+      linked: boolean;
+      /** The scene became an instance of the version (linked, the open editable and still open). */
+      adopted: boolean;
+      /** The host's message, or why a linked unit was not adopted. */
+      message?: string;
+    }
+  | {
+      ok: false;
+      /**
+       * The host's refusal code (PUBLISH_REFUSALS, read leniently), or the desk's own: 'timeout' (no
+       * answer in time), 'bad_reply' (an invalid unit-ack), 'closed' (the desk closed first),
+       * 'unavailable' (units or publishing are off, no host), 'not_open', 'busy' (another save runs),
+       * 'invalid' (a name or description the protocol does not take), 'failed' (the unit could not
+       * be made or sent).
+       */
+      code: string;
+      message: string;
+    };
+
+/** A Save to library in progress. */
+export interface PublishProgress {
+  kind: UnitKind | null;
+  name: string;
+  /** Making the unit and its thumbnail, waiting for the host's answer, linking the scene. */
+  phase: 'extracting' | 'waiting' | 'linking';
+  startedAt: number;
+  /** The unit-publish's id once sent. */
+  id: string | null;
+}
+
+/** The last Save to library and what came of it. */
+export interface PublishOutcome {
+  result: PublishResult;
+  kind: UnitKind | null;
+  name: string;
+  at: number;
+}
+
+/** What the Save to library dialog shows before saving (previewUnit). */
+export interface UnitPreview {
+  kind: UnitKind;
+  name: string;
+  /** The library version it would be a new version of (the instance it is), else null. */
+  basedOn: { ref: string; version: number } | null;
+  /** The brief slot it comes from, in the protocol's shape (null: none). */
+  from: { castId: string | null; elementId: string | null; set: boolean } | null;
+  counts: UnitHeader['counts'];
+  /** The protocol meta: size, objects, triangles, the figure's kind and height, credits. */
+  meta: UnitPublishMeta;
+  /** Bytes of the unit file. */
+  bytes: number;
+  /** Its thumbnail (a PNG of at most 64 KiB, a copy the dialog may keep), else null. */
+  thumbnail: Uint8Array | null;
+  warnings: string[];
+}
+
+/** The library pins a brief carries (its set's, its cast members' and its elements'). */
+const pinCount = (b: SceneBrief): number =>
+  (b.set?.unit ? 1 : 0) +
+  (b.cast ?? []).filter((c) => c.unit).length +
+  (b.elements ?? []).filter((e) => e.unit).length;
+
+/** What a unit-publish waits for. */
+type AckOutcome =
+  | { kind: 'ack'; message: UnitAckMessage }
+  | { kind: 'invalid'; problems: string }
+  | { kind: 'timeout' }
+  | { kind: 'closed' };
+
+/** An ArrayBuffer holding exactly `bytes` (the view's own buffer when it is all of it). */
+const exactBuffer = (bytes: Uint8Array): ArrayBuffer =>
+  bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
+    ? (bytes.buffer as ArrayBuffer)
+    : (bytes.slice().buffer as ArrayBuffer);
+
 const realTimers = {
   now: () => Date.now(),
   setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms),
@@ -214,6 +373,16 @@ export class DeskController {
   /** The reference the person's Send renders (Follow): one of the host's modes, preselected from the options. */
   readonly mode = signal<Mode>('camera');
   readonly opened = signal<OpenOutcome | null>(null);
+  /** The library units of this open (null: off, as for a host without them). */
+  readonly units = signal<UnitsOption | null>(null);
+  /** Whether Save to library is offered: units on with `publish`, the scene open. */
+  readonly canPublish = computed(() => this.units.value?.publish === true && this.status.value === 'open');
+  /** The Library tab's rows (after the open, edits, Update shots, a link and Make local; [] with units off). */
+  readonly libraryRows = signal<LibraryRow[]>([]);
+  /** A Save to library in progress (null: none). */
+  readonly publishing = signal<PublishProgress | null>(null);
+  /** The last Save to library's outcome. */
+  readonly lastPublish = signal<PublishOutcome | null>(null);
 
   private hostOrigin: string | null = null;
   private deskSeq = 0;
@@ -238,6 +407,12 @@ export class DeskController {
   private progressTimer: unknown = null;
   private pendingProgress: ProgressMessage | null = null;
   private lastProgressAt = 0;
+  /** Save to library's ids ('pub-<n>'). */
+  private pubSeq = 0;
+  /** The unit-publish messages waiting for their unit-ack, by id. */
+  private readonly acks = new Map<string, (r: AckOutcome) => void>();
+  /** The last extraction the Save dialog previewed (reused by publish while the scene is unchanged). */
+  private preview: { key: string; revision: number; unit: UnitExtract } | null = null;
   private readonly timers: NonNullable<ControllerDeps['timers']>;
   private readonly log: NonNullable<ControllerDeps['log']>;
 
@@ -301,6 +476,9 @@ export class DeskController {
           modes: [...MODES],
         },
         offline: true,
+        // library units: a desk with them always says so; nothing else of them goes unless the
+        // host's open turns them on (options.units)
+        units: { versions: [1], kinds: [...UNIT_KINDS], maxBytes: MAX_UNIT_BYTES, publish: true },
       },
     });
   }
@@ -329,7 +507,27 @@ export class DeskController {
       case 'result-ack':
         this.showAck(m);
         return;
+      case 'unit-ack':
+        this.unitAck(m);
+        return;
     }
+  }
+
+  /**
+   * An invalid reply of the host to one of the desk's requests, with that request's id (the bridge
+   * has answered it bad_message): a unit-publish waiting for it fails at once.
+   */
+  invalidReply(type: HostMessageType, id: string, problems: string): void {
+    if (type !== 'unit-ack') return;
+    const waiter = this.acks.get(id);
+    if (waiter) waiter({ kind: 'invalid', problems });
+  }
+
+  private unitAck(m: UnitAckMessage): void {
+    const waiter = this.acks.get(m.id);
+    // a late answer (after the wait) or one of no publish of this desk is not applied
+    if (!waiter) return this.log('info', `ignored a unit-ack of '${m.id}': no unit waits for it`);
+    waiter({ kind: 'ack', message: m });
   }
 
   // ---------------------------------------------------------------- open
@@ -370,13 +568,39 @@ export class DeskController {
     const options = resolveOptions(m.options);
     this.options.value = options;
     this.mode.value = options.defaultMode;
-    this.brief.value = m.scene;
+    // library units for this open: on only when the host's options.units reads; off, the brief's
+    // pins are stripped (staged as though the host never sent them) and open.units is not read
+    const units = acceptUnits(m.options?.units);
+    this.units.value = units;
+    this.libraryRows.value = [];
+    this.preview = null;
+    const pinned = pinCount(m.scene);
+    // a brief without pins stays the very brief the host sent (units on or off)
+    const brief = units || !pinned ? m.scene : briefWithoutPins(m.scene);
+    if (!units && (pinned || m.units !== undefined))
+      this.log(
+        'info',
+        `library units are off for this open (no options.units the desk reads): ${pinned} pin(s) staged from the words, open.units not read`,
+      );
+    this.brief.value = brief;
+    let intake: UnitIntake | null = null;
+    if (units) {
+      intake = await readOpenUnits(m.units, brief, this.deps.sha256 ? { hash: this.deps.sha256 } : {});
+      for (const i of intake.ignored) this.log('warn', `open.units[${i.index}] left out: ${i.reason}`);
+      // Close while the files were checked: the open is cancelled before anything is opened
+      if (this.openCancelled) {
+        this.openCancelled = false;
+        this.brief.value = null;
+        return;
+      }
+    }
     let r: OpenOutcome;
     try {
       r = await this.deps.workspace.open({
         hostOrigin: this.hostOrigin ?? 'null',
-        brief: m.scene,
+        brief,
         state: m.state,
+        ...(units ? { units: intake } : {}),
       });
     } catch (err) {
       this.brief.value = null;
@@ -417,7 +641,11 @@ export class DeskController {
     if (size) notices.push(size);
     // storage that failed: the scene is kept in memory only (workspace.ts)
     if (r.notice) notices.push(r.notice);
+    // library units the staging did not use (not sent, refused …): staged from the words
+    const missed = units && r.units ? unitNotice(r.units, brief) : null;
+    if (missed) notices.push(missed);
     if (notices.length) this.tell('warning', notices.join(' '));
+    this.refreshLibrary();
     // the contract's lists only (the banner shows the desk's own notes too)
     this.deps.send({
       type: 'opened',
@@ -449,7 +677,23 @@ export class DeskController {
     this.changesTimer = this.timers.setTimeout(() => {
       this.changesTimer = null;
       this.refreshChanges();
+      this.refreshLibrary();
     }, CHANGES_QUIET_MS);
+  }
+
+  /** The Library tab's rows as the scene has them now ([] with units off). */
+  private refreshLibrary(): void {
+    if (!this.units.peek() || !this.brief.peek()) {
+      if (this.libraryRows.peek().length) this.libraryRows.value = [];
+      return;
+    }
+    let rows: LibraryRow[];
+    try {
+      rows = this.deps.workspace.libraryRows?.() ?? [];
+    } catch {
+      return;
+    }
+    if (JSON.stringify(rows) !== JSON.stringify(this.libraryRows.peek())) this.libraryRows.value = rows;
   }
 
   /** The brief's changes as the scene has them now (kept as they are when nothing differs). */
@@ -500,7 +744,7 @@ export class DeskController {
       return false;
     }
     this.dirty.value = false;
-    let encoded: { state: DeskState; shots: number };
+    let encoded: { state: DeskState; shots: number; units?: StateUnit[] };
     try {
       encoded = await this.deps.workspace.encodeState();
     } catch (err) {
@@ -523,7 +767,15 @@ export class DeskController {
     this.lastSentAt = this.timers.now();
     this.lastStateAt.value = this.lastSentAt;
     this.deps.send(
-      { type: 'state', ...(id ? { id } : {}), sceneId: brief.id, state: encoded.state, shots: encoded.shots },
+      {
+        type: 'state',
+        ...(id ? { id } : {}),
+        sceneId: brief.id,
+        state: encoded.state,
+        shots: encoded.shots,
+        // after an open with units only: what the scene holds of each pinned slot
+        ...(this.units.peek() ? { units: encoded.units ?? [] } : {}),
+      },
       [encoded.state.data],
     );
     return true;
@@ -538,7 +790,11 @@ export class DeskController {
     this.updating.value = true;
     try {
       this.changes.value = await this.deps.workspace.updateFromBrief();
-      this.tell('info', 'The shots were updated to the brief (Ctrl+Z undoes it).');
+      const brief = this.brief.peek();
+      const rows = this.units.peek() ? (this.deps.workspace.unitRows?.() ?? null) : null;
+      const missed = rows && brief ? unitNotice(rows, brief) : null;
+      if (missed) this.tell('warning', `The shots were updated to the brief (Ctrl+Z undoes it). ${missed}`);
+      else this.tell('info', 'The shots were updated to the brief (Ctrl+Z undoes it).');
     } catch (err) {
       this.tell(
         'error',
@@ -546,7 +802,253 @@ export class DeskController {
       );
     } finally {
       this.updating.value = false;
+      this.refreshLibrary();
     }
+  }
+
+  // ---------------------------------------------------------------- library units
+
+  /** What Save to library can save of the scene: the set, each actor, each prop ([] without a scene). */
+  saveTargets(): SaveTarget[] {
+    if (!this.brief.peek()) return [];
+    try {
+      return this.deps.workspace.saveTargets?.() ?? [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * The target the Save dialog starts with: the one the object `selected` belongs to (the editor's
+   * active object), else the set; null without a scene.
+   */
+  defaultSaveTarget(selected: string | null): SaveTarget | null {
+    if (!this.brief.peek()) return null;
+    try {
+      return this.deps.workspace.defaultSaveTarget?.(selected) ?? this.saveTargets()[0] ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** The key of an extraction: what and its name. */
+  private static extractKey(what: UnitTarget, name: string): string {
+    return `${'set' in what ? 'set' : `root:${what.root}`}\n${name}`;
+  }
+
+  /**
+   * Makes the unit `what` named `name` (the extraction the dialog previewed, while the scene has not
+   * changed since; it is used once, as publishing hands its buffers over).
+   */
+  private async extract(what: UnitTarget, name: string, keep: boolean): Promise<UnitExtract> {
+    const ws = this.deps.workspace;
+    if (!ws.extractUnit) throw new Error('this desk cannot make library units');
+    const key = DeskController.extractKey(what, name);
+    const revision = ws.revision?.() ?? -1;
+    const cached = this.preview;
+    if (cached && cached.key === key && cached.revision === revision && revision >= 0) {
+      if (!keep) this.preview = null;
+      return cached.unit;
+    }
+    const unit = await ws.extractUnit(what, name);
+    this.preview = keep ? { key, revision, unit } : null;
+    return unit;
+  }
+
+  /**
+   * What the Save to library dialog shows for `what` named `name` before saving: the unit's kind,
+   * the version it would be a new version of, the slot it comes from, its counts, meta, size,
+   * thumbnail and warnings. Read only; rejects when the unit cannot be made (its reason).
+   */
+  async previewUnit(what: UnitTarget, name: string): Promise<UnitPreview> {
+    const unit = await this.extract(what, name.trim(), true);
+    return {
+      kind: unit.header.kind,
+      name: unit.header.name,
+      basedOn: unit.basedOn,
+      from: protocolFrom(unit.from),
+      counts: unit.header.counts,
+      meta: unit.meta,
+      bytes: unit.data.byteLength,
+      thumbnail: unit.thumbnail ? unit.thumbnail.slice() : null,
+      warnings: [...unit.warnings],
+    };
+  }
+
+  /** Waits for the unit-ack of `id` for at most `ms`. */
+  private waitForAck(id: string, ms: number): { done: Promise<AckOutcome>; cancel(): void } {
+    let resolve!: (r: AckOutcome) => void;
+    const done = new Promise<AckOutcome>((r) => (resolve = r));
+    const timer = this.timers.setTimeout(() => settle({ kind: 'timeout' }), ms);
+    const settle = (r: AckOutcome) => {
+      if (!this.acks.has(id)) return;
+      this.acks.delete(id);
+      this.timers.clearTimeout(timer);
+      resolve(r);
+    };
+    this.acks.set(id, settle);
+    return { done, cancel: () => settle({ kind: 'closed' }) };
+  }
+
+  /** The brief with `pin` on `slot` (the host moved it: a linked publish); null when the slot is not the brief's. */
+  private static briefWithPin(brief: SceneBrief, slot: UnitSlot, pin: BriefUnitPin): SceneBrief | null {
+    const next = structuredClone(brief);
+    const unit = { ref: pin.ref, version: pin.version, sha256: pin.sha256 };
+    if ('set' in slot) next.set = { ...next.set, unit };
+    else if ('castId' in slot) {
+      const c = next.cast.find((x) => x.id === slot.castId);
+      if (!c) return null;
+      c.unit = unit;
+    } else {
+      const e = next.elements.find((x) => x.id === slot.elementId && x.kind !== 'location');
+      if (!e) return null;
+      e.unit = unit;
+    }
+    return next;
+  }
+
+  /**
+   * Save to library: makes the unit of `what` (the set, an actor's figure or a prop) named `name`,
+   * sends it to the host (unit-publish, its file and thumbnail transferred; as a new version of the
+   * instance it is with `asNewVersion`) and waits for the host's unit-ack: 120 s plus 10 s per MiB of
+   * the file (an invalid ack ends the wait at once; a later one is not applied). When the host saved
+   * and linked it and the open is editable and still open, the scene becomes an instance of the
+   * version (not an undo step) and the brief follows the pin the host moved. Only with units on and
+   * `publish`; a read-only open publishes but never links. Resolves with what came of it (also kept
+   * in lastPublish); never rejects.
+   */
+  async publish(p: {
+    what: UnitTarget;
+    name: string;
+    description?: string;
+    asNewVersion?: boolean;
+  }): Promise<PublishResult> {
+    const name = p.name.trim();
+    const host = this.options.peek().hostName;
+    let kind: UnitKind | null = null;
+    const finish = (result: PublishResult): PublishResult => {
+      this.lastPublish.value = { result, kind, name, at: this.timers.now() };
+      return result;
+    };
+    const fail = (code: string, message: string) => finish({ ok: false, code, message });
+    const units = this.units.peek();
+    if (!units) return fail('unavailable', `${host} did not turn on library units for this scene.`);
+    if (!units.publish) return fail('unavailable', `${host} does not take units saved to its library here.`);
+    if (this.status.peek() !== 'open') return fail('not_open', 'No scene is open.');
+    if (this.publishing.peek()) return fail('busy', 'Another unit is being saved to the library.');
+    if (!name || name.length > 120) return fail('invalid', 'A unit needs a name of 1 to 120 characters.');
+    if (p.description !== undefined && p.description.length > 2000)
+      return fail('invalid', 'A unit’s description is at most 2000 characters.');
+    this.publishing.value = { kind: null, name, phase: 'extracting', startedAt: this.timers.now(), id: null };
+    try {
+      let unit: UnitExtract;
+      try {
+        unit = await this.extract(p.what, name, false);
+      } catch (err) {
+        return fail(
+          'failed',
+          `The unit could not be made: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      kind = unit.header.kind;
+      const id = `pub-${++this.pubSeq}`;
+      const from = protocolFrom(unit.from);
+      const description = p.description?.trim();
+      const message: UnitPublishMessage = {
+        type: 'unit-publish',
+        id,
+        kind,
+        name: unit.header.name,
+        ...(description ? { description } : {}),
+        ...(p.asNewVersion && unit.basedOn ? { newVersionOf: { ...unit.basedOn } } : {}),
+        ...(from ? { from } : {}),
+        unit: { format: UNIT_DATA_FORMAT, version: UNIT_DATA_VERSION, data: exactBuffer(unit.data) },
+        sha256: unit.sha256,
+        thumbnail: unit.thumbnail ? { mime: 'image/png', data: exactBuffer(unit.thumbnail) } : null,
+        meta: unit.meta,
+      };
+      const problem = deskMessageProblems(message);
+      if (problem) return fail('invalid', `The unit could not be sent: ${problem}`);
+      const wait = this.waitForAck(id, publishAckTimeoutMs(message.unit.data.byteLength));
+      const transfer: Transferable[] = [
+        message.unit.data,
+        ...(message.thumbnail ? [message.thumbnail.data] : []),
+      ];
+      if (!this.deps.send(message, transfer)) {
+        wait.cancel();
+        return fail('unavailable', 'No host is connected.');
+      }
+      this.publishing.value = { ...this.publishing.peek()!, kind, phase: 'waiting', id };
+      const answer = await wait.done;
+      if (answer.kind === 'timeout')
+        return fail('timeout', `${host} did not say whether it saved '${unit.header.name}'.`);
+      if (answer.kind === 'closed') return fail('closed', 'The desk closed before the host answered.');
+      if (answer.kind === 'invalid')
+        return fail('bad_reply', `${host}'s answer was not valid: ${answer.problems}`);
+      const ack = answer.message;
+      if (!ack.ok)
+        return fail(ack.code ?? 'failed', ack.message ?? `${host} did not save '${unit.header.name}'.`);
+      const pin = { ref: ack.ref!, version: ack.version!, sha256: unit.sha256 };
+      const linked = ack.linked === true;
+      let adopted = false;
+      let note = ack.message;
+      const ws = this.deps.workspace;
+      if (linked) {
+        if (this.options.peek().readOnly) note = 'The scene is read-only here: it stays as it is.';
+        else if (this.status.peek() !== 'open' || !ws.adoptUnit)
+          note = 'The desk was closed: the next open brings the link.';
+        else {
+          this.publishing.value = { ...this.publishing.peek()!, phase: 'linking' };
+          try {
+            const r = await ws.adoptUnit(unit, pin, true);
+            adopted = true;
+            // the host pins the version from now on (its next brief says so): the desk follows
+            const brief = this.brief.peek();
+            const next =
+              r.recorded && brief && unit.from ? DeskController.briefWithPin(brief, unit.from, pin) : null;
+            if (next) {
+              this.brief.value = next;
+              ws.setBrief?.(next);
+            }
+          } catch (err) {
+            note = `${host} saved and linked it, but the scene could not be linked to it here: ${err instanceof Error ? err.message : String(err)}`;
+          }
+          this.refreshChanges();
+          this.refreshLibrary();
+        }
+      }
+      return finish({
+        ok: true,
+        ref: pin.ref,
+        version: pin.version,
+        linked,
+        adopted,
+        ...(note ? { message: note } : {}),
+      });
+    } finally {
+      this.publishing.value = null;
+    }
+  }
+
+  /**
+   * Make local: the library unit instance `root` keeps its objects as plain ones of the scene (one
+   * undo step); its slot stays local (the record keeps its pin; staging never places a unit there
+   * again). Refused while read-only or no scene is open.
+   */
+  async makeLocal(root: string): Promise<{ ok: true } | { ok: false; message: string }> {
+    const ws = this.deps.workspace;
+    if (this.status.peek() !== 'open') return { ok: false, message: 'No scene is open.' };
+    if (this.options.peek().readOnly) return { ok: false, message: 'The scene is read-only here.' };
+    if (!ws.makeLocal) return { ok: false, message: 'This desk cannot make library units local.' };
+    try {
+      await ws.makeLocal(root);
+    } catch (err) {
+      return { ok: false, message: err instanceof Error ? err.message : String(err) };
+    } finally {
+      this.refreshChanges();
+      this.refreshLibrary();
+    }
+    return { ok: true };
   }
 
   // ---------------------------------------------------------------- export
@@ -897,6 +1399,8 @@ export class DeskController {
   }
 
   dispose(): void {
+    // a Save to library waiting for its ack ends: the desk is gone
+    for (const settle of [...this.acks.values()]) settle({ kind: 'closed' });
     this.stopEdits?.();
     this.stopEdits = null;
     if (this.stateTimer !== null) this.timers.clearTimeout(this.stateTimer);

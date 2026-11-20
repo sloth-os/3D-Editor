@@ -4,11 +4,16 @@ import { bytesToHex } from '@noble/hashes/utils.js';
 import {
   briefChanges,
   briefRecord,
+  docHasUnitInstances,
   getShots,
+  pinKey,
+  pinsWanted,
   type BriefChanges,
   type DeskCheckResult,
   type SceneBrief,
   type ShotResultMeta,
+  type StageUnitRow,
+  type UnitSource,
 } from '@3d-editor/core';
 import { session as sessionSignal } from '../app/store';
 import { projectDbName } from '../project/local-index';
@@ -22,6 +27,7 @@ import {
   type DeskState,
   type GivenState,
   type OpenSource,
+  type StateUnit,
 } from './protocol';
 import {
   StateUnreadable,
@@ -33,7 +39,21 @@ import {
   type DecodedState,
   type RestorePlan,
 } from './state';
-import { StagingClient } from './staging';
+import { StagingClient, StagingError, type Staged } from './staging';
+import type { UnitExtract, UnitTarget } from './staging-engine';
+import {
+  defaultSaveTarget,
+  intakeCopy,
+  intakeSource,
+  keepWanted,
+  libraryRows,
+  saveTargets,
+  stateUnits,
+  withoutFiles,
+  type LibraryRow,
+  type SaveTarget,
+  type UnitIntake,
+} from './units';
 
 /*
  * The desk's scene (docs/embedding.md, "What the desk does"): the project of one host scene in this
@@ -69,6 +89,16 @@ import { StagingClient } from './staging';
  *   made while the worker checks shows them as out of date); after the scene opens and after
  *   Update shots the full checks (blocking lines, layouts) run in the background, behind the
  *   person's requests to the worker while they wait.
+ * - Library units (docs/embedding.md "Library units"), only when the host turned them on for the
+ *   open: the files that count for the brief's pins (units.ts readOpenUnits) go to the staging and
+ *   to Update shots (copies, handed over to the worker); after the open and after each Update shots
+ *   only those an Update shots could still place are kept (core pinsWanted, within one staging's
+ *   budget), none after the scene closes. A worker that fails with the files (it stops, runs out of
+ *   memory) gets the staging or the update again without them: their pins wait (`unavailable`). The brief's changes are read with their headers (nothing
+ *   decoded on the page). A state of a document holding instances of units is container version 2.
+ *   Save to library makes the unit in the worker (read only); the version the host saved and linked
+ *   is adopted with the storage origin (not an undo step: it records what the host did), and Make
+ *   local is one undo step.
  */
 
 /** The local project id of a host's scene: a digest of the host's origin and the scene id. */
@@ -210,6 +240,11 @@ export interface OpenOutcome {
   persistent: boolean;
   /** What the person should be told about where the scene is kept (storage that failed). */
   notice?: string | null;
+  /**
+   * The brief's library pins as the staging left them (core's report.units: per pinned slot, its
+   * unit or the words and why); null when nothing was staged or units are off for the open.
+   */
+  units?: StageUnitRow[] | null;
 }
 
 /** A brief shot whose length in the desk differs from the brief's. */
@@ -263,6 +298,12 @@ export class DeskWorkspace {
   private release: (() => void) | null = null;
   /** The open in progress, from its start (cancelOpen and close abort it: Close while it opens). */
   private opening: AbortController | null = null;
+  /** The library units held for the brief's pins (null: units are off for the open). */
+  private units: UnitIntake | null = null;
+  /** The page's source of `units` (headers only), made once per change of them. */
+  private unitSourceCache: UnitSource | null = null;
+  /** The brief's pins as the last staging or Update shots left them (report.units). */
+  private lastUnitRows: StageUnitRow[] | null = null;
   private readonly locks: SceneLocks | null;
   private readonly storageTimeoutMs: number;
 
@@ -406,27 +447,86 @@ export class DeskWorkspace {
    * Stages `brief` into session `s` (empty). The open's `signal` stops it at any moment: the worker's
    * staging is stopped, and a staging that came back is not applied (the local copy gets none of it).
    */
-  private async stage(s: ProjectSession, brief: SceneBrief, signal: AbortSignal): Promise<number> {
+  private async stage(
+    s: ProjectSession,
+    brief: SceneBrief,
+    signal: AbortSignal,
+  ): Promise<{ ms: number; units: StageUnitRow[] | null }> {
     this.onWork({
       label: `Staging ${brief.shots.length} shot${brief.shots.length === 1 ? '' : 's'}…`,
       startedAt: Date.now(),
     });
     try {
-      const r = await this.staging.stage(
-        Y.encodeStateAsUpdate(s.doc.ydoc),
-        brief,
-        newLineage(),
-        GENERATOR,
-        signal,
-      );
+      const update = Y.encodeStateAsUpdate(s.doc.ydoc);
+      const lineage = newLineage();
+      // the worker gets copies of the units: the page keeps those an Update shots may still need
+      const run = () =>
+        this.staging.stage(
+          update,
+          brief,
+          lineage,
+          GENERATOR,
+          signal,
+          this.units ? intakeCopy(this.units) : undefined,
+        );
+      let r: Staged;
+      try {
+        r = await run();
+      } catch (err) {
+        // the worker failed with the units' files (it stopped, ran out of memory): staged again
+        // without them, their slots wait for another open (pending unavailable)
+        if (!this.giveUpFiles(err, signal)) throw err;
+        r = await run();
+      }
       stopIfCancelled(signal);
       Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
       // nobody edits the scene before it opens: the checks are of the document as it is now
       this.keepCheck(s, r.check, s.revision.peek());
-      return r.ms;
+      return { ms: r.ms, units: this.units ? (r.summary.units ?? []) : null };
     } finally {
       this.onWork(null);
     }
+  }
+
+  /**
+   * After a staging or an update failed: when it had units' files and the worker failed (not a
+   * cancel), lets go of the files, their pins pending `unavailable` (units.ts withoutFiles), so that
+   * the caller runs it again without them; false when it should fail as it is.
+   */
+  private giveUpFiles(err: unknown, signal?: AbortSignal): boolean {
+    if (!this.units?.units.length || signal?.aborted) return false;
+    if (!(err instanceof StagingError) || err.code === 'CANCELLED') return false;
+    this.units = withoutFiles(this.units, err.message);
+    this.unitSourceCache = null;
+    return true;
+  }
+
+  /** The source of the units held (null: units are off). */
+  private unitSource(): UnitSource | null {
+    if (!this.units) return null;
+    this.unitSourceCache ??= intakeSource(this.units);
+    return this.unitSourceCache;
+  }
+
+  /** briefChanges' and the staging's options: the units held, when units are on. */
+  private unitOptions(): { units?: UnitSource } {
+    const source = this.unitSource();
+    return source ? { units: source } : {};
+  }
+
+  /**
+   * Keeps of the units held only those an Update shots of `doc` could still place (core
+   * pinsWanted), within one staging's budget: the files of slots that hold their version, were
+   * refused or made local are let go.
+   */
+  private keepWantedUnits(s: ProjectSession, brief: SceneBrief): void {
+    if (!this.units) return;
+    try {
+      this.units = keepWanted(this.units, pinsWanted(s.doc, brief));
+    } catch {
+      // a brief core does not take (the protocol checked it): the units stay as they are
+    }
+    this.unitSourceCache = null;
   }
 
   /**
@@ -444,6 +544,9 @@ export class DeskWorkspace {
     const s = this.session;
     this.session = null;
     this.kept = null;
+    this.units = null;
+    this.unitSourceCache = null;
+    this.lastUnitRows = null;
     if (s && sessionSignal.peek() === s) sessionSignal.value = null;
     void s?.close(false);
     this.release?.();
@@ -457,7 +560,13 @@ export class DeskWorkspace {
    * of the copy is changed; later (while a copy it replaces is cleared, while it stages) nothing new
    * is written into the copy, and a staging under way is stopped.
    */
-  async open(o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null }): Promise<OpenOutcome> {
+  async open(o: {
+    hostOrigin: string;
+    brief: SceneBrief;
+    state: GivenState | null;
+    /** The library units of the open (units.ts readOpenUnits); null or absent: units are off. */
+    units?: UnitIntake | null;
+  }): Promise<OpenOutcome> {
     const cancel = new AbortController();
     this.opening?.abort();
     this.opening = cancel;
@@ -469,12 +578,13 @@ export class DeskWorkspace {
   }
 
   private async openScene(
-    o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null },
+    o: { hostOrigin: string; brief: SceneBrief; state: GivenState | null; units?: UnitIntake | null },
     signal: AbortSignal,
   ): Promise<OpenOutcome> {
     const { brief } = o;
     this.letGo();
     this.brief = brief;
+    this.units = o.units ?? null;
     const id = deskProjectId(o.hostOrigin, brief.id);
     let unreadable: string | null = null;
     let decoded: DecodedState | null = null;
@@ -528,14 +638,22 @@ export class DeskWorkspace {
           };
       }
       let stageMs: number | null = null;
-      if (plan === 'stage') stageMs = await this.stage(s, brief, signal);
+      let unitRows: StageUnitRow[] | null = null;
+      if (plan === 'stage') {
+        const staged = await this.stage(s, brief, signal);
+        stageMs = staged.ms;
+        unitRows = staged.units;
+      }
       s.undo.clear();
       this.session = s;
       this.release = release;
       this.kept = kept && { session: s, ...kept };
+      this.lastUnitRows = unitRows;
+      // the units an Update shots may still place stay; the others are let go
+      this.keepWantedUnits(s, brief);
       sessionSignal.value = s;
       const source: OpenSource = plan === 'stage' ? 'brief' : plan === 'local' ? 'local' : 'state';
-      const changes = source === 'brief' ? null : briefChanges(s.doc, brief);
+      const changes = source === 'brief' ? null : briefChanges(s.doc, brief, this.unitOptions());
       // the full checks (blocking lines, layouts) of the scene as it opened, in the background
       void this.refreshCheck();
       return {
@@ -546,10 +664,13 @@ export class DeskWorkspace {
         stageMs,
         persistent: stored.persistent,
         notice: this.notice,
+        units: unitRows,
       };
     } catch (err) {
       await s?.close(false).catch(() => undefined);
       release();
+      this.units = null;
+      this.unitSourceCache = null;
       throw err;
     }
   }
@@ -582,30 +703,34 @@ export class DeskWorkspace {
 
   /**
    * The scene's desk state: the bytes it opened from or last wrote while the document holds the
-   * same, else written anew. Throws StateTooLarge over 64 MiB (or a document over 256 MiB).
+   * same, else written anew (container version 2 when it holds instances of library units). Its
+   * `units`: the rows of state.units of the same document (the controller sends them only after an
+   * open with units). Throws StateTooLarge over 64 MiB (or a document over 256 MiB).
    */
-  async encodeState(): Promise<{ state: DeskState; shots: number }> {
+  async encodeState(): Promise<{ state: DeskState; shots: number; units: StateUnit[] }> {
     const s = this.session;
     const brief = this.brief;
     if (!s || !brief) throw new Error('no scene is open');
     const snapshot = Y.snapshot(s.doc.ydoc);
     const kept = this.kept;
+    // read with the snapshot: the rows are of the document the bytes hold
+    const units = stateUnits(s.doc);
     // each state gets its own buffer: the controller hands it over (transfers it)
     if (kept && kept.session === s && Y.equalSnapshots(kept.snapshot, snapshot))
       return {
         state: { format: DESK_STATE_FORMAT, version: DESK_STATE_VERSION, data: kept.bytes.slice().buffer },
         shots: kept.shots,
+        units,
       };
     const shots = getShots(s.doc).length;
-    const state = await encodeDeskState(Y.encodeStateAsUpdate(s.doc.ydoc), {
-      sceneId: brief.id,
-      lineage: readLineage(s.doc) ?? 'none',
-      shots,
-      deskVersion: DESK_VERSION,
-    });
+    const state = await encodeDeskState(
+      Y.encodeStateAsUpdate(s.doc.ydoc),
+      { sceneId: brief.id, lineage: readLineage(s.doc) ?? 'none', shots, deskVersion: DESK_VERSION },
+      { units: docHasUnitInstances(s.doc) },
+    );
     if (this.session === s)
       this.kept = { session: s, snapshot, bytes: new Uint8Array(state.data.slice(0)), shots };
-    return { state, shots };
+    return { state, shots, units };
   }
 
   /** Calls `cb` after every change of the scene from now on; returns the unsubscribe. */
@@ -651,11 +776,14 @@ export class DeskWorkspace {
     return out;
   }
 
-  /** How the brief differs from what the scene was staged from (null: it agrees). */
+  /**
+   * How the brief differs from what the scene was staged from (null: it agrees); with units on, the
+   * library pins an Update shots would place with the units held (their headers only).
+   */
   changes(): BriefChanges | null {
     const s = this.session;
     const brief = this.brief;
-    return s && brief ? briefChanges(s.doc, brief) : null;
+    return s && brief ? briefChanges(s.doc, brief, this.unitOptions()) : null;
   }
 
   /**
@@ -669,7 +797,16 @@ export class DeskWorkspace {
     this.onWork({ label: `Updating ${brief.shots.length} shots from the brief…`, startedAt: Date.now() });
     try {
       const asked = s.revision.peek();
-      const r = await this.staging.update(Y.encodeStateAsUpdate(s.doc.ydoc), brief);
+      const update = Y.encodeStateAsUpdate(s.doc.ydoc);
+      const run = () => this.staging.update(update, brief, this.units ? intakeCopy(this.units) : undefined);
+      let r: Staged;
+      try {
+        r = await run();
+      } catch (err) {
+        // as in stage: the units' files given up, their slots keep what they hold
+        if (!this.giveUpFiles(err)) throw err;
+        r = await run();
+      }
       // the worker's checks are of the document it got plus its change: current only when nothing
       // else changed the scene meanwhile (else shown as out of date until the next check)
       const edited = s.revision.peek() !== asked;
@@ -677,12 +814,111 @@ export class DeskWorkspace {
       Y.applyUpdate(s.doc.ydoc, r.diff, s.doc.origin);
       s.undo.stopCapturing();
       this.keepCheck(s, r.check, edited ? asked : s.revision.peek());
+      if (this.units) {
+        this.lastUnitRows = r.summary.units ?? [];
+        // a unit the update placed is in the scene now: its file is let go
+        this.keepWantedUnits(s, brief);
+      }
       // the full checks (blocking lines, layouts) of the updated scene, in the background
       void this.refreshCheck();
-      return briefChanges(s.doc, brief);
+      return briefChanges(s.doc, brief, this.unitOptions());
     } finally {
       this.onWork(null);
     }
+  }
+
+  /** The brief's library pins as the last staging or Update shots left them (null: none, or units are off). */
+  unitRows(): StageUnitRow[] | null {
+    return this.lastUnitRows;
+  }
+
+  /** The units held for an Update shots (their pins, `ref@version`), for tests and the Library tab. */
+  heldUnits(): string[] {
+    return this.units ? this.units.units.map(pinKey) : [];
+  }
+
+  /** The document's revision now (it changes with every edit). */
+  revision(): number {
+    return this.session?.revision.peek() ?? -1;
+  }
+
+  /** Sets the brief the scene follows (a publish the host linked moved one of its pins). */
+  setBrief(brief: SceneBrief): void {
+    this.brief = brief;
+  }
+
+  /** The Library tab's rows of the scene (units.ts libraryRows); [] without a scene. */
+  libraryRows(): LibraryRow[] {
+    const s = this.session;
+    const brief = this.brief;
+    if (!s || !brief) return [];
+    const source = this.unitSource();
+    return libraryRows(s.doc, brief, (pin) => !!source?.header(pin));
+  }
+
+  /** What Save to library can save of the scene (units.ts saveTargets); [] without a scene. */
+  saveTargets(): SaveTarget[] {
+    const s = this.session;
+    const brief = this.brief;
+    return s && brief ? saveTargets(s.doc, brief) : [];
+  }
+
+  /** The target the Save dialog starts with for the selected object (units.ts defaultSaveTarget). */
+  defaultSaveTarget(selected: string | null): SaveTarget | null {
+    const s = this.session;
+    const targets = this.saveTargets();
+    return s && targets.length ? defaultSaveTarget(s.doc, targets, selected) : null;
+  }
+
+  /** A unit of the scene for Save to library, with its thumbnail: read only, made in the worker. */
+  async extractUnit(what: UnitTarget, name: string): Promise<UnitExtract> {
+    const s = this.session;
+    if (!s) throw new Error('no scene is open');
+    return this.staging.extractUnit(Y.encodeStateAsUpdate(s.doc.ydoc), what, name, DESK_VERSION);
+  }
+
+  /**
+   * Makes the scene's objects published as `pin` an instance of it (core adoptPublished, in the
+   * worker), with the record's pin of the unit's slot when `linked`. Applied with the storage origin:
+   * not an undo step (it records what the host did). Throws when no scene is open or the scene's
+   * published objects are gone.
+   */
+  async adoptUnit(
+    unit: Pick<UnitExtract, 'link' | 'from' | 'header'>,
+    pin: { ref: string; version: number; sha256: string },
+    linked: boolean,
+  ): Promise<{ root: string; recorded: boolean; warnings: string[] }> {
+    const s = this.session;
+    const brief = this.brief;
+    if (!s || !brief) throw new Error('no scene is open');
+    const r = await this.staging.adoptUnit(Y.encodeStateAsUpdate(s.doc.ydoc), brief, {
+      slot: unit.from,
+      link: unit.link,
+      pin,
+      linked,
+      header: unit.header,
+    });
+    // the scene was let go meanwhile: nothing is applied
+    if (this.session !== s) throw new Error('the scene was closed');
+    Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
+    return { root: r.root, recorded: r.recorded, warnings: r.warnings };
+  }
+
+  /**
+   * Make local: instance `root` keeps its objects as plain ones of the scene (core makeLocal, in the
+   * worker), as one undo step. Throws when no scene is open, or the instance is gone.
+   */
+  async makeLocal(root: string): Promise<{ root: string; parts: number }> {
+    const s = this.session;
+    if (!s) throw new Error('no scene is open');
+    const r = await this.staging.makeLocal(Y.encodeStateAsUpdate(s.doc.ydoc), root);
+    // deleted while the worker ran, or the scene let go: nothing is applied
+    if (this.session !== s || !s.doc.getObject(root))
+      throw new Error('the library unit is no longer in the scene');
+    s.undo.stopCapturing();
+    Y.applyUpdate(s.doc.ydoc, r.diff, s.doc.origin);
+    s.undo.stopCapturing();
+    return { root: r.root, parts: r.parts };
   }
 
   /** The shot results of a snapshot (host shot ids, brief order), from the worker. */

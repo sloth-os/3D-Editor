@@ -6,8 +6,9 @@ import type { DeskMessage } from '../src/embed/protocol';
  * The desk's side of the connection (embed/bridge.ts) with a fake window, parent and ports: hello
  * to the parent only inside a frame, one connect only from the parent with a version the desk
  * speaks (another version answered on its port and refused), nothing on window afterwards, the
- * port's messages validated (unknown types ignored, bad ones answered when they carry an id), and
- * what the host sends before the desk's ready handled after it, in order.
+ * port's messages validated (unknown types ignored, bad ones answered when they carry an id, an
+ * invalid unit-ack also handed to the desk with its id), and what the host sends before the desk's
+ * ready handled after it, in order.
  */
 
 const READY: DeskMessage = {
@@ -67,6 +68,7 @@ function setup(opts: { framed?: boolean } = {}) {
   const handler = {
     connected: vi.fn<BridgeHandler['connected']>(),
     message: vi.fn<BridgeHandler['message']>(),
+    invalidReply: vi.fn<NonNullable<BridgeHandler['invalidReply']>>(),
   };
   const log = { info: vi.fn(), warn: vi.fn() };
   const bridge = new DeskBridge(win, handler, log);
@@ -167,6 +169,33 @@ describe('the desk bridge', () => {
     ]);
     expect(t.handler.message).toHaveBeenCalledTimes(1);
     expect(t.log.info).toHaveBeenCalledWith(expect.stringContaining('frobnicate'));
+  });
+
+  it('answers an invalid unit-ack with bad_message and gives its id to the desk, whose save waiting for it ends', () => {
+    const t = setup();
+    t.bridge.start();
+    const port = t.connect()!;
+    t.bridge.send(READY);
+    port.posted.length = 0;
+    // ok without the item it saved
+    port.emit({ type: 'unit-ack', id: 'pub-1', ok: true });
+    expect(port.posted.map((p) => p.message)).toEqual([
+      expect.objectContaining({ type: 'error', id: 'pub-1', code: 'bad_message' }),
+    ]);
+    expect(t.handler.invalidReply).toHaveBeenCalledTimes(1);
+    expect(t.handler.invalidReply).toHaveBeenCalledWith('unit-ack', 'pub-1', expect.stringContaining('ref'));
+    expect(t.handler.message).not.toHaveBeenCalled();
+    // a valid one goes to the handler; an invalid message of another kind is no reply to the desk
+    port.emit({ type: 'unit-ack', id: 'pub-2', ok: false, code: 'refused' });
+    expect(t.handler.message).toHaveBeenCalledWith({
+      type: 'unit-ack',
+      id: 'pub-2',
+      ok: false,
+      code: 'refused',
+    });
+    port.emit({ type: 'export', id: 'e-1', modes: ['smell'] });
+    port.emit({ type: 'unit-ack', ok: true });
+    expect(t.handler.invalidReply).toHaveBeenCalledTimes(1);
   });
 
   it('handles what the host sends before ready once ready is out, in order (ready goes first)', () => {

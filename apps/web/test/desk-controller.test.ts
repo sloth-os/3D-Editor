@@ -215,6 +215,9 @@ describe('the desk controller', () => {
             modes: ['motion', 'pose', 'camera'],
           },
           offline: true,
+          // library units: always announced (docs/embedding.md "Library units"); nothing else of
+          // them goes unless an open turns them on
+          units: { versions: [1], kinds: ['set', 'prop', 'figure'], maxBytes: 33554432, publish: true },
         },
       },
     ]);

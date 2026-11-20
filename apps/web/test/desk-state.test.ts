@@ -6,16 +6,18 @@ import { gzipSync } from 'node:zlib';
 import { Gunzip } from 'fflate';
 import * as Y from 'yjs';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { SceneDoc, type SceneBrief } from '@3d-editor/core';
+import { SceneDoc, docHasUnitInstances, type SceneBrief } from '@3d-editor/core';
 import { MAX_STATE_BYTES } from '../src/embed/protocol';
 import { runStaging } from '../src/embed/staging-engine';
 import {
+  CONTAINER_VERSION,
   MAX_HEADER_BYTES,
   MAX_UPDATE_BYTES,
   STATE_HEADER_KEYS,
   STATE_MAGIC,
   StateTooLarge,
   StateUnreadable,
+  UNITS_CONTAINER_VERSION,
   compressesStates,
   decodeDeskState,
   encodeDeskState,
@@ -25,6 +27,7 @@ import {
   restorePlan,
   writeLineage,
 } from '../src/embed/state';
+import { KITE, library, withPins } from './desk-units-helpers';
 
 /*
  * The desk state (embed/state.ts): the container round trip (gzipped and not), the same bytes for
@@ -32,7 +35,8 @@ import {
  * read (another format, version, scene or container, a cut or corrupted payload, not a Yjs
  * document, no staging of the scene), gzip read where the browser has no DecompressionStream, the
  * limits both ways (64 MiB packed, 256 MiB unpacked) and a gzip bomb stopped while it unpacks, the
- * lineage and the merge rule.
+ * lineage and the merge rule; container version 2 for a document with instances of library units
+ * (read here, refused by a desk from before units).
  */
 
 const BRIEF = (): SceneBrief =>
@@ -476,4 +480,47 @@ describe('the desk state', () => {
     expect(restorePlan(null, local('a'))).toBe('local');
     expect(restorePlan(null, { staged: false, lineage: null })).toBe('stage');
   });
+});
+
+describe('the desk state of a scene with library units', () => {
+  it('is container version 2 exactly when the document holds instances of library units: this desk reads both, a desk from before units refuses it', async () => {
+    const lib = library();
+    const r = runStaging({
+      kind: 'stage',
+      update: Y.encodeStateAsUpdate(new Y.Doc()),
+      brief: withPins(BRIEF(), { elements: { [KITE]: lib.kite } }),
+      lineage: 'lineage-u',
+      generator: 'test',
+      units: { units: [{ ...lib.kite.pin, data: lib.kite.data.slice() }], problems: [] },
+    });
+    if (!r.ok || r.kind !== 'stage') throw new Error(JSON.stringify(r));
+    const ydoc = new Y.Doc();
+    Y.applyUpdate(ydoc, r.diff);
+    const update = Y.encodeStateAsUpdate(ydoc);
+    expect(docHasUnitInstances(SceneDoc.fromUpdate(update))).toBe(true);
+    for (const compress of [true, false]) {
+      const head = header({ lineage: 'lineage-u' });
+      const v2 = await encodeDeskState(update, head, { compress, units: true });
+      expect(bytesOf(v2)[8]).toBe(UNITS_CONTAINER_VERSION);
+      const read = await decodeDeskState(v2, SCENE);
+      expect(read.header.lineage).toBe('lineage-u');
+      expect(same(read.update, update)).toBe(true);
+      // a desk from before library units reads version 1 only: state_unreadable
+      expect(() => readStateHeader(bytesOf(v2), [CONTAINER_VERSION])).toThrow(StateUnreadable);
+      expect(() => readStateHeader(bytesOf(v2), [CONTAINER_VERSION])).toThrow(
+        /the desk state's container is version 2, this desk reads 1$/,
+      );
+      // the same document written as one without instances: version 1, the rest byte for byte
+      const v1 = await encodeDeskState(update, head, { compress });
+      expect(bytesOf(v1)[8]).toBe(CONTAINER_VERSION);
+      const differ = [...bytesOf(v1)].flatMap((b, i) => (b !== bytesOf(v2)[i] ? [i] : []));
+      expect(differ).toEqual([8]);
+    }
+    // a version neither desk wrote names both this one reads
+    const v3 = bytesOf(await encodeDeskState(staged, header())).slice();
+    v3[8] = 3;
+    await expect(
+      decodeDeskState({ format: '3d-editor.desk-state', version: 1, data: v3.buffer }, SCENE),
+    ).rejects.toThrow(/container is version 3, this desk reads 1 and 2/);
+  }, 60_000);
 });

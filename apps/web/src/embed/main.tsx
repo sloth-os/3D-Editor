@@ -168,6 +168,7 @@ if (window.parent !== window) {
   bridge = new DeskBridge(window, {
     connected: (origin) => void c.connected(origin),
     message: (m) => c.message(m),
+    invalidReply: (type, id, problems) => c.invalidReply(type, id, problems),
   });
   exposeHook(c);
   render(<Embedded c={c} />, root);
