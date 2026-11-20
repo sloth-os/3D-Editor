@@ -24,7 +24,7 @@ import type { UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance, unitOf } from '../units/list';
 import { removeObjectTrees } from '../units/remove';
-import { updateUnit } from '../units/update';
+import { updateUnit, withArticle } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { defaultActorHeight } from '../characters';
 import { deskTetherFly } from '../physics';
@@ -1889,7 +1889,10 @@ function remapShotRefs(doc: SceneDoc, from: string, to: string): void {
  * prop's spot with its base on the ground and the unit's own size. An earlier root of the same library
  * item (an instance, or one made local) is kept, updated to the pin's version, cleared of its
  * animation and of the import's holds; another earlier root is swapped for the unit (the unit's root
- * takes its id when their types agree, else shots that named it name the new root).
+ * takes its id when their types agree, else shots that named it name the new root). A version whose
+ * root is another type of object than the instance's (an empty in one version, a mesh in the next),
+ * which no update turns into the other, takes the instance's place as another item's unit does, with
+ * a warning.
  */
 function buildUnitProp(
   doc: SceneDoc,
@@ -1907,20 +1910,27 @@ function buildUnitProp(
   const cur = old && doc.getObject(old.id) ? old : undefined;
   const inst = cur ? readInstance(doc, cur.id) : null;
   const sameItem = cur && (inst ? inst.ref === unit.pin.ref : unitBuildOf(doc, cur.id)?.ref === unit.pin.ref);
+  const unitRoot = unit.unit?.body.blocks.objects?.['@root'];
+  const curType = cur ? doc.getObject(cur.id)?.type : undefined;
+  // the instance's own item at another version: updated in place, unless its root is another type of
+  // object than the instance's, which no update turns into the other: it then takes the instance's
+  // place, in the insert's transaction, as another item's unit does
+  const next =
+    inst && sameItem && unit.unit && (inst.version !== unit.pin.version || inst.sha256 !== unit.pin.sha256)
+      ? unit.unit
+      : null;
+  const retyped = next !== null && unitRoot !== undefined && unitRoot.type !== curType;
   let root: string;
   let created = false;
   const warnings: string[] = [];
-  if (cur && sameItem) {
+  if (cur && sameItem && !retyped) {
     root = cur.id;
-    if (inst && unit.unit && (inst.version !== unit.pin.version || inst.sha256 !== unit.pin.sha256))
-      updateUnit(doc, root, unit.unit, unit.pin);
+    if (next) updateUnit(doc, root, next, unit.pin);
     clearAnimation(doc, root);
     removeAttachments(doc, root);
   } else {
     if (!unit.unit) throw new OperatorError(`the library unit of '${label}' is not here to place`, 'FAILED');
-    const unitRoot = unit.unit.body.blocks.objects?.['@root'];
-    const swap =
-      cur && !inst && unitRoot && doc.getObject(cur.id)?.type === unitRoot.type ? cur.id : undefined;
+    const swap = cur && !inst && unitRoot && curType === unitRoot.type ? cur.id : undefined;
     // the prop it takes the place of goes in the insert's own transaction: a unit that does not go
     // in leaves it as it is
     const r = insertUnit(doc, unit.unit, {
@@ -1934,6 +1944,10 @@ function buildUnitProp(
     root = r.root;
     // what the person put on the prop the unit replaces stays, named here
     warnings.push(...r.warnings);
+    if (retyped && inst)
+      warnings.push(
+        `v${unit.pin.version}'s root is ${withArticle(unitRoot?.type)} and v${inst.version}'s ${withArticle(curType)}, so v${unit.pin.version} replaces v${inst.version}, edits and all, instead of updating it`,
+      );
     if (cur && !swap) remapShotRefs(doc, cur.id, root);
     created = !swap;
   }

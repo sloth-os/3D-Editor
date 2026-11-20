@@ -79,6 +79,10 @@ export interface UnitUpdateReport {
 const isRecord = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Uint8Array);
 
+/** An object type with its article, for messages: 'an EMPTY', 'a MESH'. */
+export const withArticle = (type: unknown): string =>
+  `${/^[AEIOU]/.test(String(type)) ? 'an' : 'a'} ${String(type)}`;
+
 /** The datablock a unit driver drives, as '<kind>:<id>'. */
 const partOf = (d: DriverData): string => dataKey(ANIM_TARGET_KINDS[d.target_type]!, d.target_id);
 
@@ -197,7 +201,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
   if (!nextRoot || nextRoot.type !== curRoot.type)
     throw new UnitError(
       'UNIT_KIND_MISMATCH',
-      `the unit's root is a ${String(nextRoot?.type)}, the instance's a ${String(curRoot.type)}`,
+      `the unit's root is ${withArticle(nextRoot?.type)}, the instance's ${withArticle(curRoot.type)}`,
     );
   const report: UnitUpdateReport = {
     root,

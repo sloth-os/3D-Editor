@@ -1020,7 +1020,11 @@ set, a prop's new look) removes the old objects in its own transaction, and a st
 puts each slot in on its own: a unit that does not go in (the scene in its way, a body that does
 not read) leaves its slot as it was or staged from the words, with its reason in the record, and
 the other slots, the shots and the rest of an update go on; one the scene was in the way of is
-pending `unavailable`, tried again at the next open or update. An update replaces the parts the
+pending `unavailable`, tried again at the next open or update. A prop's version whose root is
+another type of object than the instance's (a set's root is always an empty, a figure's an
+armature) is no update in place: it takes the instance's place in the insert's transaction, as
+another item does; an instance the scene changed so that no version fits it (its root's type
+changed by other means) leaves the slot pending `unavailable`. An update replaces the parts the
 scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts
 edited or deleted in the scene, adds new parts at ids of the instance's generation (or of the next
 free one) and removes dropped untouched ones that nothing staying uses (a record that stays refers

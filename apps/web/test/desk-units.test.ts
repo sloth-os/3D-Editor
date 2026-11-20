@@ -5,12 +5,14 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SceneDoc,
   SceneEvaluator,
+  adoptUnit,
   briefWithoutPins,
   decodePNG,
   decodeUnit,
   encodeUnit,
   evaluatedBounds,
   extractUnit,
+  fcurveKey,
   getShots,
   listUnits,
   pendingPublishes,
@@ -48,6 +50,7 @@ import {
   intakeCopy,
   intakeTransfer,
   keepWanted,
+  libraryRows,
   protocolFrom,
   readOpenUnits,
   sha256Hex,
@@ -2188,4 +2191,40 @@ describe('the desk state container with library units', () => {
       'the staging worker failed while reading the unit (out of memory, a worker restart)',
     );
   });
+});
+
+describe("the Library tab's rows", () => {
+  it('shows an instance whose unit driver the desk edited or deleted as edited', () => {
+    // the kite, its sail driven, saved to the library and linked: the driver is the unit's
+    const doc = stagedDoc();
+    const kite = roots(doc).kite;
+    const sail = doc.listObjects().find((o) => o.parent === kite && o.name.startsWith('sail'))!.id;
+    doc.setDriver({
+      target_type: 'object',
+      target_id: sail,
+      path: 'rotation_euler',
+      index: 0,
+      expression: 'frame / 10',
+      variables: [],
+      mute: false,
+    });
+    const ex = extractUnit(doc, { kind: 'prop', root: kite, name: 'Red kite' }, { deskVersion: 'test' });
+    ex.probe.destroy();
+    adoptUnit(doc, ex.link, { ref: L().kite.pin.ref, version: 1, sha256: ex.sha256 });
+    const row = () => libraryRows(doc, exampleBrief(), () => false).find((r) => r.root === kite);
+    expect(row()).toMatchObject({ key: `el:${KITE}`, status: 'current', edited: 0, text: 'up to date' });
+    // the driver edited here (no part is): the row counts it with the parts
+    const driver = doc.listDrivers(sail)[0];
+    doc.setDriver({ ...driver, expression: 'frame / 5' });
+    expect(unitStatus(doc, kite)).toMatchObject({
+      edited: [],
+      missing: [],
+      drivers: { edited: [{ target: sail }], missing: [] },
+    });
+    expect(row()).toMatchObject({ status: 'edited', edited: 1, text: '1 part edited here' });
+    // deleted here: the same
+    doc.removeDriver(fcurveKey(driver));
+    expect(unitStatus(doc, kite).drivers).toMatchObject({ edited: [], missing: [{ target: sail }] });
+    expect(row()).toMatchObject({ status: 'edited', edited: 1, text: '1 part edited here' });
+  }, 60_000);
 });

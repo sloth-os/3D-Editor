@@ -165,7 +165,10 @@ export interface GivenProblem {
  * (unreadable, too_new, too_large), else pending 'unavailable', tried again at the next open or
  * update: an error that is not the unit's (out of memory, a worker restart), or the scene in the
  * unit's way as it goes in (an id it takes that something of the scene holds, an instance or object
- * it needs: UNIT_ID_TAKEN, UNIT_INSTANCE_EXISTS, UNIT_NOT_FOUND), which the message names.
+ * it needs, an instance or object of another kind or type where it goes: UNIT_ID_TAKEN,
+ * UNIT_INSTANCE_EXISTS, UNIT_NOT_FOUND, UNIT_KIND_MISMATCH; a file that decodes always roots a unit
+ * of its kind in an object of the type its kind takes, so a mismatch is the scene's), which the
+ * message names.
  */
 export function unitReadProblem(err: unknown): UnitProblem {
   const message = err instanceof Error ? err.message : String(err);
@@ -178,6 +181,7 @@ export function unitReadProblem(err: unknown): UnitProblem {
       return { staged: 'refused', why: 'too_large', message };
     case 'UNIT_ID_TAKEN':
     case 'UNIT_INSTANCE_EXISTS':
+    case 'UNIT_KIND_MISMATCH':
       return { staged: 'pending', why: 'unavailable', message: `the scene is in its way: ${message}` };
     case 'UNIT_NOT_FOUND':
       return { staged: 'pending', why: 'unavailable', message };

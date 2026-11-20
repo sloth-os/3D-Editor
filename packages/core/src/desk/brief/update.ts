@@ -145,7 +145,8 @@ import {
  *   mannequin of the actor's kind and height (another kind or height is refused and the actor kept:
  *   rebuilding it is left to staging the brief in a new project);
  * - a prop unit replaces the element's prop, or updates it to a new version of the same item (its
- *   root id stays), held or flown again; no pin brings back the words' prop;
+ *   root id stays; a version whose root is another type of object than the instance's replaces it,
+ *   as another item does), held or flown again; no pin brings back the words' prop;
  * - a unit not held changes nothing (the words, or the version placed, stay), a slot made local stays
  *   local, a refused pin is not tried again; the record says what each slot holds;
  * - a unit saved to the host's library from a slot whose answer the desk did not take in (library.ts

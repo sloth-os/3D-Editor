@@ -379,11 +379,11 @@ export function stateUnits(doc: SceneDoc): StateUnit[] {
 // ---------------------------------------------------------------- the Library tab's rows
 
 /**
- * What the Library tab says of a slot or an instance: 'current' up to date; 'edited' parts edited
- * here; 'update' the brief pins another version whose file the desk holds (Update shots places it);
- * 'pending' the pinned version waits (not sent yet, or not usable this time); 'refused' the pinned
- * version cannot be used (the record says so, or the desk holds its file and the staging refuses
- * it); 'local' the slot was made local.
+ * What the Library tab says of a slot or an instance: 'current' up to date; 'edited' parts (or the
+ * drivers the unit gave) edited here; 'update' the brief pins another version whose file the desk
+ * holds (Update shots places it); 'pending' the pinned version waits (not sent yet, or not usable
+ * this time); 'refused' the pinned version cannot be used (the record says so, or the desk holds its
+ * file and the staging refuses it); 'local' the slot was made local.
  */
 export type LibraryStatus = 'current' | 'edited' | 'update' | 'pending' | 'refused' | 'local';
 
@@ -401,7 +401,10 @@ export interface LibraryRow {
   /** The version the scene holds (an instance's), else the version the slot's record or the brief pins. */
   version: number;
   status: LibraryStatus;
-  /** Parts of the instance edited or deleted here (0 without an instance). */
+  /**
+   * Parts of the instance edited or deleted here, and drivers the unit gave it edited or deleted here
+   * (0 without an instance).
+   */
   edited: number;
   /** The version the brief pins for the slot when it is not the one the scene holds (else null). */
   pinned: { ref: string; version: number } | null;
@@ -424,12 +427,12 @@ function slotOrder(brief: SceneBrief): Map<string, number> {
 
 /**
  * The Library tab's rows of the scene (see LibraryStatus): one per instance of a library unit
- * (listUnits, with unitStatus's edited and deleted parts and the brief's pin of its slot), and one
- * per brief slot with a pin or a record pin but no instance (pending, refused, made local, or a
- * version the desk holds for Update shots). `held(pin)`: whether the desk holds the pin's file now;
- * `refused`: the pins whose file the desk holds but the staging cannot use (core pinsRefused), which
- * show as refused with why, not as versions Update shots brings in (its update records them so). In
- * slot order (the set, the cast, the elements), then instances of no slot.
+ * (listUnits, with unitStatus's edited and deleted parts and drivers and the brief's pin of its
+ * slot), and one per brief slot with a pin or a record pin but no instance (pending, refused, made
+ * local, or a version the desk holds for Update shots). `held(pin)`: whether the desk holds the
+ * pin's file now; `refused`: the pins whose file the desk holds but the staging cannot use (core
+ * pinsRefused), which show as refused with why, not as versions Update shots brings in (its update
+ * records them so). In slot order (the set, the cast, the elements), then instances of no slot.
  */
 export function libraryRows(
   doc: SceneDoc,
@@ -449,7 +452,9 @@ export function libraryRows(
     let edited = 0;
     try {
       const st = unitStatus(doc, inst.root);
-      edited = st.edited.length + st.missing.length;
+      // a driver the unit gave that the scene edited or deleted counts with the parts
+      const drivers = st.drivers ? st.drivers.edited.length + st.drivers.missing.length : 0;
+      edited = st.edited.length + st.missing.length + drivers;
     } catch {
       // an instance whose provenance stopped reading meanwhile: no parts counted
     }

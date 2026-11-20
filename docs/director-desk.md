@@ -705,7 +705,7 @@ version, and its status in words:
 | The row says                                                       | When                                                                                     |
 | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------------- |
 | up to date                                                         | The slot holds an instance of the version its pin names                                  |
-| 3 parts edited here                                                | It does, with three of the instance's parts edited or deleted in the desk                |
+| 3 parts edited here                                                | It does, with three of its parts (or drivers it gave them) edited or deleted in the desk |
 | v3 is here: Update shots places it                                 | The brief pins a version the slot does not hold, and the host sent its file              |
 | the brief pins v3: Update shots brings it in                       | The same over the version the slot holds: Update shots updates or replaces it            |
 | waiting: its file was not sent; staged from the words              | The pin waits (`pending`, with its reason): tried again at the next open                 |
@@ -743,11 +743,14 @@ undo step). For a new version of the item a slot holds, the instance is updated 
   object or a part the update keeps), else it stays with what it uses;
 - the drivers the unit gave follow the same rules: one left as it was takes the new version or goes
   with it, one edited in the desk is kept (with a warning when the new version changed it too), one
-  deleted in the desk stays deleted;
+  deleted in the desk stays deleted; one the new version drops together with a part the scene keeps
+  stays on that part, the scene's own from then on, and so does what it reads;
 - a new version with the same content changes no part, only the version the instance names.
 
 Another item pinned to the slot replaces the instance: its objects, edits and all, give way to the
-new unit's, at the set's place or the prop's spot. A figure, a new version or another item,
+new unit's, at the set's place or the prop's spot. So does a prop's new version whose root is
+another type of object than the instance's (an empty in one version, a mesh in the next), which no
+update turns into the other: a warning says so. A figure, a new version or another item,
 restyles its member's actor in place (the same armature, keys, holds and shots) when its kind and
 height are the actor's, and is refused otherwise. A brief that drops the pin brings back the
 words' set, the mannequin or the words' prop. A new look in place of an old one (a figure or a

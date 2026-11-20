@@ -24,6 +24,7 @@ import {
   UNIT_ROOT,
   derivePartId,
   deriveUnitId,
+  encodeUnit,
   listUnits,
   readInstance,
   unitOf,
@@ -31,7 +32,18 @@ import {
   type UnitPayload,
 } from '../src/desk/units';
 import { createCube } from '../src/mesh/primitives';
-import { KITE, MIRA, actorOf, openBrief, prop, propOf, stagedDoc, unitFrom } from './desk-units-helpers';
+import {
+  KITE,
+  MIRA,
+  actorOf,
+  editedUnit,
+  headerInput,
+  openBrief,
+  prop,
+  propOf,
+  stagedDoc,
+  unitFrom,
+} from './desk-units-helpers';
 
 /*
  * A slot always takes its unit again (desk/units ids.ts generations): an instance taken out of a
@@ -433,5 +445,131 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
     ]);
     expect(done.has(slot.key)).toBe(false);
     expect(slot.action).toBe('none');
+  });
+});
+
+describe("a later version whose root is another type of object than the instance's", () => {
+  const key = `el:${KITE}`;
+  /** Version `version` of the kite, its root an EMPTY or a MESH (wearing one of the kite's meshes). */
+  function kiteRooted(type: 'EMPTY' | 'MESH', version: number): Lib {
+    const L = library();
+    const unit = editedUnit(L.units.kite, (body) => {
+      const root = body.blocks.objects![UNIT_ROOT];
+      root.type = type;
+      if (type === 'EMPTY') delete root.data;
+      else root.data = Object.keys(body.blocks.meshes!).sort()[0];
+    });
+    return lib(L.kite.pin.ref, version, encodeUnit(unit.body, headerInput(unit.header)));
+  }
+  /** How the update stages the kite's flight: its hold, its holder and what flies it. */
+  const flight = (doc: SceneDoc, kite: string) => ({
+    constraints: (doc.getObject(kite)!.constraints ?? []).map((c) => [c.type, c.target, c.subtarget]),
+    heldBy: prop(doc.getObject(kite), 'desk_rideo_held_by'),
+    tether: doc
+      .listObjects()
+      .filter((o) => prop(o, 'desk_string_to') === kite || prop(o, 'desk_tail_of') === kite).length,
+  });
+
+  it("Update shots puts the prop's new version in the old one's place in one undo step: the row reads unit at it", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    expect(v1.type).toBe('EMPTY');
+    const parts = readInstance(doc, v1.id)!.parts.size;
+    const before = flight(doc, v1.id);
+    const subjects = getShots(doc).map((s) => s.subjects);
+    const undo = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
+    const v2 = kiteRooted('MESH', 2);
+    const b2 = withPins(openBrief(), { el: { [KITE]: v2 } });
+    const u = update(doc, b2, source(v2));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    expect(u.r.units).toEqual([expect.objectContaining({ ref: v2.pin.ref, version: 2 })]);
+    expect(u.r.warnings.join('\n')).not.toMatch(/cannot be used|could not be used/);
+    expect(u.r.warnings).toContainEqual(
+      expect.stringMatching(
+        /: v2's root is a MESH and v1's an EMPTY, so v2 replaces v1, edits and all, instead of updating it$/,
+      ),
+    );
+    // the kite is v2, as a placed v2 is: its root at the old one's id, nothing of v1 beside it, and
+    // the shots, its hold and its flight find it
+    const kite = propOf(doc, KITE);
+    expect(kite.id).toBe(v1.id);
+    expect(kite.type).toBe('MESH');
+    expect(readInstance(doc, kite.id)).toMatchObject({ ref: v2.pin.ref, version: 2, sha256: v2.pin.sha256 });
+    expect(unitStatus(doc, kite.id)).toEqual({ edited: [], missing: [] });
+    expect(listUnits(doc)).toMatchObject([{ key, version: 2, parts, present: parts }]);
+    expect(doc.listObjects().filter((o) => prop(o, 'desk_element_id') === KITE)).toHaveLength(1);
+    expect(getShots(doc).map((s) => s.subjects)).toEqual(subjects);
+    expect(flight(doc, kite.id)).toEqual(before);
+    expect(stateUnitRows(doc)).toEqual([
+      { slot: key, ref: v2.pin.ref, version: 2, sha256: v2.pin.sha256, staged: 'unit', local: false },
+    ]);
+    expect(briefChanges(doc, b2, { units: source(v2) })).toBeNull();
+    // one undo step: v1 again, as it was
+    undo.undo();
+    expect(propOf(doc, KITE).type).toBe('EMPTY');
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 1, sha256: L.kite.pin.sha256 });
+    expect(flight(doc, v1.id)).toEqual(before);
+    undo.redo();
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 2 });
+    // and a v3 whose root is an empty again takes v2's place the same way
+    const v3 = kiteRooted('EMPTY', 3);
+    const b3 = withPins(openBrief(), { el: { [KITE]: v3 } });
+    const u3 = update(doc, b3, source(v3));
+    expect(rowsOf(u3.r)).toEqual([`${key} unit`]);
+    expect(u3.r.warnings).toContainEqual(
+      expect.stringMatching(/: v3's root is an EMPTY and v2's a MESH, so v3 replaces v2/),
+    );
+    expect(propOf(doc, KITE)).toMatchObject({ id: v1.id, type: 'EMPTY' });
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 3, sha256: v3.pin.sha256 });
+    expect(stateUnitRows(doc)).toEqual([expect.objectContaining({ slot: key, version: 3, staged: 'unit' })]);
+    expect(flight(doc, v1.id)).toEqual(before);
+  });
+
+  it('cannot differ for a set or a figure: every version roots a set in an empty and a figure in an armature', () => {
+    const L = library();
+    const set = structuredClone(L.units.set.body);
+    set.blocks.objects![UNIT_ROOT].type = 'MESH';
+    expect(() => encodeUnit(set, headerInput(L.units.set.header))).toThrow(/a set's root is an empty/);
+    const figure = structuredClone(L.units.mira.body);
+    figure.blocks.objects![UNIT_ROOT].type = 'EMPTY';
+    expect(() => encodeUnit(figure, headerInput(L.units.mira.header))).toThrow(
+      /a figure's root is an armature/,
+    );
+  });
+
+  it('a set root the scene holds as another type of object waits as unavailable and is tried again', () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    const root = deriveUnitId('set', UNIT_ROOT);
+    expect(readInstance(doc, root)).toMatchObject({ version: 1 });
+    const edited = editedUnit(L.units.set, (body) => {
+      const piece = Object.keys(body.blocks.objects!).find((src) => src !== UNIT_ROOT)!;
+      const at = body.blocks.objects![piece].location as number[];
+      body.blocks.objects![piece].location = [at[0] + 1, at[1], at[2]];
+    });
+    const v2 = lib(L.set.pin.ref, 2, encodeUnit(edited.body, headerInput(edited.header)));
+    const b2 = withPins(openBrief(), { set: v2 });
+    // no operator turns an empty into another type: a scene written by other means
+    doc.transact(() => doc.updateObject(root, { type: 'MESH' }));
+    let r: StageBriefReport | null = null;
+    expect(() => (r = updateFromBrief(doc, b2, { units: source(v2) }))).not.toThrow();
+    expect(rowsOf(r!)).toEqual(['set words unavailable']);
+    // v1 stays, as the record says, and v2 is not refused: the next open or update tries it again
+    expect(readInstance(doc, root)).toMatchObject({ version: 1 });
+    expect(readBriefRecord(doc)!.setUnit).toMatchObject({ version: 1, staged: 'unit' });
+    expect(r!.warnings.join('\n')).toMatch(
+      /v2 could not be used this time \(the scene is in its way: the unit's root is an EMPTY, the instance's a MESH\): v1 stays/,
+    );
+    expect(pinsWanted(doc, b2).map((p) => p.ref)).toEqual([L.set.pin.ref]);
+    expect(briefChanges(doc, b2, { units: source(v2) })).not.toBeNull();
+    // once the scene's root is an empty again, the next update places v2
+    doc.transact(() => doc.updateObject(root, { type: 'EMPTY' }));
+    const again = update(doc, b2, source(v2));
+    expect(rowsOf(again.r)).toEqual(['set unit']);
+    expect(readInstance(doc, root)).toMatchObject({ version: 2 });
   });
 });
