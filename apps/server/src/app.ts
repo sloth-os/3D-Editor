@@ -156,7 +156,7 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
     sweepIntervalMs: opts.sweepIntervalMs,
     refreshIntervalMs: opts.refreshIntervalMs,
   });
-  const sync = new SyncServer({ rooms, config, log, keepaliveMs: opts.keepaliveMs });
+  const sync = new SyncServer({ rooms, config, log, metrics, keepaliveMs: opts.keepaliveMs });
   app.server.on('upgrade', sync.handleUpgrade);
 
   // the services of the MCP tools and REST routes (the operator registry is made now when MCP is
