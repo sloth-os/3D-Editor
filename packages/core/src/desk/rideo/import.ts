@@ -23,6 +23,7 @@ import { createFigureActor } from '../characters/figure';
 import type { UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance, unitOf } from '../units/list';
+import { removeObjectTrees } from '../units/remove';
 import { updateUnit } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { defaultActorHeight } from '../characters';
@@ -333,11 +334,13 @@ function subtree(doc: SceneDoc, id: string): string[] {
   return out;
 }
 
-/** Removes objects with everything below them. */
+/**
+ * Removes objects with everything below them; a library unit instance among them goes whole, with the
+ * datablocks its part table lists that nothing else uses (units/remove.ts: a unit placed in its slot
+ * again derives the same ids).
+ */
 export function removeTrees(doc: SceneDoc, ids: readonly string[]): void {
-  const all = new Set<string>();
-  for (const id of ids) if (doc.getObject(id)) for (const x of subtree(doc, id)) all.add(x);
-  doc.removeObjects([...all]);
+  removeObjectTrees(doc, ids);
 }
 
 const prop = (o: ObjectData | null | undefined, key: string): string => {

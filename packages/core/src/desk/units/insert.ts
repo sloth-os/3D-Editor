@@ -10,6 +10,7 @@ import { UNIT_BLOCK_KINDS, type UnitKind } from './kinds';
 import { provenanceProps, readInstance, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, splitProps } from './ownership';
 import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
+import { dataKey, deleteData, unusedData } from './remove';
 
 /*
  * Inserting a unit: its records are copied into the scene, each datablock under the id
@@ -19,13 +20,16 @@ import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
  * and desk_rideo_clip on a set's root, desk_character_id on a figure's …), then the provenance
  * (list.ts). Names are made unique as every new datablock's are. If a derived id is taken the insert
  * is refused rather than salted, so two replicas stay identical: UNIT_INSTANCE_EXISTS when the slot
- * already holds an instance with this key, UNIT_ID_TAKEN otherwise.
+ * already holds an instance with this key, UNIT_ID_TAKEN otherwise. A datablock (not an object) at
+ * a derived id that nothing in the document uses (remove.ts: left behind by an instance taken out
+ * before) does not count as taken: the insert deletes it and writes the unit's.
  *
  * `replace` makes an existing object the root (a procedural actor or prop swapped for a library
  * one): its id, name, placement, parent, constraints, physics, pose, F-curves and scene-owned props
- * stay; its old parts (children that are not cameras or actors) and the data and materials only they
- * used are removed. Bones the scene's animation or attachments name that the unit's rig lacks are
- * reported in `warnings`.
+ * stay; its old parts (children that are not cameras or actors) go, and its own data and materials
+ * and those of its old parts go when nothing else uses them (they are free for the unit's even when
+ * the unit derives their ids). Bones the scene's animation or attachments name that the unit's rig
+ * lacks are reported in `warnings`.
  */
 
 /** A library version: the host's item id, its version number and the SHA-256 of its unit file. */
@@ -124,8 +128,8 @@ function missingBones(doc: SceneDoc, root: string, bones: Set<string>, keep: Set
     .map((b) => `the library figure has no bone '${b}' that the scene's animation, holds or attachments use`);
 }
 
-/** Removes `root`'s old parts (children but cameras and actors) and the data and materials only they used. */
-function removeOldParts(doc: SceneDoc, root: string): Set<string> {
+/** `root`'s old parts (children but cameras and actors, deep) and the children it keeps. */
+function oldParts(doc: SceneDoc, root: string): { doomed: string[]; kept: Set<string> } {
   const index = doc.childrenIndex();
   const doomed: string[] = [];
   const kept = new Set<string>();
@@ -142,14 +146,20 @@ function removeOldParts(doc: SceneDoc, root: string): Set<string> {
     }
   };
   walk(root);
-  const materials = new Set<string>();
-  for (const id of doomed) for (const m of doc.getObject(id)?.material_slots ?? []) if (m) materials.add(m);
-  doc.removeObjects(doomed);
-  if (materials.size) {
-    const used = new Set(doc.listObjects().flatMap((o) => o.material_slots));
-    for (const m of materials) if (!used.has(m)) doc.removeMaterial(m);
+  return { doomed, kept };
+}
+
+/** The data and materials an object record refers to, as '<kind>:<id>'. */
+function dataOf(rec: UnitRecord | null): string[] {
+  if (!rec) return [];
+  const out: string[] = [];
+  if (typeof rec.data === 'string' && rec.data) {
+    const dk = dataKindOf(rec.type as ObjectData['type']);
+    if (dk) out.push(dataKey(dk, rec.data));
   }
-  return kept;
+  if (Array.isArray(rec.material_slots))
+    for (const m of rec.material_slots) if (typeof m === 'string' && m) out.push(dataKey('materials', m));
+  return out;
 }
 
 /**
@@ -175,6 +185,8 @@ export function writeUnitRecords(
   if (!rootId || !unitRoot) throw new UnitError('UNIT_BAD_RECORD', "the unit has no root object ('@root')");
 
   let old: UnitRecord | null = null;
+  let doomed: string[] = [];
+  let kept = new Set<string>();
   if (o.replace) {
     old = doc.readRecord('objects', o.replace);
     if (!old) throw new UnitError('UNIT_NOT_FOUND', `object '${o.replace}' is not in the scene`);
@@ -185,17 +197,31 @@ export function writeUnitRecords(
       );
     if (readInstance(doc, o.replace))
       throw new UnitError('UNIT_INSTANCE_EXISTS', `'${o.replace}' is already an instance: update it instead`);
+    ({ doomed, kept } = oldParts(doc, o.replace));
   } else if (doc.has('objects', rootId)) {
     const props = doc.readRecord('objects', rootId)?.custom_props as Record<string, unknown> | undefined;
     if (props?.unit_key === key)
       throw new UnitError('UNIT_INSTANCE_EXISTS', `the scene already holds the instance '${key}'`);
     throw new UnitError('UNIT_ID_TAKEN', `the id ${rootId} the unit's root derives to is taken`);
   }
+  // what the insert frees (remove.ts): the ids it derives that a datablock nothing uses holds, and,
+  // replacing an object, its own data and materials and its old parts' once nothing else uses them
+  const going = new Set(doomed);
+  const candidates: string[] = [];
+  for (const [pk, id] of Object.entries(ids)) {
+    const k = pk.slice(0, pk.indexOf(':')) as DatablockKind;
+    if (id !== rootId && k !== 'objects' && doc.has(k, id)) candidates.push(dataKey(k, id));
+  }
+  if (old) {
+    candidates.push(...dataOf(old));
+    for (const id of doomed) candidates.push(...dataOf(doc.readRecord('objects', id)));
+  }
+  const free = unusedData(doc, candidates, { going, replaced: o.replace });
   for (const [pk, id] of Object.entries(ids)) {
     if (id === rootId) continue;
     const k = pk.slice(0, pk.indexOf(':')) as DatablockKind;
-    if (doc.has(k, id))
-      throw new UnitError('UNIT_ID_TAKEN', `the id ${id} a part derives to is taken (${pk})`);
+    if (!doc.has(k, id) || (k === 'objects' ? going.has(id) : free.has(dataKey(k, id)))) continue;
+    throw new UnitError('UNIT_ID_TAKEN', `the id ${id} a part derives to is taken (${pk})`);
   }
   if (o.parent && !doc.has('objects', o.parent))
     throw new UnitError('UNIT_NOT_FOUND', `the parent '${o.parent}' is not in the scene`);
@@ -205,15 +231,8 @@ export function writeUnitRecords(
   const map = (k: DatablockKind, src: string) => ids[`${k}:${src}`] ?? null;
   const stamps = new Map<string, UnitPartStamp>();
   doc.transact(() => {
-    let kept = new Set<string>();
-    let oldData: { kind: DatablockKind; id: string } | null = null;
-    if (o.replace && old) {
-      kept = removeOldParts(doc, o.replace);
-      if (typeof old.data === 'string' && old.data) {
-        const dk = dataKindOf(old.type as ObjectData['type']);
-        if (dk) oldData = { kind: dk, id: old.data };
-      }
-    }
+    if (doomed.length) doc.removeObjects(doomed);
+    deleteData(doc, free);
     for (const k of UNIT_BLOCK_KINDS) {
       const m = body.blocks[k];
       if (!m) continue;
@@ -252,7 +271,6 @@ export function writeUnitRecords(
       const mapped = mapDriverRefs(d, map);
       if (mapped) doc.setDriver(cloneJson(mapped) as unknown as DriverData);
     }
-    if (oldData && !doc.dataUserCounts().get(oldData.id)) doc.map(oldData.kind).delete(oldData.id);
     if (provenance) {
       const cur = doc.readRecord('objects', rootId)!;
       doc.updateObject(rootId, {

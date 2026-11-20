@@ -985,7 +985,11 @@ the declared size, every reference checked to stay inside the unit before anythi
 An instance is a root object with `unit_*` custom props: the library item, its version, the file's
 SHA-256, the body digest, the kind, the key, the name and `unit_parts` (each source id's scene id
 and a 16-digit stamp of the fields the unit owns). Insertion derives every id from the instance
-key and the source id (`deriveUnitId`), so two replicas inserting the same unit agree. An update
+key and the source id (`deriveUnitId`), so two replicas inserting the same unit agree. Taking an
+instance out removes all of it (`remove.ts`): its objects and the datablocks its part table lists
+that nothing left in the scene uses, so a unit placed in the slot again finds its ids free. A
+datablock at a derived id that nothing uses counts as free and goes in the insert's transaction;
+one something uses refuses the insert (`UNIT_ID_TAKEN`). An update
 replaces the parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep
 resolving; it keeps parts edited or deleted in the scene, adds new parts and removes dropped
 untouched ones. Scene-owned fields (names, the root's placement, pose, constraints and physics,

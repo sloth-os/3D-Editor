@@ -9,6 +9,7 @@ import { UNIT_BLOCK_KINDS } from './kinds';
 import { UNIT_PROPS, provenanceProps, requireInstance, splitPartKey, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16 } from './ownership';
 import { collectDriverRefs, collectRecordRefs, mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
+import { dataKey, deleteData, unusedData } from './remove';
 import { currentSum, sourceIndex, toSourceMap, type UnitPartRef } from './status';
 import type { DriverData } from '../../doc/types';
 import { cloneJson } from '../../util/json';
@@ -23,7 +24,8 @@ import { cloneJson } from '../../util/json';
  *   physics, hiding and pose, the scene's props, constraints targeting outside) are kept;
  * - a part edited in the scene is kept as it is and reported ('edited'; with a warning when the new
  *   version changed it too); a part deleted in the scene stays deleted ('deleted');
- * - a part only the new version has is added with a derived id;
+ * - a part only the new version has is added with a derived id (a datablock nothing uses at that id,
+ *   left behind by an instance taken out of the slot before, is deleted for it; remove.ts);
  * - a part the new version drops is removed when the scene left it untouched and nothing outside the
  *   instance uses it (animation, drivers, shots, the scene camera, other objects' references), with
  *   the data and materials only it used; otherwise it is kept and taken out of the table
@@ -161,6 +163,13 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       idOf.set(pk, id);
       added.set(pk, id);
     }
+  const free = unusedData(
+    doc,
+    [...added].flatMap(([pk, id]) => {
+      const s = splitPartKey(pk);
+      return s && s.kind !== 'objects' && doc.has(s.kind, id) ? [dataKey(s.kind, id)] : [];
+    }),
+  );
   const toSrc = toSourceMap(sourceIndex(inst, added));
   const members = new Set<string>();
   for (const [pk, id] of idOf) if (pk.startsWith('objects:')) members.add(id);
@@ -184,7 +193,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     if (!s) continue;
     const old = inst.parts.get(pk);
     const id = idOf.get(pk)!;
-    const cur = doc.readRecord(s.kind, id);
+    const cur = free.has(dataKey(s.kind, id)) ? null : doc.readRecord(s.kind, id);
     current.set(pk, cur);
     const next = unit.body.blocks[s.kind as keyof typeof unit.body.blocks]?.[s.src];
     if (!old) fate.set(pk, cur ? 'taken' : 'add');
@@ -205,6 +214,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
 
   const table = new Map<string, UnitPartStamp>();
   doc.transact(() => {
+    deleteData(doc, free);
     let usedOutside: Set<string> | null = null;
     const dropObjects: string[] = [];
     const dropData: { kind: DatablockKind; id: string; pk: string }[] = [];

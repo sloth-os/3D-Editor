@@ -5,6 +5,7 @@ import { DESK_PROPS } from '../props';
 import { rigDigest, type UnitHeader, type UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance } from '../units/list';
+import { dataKey, deleteData, instanceData, unusedData } from '../units/remove';
 import { makeLocal, updateUnit } from '../units/update';
 import { actorMaterials, buildActorParts, keyPose } from './actor';
 import { refreshAttached } from './index';
@@ -155,12 +156,15 @@ export function restyleActor(
           ...insertUnit(doc, look.figure, { ...look.pin, key: look.key, replace: actorId }).warnings,
         );
     } else {
+      // the figure's datablocks (its part table, read before Make local clears it) and the old
+      // parts' materials go once nothing else uses them: a figure pinned again derives their ids
+      const data = instanceData(doc, actorId);
       if (readInstance(doc, actorId)) makeLocal(doc, actorId);
       const old = lookParts(doc, actorId);
-      const materials = new Set(old.flatMap((id) => doc.getObject(id)?.material_slots ?? []));
+      for (const id of old)
+        for (const m of doc.getObject(id)?.material_slots ?? []) if (m) data.push(dataKey('materials', m));
       doc.removeObjects(old);
-      const used = new Set(doc.listObjects().flatMap((x) => x.material_slots));
-      for (const m of materials) if (m && !used.has(m)) doc.removeMaterial(m);
+      deleteData(doc, unusedData(doc, data));
       const kind = meta.kind as ActorKind;
       const bp = blueprintFor(kind, meta.height);
       const color = look.mannequin.color.toLowerCase();

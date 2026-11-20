@@ -3,8 +3,9 @@
  * a scene (a set, a prop, a figure) that a host's library keeps and pins in its briefs. The file
  * format (format.ts), instance keys and derived ids (ids.ts), which fields belong to the unit and
  * which to the scene (ownership.ts), the id-bearing fields (refs.ts), making a unit from a scene
- * (extract.ts), putting one in (insert.ts), updating an instance (update.ts), linking a published
- * scene (adopt.ts), the instances a scene holds (list.ts) and what was edited of them (status.ts).
+ * (extract.ts), putting one in (insert.ts), updating an instance (update.ts), taking one out
+ * (remove.ts), linking a published scene (adopt.ts), the instances a scene holds (list.ts) and what
+ * was edited of them (status.ts).
  * Pure core: every function runs in the desk's staging worker and in Node.
  */
 export { UNIT_ERROR_CODES, UnitError, type UnitErrorCode } from './errors';
@@ -87,6 +88,7 @@ export {
   type UnitPin,
 } from './insert';
 export { makeLocal, updateUnit, type UnitKeptReason, type UnitUpdateReport } from './update';
+export { removeObjectTrees } from './remove';
 export { adoptUnit } from './adopt';
 export {
   UNIT_PROPS,

@@ -12,18 +12,29 @@ import {
   deriveUnitId,
   insertUnit,
   listUnits,
+  makeLocal,
   readInstance,
+  removeObjectTrees,
   unitStatus,
   type UnitPayload,
 } from '../src/desk/units';
+import type { DatablockKind } from '../src/doc/types';
 import { createCube } from '../src/mesh/primitives';
 import { MIRA, PIP, actorOf, dress, pin, stagedDoc, unitFrom } from './desk-units-helpers';
 
 /*
  * Inserting a decoded unit (desk/units/insert.ts): derived ids, names, placement, scene props, the
- * refusals, one undo step, a figure that works as an actor, two replicas inserting the same unit, and
- * a procedural actor replaced by a library figure.
+ * refusals, one undo step, a figure that works as an actor, two replicas inserting the same unit, a
+ * procedural actor replaced by a library figure, and a slot an instance was taken out of (remove.ts).
  */
+
+const kindOf = (pk: string) => pk.slice(0, pk.indexOf(':')) as DatablockKind;
+
+/** The '<kind>:<id>' of the ids `ids` (an insert's) the document still holds. */
+const held = (doc: SceneDoc, ids: Record<string, string>) =>
+  Object.entries(ids)
+    .filter(([pk, id]) => doc.has(kindOf(pk), id))
+    .map(([pk, id]) => `${kindOf(pk)}:${id}`);
 
 const code = (fn: () => unknown) => {
   try {
@@ -119,10 +130,15 @@ describe('insertUnit', () => {
     seeded.addObject({ type: 'EMPTY', name: 'In the way' }, deriveUnitId('cast:b', UNIT_ROOT));
     expect(code(() => insertUnit(seeded, unit, { ...pin(), key: 'cast:b' }))).toBe('UNIT_ID_TAKEN');
     const part = Object.keys(unit.body.blocks.meshes!)[0];
+    // a datablock at a derived id is taken while something uses it (one nothing uses is free: remove.ts)
     const seeded2 = SceneDoc.create({ empty: true });
-    seeded2.addMesh('x', createCube(), deriveUnitId('cast:c', part));
+    const user = seeded2.addObject({
+      type: 'MESH',
+      name: 'Uses it',
+      data: seeded2.addMesh('x', createCube(), deriveUnitId('cast:c', part)),
+    });
     expect(code(() => insertUnit(seeded2, unit, { ...pin(), key: 'cast:c' }))).toBe('UNIT_ID_TAKEN');
-    expect(seeded2.listObjects()).toHaveLength(0);
+    expect(seeded2.objectIds()).toEqual([user]);
     expect(code(() => insertUnit(doc, unit, { ...pin(), key: 'has space' }))).toBe('UNIT_BAD_KEY');
     expect(code(() => insertUnit(doc, unit, { ...pin(0), key: 'cast:d' }))).toBe('UNIT_BAD_SPEC');
     expect(code(() => insertUnit(doc, unit, { ...pin(1, 'ABC'), key: 'cast:d' }))).toBe('UNIT_BAD_SPEC');
@@ -288,5 +304,72 @@ describe('a set unit', () => {
     expect(doc.childIds(r.root).length).toBeGreaterThan(3);
     expect(listUnits(doc)[0].binding).toEqual({ set: true });
     expect(unitStatus(doc, r.root)).toEqual({ edited: [], missing: [] });
+  });
+});
+
+describe('a slot an instance was taken out of', () => {
+  it('removeObjectTrees takes all of the instance: no id it derives is left, and it goes back in', () => {
+    const unit = miraUnit();
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
+    removeObjectTrees(doc, [r.root]);
+    expect(held(doc, r.ids)).toEqual([]);
+    expect(doc.listObjects()).toHaveLength(0);
+    const again = insertUnit(doc, unit, { ...pin(2), key: 'cast:a' });
+    expect(again.ids).toEqual(r.ids);
+    expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
+  });
+
+  it('removeObjectTrees keeps a datablock of the instance that something left in the scene uses', () => {
+    const unit = miraUnit();
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
+    const mat = Object.entries(r.ids).find(([pk]) => kindOf(pk) === 'materials')![1];
+    const cube = doc.addObject({
+      type: 'MESH',
+      data: doc.addMesh('Cube', createCube()),
+      material_slots: [mat],
+    });
+    removeObjectTrees(doc, [r.root]);
+    expect(held(doc, r.ids)).toEqual([`materials:${mat}`]);
+    expect(doc.getObject(cube)?.material_slots).toEqual([mat]);
+    expect(code(() => insertUnit(doc, unit, { ...pin(), key: 'cast:a' }))).toBe('UNIT_ID_TAKEN');
+  });
+
+  it('what an older removal left at the ids the slot derives is deleted for the unit; one in use refuses it', () => {
+    const unit = miraUnit();
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
+    // objects only, as the desk took instances out before: their materials stayed behind
+    doc.removeObjects(
+      Object.entries(r.ids)
+        .filter(([pk]) => kindOf(pk) === 'objects')
+        .map(([, id]) => id),
+    );
+    const left = held(doc, r.ids);
+    expect(left.length).toBeGreaterThan(0);
+    const used = SceneDoc.fromUpdate(doc.encodeState());
+    const mat = left.find((k) => k.startsWith('materials:'))!.slice('materials:'.length);
+    const cube = used.addObject({
+      type: 'MESH',
+      data: used.addMesh('Cube', createCube()),
+      material_slots: [mat],
+    });
+    expect(code(() => insertUnit(used, unit, { ...pin(), key: 'cast:a' }))).toBe('UNIT_ID_TAKEN');
+    expect(used.objectIds()).toEqual([cube]);
+    const again = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
+    expect(again.ids).toEqual(r.ids);
+    expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
+  });
+
+  it('a figure made local and restyled from the same slot frees its own data for the unit', () => {
+    const unit = miraUnit();
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, unit, { ...pin(), key: 'cast:a' });
+    makeLocal(doc, r.root);
+    const again = insertUnit(doc, unit, { ...pin(2), key: 'cast:a', replace: r.root });
+    expect(again.ids).toEqual(r.ids);
+    expect(held(doc, again.ids)).toHaveLength(Object.keys(r.ids).length);
+    expect(unitStatus(doc, again.root)).toEqual({ edited: [], missing: [] });
   });
 });

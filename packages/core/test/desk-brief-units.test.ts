@@ -32,15 +32,19 @@ import { importRideoBlocking } from '../src/desk/rideo/import';
 import { getShots } from '../src/desk/shots';
 import {
   UnitError,
+  deriveUnitId,
   encodeUnit,
   extractUnit,
   listUnits,
   makeLocal,
   readInstance,
   unitOf,
+  unitStatus,
   type UnitHeaderInput,
   type UnitPayload,
 } from '../src/desk/units';
+import { unusedData } from '../src/desk/units/remove';
+import type { DatablockKind } from '../src/doc/types';
 import { BUILTIN_CATALOG } from '../src/store/catalog';
 import { goldenBriefs, readGolden, stageGolden } from './desk-brief-golden-helpers';
 import {
@@ -453,6 +457,99 @@ describe('a pin whose unit is not held', () => {
     expect(update(doc, dusk).changes?.other).toEqual(['the set']);
     expect(doc.listObjects().filter((o) => prop(o, 'desk_label') === 'ground')).toHaveLength(1);
   });
+});
+
+describe('a slot that held an instance before (its ids are derived from the slot)', () => {
+  type Kind = 'set' | 'prop' | 'figure';
+  const slotOf = (kind: Kind) => (kind === 'set' ? 'set' : kind === 'prop' ? `el:${KITE}` : `cast:${MIRA}`);
+  const pinOf = (kind: Kind, l: Lib | null) =>
+    kind === 'set' ? { set: l } : kind === 'prop' ? { el: { [KITE]: l } } : { cast: { [MIRA]: l } };
+  /** The datablocks (not objects) a unit's parts derive to in slot `key`, as '<kind>:<id>'. */
+  const derived = (u: UnitPayload, key: string) =>
+    Object.entries(u.body.blocks).flatMap(([k, m]) =>
+      k === 'objects' ? [] : Object.keys(m ?? {}).map((src) => `${k}:${deriveUnitId(key, src)}`),
+    );
+
+  it.each(['set', 'prop', 'figure'] as const)(
+    'places a %s pinned, unpinned and pinned again; nothing the instance held is left unused',
+    (kind) => {
+      const L = library();
+      const l = kind === 'set' ? L.set : kind === 'prop' ? L.kite : L.mira;
+      const unit = kind === 'set' ? L.units.set : kind === 'prop' ? L.units.kite : L.units.mira;
+      const key = slotOf(kind);
+      const b = withPins(openBrief(), pinOf(kind, l));
+      const { doc } = staged(b, source(l));
+      expect(listUnits(doc).map((i) => i.key)).toEqual([key]);
+      // the host unlinks the unit: the slot goes back to the words, its datablocks with it
+      update(doc, withPins(openBrief(), pinOf(kind, null)));
+      expect(listUnits(doc)).toEqual([]);
+      expect([...unusedData(doc, derived(unit, key))]).toEqual([]);
+      if (kind !== 'figure')
+        expect(
+          derived(unit, key).filter((k) => doc.has(...(k.split(':') as [DatablockKind, string]))),
+        ).toEqual([]);
+      // and links the same version again: placed as the first time
+      const back = update(doc, b, source(l));
+      expect(back.changes?.other).toHaveLength(1);
+      expect(rowsOf(back.r)).toContain(`${key} unit`);
+      const inst = listUnits(doc);
+      expect(inst.map((i) => [i.key, i.ref, i.version])).toEqual([[key, l.pin.ref, 1]]);
+      expect(unitStatus(doc, inst[0].root)).toEqual({ edited: [], missing: [] });
+    },
+  );
+
+  it.each(['element', 'cast member'] as const)(
+    'places the %s dropped from the brief and back with its pin',
+    (what) => {
+      const L = library();
+      const l = what === 'element' ? L.kite : L.pip;
+      const full = withPins(openBrief(), what === 'element' ? { el: { [KITE]: l } } : { cast: { [PIP]: l } });
+      const without = structuredClone(full);
+      if (what === 'element') {
+        without.elements = without.elements.filter((e) => e.id !== KITE);
+        for (const s of without.shots) s.elementIds = s.elementIds.filter((x) => x !== KITE);
+      } else {
+        without.cast = without.cast.filter((c) => c.id !== PIP);
+        for (const s of without.shots) {
+          s.castIds = s.castIds.filter((x) => x !== PIP);
+          s.layout = s.layout.filter((e) => e.castId !== PIP);
+        }
+      }
+      const key = what === 'element' ? `el:${KITE}` : `cast:${PIP}`;
+      const { doc } = staged(full, source(l));
+      update(doc, without, source(l));
+      expect(listUnits(doc)).toEqual([]);
+      const back = update(doc, full, source(l));
+      expect(rowsOf(back.r)).toContain(`${key} unit`);
+      expect(listUnits(doc).map((i) => i.key)).toEqual([key]);
+    },
+  );
+
+  it.each(['prop', 'set'] as const)(
+    'replaces a %s by another library item saved from the placed instance',
+    (kind) => {
+      const L = library();
+      const a = kind === 'prop' ? L.kite : L.set;
+      const { doc } = staged(withPins(openBrief(), pinOf(kind, a)), source(a));
+      // saved as a new item (not a new version): its parts keep the instance's source ids
+      const ex =
+        kind === 'prop'
+          ? extractUnit(
+              doc,
+              { kind: 'prop', root: propOf(doc, KITE).id, name: 'Blue kite' },
+              { deskVersion: 'test' },
+            )
+          : extractUnit(doc, { kind: 'set', name: 'Meadow at dusk' }, { deskVersion: 'test' });
+      expect(ex.basedOn).toEqual({ ref: a.pin.ref, version: 1 });
+      const b = lib(`${a.pin.ref.slice(0, -4)}xxxB`, 1, ex.data);
+      const u = update(doc, withPins(openBrief(), pinOf(kind, b)), source(b));
+      expect(u.changes?.other).toEqual([
+        kind === 'prop' ? '1 prop with a new library version' : 'another library set',
+      ]);
+      expect(listUnits(doc).map((i) => [i.key, i.ref])).toEqual([[slotOf(kind), b.pin.ref]]);
+      expect(unitStatus(doc, listUnits(doc)[0].root)).toEqual({ edited: [], missing: [] });
+    },
+  );
 });
 
 describe('a unit that cannot be used is refused, with its reason', () => {
