@@ -957,7 +957,7 @@ describe('a pin the desk holds but cannot use is a change until an update record
   });
 });
 
-describe('the units one staging takes (48 MiB of files)', () => {
+describe('the units one staging takes (48 MiB of files, 160 MiB unpacked)', () => {
   const MiB = 2 ** 20;
   const pins = ['a', 'b', 'c'].map((ref) => ({ ref, version: 1 }));
 
@@ -979,10 +979,87 @@ describe('the units one staging takes (48 MiB of files)', () => {
       unpacked: UNIT_BUDGET.unpackedBytes + 1,
     }));
     expect(big.verdicts.get('a@1')).toBe('over_budget');
-    // each version once, and one without a size left out
-    expect([
-      ...unitBudget([pins[0], pins[0], pins[1]], (p) => (p.ref === 'a' ? sizes.a : null)).verdicts,
-    ]).toEqual([['a@1', 'fits']]);
+    // a version pinned in several slots: its file and its body once, the scene's copy in each slot;
+    // one without a size left out
+    const each = unitBudget([pins[0], pins[2], pins[0], pins[1], pins[0], pins[0]], (p) =>
+      p.ref === 'b' ? null : { ...sizes[p.ref], copy: sizes[p.ref].unpacked / 2 },
+    );
+    expect(each.slots).toEqual(['fits', 'fits', 'fits', null, 'fits', 'unavailable']);
+    expect([...each.verdicts]).toEqual([
+      ['a@1', 'fits'],
+      ['c@1', 'fits'],
+    ]);
+    expect([each.packed, each.unpacked]).toEqual([40 * MiB, 140 * MiB]);
+    // a size without its copy: each slot takes the whole unpacked bound
+    expect(unitBudget([pins[0], pins[0], pins[0]], () => sizes.a).slots).toEqual([
+      'fits',
+      'fits',
+      'unavailable',
+    ]);
+  });
+
+  /** The brief with `n` more props pinned to the kite's version (in the first shot). */
+  const kites = (n: number): SceneBrief => {
+    const b = openBrief();
+    for (let i = 1; i <= n; i++) {
+      b.elements.push({
+        id: `ele_0123456789kit${i}`,
+        name: `Kite ${i}`,
+        description: 'A red kite.',
+        kind: 'prop',
+        unit: library().kite.pin,
+      });
+      b.shots[0].elementIds.push(`ele_0123456789kit${i}`);
+    }
+    return b;
+  };
+  const kiteRows = (placed: number, n = 4) =>
+    Array.from({ length: n }, (_, i) =>
+      i < placed ? `el:ele_0123456789kit${i + 1} unit` : `el:ele_0123456789kit${i + 1} words unavailable`,
+    );
+
+  it('counts a version pinned in several slots: its file and body once, the scene’s copy in each slot', () => {
+    const real = source(library().kite);
+    // a header saying 40 MiB a body: the first slot takes 80 MiB unpacked (the body and its copy), each further one 40 MiB
+    const big: UnitSource = {
+      ...real,
+      header: (pin) => {
+        const h = real.header(pin);
+        return h && { ...h, bodyBytes: 40 * MiB };
+      },
+    };
+    expect(rowsOf(staged(kites(1), big).r)).toEqual(kiteRows(1, 1));
+    const four = staged(kites(4), big);
+    expect(rowsOf(four.r)).toEqual(kiteRows(3));
+    expect(listUnits(four.doc)).toHaveLength(3);
+    expect(recordElement(four.doc, 'ele_0123456789kit4').unit).toMatchObject({
+      staged: 'pending',
+      why: 'unavailable',
+    });
+    expect(four.r.warnings).toContainEqual(
+      expect.stringContaining(
+        `Kite 4's library unit lib_0123456789kite@1 does not fit what the units before it left of this staging's budget`,
+      ),
+    );
+    // the next update places the fourth: the other three hold the version already
+    const u = update(four.doc, kites(4), big);
+    expect(u.changes?.other).toEqual(['1 prop from the library']);
+    expect(rowsOf(u.r)).toEqual(kiteRows(4));
+    expect(listUnits(four.doc)).toHaveLength(4);
+  });
+
+  it('counts a decoded version’s body once and its copy, blob references written out, in each slot', () => {
+    const real = source(library().kite);
+    const expanded: UnitSource = { ...real, unit: (pin) => ({ ...real.unit(pin), expandedBytes: 40 * MiB }) };
+    // the body (a few KiB) and four copies of 40 MiB are past 160 MiB: the fourth waits
+    const four = staged(kites(4), expanded);
+    expect(rowsOf(four.r)).toEqual(kiteRows(3));
+    expect(listUnits(four.doc)).toHaveLength(3);
+    expect(recordElement(four.doc, 'ele_0123456789kit4').unit).toMatchObject({
+      staged: 'pending',
+      why: 'unavailable',
+    });
+    expect(rowsOf(staged(kites(3), expanded).r)).toEqual(kiteRows(3, 3));
   });
 
   it('stages a unit that can never fit from the words (refused), one that does not fit this time pending', () => {

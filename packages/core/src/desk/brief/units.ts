@@ -418,56 +418,75 @@ export function unitRefusal(kind: UnitKind, header: UnitHeader): UnitProblem | n
 export const UNIT_BUDGET = { packedBytes: 48 * 2 ** 20, unpackedBytes: 160 * 2 ** 20 } as const;
 
 /**
- * A unit's size for the budget: its file, and its unpacked bound (the decoded body and the scene's
- * copy of it; from the header, twice the body: decodeHeld counts the copy again once it is decoded,
- * with every blob reference written out).
+ * A unit's size for the budget: its file; its unpacked bound for one instance (the decoded body and
+ * the scene's copy of it; from the header, twice the body: decodeHeld counts again once it is
+ * decoded, with every blob reference written out); and the scene's copy alone (`copy`), which each
+ * further slot placing the same version adds (absent: the whole unpacked bound again).
  */
 export interface UnitSize {
   packed: number;
   unpacked: number;
+  copy?: number;
 }
 
 /** A unit's size from its header and its file's length. */
 export const unitSize = (header: UnitHeader, fileBytes: number): UnitSize => ({
   packed: fileBytes,
   unpacked: 2 * header.bodyBytes,
+  copy: header.bodyBytes,
 });
 
 export type UnitBudgetVerdict = 'fits' | 'unavailable' | 'over_budget';
 
 /**
  * The units one staging takes, counted in the order of `pins` (slot order: the set, the cast, the
- * elements), each `ref@version` once: one that fits what earlier ones left of UNIT_BUDGET 'fits'; one
- * that does not, but would on its own, is 'unavailable' this time (a later open tries it again); one
- * whose own size is over the budget is 'over_budget' (never). Pins `sizeOf` gives no size are left
- * out. Returns the verdict of each `ref@version` and the sizes taken.
+ * elements; a version pinned in several slots once per slot): each version's file and decoded body
+ * once, and the scene's copy of it in every slot (its first slot takes `unpacked`, each further one
+ * `copy`). A slot whose unit fits what the slots before it left of UNIT_BUDGET 'fits'; one whose unit
+ * does not, but would on its own, is 'unavailable' this time (a later open tries it again); one whose
+ * unit's single instance is over the budget is 'over_budget' (never). Pins `sizeOf` gives no size are
+ * left out (null). Returns the verdict of each slot (`slots`, in the order of `pins`) and of each
+ * `ref@version` (its first slot's: whether its file is used), and the sizes taken.
  */
 export function unitBudget<P extends { ref: string; version: number }>(
   pins: readonly P[],
   sizeOf: (pin: P) => UnitSize | null,
-): { verdicts: Map<string, UnitBudgetVerdict>; packed: number; unpacked: number } {
+): {
+  slots: (UnitBudgetVerdict | null)[];
+  verdicts: Map<string, UnitBudgetVerdict>;
+  packed: number;
+  unpacked: number;
+} {
+  const slots: (UnitBudgetVerdict | null)[] = [];
   const verdicts = new Map<string, UnitBudgetVerdict>();
   let packed = 0;
   let unpacked = 0;
   for (const p of pins) {
     const key = pinKey(p);
-    if (verdicts.has(key)) continue;
     const size = sizeOf(p);
-    if (!size) continue;
-    if (size.packed > UNIT_BUDGET.packedBytes || size.unpacked > UNIT_BUDGET.unpackedBytes)
-      verdicts.set(key, 'over_budget');
+    let verdict: UnitBudgetVerdict | null;
+    if (!size) verdict = null;
+    else if (verdicts.get(key) === 'fits') {
+      // the version's file and body are taken already: another copy of it in the scene
+      const copy = size.copy ?? size.unpacked;
+      verdict = unpacked + copy > UNIT_BUDGET.unpackedBytes ? 'unavailable' : 'fits';
+      if (verdict === 'fits') unpacked += copy;
+    } else if (size.packed > UNIT_BUDGET.packedBytes || size.unpacked > UNIT_BUDGET.unpackedBytes)
+      verdict = 'over_budget';
     else if (
       packed + size.packed > UNIT_BUDGET.packedBytes ||
       unpacked + size.unpacked > UNIT_BUDGET.unpackedBytes
     )
-      verdicts.set(key, 'unavailable');
+      verdict = 'unavailable';
     else {
-      verdicts.set(key, 'fits');
+      verdict = 'fits';
       packed += size.packed;
       unpacked += size.unpacked;
     }
+    slots.push(verdict);
+    if (verdict && !verdicts.has(key)) verdicts.set(key, verdict);
   }
-  return { verdicts, packed, unpacked };
+  return { slots, verdicts, packed, unpacked };
 }
 
 // ---------------------------------------------------------------- slots
@@ -621,17 +640,18 @@ export function resolveUnits(
     s.held = { header, info };
     sizes.set(pinKey(s.pin), unitSize(header, source?.bytes?.(s.pin) ?? header.bodyBytes));
   }
+  // per slot: a version pinned in several slots is one file and one body, and a copy in each
+  const held = out.all.filter((s) => s.held && s.pin);
   const budget = unitBudget(
-    out.all.filter((s) => s.held && s.pin).map((s) => s.pin!),
+    held.map((s) => s.pin!),
     (p) => sizes.get(pinKey(p)) ?? null,
   );
-  for (const s of out.all) {
-    if (!s.held || !s.pin) continue;
-    const verdict = budget.verdicts.get(pinKey(s.pin));
-    if (verdict === 'fits') continue;
+  held.forEach((s, i) => {
+    const verdict = budget.slots[i];
+    if (verdict === 'fits') return;
     s.held = null;
     s.problem = budgetProblem(s, verdict ?? 'unavailable');
-  }
+  });
   for (const s of out.all) s.action = actionOf(s);
   return out;
 }
@@ -680,44 +700,40 @@ function actionOf(s: SlotUnit): UnitAction {
  * Decodes the units of the slots that place, update or replace, in slot order. A unit that does not
  * decode is not used: its slot keeps what it has, with the problem (refused, or 'unavailable' for an
  * error that is not the unit's). The unpacked budget is counted again from what each decoded version
- * holds (its body, and the scene's copy of it with every blob reference written out: a file can
- * share one large byte array among many references, which the header's estimate cannot see): a
- * version that no longer fits what the ones before it left is 'unavailable', one that never can is
- * 'over_budget', as unitBudget says.
+ * holds (unitBudget, its files counted already): its body once, and in each slot the scene's copy of
+ * it with every blob reference written out (a file can share one large byte array among many
+ * references, which the header's estimate cannot see). A slot that no longer fits what the ones
+ * before it left is 'unavailable', one whose unit's single instance never can is 'over_budget'.
  */
 export function decodeHeld(resolved: ResolvedUnits, source: UnitSource | null): void {
-  const verdicts = new Map<string, UnitBudgetVerdict>();
-  let unpacked = 0;
+  const decoded: SlotUnit[] = [];
   for (const s of resolved.all) {
     if (!s.held || !s.pin || (s.action !== 'place' && s.action !== 'update' && s.action !== 'replace'))
       continue;
     try {
       if (!source) throw new UnitError('UNIT_NOT_FOUND', 'no units are held');
-      const payload = source.unit(s.pin);
-      const key = pinKey(s.pin);
-      let verdict = verdicts.get(key);
-      if (!verdict) {
-        const size = payload.header.bodyBytes + payload.expandedBytes;
-        verdict =
-          size > UNIT_BUDGET.unpackedBytes
-            ? 'over_budget'
-            : unpacked + size > UNIT_BUDGET.unpackedBytes
-              ? 'unavailable'
-              : 'fits';
-        if (verdict === 'fits') unpacked += size;
-        verdicts.set(key, verdict);
-      }
-      if (verdict === 'fits') s.payload = payload;
-      else {
-        s.payload = null;
-        s.held = null;
-        s.problem = budgetProblem(s, verdict);
-        s.action = 'none';
-      }
+      s.payload = source.unit(s.pin);
+      decoded.push(s);
     } catch (err) {
       failSlot(s, err);
     }
   }
+  const payloads = new Map(decoded.map((s) => [pinKey(s.pin!), s.payload!]));
+  const budget = unitBudget(
+    decoded.map((s) => s.pin!),
+    (p) => {
+      const u = payloads.get(pinKey(p))!;
+      return { packed: 0, unpacked: u.header.bodyBytes + u.expandedBytes, copy: u.expandedBytes };
+    },
+  );
+  decoded.forEach((s, i) => {
+    const verdict = budget.slots[i]!;
+    if (verdict === 'fits') return;
+    s.payload = null;
+    s.held = null;
+    s.problem = budgetProblem(s, verdict);
+    s.action = 'none';
+  });
 }
 
 /**

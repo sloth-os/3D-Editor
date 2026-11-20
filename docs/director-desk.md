@@ -534,12 +534,14 @@ again at the next open, `refused` (unreadable, too new, too large, of another ki
 desk does not build or whose bones are not its kind's, a set whose ground is off height 0, a unit
 that can never fit a staging) only when the brief pins another version ([when a unit is not
 used](embedding.md#when-a-unit-is-not-used)). The units one staging takes are counted in slot order
-(the set, the cast, the elements): 48 MiB of files and 160 MiB unpacked (each body and the scene's
-copy of it, with byte arrays the file shares counted at every reference). The report's `units` has a
-row per pin: its slot (`set`, `cast:<castId>`, `el:<elementId>`), `ref`, `version`, the object (the
-set's root, the actor, the prop) and `staged` `unit` (the slot holds that version) or `words` with
-`why` (a reason above, or `local`). The record keeps each pin with what was staged for it; a brief
-without pins records nothing more, so it stages, records and reports exactly as before.
+(the set, the cast, the elements): 48 MiB of files and 160 MiB unpacked (a version pinned in several
+slots is one file and one decoded body, and the scene's copy of it in each slot that places it, with
+byte arrays the file shares counted at every reference); a slot past that waits, `pending`
+`unavailable`, for the next open. The report's `units` has a row per pin: its slot (`set`,
+`cast:<castId>`, `el:<elementId>`), `ref`, `version`, the object (the set's root, the actor, the
+prop) and `staged` `unit` (the slot holds that version) or `words` with `why` (a reason above, or
+`local`). The record keeps each pin with what was staged for it; a brief without pins records
+nothing more, so it stages, records and reports exactly as before.
 
 `pinsWanted(doc, brief)` lists the pins whose slot an update would place, update or replace if the
 unit were held (not those the scene holds, made local, or refused at that version): the files a desk

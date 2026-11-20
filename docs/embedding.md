@@ -480,7 +480,7 @@ desk, and its record says why. The record's state is the row's `staged` and `why
 | `wrong_kind`       | `refused`                | Its kind does not fit the slot (a `prop` unit on the set)                                        | when the brief pins another version | cannot use the unit, with the reason                               |
 | `figure_kind`      | `refused`                | A figure of a kind the desk does not build, or not the kind of the actor staged                  | when the brief pins another version | cannot use the unit, with the reason                               |
 | `figure_rig`       | `refused`                | A figure whose bones are not its kind's, or not the height of the actor staged (±5 mm)           | when the brief pins another version | cannot use the unit, with the reason                               |
-| `over_budget`      | `refused`                | A unit whose own unpacked size can never fit one staging's budget (160 MiB unpacked)             | when the brief pins another version | cannot use the unit, with the reason                               |
+| `over_budget`      | `refused`                | A unit a single instance of which can never fit one staging's budget (160 MiB unpacked)          | when the brief pins another version | cannot use the unit, with the reason                               |
 | `set_ground`       | `refused`                | A set whose ground is more than 1 cm off height 0                                                | when the brief pins another version | cannot use the unit, with the reason                               |
 | —                  | no `units` in `state`    | An open without units, a desk from before units, rows the host cannot read                       | —                                   | unknown                                                            |
 
@@ -494,8 +494,11 @@ shots again and again.
 `unavailable` means the host sent matching bytes but the desk could not use them this time, for a
 reason that may pass: the open's unit budget (48 MiB of files and 160 MiB unpacked, counted in slot
 order: the set, the cast, the elements) was already spent by earlier slots, or the staging worker
-failed while reading the unit (out of memory, a worker restart). The next open tries again.
-`over_budget` is only for a unit whose own unpacked bound can never fit the staging's budget: its
+failed while reading the unit (out of memory, a worker restart). The next open tries again. A
+version pinned in several slots counts as one file and one decoded body, and the scene's copy of it
+in each slot that places it, so a slot past the budget is `unavailable` although the same version
+went into the slots before it: the next open places it there, as those slots hold theirs already.
+`over_budget` is only for a unit a single instance of which can never fit the staging's budget: its
 body, and the scene's copy of it with each byte array written out at every reference (a file may
 share one array among many records, and inserting copies it for each), which the desk counts again
 once the unit is decoded. `figure_kind` and `figure_rig` are also how an update answers a figure
@@ -516,18 +519,18 @@ the actor stays as it is, and staging the brief in a new project uses the figure
 
 ### Unit limits and timings
 
-| What                                | Limit                                                                           |
-| ----------------------------------- | ------------------------------------------------------------------------------- |
-| A unit file                         | 1 byte to 32 MiB (`capabilities.units.maxBytes`: 33554432)                      |
-| `open.units`                        | at most 81 entries (a set, 16 cast members, 64 elements), at most 48 MiB in all |
-| The units one staging places        | 48 MiB of files and 160 MiB unpacked, in slot order; past that `unavailable`    |
-| A version                           | an integer 1–1 000 000 000                                                      |
-| A thumbnail                         | a PNG of at most 64 KiB and at most 256 px a side                               |
-| `meta`                              | at most 16 KiB as JSON in UTF-8, at most 32 credits                             |
-| A saved unit's name and description | 1–120 characters, at most 2000                                                  |
-| `state.units`                       | at most 128 rows                                                                |
-| `unit-ack`                          | `code` 1–40 characters, `message` at most 2000                                  |
-| The desk's wait for `unit-ack`      | 120 s plus 10 s per MiB of the file, counted up (440 s for 32 MiB)              |
+| What                                | Limit                                                                                                                                |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| A unit file                         | 1 byte to 32 MiB (`capabilities.units.maxBytes`: 33554432)                                                                           |
+| `open.units`                        | at most 81 entries (a set, 16 cast members, 64 elements), at most 48 MiB in all                                                      |
+| The units one staging places        | 48 MiB of files and 160 MiB unpacked (a version's file and body once, its copy in each slot), in slot order; past that `unavailable` |
+| A version                           | an integer 1–1 000 000 000                                                                                                           |
+| A thumbnail                         | a PNG of at most 64 KiB and at most 256 px a side                                                                                    |
+| `meta`                              | at most 16 KiB as JSON in UTF-8, at most 32 credits                                                                                  |
+| A saved unit's name and description | 1–120 characters, at most 2000                                                                                                       |
+| `state.units`                       | at most 128 rows                                                                                                                     |
+| `unit-ack`                          | `code` 1–40 characters, `message` at most 2000                                                                                       |
+| The desk's wait for `unit-ack`      | 120 s plus 10 s per MiB of the file, counted up (440 s for 32 MiB)                                                                   |
 
 ### Server calls
 
