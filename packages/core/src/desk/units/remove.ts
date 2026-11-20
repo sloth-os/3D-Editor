@@ -215,12 +215,16 @@ export function oldLook(doc: SceneDoc, root: string): OldLook {
         continue;
       }
       kept.push(child);
-      if (o.type !== 'CAMERA' && o.custom_props?.[DESK_PROPS.role] !== 'actor') named.push(o.name);
+      if (namedWhenKept(o)) named.push(o.name);
     }
   };
   walk(root);
   return { look: [...look], kept, named };
 }
+
+/** Whether the warnings name an object that stays when a new look comes (cameras and actors are not named). */
+export const namedWhenKept = (o: ObjectData): boolean =>
+  o.type !== 'CAMERA' && o.custom_props?.[DESK_PROPS.role] !== 'actor';
 
 /** The warning naming what stays (oldLook's `named`): "keeps 'A' and 'B', which are not part of `of`". */
 export function keptWarning(named: readonly string[], of: string): string {

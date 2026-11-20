@@ -750,13 +750,17 @@ undo step). For a new version of the item a slot holds, the instance is updated 
 Another item pinned to the slot replaces the instance: its objects, edits and all, give way to the
 new unit's, at the set's place or the prop's spot. So does a prop's new version whose root is
 another type of object than the instance's (an empty in one version, a mesh in the next), which no
-update turns into the other: a warning says so. A figure, a new version or another item,
-restyles its member's actor in place (the same armature, keys, holds and shots) when its kind and
-height are the actor's, and is refused otherwise. A brief that drops the pin brings back the
-words' set, the mannequin or the words' prop. A new look in place of an old one (a figure or a
-library prop where the words built the mannequin or the prop, the mannequin again where a figure
-was) takes away only the old look: what the person put on the actor or the prop in the desk stays
-where it is, and the update's warnings name it. A slot made local takes none of it;
+update turns into the other: a warning says so (naming the scene's object when the scene changed the
+instance's root). What the person put on a prop that another item or such a version replaces
+(objects of their own below it) stays, hung from the new root where it is in the world, and the
+warnings name it; one that the new root's uneven scale would change there stays where it was, no
+longer on the prop, and a warning says so. A figure, a new version or another item, restyles its
+member's actor in place (the same armature, keys, holds and shots) when its kind and height are the
+actor's, and is refused otherwise. A brief that drops the pin brings back the words' set, the
+mannequin or the words' prop. A new look in place of an old one (a figure or a library prop where
+the words built the mannequin or the prop, the mannequin again where a figure was) takes away only
+the old look: what the person put on the actor or the prop in the desk stays where it is, and the
+update's warnings name it. A slot made local takes none of it;
 [Updating from a later brief](#updating-from-a-later-brief) says the rest.
 
 #### Save to library

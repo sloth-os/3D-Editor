@@ -31,6 +31,7 @@ import {
   unitStatus,
   type UnitPayload,
 } from '../src/desk/units';
+import type { Vec3 } from '../src/math/types';
 import { createCube } from '../src/mesh/primitives';
 import {
   KITE,
@@ -450,17 +451,39 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
 
 describe("a later version whose root is another type of object than the instance's", () => {
   const key = `el:${KITE}`;
-  /** Version `version` of the kite, its root an EMPTY or a MESH (wearing one of the kite's meshes). */
-  function kiteRooted(type: 'EMPTY' | 'MESH', version: number): Lib {
+  /**
+   * Version `version` of the kite, its root an EMPTY or a MESH (wearing one of the kite's meshes),
+   * scaled by `scale` when given.
+   */
+  function kiteRooted(type: 'EMPTY' | 'MESH', version: number, scale?: [number, number, number]): Lib {
     const L = library();
     const unit = editedUnit(L.units.kite, (body) => {
       const root = body.blocks.objects![UNIT_ROOT];
       root.type = type;
       if (type === 'EMPTY') delete root.data;
       else root.data = Object.keys(body.blocks.meshes!).sort()[0];
+      if (scale) root.scale = scale;
     });
     return lib(L.kite.pin.ref, version, encodeUnit(unit.body, headerInput(unit.header)));
   }
+  /** A cube of the person's under `parent`, at local `location` and `rotation`. */
+  function mine(doc: SceneDoc, name: string, parent: string, location: Vec3, rotation: Vec3): string {
+    let id = '';
+    doc.transact(() => {
+      id = doc.addObject({
+        type: 'MESH',
+        name,
+        data: doc.addMesh(name, createCube()),
+        parent,
+        location,
+        rotation_euler: rotation,
+      });
+    });
+    return id;
+  }
+  /** Expects two world matrices to agree to rounding. */
+  const sameWorld = (a: readonly number[], b: readonly number[]) =>
+    a.forEach((v, i) => expect(v, `entry ${i}`).toBeCloseTo(b[i], 9));
   /** How the update stages the kite's flight: its hold, its holder and what flies it. */
   const flight = (doc: SceneDoc, kite: string) => ({
     constraints: (doc.getObject(kite)!.constraints ?? []).map((c) => [c.type, c.target, c.subtarget]),
@@ -527,6 +550,124 @@ describe("a later version whose root is another type of object than the instance
     expect(readInstance(doc, v1.id)).toMatchObject({ version: 3, sha256: v3.pin.sha256 });
     expect(stateUnitRows(doc)).toEqual([expect.objectContaining({ slot: key, version: 3, staged: 'unit' })]);
     expect(flight(doc, v1.id)).toEqual(before);
+  });
+
+  it("keeps the person's own objects under the old instance where they are, hung from the new root, in the same undo step", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    // objects of the person's: one under the kite's root (with one of their own under it), one
+    // under a part of the kite
+    const part = [...readInstance(doc, v1.id)!.parts.values()]
+      .map((p) => p.id)
+      .find((id) => id !== v1.id && doc.getObject(id)?.parent === v1.id)!;
+    expect(part).toBeTruthy();
+    const lantern = mine(doc, 'Lantern', v1.id, [0.3, -0.2, 0.4], [0.2, 0.1, 0.5]);
+    const wick = mine(doc, 'Wick', lantern, [0, 0, 0.2], [0, 0, 0.3]);
+    const ribbon = mine(doc, 'Ribbon', part, [0.1, 0, -0.3], [0, 0.4, 0]);
+    const ours = [lantern, wick, ribbon];
+    const worlds = () => ours.map((id) => doc.worldMatrix(id));
+    const before = worlds();
+    const undo = new Y.UndoManager(doc.sharedTypes(), {
+      trackedOrigins: new Set([doc.origin]),
+      captureTimeout: 0,
+    });
+    // v2's root is a mesh twice v1's size: the objects keep their place in the world, not their channels
+    const v2 = kiteRooted('MESH', 2, [2, 2, 2]);
+    const u = update(doc, withPins(openBrief(), { el: { [KITE]: v2 } }), source(v2));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    const kite = propOf(doc, KITE);
+    expect(kite).toMatchObject({ id: v1.id, type: 'MESH', scale: [2, 2, 2] });
+    expect(readInstance(doc, kite.id)).toMatchObject({ version: 2, sha256: v2.pin.sha256 });
+    expect(unitStatus(doc, kite.id)).toEqual({ edited: [], missing: [] });
+    const parents = () => ours.map((id) => doc.getObject(id)?.parent);
+    expect(parents()).toEqual([kite.id, lantern, kite.id]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    expect(doc.getObject(lantern)!.location).not.toEqual([0.3, -0.2, 0.4]);
+    // the warnings name what stays (the tops of what the person put there), not the objects below them
+    const kept = u.r.warnings.find((w) =>
+      / which are not part of the look the library prop replaces$/.test(w),
+    );
+    expect(kept).toMatch(/: keeps '(Lantern|Ribbon)' and '(Lantern|Ribbon)', which/);
+    expect(kept).toMatch(/'Lantern'/);
+    expect(kept).toMatch(/'Ribbon'/);
+    // one undo step: v1 again, the objects where they were under it
+    undo.undo();
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 1 });
+    expect(parents()).toEqual([v1.id, lantern, part]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    undo.redo();
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 2 });
+    expect(parents()).toEqual([kite.id, lantern, kite.id]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+  });
+
+  it("another item pinned to the slot keeps the person's own objects under the instance too", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    const lantern = mine(doc, 'Lantern', v1.id, [0.3, -0.2, 0.4], [0.2, 0.1, 0.5]);
+    const before = doc.worldMatrix(lantern);
+    // another library item, its root a mesh
+    const rooted = kiteRooted('MESH', 1);
+    const other = lib('lib_0123456789othr', 1, rooted.given.data);
+    const u = update(doc, withPins(openBrief(), { el: { [KITE]: other } }), source(other));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    const kite = propOf(doc, KITE);
+    expect(readInstance(doc, kite.id)).toMatchObject({ ref: other.pin.ref, version: 1 });
+    expect(doc.getObject(lantern)?.parent).toBe(kite.id);
+    sameWorld(doc.worldMatrix(lantern), before);
+    expect(u.r.warnings).toContainEqual(
+      expect.stringMatching(/: keeps 'Lantern', which is not part of the look the library prop replaces$/),
+    );
+  });
+
+  it("an object of the person's the new root's uneven scale would skew stays where it was, named", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    const s = v1.scale;
+    expect(s[1]).toBeCloseTo(s[0], 12);
+    expect(s[2]).toBeCloseTo(s[0], 12);
+    // turned about Z under a root stretched along Y it would be sheared, which no channels hold
+    const lantern = mine(doc, 'Lantern', v1.id, [0.3, 0, 0.4], [0, 0, Math.PI / 4]);
+    expect(doc.getObject(lantern)!.parent).toBe(v1.id);
+    const before = doc.worldMatrix(lantern);
+    const v2 = kiteRooted('MESH', 2, [1, 2, 1]);
+    const u = update(doc, withPins(openBrief(), { el: { [KITE]: v2 } }), source(v2));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    expect(propOf(doc, KITE)).toMatchObject({ type: 'MESH', scale: [1, 2, 1] });
+    // it stays where the root's parent holds it (the scene), where it was in the world
+    expect(doc.getObject(lantern)!.parent).toBe(v1.parent);
+    sameWorld(doc.worldMatrix(lantern), before);
+    expect(u.r.warnings).toContainEqual(
+      expect.stringMatching(
+        /: 'Lantern' stays where it was, not on the library prop's root: its scale would change it there$/,
+      ),
+    );
+  });
+
+  it("words the warning from the scene's object when the scene changed the type of the instance's root", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    expect(v1.type).toBe('EMPTY');
+    // a scene written by other means: v1's file roots the kite in an empty, the scene in a mesh
+    doc.transact(() =>
+      doc.updateObject(v1.id, { type: 'MESH', data: doc.addMesh('Scene mesh', createCube()) }),
+    );
+    const v2 = kiteRooted('EMPTY', 2);
+    const u = update(doc, withPins(openBrief(), { el: { [KITE]: v2 } }), source(v2));
+    expect(rowsOf(u.r)).toEqual([`${key} unit`]);
+    expect(propOf(doc, KITE)).toMatchObject({ id: v1.id, type: 'EMPTY' });
+    expect(readInstance(doc, v1.id)).toMatchObject({ version: 2 });
+    const said = u.r.warnings.find((w) => /so v2 replaces v1/.test(w));
+    expect(said).toMatch(
+      new RegExp(
+        `: v2's root is an EMPTY and the scene's '${v1.name}' \\(v1's root, edited here\\) a MESH, so v2 replaces v1, edits and all, instead of updating it$`,
+      ),
+    );
+    expect(said).not.toMatch(/v1's an? [A-Z]/);
   });
 
   it('cannot differ for a set or a figure: every version roots a set in an empty and a figure in an armature', () => {

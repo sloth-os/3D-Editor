@@ -1,6 +1,6 @@
 import { dataKindOf, type SceneDoc } from '../../doc/scene-doc';
 import { ROOT_COLLECTION_ID, type DatablockKind, type DriverData, type ObjectData } from '../../doc/types';
-import type { Vec3 } from '../../math/types';
+import type { Mat4, Vec3 } from '../../math/types';
 import { cloneJson } from '../../util/json';
 import { UnitError } from './errors';
 import { unitRecord, type UnitBody, type UnitHeader, type UnitPayload } from './format';
@@ -9,7 +9,7 @@ import { UNIT_BLOCK_KINDS, type UnitKind } from './kinds';
 import { provenanceProps, readInstance, withProvenance, type UnitPartStamp } from './list';
 import { mergeForUpdate, partSum16, withUnitProps } from './ownership';
 import { mapDriverRefs, mapRecordRefs, type UnitRecord } from './refs';
-import { dataKey, deleteData, instanceData, keptWarning, oldLook, unusedData } from './remove';
+import { dataKey, deleteData, instanceData, keptWarning, namedWhenKept, oldLook, unusedData } from './remove';
 import { driverKeyOf, driverSum16 } from './drivers';
 
 /*
@@ -30,7 +30,12 @@ import { driverKeyOf, driverSum16 } from './drivers';
  *
  * `remove`: what the unit takes the place of (the words' set, the instance of another item it
  * replaces) goes in the same transaction, once the unit is sure to go in, with the datablocks only
- * it used; a unit that does not go in leaves it as it is.
+ * it used; a unit that does not go in leaves it as it is. `keep`: objects below it that are not
+ * part of it (what the person put on a prop the unit replaces) stay, each with what is below it,
+ * hung from the unit's root where they are in the world, in the same transaction, and `warnings`
+ * names them. One that the root's scale would change there (a root scaled unevenly shears an
+ * object turned under it, which no channels hold) stays where it was in the world, under the root's
+ * parent, and `warnings` says so.
  *
  * `replace` makes an existing object the root (a procedural actor or prop swapped for a library
  * one): its id, name, placement, parent, constraints, physics, pose, F-curves and scene-owned props
@@ -73,6 +78,11 @@ export interface InsertUnitOptions extends UnitPin {
    * instances among them): see the module comment.
    */
   remove?: readonly string[];
+  /**
+   * Objects right below what `remove` takes out that stay, each with everything below it: hung from
+   * the root where they are in the world (see the module comment). Others are ignored.
+   */
+  keep?: readonly string[];
 }
 
 export interface InsertUnitResult {
@@ -157,18 +167,27 @@ function dataOf(rec: UnitRecord | null): string[] {
   return out;
 }
 
-/** The objects `ids` and everything below them, in the order removeObjectTrees takes them out. */
-function treesOf(doc: SceneDoc, ids: readonly string[]): string[] {
+/**
+ * The objects `ids` and everything below them but the objects in `keep` and what is below those, in
+ * the order removeObjectTrees takes them out.
+ */
+function treesOf(doc: SceneDoc, ids: readonly string[], keep: ReadonlySet<string>): string[] {
   if (!ids.length) return [];
   const index = doc.childrenIndex();
   const all = new Set<string>();
   const visit = (id: string) => {
     if (all.has(id)) return;
     all.add(id);
-    for (const c of index.get(id) ?? []) visit(c);
+    for (const c of index.get(id) ?? []) if (!keep.has(c)) visit(c);
   };
   for (const id of ids) if (doc.has('objects', id)) visit(id);
   return [...all];
+}
+
+/** Whether world matrix `a` is `b` to rounding (1e-9 of the largest entry, or of 1). */
+function sameWorld(a: Readonly<Mat4>, b: Readonly<Mat4>): boolean {
+  const tol = 1e-9 * Math.max(1, ...b.map(Math.abs));
+  return a.every((v, i) => Math.abs(v - b[i]) <= tol);
 }
 
 /**
@@ -195,9 +214,19 @@ export function writeUnitRecords(
   if (!unitRoot) throw new UnitError('UNIT_BAD_RECORD', "the unit has no root object ('@root')");
   const rootId = o.replace ?? deriveUnitId(key, UNIT_ROOT);
   const rootKey = `objects:${UNIT_ROOT}`;
-  // what the unit takes the place of: those objects and everything below them
-  const removed = treesOf(doc, o.remove ?? []);
+  // what the unit takes the place of: those objects and everything below them, but what stays
+  const keeping = new Set(o.keep ?? []);
+  const removed = treesOf(doc, o.remove ?? [], keeping);
   const removing = new Set(removed);
+  // what stays right below it, hung from the root where it is in the world (not one the root is to
+  // hang from itself)
+  const hung = [...keeping].filter((id) => {
+    const parent = doc.getObject(id)?.parent;
+    return (
+      !removing.has(id) && !!parent && removing.has(parent) && !(o.parent && doc.isAncestor(id, o.parent))
+    );
+  });
+  const worlds = new Map(hung.map((id) => [id, doc.worldMatrix(id)]));
 
   let old: UnitRecord | null = null;
   let doomed: string[] = [];
@@ -365,8 +394,50 @@ export function writeUnitRecords(
     }
     if (named.length) warnings.push(keptWarning(named, `the look the library ${kind} replaces`));
     if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
+    warnings.push(...hangKept(doc, rootId, hung, worlds, kind));
   });
   return { root: rootId, ids, generation, warnings };
+}
+
+/**
+ * Hangs the objects `hung` (left where removing their parents put them) from `root` where they were
+ * in the world (`worlds`), and returns the warnings naming them: one that the root's scale would
+ * change (shear) goes back under its parent of the moment, where it was in the world.
+ */
+function hangKept(
+  doc: SceneDoc,
+  root: string,
+  hung: readonly string[],
+  worlds: ReadonlyMap<string, Mat4>,
+  kind: UnitKind,
+): string[] {
+  if (!hung.length) return [];
+  const named: string[] = [];
+  const stayed: string[] = [];
+  for (const id of hung) {
+    const o = doc.getObject(id);
+    if (!o) continue;
+    const world = worlds.get(id)!;
+    const was = o.parent;
+    doc.setParent(id, root, true, { world, parentWorld: doc.worldMatrix(root) });
+    if (!sameWorld(doc.worldMatrix(id), world)) {
+      doc.setParent(id, was, true, { world, parentWorld: was ? doc.worldMatrix(was) : null });
+      stayed.push(o.name);
+    }
+    if (namedWhenKept(o)) named.push(o.name);
+  }
+  const out: string[] = [];
+  if (named.length) out.push(keptWarning(named, `the look the library ${kind} replaces`));
+  if (stayed.length) {
+    const q = stayed.map((n) => `'${n}'`);
+    const list = q.length > 1 ? `${q.slice(0, -1).join(', ')} and ${q[q.length - 1]}` : q[0];
+    out.push(
+      q.length > 1
+        ? `${list} stay where they were, not on the library ${kind}'s root: its scale would change them there`
+        : `${list} stays where it was, not on the library ${kind}'s root: its scale would change it there`,
+    );
+  }
+  return out;
 }
 
 /**

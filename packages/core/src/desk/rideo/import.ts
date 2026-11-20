@@ -23,7 +23,9 @@ import { createFigureActor } from '../characters/figure';
 import type { UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance, unitOf } from '../units/list';
-import { removeObjectTrees } from '../units/remove';
+import { UNIT_ROOT } from '../units/ids';
+import { oldLook, removeObjectTrees } from '../units/remove';
+import { unitStatus } from '../units/status';
 import { updateUnit, withArticle } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { defaultActorHeight } from '../characters';
@@ -1892,7 +1894,8 @@ function remapShotRefs(doc: SceneDoc, from: string, to: string): void {
  * takes its id when their types agree, else shots that named it name the new root). A version whose
  * root is another type of object than the instance's (an empty in one version, a mesh in the next),
  * which no update turns into the other, takes the instance's place as another item's unit does, with
- * a warning.
+ * a warning. What the person put on the prop a unit takes the place of (objects of their own below
+ * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`).
  */
 function buildUnitProp(
   doc: SceneDoc,
@@ -1920,6 +1923,12 @@ function buildUnitProp(
       ? unit.unit
       : null;
   const retyped = next !== null && unitRoot !== undefined && unitRoot.type !== curType;
+  // the scene's root as its version wrote it (then its type is the version's own), or edited here
+  const rootEdited =
+    retyped && cur
+      ? unitStatus(doc, cur.id).edited.some((p) => p.kind === 'objects' && p.src === UNIT_ROOT)
+      : false;
+  const curName = cur ? doc.getObject(cur.id)?.name : undefined;
   let root: string;
   let created = false;
   const warnings: string[] = [];
@@ -1931,23 +1940,31 @@ function buildUnitProp(
   } else {
     if (!unit.unit) throw new OperatorError(`the library unit of '${label}' is not here to place`, 'FAILED');
     const swap = cur && !inst && unitRoot && curType === unitRoot.type ? cur.id : undefined;
-    // the prop it takes the place of goes in the insert's own transaction: a unit that does not go
-    // in leaves it as it is
+    // the prop it takes the place of goes in the insert's own transaction (a unit that does not go
+    // in leaves it as it is), but for what the person put on it, which the root placed at the
+    // prop's spot takes over where it is
     const r = insertUnit(doc, unit.unit, {
       ...unit.pin,
       key: unit.key,
       name: label,
+      location: at,
+      rotation_euler: [0, 0, 0],
       ...(swap ? { replace: swap } : {}),
-      ...(cur && !swap ? { remove: [cur.id] } : {}),
+      ...(cur && !swap ? { remove: [cur.id], keep: oldLook(doc, cur.id).kept } : {}),
       rootProps: own,
     });
     root = r.root;
     // what the person put on the prop the unit replaces stays, named here
     warnings.push(...r.warnings);
-    if (retyped && inst)
+    if (retyped && inst) {
+      // v1's own root type is the scene's only while the scene left its root as v1 wrote it
+      const was = rootEdited
+        ? `the scene's '${curName}' (v${inst.version}'s root, edited here) ${withArticle(curType)}`
+        : `v${inst.version}'s ${withArticle(curType)}`;
       warnings.push(
-        `v${unit.pin.version}'s root is ${withArticle(unitRoot?.type)} and v${inst.version}'s ${withArticle(curType)}, so v${unit.pin.version} replaces v${inst.version}, edits and all, instead of updating it`,
+        `v${unit.pin.version}'s root is ${withArticle(unitRoot?.type)} and ${was}, so v${unit.pin.version} replaces v${inst.version}, edits and all, instead of updating it`,
       );
+    }
     if (cur && !swap) remapShotRefs(doc, cur.id, root);
     created = !swap;
   }
