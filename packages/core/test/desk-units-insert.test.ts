@@ -26,6 +26,7 @@ import {
 import { UNIT_MAGIC, gzipDeterministic, sha256Hex, writeContainer } from '../src/desk/container';
 import type { DatablockKind } from '../src/doc/types';
 import { createCube } from '../src/mesh/primitives';
+import { exportScene } from '../src/io';
 import {
   KITE,
   MIRA,
@@ -480,5 +481,21 @@ describe("a unit whose records carry the scene's props", () => {
     expect(doc.getObject(r.ids[`objects:${part}`])?.custom_props).not.toHaveProperty('desk_element_id');
     makeLocal(doc, r.root);
     expect(docHasUnitInstances(doc)).toBe(false);
+  });
+});
+
+describe('an instance outside the editor', () => {
+  it("leaves its part table out of glTF node extras: the root's extras say how many parts it has", () => {
+    const src = stagedDoc();
+    const kite = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id }).unit;
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, kite, { ...pin(), key: `el:${KITE}` });
+    const parts = readInstance(doc, r.root)!.parts.size;
+    expect(parts).toBe(19);
+    const json = JSON.parse(new TextDecoder().decode(exportScene(doc, 'gltf').data));
+    const node = json.nodes.find((n: { name: string }) => n.name === doc.getObject(r.root)!.name);
+    expect(node.extras).not.toHaveProperty('unit_parts');
+    expect(node.extras).not.toHaveProperty('unit_drivers');
+    expect(node.extras).toMatchObject({ unit_ref: pin().ref, unit_version: 1, unit_parts_count: parts });
   });
 });

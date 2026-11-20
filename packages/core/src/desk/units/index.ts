@@ -96,6 +96,7 @@ export { adoptUnit } from './adopt';
 export {
   UNIT_PROPS,
   docHasUnitInstances,
+  exportedCustomProps,
   listUnits,
   readInstance,
   unitOf,

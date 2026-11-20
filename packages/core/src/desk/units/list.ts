@@ -126,6 +126,32 @@ function parseDrivers(text: unknown): Map<string, string> {
   return out;
 }
 
+/** How many entries a table prop holds (JSON object text; anything else: 0). */
+function tableSize(text: unknown): number {
+  if (typeof text !== 'string') return 0;
+  try {
+    const parsed: unknown = JSON.parse(text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed).length : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * An object's custom props as they leave the editor (glTF node extras, agents' object summaries): an
+ * instance root's tables (unit_parts, unit_drivers) give way to how many entries they hold
+ * (unit_parts_count, unit_drivers_count); every other prop is as it is.
+ */
+export function exportedCustomProps<T>(props: Readonly<Record<string, T>>): Record<string, T | number> {
+  const out: Record<string, T | number> = {};
+  for (const [k, v] of Object.entries(props)) {
+    if (k === UNIT_PROPS.parts) out.unit_parts_count = tableSize(v);
+    else if (k === UNIT_PROPS.drivers) out.unit_drivers_count = tableSize(v);
+    else out[k] = v;
+  }
+  return out;
+}
+
 /** The custom props that make `root` an instance root. */
 export function provenanceProps(i: Omit<UnitInstance, 'root'>): Record<string, string | number> {
   return {

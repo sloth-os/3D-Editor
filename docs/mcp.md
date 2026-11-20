@@ -449,9 +449,11 @@ after parents, constraints and physics), `children`, materials per slot with eve
 modifier stack with parameters (`stored_params` where animated), constraints with parameters and
 errors, particle systems with settings, rigid body settings, drivers with variables, `animation`
 (F-curves with extrapolation and F-curve modifiers, including the object's data; their keys below),
-custom properties, display and visibility flags. The mesh statistics in `data` are those of the
-object itself, also when it is hidden from renders (`get_scene` then counts it in `not_rendered`).
-Particle systems give instance counts; their transforms come from [`get_instances`](#get_instances).
+custom properties (a library instance root's part and driver tables as how many entries they hold,
+`unit_parts_count` and `unit_drivers_count`), display and visibility flags. The mesh statistics in
+`data` are those of the object itself, also when it is hidden from renders (`get_scene` then counts
+it in `not_rendered`). Particle systems give instance counts; their transforms come from
+[`get_instances`](#get_instances).
 
 An animation channel with at most 20 keys lists them; a longer one (a walk keyed at every step, a
 baked simulation or tether) gives `keyframe_count`, `first_frame`, `last_frame` and `value_at_frame`

@@ -25,6 +25,7 @@ import { quatFromRotationMatrix } from '../armature/bone-math';
 import type { PoseBoneMatrix } from '../armature/types';
 import { invertAffine } from '../instancing/matrix';
 import { base64Encode, stableStringify } from '../util/json';
+import { exportedCustomProps } from '../desk/units/list';
 import { M_Y_TO_Z, M_Z_TO_Y, trsToYUp, type TRS } from './axes';
 import { utf8Encode } from './bytes';
 import { collectExport, type ExportItem } from './common';
@@ -1753,7 +1754,7 @@ export function exportGLTF(doc: SceneDoc, opts: ExportOptions, binary: boolean):
     else if (ev.type === 'LIGHT' && ev.light)
       node.extensions = { KHR_lights_punctual: { light: lightIndex(ev.light) } };
     if (ev.data.custom_props && Object.keys(ev.data.custom_props).length && !it.instance)
-      node.extras = { ...ev.data.custom_props };
+      node.extras = exportedCustomProps(ev.data.custom_props);
   }
   for (const [it, plan] of plans)
     if (plan.why && plan.why !== 'topology' && deformations.has(it) && !bakedPlan.has(it))
