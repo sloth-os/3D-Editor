@@ -12,6 +12,7 @@ import { meshWorldBounds } from '../src/store/builtin/kit';
 import {
   LEO,
   MAYA,
+  MUM,
   PEPPER,
   ROSIE,
   dialogueClip,
@@ -145,16 +146,6 @@ const cameraAt = (doc: SceneDoc, name: string, frames: readonly number[]): Mat4[
 const largest = (a: readonly Mat4[], b: readonly Mat4[], entries = [...Array(16).keys()]) =>
   Math.max(...a.map((m, i) => Math.max(...entries.map((k) => Math.abs(m[k] - b[i][k])))));
 
-/** The axes of a world matrix made unit length, and its origin: where a camera stands and looks. */
-const view = (m: Mat4): Mat4 => {
-  const out = [...m] as Mat4;
-  for (let c = 0; c < 3; c++) {
-    const l = Math.hypot(m[c * 4], m[c * 4 + 1], m[c * 4 + 2]);
-    for (let r = 0; r < 3; r++) out[c * 4 + r] = m[c * 4 + r] / l;
-  }
-  return out;
-};
-
 /** A document with `first` imported, then `again` (the reference: nothing hung from anything). */
 function reimported(first: () => ReturnType<typeof kiteClip>, again: () => ReturnType<typeof kiteClip>) {
   const doc = SceneDoc.create({ empty: true });
@@ -179,8 +170,11 @@ function rig(doc: SceneDoc, rotation: Vec3, scale: Vec3, name = 'Rig', parent: s
 }
 
 describe('rideo re-import of a shot camera the person hung from another object', () => {
-  /** Shot 1's camera hung from the kite, the clip imported again with `again`: the import's result. */
-  function flownCamera(again: () => ReturnType<typeof kiteClip>, flyer: string) {
+  /**
+   * Shot 1's camera hung from the kite, the clip imported again with `again`: the import's result.
+   * `hungFrom`: how the warning names what the person hung it from; `flyer`: what it took it off.
+   */
+  function flownCamera(again: () => ReturnType<typeof kiteClip>, hungFrom: string, flyer: string) {
     const ref = reimported(kiteClip, again);
     const doc = SceneDoc.create({ empty: true });
     const cam = hangCamera(doc, 'Shot 1', importClip(doc, kiteClip()).props[0].id);
@@ -191,7 +185,7 @@ describe('rideo re-import of a shot camera the person hung from another object',
       1e-9,
     );
     expect(r.warnings).toContain(
-      `Shot 1: its camera hung from '${flyer}', which moves during the shot; the import took it off '${flyer}' to place it where the clip's blocking has it`,
+      `Shot 1: its camera hung from ${hungFrom}, which moves during the shot; the import took it off '${flyer}' to place it where the clip's blocking has it`,
     );
     // and the camera is named as changed since the last import, its changes gone as that says
     expect(changedWarnings(r.warnings).join('\n')).toContain("the camera of shot 'Shot 1'");
@@ -199,8 +193,9 @@ describe('rideo re-import of a shot camera the person hung from another object',
   }
 
   it('takes a camera hung from a prop built anew that flies in the shot off it, where the blocking has it', () => {
-    // the kite drawn as a balloon now: built anew, the camera hung from it as from the kite
-    const { doc, ref } = flownCamera(balloonClip, 'balloon');
+    // the kite drawn as a balloon now: built anew, the camera hung from it as from the kite; the
+    // warning names the kite the person hung it from, and the balloon built in its place
+    const { doc, ref } = flownCamera(balloonClip, "'kite' (built anew as 'balloon')", 'balloon');
     // the import recorded the camera it left: the next one names nothing of it
     const third = importClip(doc, balloonClip());
     expect(third.warnings.filter((w) => w.includes('Shot 1') || CHANGED.test(w))).toEqual([]);
@@ -210,7 +205,7 @@ describe('rideo re-import of a shot camera the person hung from another object',
   });
 
   it('takes a camera hung from a kept prop that flies in the shot off it, where the blocking has it', () => {
-    flownCamera(kiteClip, 'kite');
+    flownCamera(kiteClip, "'kite'", 'kite');
   });
 
   it("keeps a camera hung from a rig that stands still, placed in the rig's space where the blocking has it", () => {
@@ -305,16 +300,36 @@ describe('rideo re-import of a shot camera the person hung from another object',
       const cam = hangCamera(doc, 'Shot 1', id);
       const r = importClip(doc, dialogueClip());
       expect(doc.getObject(cam)!.parent).toBeNull();
-      // it keeps the stretch the rig gave it in the world (its scale), which no view uses
+      // the stretch the rig gave it in the world goes with the rig: its world matrix is the camera's
+      // that never hung, axes and all
+      expect(doc.getObject(cam)!.scale).toEqual([1, 1, 1]);
       expect(
-        largest(
-          cameraMotion(doc, 'Shot 1').worlds.map(view),
-          cameraMotion(ref.doc, 'Shot 1').worlds.map(view),
-        ),
+        largest(cameraMotion(doc, 'Shot 1').worlds, cameraMotion(ref.doc, 'Shot 1').worlds),
       ).toBeLessThan(1e-9);
       expect(r.warnings).toContain(
         "Shot 1: its camera hung from 'Rig', which is scaled unevenly or mirrored; the import took it off 'Rig' to place it where the clip's blocking has it",
       );
     }
+  });
+
+  it('takes a camera off an actor hidden by her scale in the shot, to stand where the blocking has it', () => {
+    const ref = reimported(kiteClip, kiteClip);
+    const doc = SceneDoc.create({ empty: true });
+    const mum = importClip(doc, kiteClip()).actors.find((a) => a.character_id === MUM)!;
+    // Mum is not in shot 3: hidden there, shrunk to a point (but still), with the camera hung from her
+    const three = shotNamed(doc, 'Shot 3');
+    const mumScale = new FrameState(doc, three.frame_start).world(mum.id)!;
+    expect(Math.hypot(mumScale[0], mumScale[1], mumScale[2])).toBeLessThan(1e-7);
+    const cam = hangCamera(doc, 'Shot 3', mum.id);
+    const r = importClip(doc, kiteClip());
+    // kept on her, its own scale would undo hers (1e8): it would stand far off wherever she is shown
+    expect(doc.getObject(cam)!.parent).toBeNull();
+    expect(doc.getObject(cam)!.scale).toEqual([1, 1, 1]);
+    expect(largest(cameraMotion(doc, 'Shot 3').worlds, cameraMotion(ref.doc, 'Shot 3').worlds)).toBeLessThan(
+      1e-9,
+    );
+    expect(r.warnings).toContain(
+      `Shot 3: its camera hung from '${mum.name}', which is hidden by its scale in the shot; the import took it off '${mum.name}' to place it where the clip's blocking has it`,
+    );
   });
 });

@@ -513,6 +513,74 @@ describe('keys of the person on a prop the staging holds or flies, which go with
   });
 });
 
+/** The brief's first shot as the desk has it. */
+const firstShot = (doc: SceneDoc) => getShots(doc).find((s) => s.external?.shot === 'sht_0123456789aaaa')!;
+
+/** The world matrix of the first shot's camera at every frame of the shot. */
+function firstShotCamera(doc: SceneDoc): Mat4[] {
+  const s = firstShot(doc);
+  const out: Mat4[] = [];
+  for (let f = s.frame_start; f <= s.frame_end; f++) out.push(new FrameState(doc, f).world(s.camera!)!);
+  return out;
+}
+
+/** The largest difference between two lists of world matrices, entry by entry (axes as they are). */
+const largestGap = (a: readonly Mat4[], b: readonly Mat4[]) =>
+  Math.max(...a.map((m, i) => Math.max(...m.map((v, k) => Math.abs(v - b[i][k])))));
+
+/**
+ * The staged scene with the first shot's camera hung from the kite, where the camera stands in the
+ * world at rest (`at` 'rest') or at the shot's first frame ('first').
+ */
+function cameraOnKite(at: 'rest' | 'first'): { doc: SceneDoc; cam: string } {
+  const doc = stagedDoc();
+  const kite = propOf(doc, KITE).id;
+  const s = firstShot(doc);
+  const cam = s.camera!;
+  const fs = new FrameState(doc, s.frame_start);
+  doc.setParent(
+    cam,
+    kite,
+    true,
+    at === 'rest'
+      ? { world: doc.worldMatrix(cam), parentWorld: doc.worldMatrix(kite) }
+      : { world: fs.world(cam)!, parentWorld: fs.world(kite)! },
+  );
+  return { doc, cam };
+}
+
+describe('a shot camera the person hung from a prop that a later brief builds anew', () => {
+  it('is taken off the new prop that flies in the shot and solved again, where the camera that never hung is', () => {
+    const ref = stagedDoc();
+    update(ref, retyped(openBrief(), { balloonWords: true }));
+    for (const at of ['rest', 'first'] as const) {
+      const { doc, cam } = cameraOnKite(at);
+      // the kite flies through the shot, and the camera with it
+      expect(largestGap(firstShotCamera(doc), firstShotCamera(stagedDoc()))).toBeGreaterThan(0.5);
+      const r = update(doc, retyped(openBrief(), { balloonWords: true }));
+      expect(doc.getObject(cam)!.parent).toBeNull();
+      expect(doc.getObject(cam)!.scale).toEqual([1, 1, 1]);
+      expect(largestGap(firstShotCamera(doc), firstShotCamera(ref))).toBeLessThan(1e-9);
+      expect(r.warnings).toContain(
+        "Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again",
+      );
+      expect(r.solved).toEqual(['sht_0123456789aaaa']);
+    }
+  });
+
+  it('stays on the new prop that stands still in the shot, where it was', () => {
+    // the balloon no one holds: it stands where the kite was at rest
+    const ref = stagedDoc();
+    update(ref, retyped(openBrief()));
+    const { doc, cam } = cameraOnKite('rest');
+    const r = update(doc, retyped(openBrief()));
+    expect(doc.getObject(cam)!.parent).toBe(propOf(doc, KITE).id);
+    expect(largestGap(firstShotCamera(doc), firstShotCamera(ref))).toBeLessThan(1e-9);
+    expect(r.warnings.filter((w) => w.includes('took it off'))).toEqual([]);
+    expect(r.solved).toEqual([]);
+  });
+});
+
 describe('what the person put on an actor, a camera or a prop the brief drops stays on the ground', () => {
   it('an actor that goes leaves what hung from its bones and itself where it was at rest, named as no longer following it', () => {
     const doc = stagedDoc();

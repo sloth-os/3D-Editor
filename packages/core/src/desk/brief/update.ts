@@ -23,6 +23,7 @@ import {
   RIDEO_PROPS,
   buildLandmark,
   buildProp,
+  cameraParents,
   dropTether,
   flyProp,
   freeRowSpot,
@@ -38,6 +39,7 @@ import {
   rideoHeightRatio,
   shotMove,
   tetherPartsOf,
+  updateCameraHold,
   type SpanShot,
 } from '../rideo/import';
 import { hideSpans } from '../rideo/keys';
@@ -120,6 +122,11 @@ import {
  *   the host gives back as staged is no change), or every shot when the render size changed, has its
  *   camera solved again;
  * - a camera set by hand in the desk is never solved again: the update keeps it and warns;
+ * - a shot's camera the person hung from another object stays on it while that object stands still
+ *   through the shot, scaled evenly, not mirrored and shown; hung from a piece the update builds
+ *   anew or stages again (or one it solves) that moves in the shot, is scaled unevenly or is hidden
+ *   by its scale there, it is taken off it and solved again, with a warning naming what the person
+ *   hung it from (rideo/import.ts updateCameraHold);
  * - cast members the brief no longer stages go; new ones stand on a free mark, shown in their shots
  *   (an actor removed in the desk is staged again only for a shot the update stages or recasts); a
  *   member the brief renames is renamed, unless the desk renamed it (it keeps the desk's name, with a
@@ -325,6 +332,9 @@ export function updateFromBriefIn(
   for (const o of props.values()) ownStaged.set(o.id, ownKeysAsStaged(doc, o.id));
   // the props this update builds or stages again (their animation is the staging's anew)
   const restagedProps = new Set<string>();
+  // what each shot's camera hangs from before any piece is built anew (a camera on the old piece
+  // hangs from the new one then): what the warnings name as what the person hung it from
+  const hungBefore = cameraParents(doc);
   const deskBefore = hostShots(doc, sceneId);
   // the shots past the scene's last frame (a range the person shortened in the desk stays so)
   const sceneEnd = doc.getScene().frame_end;
@@ -821,6 +831,20 @@ export function updateFromBriefIn(
   }
 
   // ------------------------------------------------------------ cameras, motion records, checks
+  // a shot's camera the person hung from another object, when this update solves it or built anew or
+  // staged again what it hangs from: off that object when it moves in the shot, is scaled unevenly or
+  // is hidden there, and solved again in the world, as a re-import places it where the blocking has
+  // it (rideo/import.ts updateCameraHold); on one that stands still, evenly scaled, it stays (a solve
+  // keys it in that object's space)
+  for (const s of desk.values()) {
+    const cam = s.camera ? doc.getObject(s.camera) : null;
+    if (!cam?.parent) continue;
+    const rehung =
+      hungBefore.get(cam.id)?.id !== cam.parent ||
+      [...restagedProps].some((root) => root !== cam.id && doc.isAncestor(root, cam.id));
+    if ((solve.has(s.id) || rehung) && updateCameraHold(doc, s, hungBefore.get(cam.id), warnings))
+      solve.add(s.id);
+  }
   if (solve.size)
     solveShotCameras(briefContext(ctx, warnings), [...solve], {
       enforce_line: false,

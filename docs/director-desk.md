@@ -586,6 +586,12 @@ and no other shot's keys are cut:
   camera plan changed (framing, movement, lens, move, layout, continuity) and every shot when the
   size changed;
 - a camera set by hand in the desk is never solved again: the update keeps it and warns;
+- a shot's camera the person hung from another object stays on it while that object stands still
+  through the shot, scaled evenly, not mirrored and shown; hung from a piece the update builds anew
+  or stages again (or one it solves) that moves in the shot, is scaled unevenly, skewed or
+  mirrored, or is hidden by its scale there, it is taken off it, at scale 1, where it stands at the
+  shot's first frame, and solved again, and a warning names what the person hung it from and why:
+  `Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again`;
 - cast members the brief drops go; new ones stand on a free spot of the front row, shown in their
   shots; one the brief renames is renamed, also one whose name was made unique (`Guard.001` beside
   another `Guard`: the record keeps the name the desk gave each actor), while one the desk renamed
@@ -1059,10 +1065,12 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   built anew or dropped stays as an update keeps it), and the re-import's warnings name the actors,
   props, landmarks and shot cameras changed in the desk since the last import. A blocked shot
   camera the person hung from another object stays on it, placed in its space where the blocking
-  has the camera, when that object stands still through the shot and is scaled evenly; one hung
-  from something that moves in the shot (a kite, an actor), or scaled unevenly or mirrored, is
-  taken off it to stand where the blocking has it, and a warning names it. Importing a long clip
-  takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
+  has the camera, when that object stands still through the shot, scaled evenly and shown; one
+  hung from something that moves in the shot (a kite, an actor), is scaled unevenly, skewed or
+  mirrored, or is hidden by its scale there (an actor not in the shot), is taken off it, at scale
+  1, to stand where the blocking has it, and a warning names what the person hung it from and why
+  (`hung from 'kite' (built anew as 'balloon'), which moves during the shot`). Importing a long
+  clip takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
 - **Real video models**: whether the references improve a model's takes is not measured yet. A host
   should compare takes with and without them on its own scenes (the kite flights, riders on their
   mounts, and shot and reverse by water that motivated the desk), with the same seeds and blind

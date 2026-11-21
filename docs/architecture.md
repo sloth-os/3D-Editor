@@ -1044,34 +1044,40 @@ again as the old one was, by the same holder, which the import reads from the ho
 records and the flight or holds it carries before it goes, and from the plan for the new one, when
 the old prop's own transform channels carry no keys of the person's: its motion record
 (`RIDEO_PROPS.motion`) keeps a digest of the keys the staging wrote there (`ownKeysDigest`), read
-before an update's ripple shifts them; an actor built anew on its marks). One that followed a bone through the pieces that went (a
-hat on a mannequin's head part) hangs from the same bone of the new root when the root is that
-armature or takes its place. One skewed by an uneven scale above it, which no parent holds, keeps
-its origin and is named as changing shape. The same steps keep what the person put on what staging
-and updates build anew or take out without a library unit (`keptPlaces`, then `hangKept`): a
-words' prop or landmark built anew or dropped, the words' ground, walls and sun built again
-(`buildSet` and `lightSet`, which name nothing when a piece comes back with its name and place), a
-cast member's actor or a shot's camera an update drops, a kite's string flown again, an actor a
-rideo re-import builds anew, and an old look's parts when a figure or the mannequin takes their
-place (insertUnit's `replace`, `restyleActor`); what goes with nothing in its place hangs from the
-set's ground, or from the scene when there is none. An update replaces the parts the
-scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts
-edited or deleted in the scene, adds new parts at ids of the instance's generation (or of the next
-free one) and removes dropped untouched ones that nothing staying uses (a record that stays refers
-to it, such as another object, a camera's focus or a part the update keeps, or a key, driver, shot
-or the scene camera names it; then it stays with what it uses), and treats the unit's drivers the
-same way by their own table: a driver the new version drops together with the part it drives goes
-with that part, or stays on it when the part stays, and what it reads stays too. `unitStatus` names
-the parts and the drivers the scene edited or deleted. Extraction carries an instance's generation
-in its link plan, so linking the saved unit (adoption) keeps it; Make local drops it with the other
-`unit_*` props. What an update writes is stamped as written: a reference to a part that is not in
-the scene is cut, and the part still reads as left as it was. Linking a saved set (adoption) stamps the
-scene's set root, also one made local before: the root a new set would take is that one. A unit's
-driver writes only the unit's own datablocks (it may read the world or the scene), and drivers count
-toward the 20,000 records. Scene-owned fields (names, the collection and rigid body of every object,
-the root's placement, pose and constraints, the scene's `desk_*` props) never count as edits, and a
-unit holds no rigid body: a drop preset that makes a library set's ground the floor edits nothing of
-the set. Measured on the sample brief:
+before an update's ripple shifts them; an actor built anew on its marks). One that followed a bone
+through the pieces that went (a hat on a mannequin's head part) hangs from the same bone of the new
+root when the root is that armature or takes its place. One skewed by an uneven scale above it,
+which no parent holds, keeps its origin and is named as changing shape. The same steps keep what the
+person put on what staging and updates build anew or take out without a library unit (`keptPlaces`,
+then `hangKept`): a words' prop or landmark built anew or dropped, the words' ground, walls and sun
+built again (`buildSet` and `lightSet`, which name nothing when a piece comes back with its name and
+place), a cast member's actor or a shot's camera an update drops, a kite's string flown again, an
+actor a rideo re-import builds anew, and an old look's parts when a figure or the mannequin takes
+their place (insertUnit's `replace`, `restyleActor`); what goes with nothing in its place hangs from
+the set's ground, or from the scene when there is none. A shot's camera the person hung from such a
+piece is then held as a re-import holds a blocked camera (rideo/import.ts `cameraHold`): it stays on
+what it hangs from while that stands still through the shot, scaled evenly, not mirrored and shown;
+otherwise it is taken off it, at scale 1, where it stands at the shot's first frame, and placed
+where the clip's blocking has it (a re-import) or solved again (an update, which does the same for a
+hung camera it solves), with a warning that names what the person hung it from (`cameraParents`,
+read before any piece is built anew: `'kite' (built anew as 'balloon')`). An update replaces the
+parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it
+keeps parts edited or deleted in the scene, adds new parts at ids of the instance's generation (or
+of the next free one) and removes dropped untouched ones that nothing staying uses (a record that
+stays refers to it, such as another object, a camera's focus or a part the update keeps, or a key,
+driver, shot or the scene camera names it; then it stays with what it uses), and treats the unit's
+drivers the same way by their own table: a driver the new version drops together with the part it
+drives goes with that part, or stays on it when the part stays, and what it reads stays too.
+`unitStatus` names the parts and the drivers the scene edited or deleted. Extraction carries an
+instance's generation in its link plan, so linking the saved unit (adoption) keeps it; Make local
+drops it with the other `unit_*` props. What an update writes is stamped as written: a reference to
+a part that is not in the scene is cut, and the part still reads as left as it was. Linking a saved
+set (adoption) stamps the scene's set root, also one made local before: the root a new set would
+take is that one. A unit's driver writes only the unit's own datablocks (it may read the world or
+the scene), and drivers count toward the 20,000 records. Scene-owned fields (names, the collection
+and rigid body of every object, the root's placement, pose and constraints, the scene's `desk_*`
+props) never count as edits, and a unit holds no rigid body: a drop preset that makes a library
+set's ground the floor edits nothing of the set. Measured on the sample brief:
 
 | Unit                            | File      | Body      | Objects |
 | ------------------------------- | --------- | --------- | ------- |

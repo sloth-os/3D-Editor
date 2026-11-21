@@ -44,6 +44,7 @@ import { deskTetherFly } from '../physics';
 import { measureActorKind } from '../../store/builtin/actors';
 import { docParts, footprint } from './footprint';
 import { KeyArchive, clearAnimation, hideSpans, replaceKeys, setKey, truncateMotion } from './keys';
+import { hiddenByScale } from '../hide';
 import {
   MOUNT_DISTANCE_M,
   PERSON_POSES,
@@ -887,6 +888,9 @@ export function importRideoBlocking(
   const oldProps = update ? importedBy(doc, 'prop', (o) => prop(o, RIDEO_PROPS.id), clip) : new Map();
   const oldLandmarks = update ? importedBy(doc, 'landmark', (o) => prop(o, RIDEO_PROPS.id), clip) : new Map();
   const oldShots = getShots(doc);
+  // what each shot's camera hangs from before any piece is built anew (a camera on the old piece
+  // hangs from the new one then): what the warnings name as what the person hung it from
+  const hungBefore = cameraParents(doc);
   const removed: string[] = [];
   // what was changed in the desk since the last import (keys, poses, holds, mounts, flights, a
   // camera solved again): the import rebuilds them from rideo's blocking, so their changes are lost
@@ -1398,7 +1402,12 @@ export function importRideoBlocking(
       toSolve.push(p.id);
       continue;
     }
-    placeCamera(doc, s, p, cameraSpace(doc, s, warnings, changedSince.has(s.camera!)));
+    placeCamera(
+      doc,
+      s,
+      p,
+      cameraSpace(doc, s, warnings, changedSince.has(s.camera!), hungBefore.get(s.camera!)),
+    );
   }
   const from = new Map<string, 'blocking' | 'solved' | 'refit'>();
   const agrees = new Map<string, boolean>();
@@ -1646,50 +1655,153 @@ function evenAxes(m: Readonly<Mat4>): boolean {
   return determinant4(m) > 0;
 }
 
+/** What a shot's camera hung from before an import or an update built anything anew (cameraParents). */
+export interface HungFrom {
+  /** The object's id then. */
+  id: string;
+  /** Its name then. */
+  name: string;
+}
+
 /**
- * The world matrix a shot's blocked camera is placed through: its parent's (null: it hangs from
- * nothing). A camera the person hung from another object (a rig) stays on it while that object
- * stands still through the shot, scaled evenly and not mirrored (evenAxes): the blocking's placement,
- * turned into the parent's space (as CameraKeys.pose turns a solved one), then holds at every frame.
- * Hung from something that moves in the shot (a kite, an actor), keys in its space would hold that
- * placement at the keys only, and an uneven parent bends the camera: such a camera is taken off its
- * parent, keeping its place in the world at the shot's first frame, and `warnings` says so. One kept
- * on its parent that the re-import names as changed since the last import (`named`: hung from it
- * since) is said to stay on it, as that warning says those changes are gone.
+ * What each shot's camera hangs from, by camera (cameras on nothing left out): read before an import
+ * or an update builds a piece anew, which hangs a camera that hung from the old piece from the new
+ * one (units/remove.ts hangKept), so that a warning names the object the person hung it from.
  */
-function cameraSpace(doc: SceneDoc, shot: ShotData, warnings: string[], named: boolean): Mat4 | null {
+export function cameraParents(doc: SceneDoc): Map<string, HungFrom> {
+  const out = new Map<string, HungFrom>();
+  for (const s of getShots(doc)) {
+    const cam = s.camera ? doc.getObject(s.camera) : null;
+    const parent = cam?.parent ? doc.getObject(cam.parent) : null;
+    if (cam && parent) out.set(cam.id, { id: parent.id, name: parent.name });
+  }
+  return out;
+}
+
+/**
+ * How a warning names `now`, what a shot's camera hangs from: as the person hung it (`was`, read
+ * before anything was built anew), and what was built in its place ("'kite' (built anew as
+ * 'balloon')") or what it was renamed ("'Mira' (now 'Mira Jones')").
+ */
+function hungFromName(doc: SceneDoc, now: ObjectData, was: HungFrom | undefined): string {
+  if (!was || (was.id === now.id && was.name === now.name)) return `'${now.name}'`;
+  if (was.id === now.id) return `'${was.name}' (now '${now.name}')`;
+  if (doc.getObject(was.id)) return `'${now.name}'`;
+  return was.name === now.name ? `'${was.name}' (built anew)` : `'${was.name}' (built anew as '${now.name}')`;
+}
+
+/** Why a shot's camera does not stay on what it hangs from (cameraHold), as a warning says it. */
+const UNSTEADY = {
+  moves: 'moves during the shot',
+  uneven: 'is scaled unevenly or mirrored',
+  hidden: 'is hidden by its scale in the shot',
+} as const;
+
+/**
+ * Whether the camera of `shot` can stay on what it hangs from through the shot (null: it hangs from
+ * nothing): `space` is that object's world matrix at the shot's first frame, and `why` (null: it can
+ * stay) why it cannot. It moves in the shot (it is not where it is at the first frame at every frame
+ * of the shot: keys in its space would hold the camera at the keys only); it is hidden by its scale
+ * there (hide.ts hiddenByScale: a camera on it stands where its squashed space puts it, far off where
+ * it is shown); or it turns and scales the camera unevenly (scaled unevenly, skewed or mirrored:
+ * evenAxes), which bends the camera.
+ */
+function cameraHold(
+  doc: SceneDoc,
+  shot: ShotData,
+): { parent: ObjectData; space: Mat4; why: keyof typeof UNSTEADY | null } | null {
   const cam = shot.camera!;
   const o = doc.getObject(cam);
   const parent = o?.parent ? doc.getObject(o.parent) : null;
   if (!o || !parent) return null;
-  const first = new FrameState(doc, shot.frame_start);
-  const space = first.parent(cam);
+  const space = new FrameState(doc, shot.frame_start).parent(cam);
   let still = true;
   // nothing above it keyed, driven, constrained or simulated: it stands still at every frame
   if (moversOf(doc, cam).length)
     for (let f = shot.frame_start + 1; f <= shot.frame_end && still; f++)
       still = sameWorld(new FrameState(doc, f).parent(cam), space);
-  if (still && evenAxes(space)) {
-    if (named)
-      warnings.push(
-        `${shot.name}: its camera stays hung from '${parent.name}', which stands still in the shot; ` +
-          "the import placed it in its space where the clip's blocking has it",
-      );
-    return space;
-  }
-  // where it stands at the shot's first frame, unless its parent squashes it there (a hidden actor)
-  const world = first.world(cam);
+  const why = !still ? 'moves' : hiddenByScale(space) ? 'hidden' : !evenAxes(space) ? 'uneven' : null;
+  return { parent, space, why };
+}
+
+/**
+ * Takes the camera of `shot` off what it hangs from, where it stands in the world at the shot's first
+ * frame (where it stands at rest when its parent squashes it there, flat or to a point: a hidden
+ * actor), at scale 1: the stretch an uneven parent gave its world matrix goes with the parent.
+ */
+function takeCameraOff(doc: SceneDoc, shot: ShotData): void {
+  const cam = shot.camera!;
+  const world = new FrameState(doc, shot.frame_start).world(cam);
   const placed =
     world &&
     world.every(Number.isFinite) &&
+    !hiddenByScale(world) &&
     [0, 1, 2].every((k) => Math.hypot(world[k * 4], world[k * 4 + 1], world[k * 4 + 2]) > 1e-9);
   doc.setParent(cam, null, true, placed ? { world, parentWorld: null } : undefined);
+  doc.updateObject(cam, { scale: [1, 1, 1] });
+}
+
+/**
+ * The world matrix a shot's blocked camera is placed through: its parent's (null: it hangs from
+ * nothing). A camera the person hung from another object (a rig) stays on it while that object
+ * stands still through the shot, scaled evenly, not mirrored and shown (cameraHold): the blocking's
+ * placement, turned into the parent's space (as CameraKeys.pose turns a solved one), then holds at
+ * every frame. Hung from something that moves in the shot (a kite, an actor), keys in its space would
+ * hold that placement at the keys only, an uneven parent bends the camera and a hidden one squashes
+ * it: such a camera is taken off its parent (takeCameraOff), and `warnings` says so, naming what the
+ * person hung it from (`was`: hungFromName). One kept on its parent that the re-import names as
+ * changed since the last import (`named`: hung from it since) is said to stay on it, as that warning
+ * says those changes are gone.
+ */
+function cameraSpace(
+  doc: SceneDoc,
+  shot: ShotData,
+  warnings: string[],
+  named: boolean,
+  was: HungFrom | undefined,
+): Mat4 | null {
+  const hold = cameraHold(doc, shot);
+  if (!hold) return null;
+  const from = hungFromName(doc, hold.parent, was);
+  if (!hold.why) {
+    if (named)
+      warnings.push(
+        `${shot.name}: its camera stays hung from ${from}, which stands still in the shot; ` +
+          "the import placed it in its space where the clip's blocking has it",
+      );
+    return hold.space;
+  }
+  takeCameraOff(doc, shot);
   warnings.push(
-    `${shot.name}: its camera hung from '${parent.name}', which ${
-      still ? 'is scaled unevenly or mirrored' : 'moves during the shot'
-    }; the import took it off '${parent.name}' to place it where the clip's blocking has it`,
+    `${shot.name}: its camera hung from ${from}, which ${UNSTEADY[hold.why]}; ` +
+      `the import took it off '${hold.parent.name}' to place it where the clip's blocking has it`,
   );
   return null;
+}
+
+/**
+ * A brief update's rule for the camera of `shot` (update.ts: one it solves, or one hanging from a
+ * piece it built or staged anew): kept on what it hangs from while that stands still through the
+ * shot, scaled evenly, not mirrored and shown (cameraHold; a solve keys it in that space, as
+ * CameraKeys.pose does); else taken off it (takeCameraOff) for the caller to solve again, and
+ * `warnings` says so, naming what the person hung it from (`was`, read before the update built
+ * anything anew: hungFromName) and why. Returns whether it was taken off.
+ */
+export function updateCameraHold(
+  doc: SceneDoc,
+  shot: ShotData,
+  was: HungFrom | undefined,
+  warnings: string[],
+): boolean {
+  const hold = cameraHold(doc, shot);
+  if (!hold?.why) return false;
+  const from = hungFromName(doc, hold.parent, was);
+  takeCameraOff(doc, shot);
+  warnings.push(
+    `${shot.name}: its camera hung from ${from}, which ${UNSTEADY[hold.why]}; ` +
+      `the update took it off '${hold.parent.name}' and solved it again`,
+  );
+  return true;
 }
 
 /**
