@@ -645,6 +645,29 @@ describe("a later version whose root is another type of object than the instance
     expect(u.r.warnings).toContainEqual(
       expect.stringMatching(/: keeps 'Lantern', which is not part of the look the library prop replaces$/),
     );
+    // Mira flies the new item as she flew the old one: what is on it follows it, unnamed
+    expect(prop(kite, 'desk_rideo_held_by')).toBe(MIRA);
+    expect(u.r.warnings.join('\n')).not.toMatch(/no longer follow/);
+  });
+
+  it("another item pinned where no one holds the prop any more names what followed the old one's flight", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
+    const v1 = propOf(doc, KITE);
+    expect(prop(v1, 'desk_rideo_held_by')).toBe(MIRA);
+    const lantern = mine(doc, 'Lantern', v1.id, [0.3, -0.2, 0.4], [0.2, 0.1, 0.5]);
+    const before = doc.worldMatrix(lantern);
+    const other = lib('lib_0123456789othr', 1, kiteRooted('MESH', 1).given.data);
+    // Mira runs past the kite now: the staging neither holds nor flies the prop in its slot
+    const b = withPins(openBrief(), { el: { [KITE]: other } });
+    b.shots[0].description = 'Wide: Mira runs across the meadow past the kite, Pip chasing.';
+    const u = update(doc, b, source(other));
+    const kite = propOf(doc, KITE);
+    expect(readInstance(doc, kite.id)).toMatchObject({ ref: other.pin.ref, version: 1 });
+    expect(prop(kite, 'desk_rideo_held_by')).toBeUndefined();
+    expect(doc.getObject(lantern)?.parent).toBe(kite.id);
+    sameWorld(doc.worldMatrix(lantern), before);
+    expect(u.r.warnings).toContain(`${kite.name}: 'Lantern' no longer follows the animation of '${v1.name}'`);
   });
 
   it("an object of the person's the new root's uneven scale would skew stays where it was, named", () => {

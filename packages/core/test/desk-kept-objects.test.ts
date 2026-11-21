@@ -112,6 +112,36 @@ function update(doc: SceneDoc, b: SceneBrief, units?: UnitSource): StageBriefRep
 const landmarkOf = (doc: SceneDoc) => doc.listObjects().find((o) => prop(o, 'desk_role') === 'landmark')!;
 const wordsGround = (doc: SceneDoc) => doc.listObjects().find((o) => prop(o, 'desk_label') === 'ground')!;
 
+/**
+ * Brief `b` with the kite described anew as a red balloon; `balloonWords`: the shots' words name the
+ * balloon where they named the kite (so Mira holds it, and flies it, again).
+ */
+function retyped(b: SceneBrief, o: { balloonWords?: boolean } = {}): SceneBrief {
+  const el = b.elements.find((e) => e.id === KITE)!;
+  el.name = 'Red balloon';
+  el.description = 'A big red balloon on a string.';
+  if (o.balloonWords)
+    for (const s of b.shots) {
+      s.description = s.description.replace(/\bkite\b/g, 'balloon');
+      s.action = s.action.replace(/\bkite\b/g, 'balloon');
+    }
+  return b;
+}
+
+/** How far object `id` moves over the frames (the largest distance from where it is at the first). */
+function travel(doc: SceneDoc, id: string): number {
+  const at = worldsAt(doc, id).map((m) => [m[12], m[13], m[14]]);
+  return Math.max(...at.map((p) => Math.hypot(p[0] - at[0][0], p[1] - at[0][1], p[2] - at[0][2])));
+}
+
+const BALL = 'ele_0123456789ball';
+/** Brief `b` with a prop no one holds, the ball `name` (`description`), in its first shot. */
+function withBall(b: SceneBrief, name: string, description: string): SceneBrief {
+  b.elements.push({ id: BALL, name, description, kind: 'prop' });
+  b.shots[0].elementIds = [...b.shots[0].elementIds, BALL];
+  return b;
+}
+
 describe("what the person put on a words' prop or landmark stays when a later brief builds it anew or drops it", () => {
   it('a prop described anew is built anew with them on it, nested and keyed, in one undo step; a reopened scene keeps them', () => {
     const doc = stagedDoc();
@@ -125,10 +155,8 @@ describe("what the person put on a words' prop or landmark stays when a later br
     const before = rests();
     const rising = ownMotion(doc, riser);
     const undo = undoOf(doc);
-    const b2 = openBrief();
-    const el = b2.elements.find((e) => e.id === KITE)!;
-    el.name = 'Red balloon';
-    el.description = 'A big red balloon on a string.';
+    // the shots' words name the balloon: Mira runs with it as she ran with the kite
+    const b2 = retyped(openBrief(), { balloonWords: true });
     const r = update(doc, b2);
     const balloon = propOf(doc, KITE);
     expect(balloon.id).not.toBe(kite.id);
@@ -140,7 +168,12 @@ describe("what the person put on a words' prop or landmark stays when a later br
     expect(r.warnings).toContain(
       `${balloon.name}: keeps 'Ribbon' and 'Riser', which are not part of the prop it replaces`,
     );
-    // the staging holds and flies the balloon as it did the kite: what is on it moves with it
+    // the staging holds and flies the balloon as it did the kite: what is on it moves with it, unnamed
+    expect([prop(kite, 'desk_rideo_held_by'), prop(balloon, 'desk_rideo_held_by')]).toEqual([MIRA, MIRA]);
+    expect(prop(balloon, 'desk_tether_flights')).toBeTruthy();
+    const flight = worldsAt(doc, balloon.id);
+    const onBalloon = worldsAt(doc, ribbon).map((m, i) => multiply4(invert4(flight[i]), m));
+    onBalloon.forEach((m) => sameWorld(m, onBalloon[0]));
     expect(r.warnings.join('\n')).not.toMatch(/no longer follow/);
     // one undo step: the kite again, with them on it
     undo.undo();
@@ -156,6 +189,95 @@ describe("what the person put on a words' prop or landmark stays when a later br
     expect(briefChanges(reopened, b2)).toBeNull();
     const again = update(reopened, b2);
     expect(again.warnings.join('\n')).not.toMatch(/keeps|goes|follow/);
+  });
+
+  it("a prop described anew that no one holds any more: what followed the old one's flight keeps its place at rest and is named", () => {
+    const doc = stagedDoc();
+    const kite = propOf(doc, KITE);
+    expect(kite.name).toBe('Red kite');
+    const ribbon = mine(doc, 'Ribbon', kite.id, [0.1, 0, -0.2], [0, 0, 0.4]);
+    const riser = mine(doc, 'Riser', kite.id, [0.05, 0, 0]);
+    keyed(doc, riser, 'location', 2, [0, 0.3, 0.6]);
+    const ours = [ribbon, riser];
+    const before = ours.map((id) => restWorld(doc, id));
+    const rising = ownMotion(doc, riser);
+    // the kite flies: what is on it goes up with it
+    expect(travel(doc, ribbon)).toBeGreaterThan(1);
+    // the shots' words still say the kite, which the brief no longer has: no one holds the balloon
+    const r = update(doc, retyped(openBrief()));
+    const balloon = propOf(doc, KITE);
+    expect(balloon.id).not.toBe(kite.id);
+    expect(prop(balloon, 'desk_rideo_held_by')).toBeUndefined();
+    expect(ours.map((id) => doc.getObject(id)?.parent)).toEqual([balloon.id, balloon.id]);
+    ours.forEach((id, i) => sameWorld(restWorld(doc, id), before[i]));
+    ownMotion(doc, riser).forEach((m, i) => sameWorld(m, rising[i]));
+    expect(travel(doc, ribbon)).toBeLessThan(1e-9);
+    expect(r.warnings).toEqual(
+      expect.arrayContaining([
+        "Red balloon: keeps 'Ribbon' and 'Riser', which are not part of the prop it replaces",
+        "Red balloon: 'Ribbon' and 'Riser' no longer follow the animation of 'Red kite'",
+      ]),
+    );
+  });
+
+  it('a prop described anew that another holds flies another way: what followed the old one is named', () => {
+    const doc = stagedDoc();
+    const kite = propOf(doc, KITE);
+    const ribbon = mine(doc, 'Ribbon', kite.id, [0.1, 0, -0.2]);
+    // Pip runs with the balloon now, where Mira ran with the kite
+    const b2 = retyped(openBrief(), { balloonWords: true });
+    b2.shots[0].description = 'Wide: Pip runs across the meadow with the balloon, Mira chasing.';
+    const r = update(doc, b2);
+    const balloon = propOf(doc, KITE);
+    expect([prop(kite, 'desk_rideo_held_by'), prop(balloon, 'desk_rideo_held_by')]).toEqual([MIRA, PIP]);
+    expect(prop(balloon, 'desk_tether_flights')).toBeTruthy();
+    expect(doc.getObject(ribbon)?.parent).toBe(balloon.id);
+    expect(r.warnings).toContain("Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'");
+  });
+
+  it('a prop described anew that its holder carries where the old one flew: what followed the flight is named', () => {
+    const doc = stagedDoc();
+    const kite = propOf(doc, KITE);
+    const ribbon = mine(doc, 'Ribbon', kite.id, [0.1, 0, -0.2]);
+    // Mira runs with a ball now: in her hand, where the kite flew on its string
+    const b2 = openBrief();
+    const el = b2.elements.find((e) => e.id === KITE)!;
+    el.name = 'Red ball';
+    el.description = 'A small red rubber ball.';
+    for (const s of b2.shots) s.description = s.description.replace(/\bkite\b/g, 'ball');
+    const r = update(doc, b2);
+    const ball = propOf(doc, KITE);
+    expect(prop(ball, 'desk_rideo_held_by')).toBe(MIRA);
+    expect(prop(ball, 'desk_tether_flights')).toBeUndefined();
+    expect(ball.constraints.some((c) => c.type === 'CHILD_OF' && c.name.startsWith('Hold '))).toBe(true);
+    expect(doc.getObject(ribbon)?.parent).toBe(ball.id);
+    expect(r.warnings).toContain("Red ball: 'Ribbon' no longer follows the animation of 'Red kite'");
+  });
+
+  it('a prop the person keyed by hand and the words describe anew: what moved with it is named, as the keys go with it', () => {
+    const doc = stagedDoc(withBall(openBrief(), 'Red ball', 'A small red rubber ball.'));
+    const ball = propOf(doc, BALL);
+    expect(ball.name).toBe('Red ball');
+    // no one holds it: the staging leaves it where it stands, and the person keys it bouncing 0.8 m
+    expect(prop(ball, 'desk_rideo_held_by')).toBeUndefined();
+    const z = ball.location[2];
+    keyed(doc, ball.id, 'location', 2, [z, z + 0.8, z]);
+    const sticker = mine(doc, 'Sticker', ball.id, [0, 0.1, 0.1]);
+    const at = restWorld(doc, sticker);
+    expect(travel(doc, sticker)).toBeCloseTo(0.8, 6);
+    const r = update(doc, withBall(openBrief(), 'Blue bucket', 'A blue plastic bucket.'));
+    const bucket = propOf(doc, BALL);
+    expect(bucket.id).not.toBe(ball.id);
+    expect(doc.getObject(ball.id)).toBeNull();
+    expect(doc.getObject(sticker)?.parent).toBe(bucket.id);
+    sameWorld(restWorld(doc, sticker), at);
+    expect(travel(doc, sticker)).toBeLessThan(1e-9);
+    expect(r.warnings).toEqual(
+      expect.arrayContaining([
+        "Blue bucket: keeps 'Sticker', which is not part of the prop it replaces",
+        "Blue bucket: 'Sticker' no longer follows the animation of 'Red ball'",
+      ]),
+    );
   });
 
   it("a prop staged again but kept keeps the keys of the person's objects on it, and what was on its old string stays on the ground", () => {
@@ -478,5 +600,25 @@ describe('what the person put on what a rideo re-import builds anew or drops sta
     expect(again.warnings.join('\n')).not.toMatch(/keeps|goes|follow|Cushion/);
     expect(doc.getObject(cushion)?.parent).toBe(wordsGround(doc).id);
     sameWorld(restWorld(doc, cushion), before[3]);
+  });
+
+  it('names what followed the flight of a prop it builds anew that no one holds any more', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const kite = importClip(doc, kiteClip()).props[0].id;
+    expect(doc.getObject(kite)?.name).toBe('kite');
+    const ribbon = mine(doc, 'Ribbon', kite, [0.1, 0, -0.2]);
+    const at = restWorld(doc, ribbon);
+    expect(travel(doc, ribbon)).toBeGreaterThan(1);
+    // the kite is a balloon now, and rideo has no one holding it
+    const clip = changedClip();
+    delete (clip.blocking as { props: { heldBy?: string }[] }).props[0].heldBy;
+    const r = importClip(doc, clip);
+    const balloon = r.props[0].id;
+    expect(balloon).not.toBe(kite);
+    expect(r.props[0].held_by ?? null).toBeNull();
+    expect(doc.getObject(ribbon)?.parent).toBe(balloon);
+    sameWorld(restWorld(doc, ribbon), at);
+    expect(travel(doc, ribbon)).toBeLessThan(1e-9);
+    expect(r.warnings).toContain("balloon: 'Ribbon' no longer follows the animation of 'kite'");
   });
 });

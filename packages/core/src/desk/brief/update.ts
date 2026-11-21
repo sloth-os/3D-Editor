@@ -31,6 +31,7 @@ import {
   holderSpans,
   motionDigest,
   parseRideoBlocking,
+  propMove,
   rideoHeightRatio,
   shotMove,
   tetherPartsOf,
@@ -760,7 +761,10 @@ export function updateFromBriefIn(
     // was (or the words' prop), its slot saying why
     const unit = slot?.action === 'remove' ? null : propHook(doc, slot, current?.id ?? null);
     if (unit?.unit) done.add(unit.key);
-    const made = buildProp(doc, p, e.name, castNames, stamp, flies, current, unit);
+    // stageHeld below holds or flies it while its holder has an actor in a shot, else hides it
+    const holderActor = p.heldBy ? actors.get(p.heldBy) : undefined;
+    const move = propMove(p, flies, !!holderActor && holderSpans(cut, p.heldBy!).length > 0);
+    const made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit);
     if (slot && made.failed !== undefined) warnings.push(...slotFailed(slot, made.failed, done));
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     const rest = { ...doc.getObject(made.root)!.custom_props };

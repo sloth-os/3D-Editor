@@ -1050,7 +1050,9 @@ export function importRideoBlocking(
       keptProps.add(p.id);
     }
     const unit = units.prop?.(p);
-    const made = buildProp(doc, p, elementName, castNames, stamp, flies, old, unit);
+    // the holds below hold or fly it while its holder is in a shot (every cast member is), else hide it
+    const move = propMove(p, flies, !!p.heldBy && cast.includes(p.heldBy));
+    const made = buildProp(doc, p, elementName, castNames, stamp, flies, move, old, unit);
     if (unit && made.failed !== undefined) units.failed?.(unit.key, made.failed);
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     props.set(p.id, { ...made, plan: p, flies });
@@ -1954,6 +1956,57 @@ function remapShotRefs(doc: SceneDoc, from: string, to: string): void {
 }
 
 /**
+ * How the staging moves a prop whose element has a holder (rideo's heldBy): in the holder's hand
+ * ('held'), on a string from it ('flown': a kite or a balloon), or out of sight while the holder is
+ * in no shot ('hidden').
+ */
+export interface PropMove {
+  /** The holder's character id. */
+  by: string;
+  how: 'held' | 'flown' | 'hidden';
+}
+
+/**
+ * How the staging moves prop `p` (null: not at all, it has no holder): its holder holds it, or flies
+ * it as `flies` says, while the holder is in a shot (`inShot`); it is hidden otherwise.
+ */
+export function propMove(
+  p: Pick<RideoBlockingProp, 'heldBy'>,
+  flies: 'kite' | 'balloon' | null,
+  inShot: boolean,
+): PropMove | null {
+  if (!p.heldBy) return null;
+  return { by: p.heldBy, how: !inShot ? 'hidden' : flies ? 'flown' : 'held' };
+}
+
+/** The tether flights a flyer records (desk.tether_fly: "lo:hi[hs][@anchor[/bone]]" entries). */
+const FLIGHTS = 'desk_tether_flights';
+
+/**
+ * How the staging moved an earlier prop (see PropMove), read before it goes: by the holder it records
+ * (RIDEO_PROPS.heldBy), flown when it carries a flight, held when it carries a hold, else hidden;
+ * null when it records no holder (the staging left it where it stands).
+ */
+function movedBy(doc: SceneDoc, id: string): PropMove | null {
+  const o = doc.getObject(id);
+  const by = prop(o, RIDEO_PROPS.heldBy);
+  if (!o || !by) return null;
+  if (prop(o, FLIGHTS).trim()) return { by, how: 'flown' };
+  if ((o.constraints ?? []).some((c) => !c.mute && c.type === 'CHILD_OF' && c.name.startsWith('Hold ')))
+    return { by, how: 'held' };
+  return { by, how: 'hidden' };
+}
+
+/**
+ * Whether the staging moves a prop built anew as it moved the one it takes the place of (KeptWords'
+ * `restaged`): held, or flown, again by the same holder, or hidden again. What was on the old one
+ * then follows the new one; otherwise what moved it with the old one is named (a flight or a hold
+ * lost with the holder, keys the person gave the old prop).
+ */
+const movesAlike = (was: PropMove | null, now: PropMove | null): boolean =>
+  !!was && !!now && was.by === now.by && was.how === now.how;
+
+/**
  * A prop staged from a library unit (see buildProp): the instance with key `unit.key`, its root at the
  * prop's spot with its base on the ground and the unit's own size. An earlier root of the same library
  * item (an instance, or one made local) is kept, updated to the pin's version, cleared of its
@@ -1962,7 +2015,8 @@ function remapShotRefs(doc: SceneDoc, from: string, to: string): void {
  * root is another type of object than the instance's (an empty in one version, a mesh in the next),
  * which no update turns into the other, takes the instance's place as another item's unit does, with
  * a warning. What the person put on the prop a unit takes the place of (objects of their own below
- * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`).
+ * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`), and
+ * follows the root's motion where the staging moves it (`move`) as it moved that prop (movesAlike).
  */
 function buildUnitProp(
   doc: SceneDoc,
@@ -1970,6 +2024,7 @@ function buildUnitProp(
   label: string,
   props: Record<string, string | number | boolean>,
   flies: 'kite' | 'balloon' | null,
+  move: PropMove | null,
   old: ObjectData | undefined,
   unit: StagedProp,
 ): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings: string[] } {
@@ -2017,7 +2072,13 @@ function buildUnitProp(
       location: at,
       rotation_euler: [0, 0, 0],
       ...(swap ? { replace: swap } : {}),
-      ...(cur && !swap ? { remove: [cur.id], keep: oldLook(doc, cur.id).kept, restaged: true } : {}),
+      ...(cur && !swap
+        ? {
+            remove: [cur.id],
+            keep: oldLook(doc, cur.id).kept,
+            restaged: movesAlike(movedBy(doc, cur.id), move),
+          }
+        : {}),
       rootProps: own,
     });
     root = r.root;
@@ -2062,7 +2123,9 @@ const stampFacts = (
  * their own below it, not its parts) stays, hung from the words' prop where it is in the world; the
  * warnings name it (units/remove.ts hangKept). So does what the person put on an earlier prop built
  * otherwise (the words describe it anew), which goes for the prop built in its place; the shots that
- * named it name the new one.
+ * named it name the new one. `move`: how the staging moves the prop once it is built (its hold or
+ * flight comes after); what was on the prop it replaces follows the new one's motion where it moves
+ * it as it moved that one (movesAlike), and is named as no longer following that one's otherwise.
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2071,6 +2134,7 @@ export function buildProp(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   flies: 'kite' | 'balloon' | null,
+  move: PropMove | null,
   old?: ObjectData,
   unit?: StagedProp | null,
 ): {
@@ -2096,17 +2160,20 @@ export function buildProp(
           ...(p.elementId ? { [DESK_PROPS.elementId]: p.elementId } : {}),
         }),
         flies,
+        move,
         old,
         unit,
       );
     } catch (err) {
-      return { ...buildProp(doc, p, elementName, castNames, stamp, flies, old), failed: err };
+      return { ...buildProp(doc, p, elementName, castNames, stamp, flies, move, old), failed: err };
     }
   // null: the element has no unit (any more): an instance of one goes, for the words' prop (the
   // shots that named it name the new prop), but for what the person put on it (objects of their own
   // below it, not its parts), which the words' prop takes over where it is
   let replaced: string | null = null;
   let kept: KeptPlaces | null = null;
+  // how the staging moved the prop that goes (what is on it follows the new one only when it moves alike)
+  let was: PropMove | null = null;
   let of = 'the library prop';
   if (
     unit === null &&
@@ -2115,6 +2182,7 @@ export function buildProp(
     (readInstance(doc, old.id) || unitBuildOf(doc, old.id))
   ) {
     replaced = old.id;
+    was = movedBy(doc, old.id);
     kept = keptPlaces(doc, readInstance(doc, old.id) ? oldLook(doc, old.id).kept : [], [old.id]);
     removeTrees(doc, [old.id], kept.ids);
     old = undefined;
@@ -2144,6 +2212,7 @@ export function buildProp(
     // built otherwise now: the prop goes for the one built in its place, but for what the person put
     // on it (objects of their own below it, not its look), which the new prop takes over where it is
     replaced = prior;
+    was = movedBy(doc, prior);
     kept = removeKeeping(doc, [prior]);
     of = 'the prop it replaces';
     old = undefined;
@@ -2191,8 +2260,11 @@ export function buildProp(
       custom_props: props,
     });
   }
-  // the staging holds, flies or hides the new prop as it did the old one: what stays follows it
-  const warnings = kept ? hangKept(doc, root, kept, { of, on: "the words' prop", restaged: true }) : [];
+  // what stays follows the new prop, and is named as no longer following the old one's motion unless
+  // the staging moves the new one alike (held or flown again by the same holder, or hidden again)
+  const warnings = kept
+    ? hangKept(doc, root, kept, { of, on: "the words' prop", restaged: movesAlike(was, move) })
+    : [];
   if (replaced) remapShotRefs(doc, replaced, root);
   const s = doc.getObject(root)!.scale;
   return { root, baseScale: [s[0], s[1], s[2]], model, created, ...(warnings.length ? { warnings } : {}) };

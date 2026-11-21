@@ -1040,7 +1040,9 @@ which `SceneDoc.worldMatrix` leaves out), with what moved each one on its own ab
 keys, drivers, constraints, an active rigid body, or the pose of the bones it hung from); one whose
 mover went and that nothing above it moves alike now is named as no longer following it, unless the
 staging moves what takes the piece's place as it moved the piece (`restaged`: a prop held or flown
-again, an actor built anew on its marks). One that followed a bone through the pieces that went (a
+again as the old one was, by the same holder, which the import reads from the holder the old prop
+records and the flight or holds it carries before it goes, and from the plan for the new one; an
+actor built anew on its marks). One that followed a bone through the pieces that went (a
 hat on a mannequin's head part) hangs from the same bone of the new root when the root is that
 armature or takes its place. One skewed by an uneven scale above it, which no parent holds, keeps
 its origin and is named as changing shape. The same steps keep what the person put on what staging

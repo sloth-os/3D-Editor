@@ -605,8 +605,11 @@ and no other shot's keys are cut:
   bones it hung from: an actor's walk, a camera's move, a kite's flight) keeps its place at rest
   and is named as no longer following it (`'Hat' no longer follows the animation of 'Pip'`),
   unless what takes the piece's place moves alike: a prop built anew is held or flown again as the
-  old one was, an actor a rideo re-import builds anew walks its marks again, and what hung from a
-  bone of the old actor or look hangs from the same bone of the new one. One turned on a piece
+  old one was, by the same holder, an actor a rideo re-import builds anew walks its marks again, and
+  what hung from a bone of the old actor or look hangs from the same bone of the new one. So what
+  followed a prop described anew that no one holds any more, that another holds, or that its holder
+  carries where the old one flew is named, as is what followed one the person keyed by hand, whose
+  keys go with it (`'Ribbon' no longer follows the animation of 'Red kite'`). One turned on a piece
   scaled unevenly was skewed by it, which no channels keep on another parent: it keeps its origin,
   and a warning says it changes shape;
 - notes the desk did not edit follow the brief's words, and the desk's own shot names (`Shot 3`)
