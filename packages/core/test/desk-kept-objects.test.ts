@@ -665,6 +665,36 @@ describe('a shot camera the person hung from a prop that a later brief builds an
     }
   });
 
+  it("hung under a rig of the person's on the prop, is taken off the rig and solved again when the new prop flies, the warning naming the rig", () => {
+    const ref = stagedDoc();
+    update(ref, retyped(openBrief(), { balloonWords: true }));
+    const doc = stagedDoc();
+    // an empty half a metre above the kite, the camera hung from it where it stands at the shot's
+    // first frame
+    let rig = '';
+    doc.transact(() => {
+      rig = doc.addObject({
+        type: 'EMPTY',
+        name: 'Rig',
+        parent: propOf(doc, KITE).id,
+        location: [0, 0, 0.5],
+        rotation_euler: [0, 0, 0],
+        scale: [1, 1, 1],
+      });
+    });
+    const cam = hangCamera(doc, rig, 'first');
+    const r = update(doc, retyped(openBrief(), { balloonWords: true }));
+    // the rig stays on the balloon, which flies otherwise than the kite did: the camera comes off it
+    expect(doc.getObject(rig)!.parent).toBe(propOf(doc, KITE).id);
+    expect(doc.getObject(cam)!.parent).toBeNull();
+    expect(doc.getObject(cam)!.scale).toEqual([1, 1, 1]);
+    expect(r.solved).toEqual(['sht_0123456789aaaa']);
+    expect(largestGap(firstShotCamera(doc), firstShotCamera(ref))).toBeLessThan(1e-9);
+    expect(cameraWarnings(doc, cam, r.warnings)).toEqual([
+      "Shot 1: its camera hung from 'Rig', which moves during the shot; the update took it off 'Rig' and solved it again",
+    ]);
+  });
+
   it('stays on the new prop that stands still in the shot, where it was', () => {
     // the balloon no one holds: it stands where the kite was at rest
     const ref = stagedDoc();
@@ -783,6 +813,39 @@ describe('a shot camera the person hung that a later brief does not solve', () =
       expect(cameraWarnings(doc, cam, r.warnings), c.what).toEqual([]);
     }
   });
+
+  it("stays on a rig of the person's scaled unevenly or mirrored, under a prop built anew that stands still, unsolved", () => {
+    // the kite in flight described anew as a balloon no one holds, which stands where the kite was at
+    // rest: what hangs from the kite moves otherwise in the shot, but the update solves the camera only
+    // off a piece that now moves, not off one that only turns it unevenly
+    const rigs: { what: string; rotation: Vec3; scale: Vec3 }[] = [
+      { what: 'scaled unevenly', rotation: [0.3, 0.2, 0.1], scale: [1, 1.3, 0.8] },
+      { what: 'mirrored', rotation: [0, 0, 0], scale: [-1, 1, 1] },
+    ];
+    for (const { what, rotation, scale } of rigs) {
+      const doc = stagedDoc();
+      let rig = '';
+      doc.transact(() => {
+        rig = doc.addObject({
+          type: 'EMPTY',
+          name: 'Rig',
+          parent: propOf(doc, KITE).id,
+          location: [0, 0, 0],
+          rotation_euler: rotation,
+          scale,
+        });
+      });
+      const cam = hangCamera(doc, rig, 'rest');
+      const atRest = restWorld(doc, cam);
+      const r = update(doc, retyped(openBrief()));
+      // on the rig, which stays on the balloon where it was at rest, and the camera with it
+      expect(doc.getObject(rig)!.parent, what).toBe(propOf(doc, KITE).id);
+      expect(doc.getObject(cam)!.parent, what).toBe(rig);
+      sameWorld(restWorld(doc, cam), atRest);
+      expect(r.solved, what).toEqual([]);
+      expect(cameraWarnings(doc, cam, r.warnings), what).toEqual([]);
+    }
+  });
 });
 
 describe('a shot camera the person hung from a prop and keyed by hand', () => {
@@ -801,6 +864,45 @@ describe('a shot camera the person hung from a prop and keyed by hand', () => {
     expect(cameraWarnings(doc, cam, r.warnings)).toEqual([
       "Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite' (built anew as 'Red balloon'), no longer moves as it did, so check its framing (solve it again with desk.shot_solve)",
     ]);
+  });
+
+  it('is kept with its keys when the prop is restyled in place or renamed, and the warning says it was staged anew', () => {
+    const cases: { what: string; next: SceneBrief; warning: string }[] = [
+      {
+        what: 'the kite restyled',
+        next: (() => {
+          const b = openBrief();
+          b.elements.find((e) => e.id === KITE)!.description = 'A blue diamond kite with a long tail.';
+          return b;
+        })(),
+        warning:
+          "Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite', was staged anew, so check its framing (solve it again with desk.shot_solve)",
+      },
+      {
+        what: 'the kite renamed',
+        next: (() => {
+          const b = openBrief();
+          b.elements.find((e) => e.id === KITE)!.name = 'Big kite';
+          return b;
+        })(),
+        warning:
+          "Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite' (built anew as 'Big kite'), was staged anew, so check its framing (solve it again with desk.shot_solve)",
+      },
+    ];
+    for (const { what, next, warning } of cases) {
+      const { doc, cam } = cameraOnKite('first');
+      const f = firstShot(doc).frame_start + 10;
+      keyMore(doc, cam, 'location', 0, [[f, new FrameState(doc, f).local(cam)[12] + 0.5]]);
+      const keys = JSON.stringify(doc.listFCurves(cam));
+      const before = firstShotCamera(doc);
+      const r = update(doc, next);
+      // the kite staged again flies as it did, and the camera with it where it was
+      expect(doc.getObject(cam)!.parent, what).toBe(propOf(doc, KITE).id);
+      expect(JSON.stringify(doc.listFCurves(cam)), what).toBe(keys);
+      expect(largestGap(before, firstShotCamera(doc)), what).toBeLessThan(1e-9);
+      expect(r.solved, what).toEqual([]);
+      expect(cameraWarnings(doc, cam, r.warnings), what).toEqual([warning]);
+    }
   });
 });
 
