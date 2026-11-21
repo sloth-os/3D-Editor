@@ -17,6 +17,7 @@ import { getShots } from '../src/desk/shots';
 import { readInstance } from '../src/desk/units';
 import { restParentWorld, restWorld } from '../src/desk/units/remove';
 import { FrameState } from '../src/eval/frame-state';
+import { insertKeyframe } from '../src/anim/fcurve';
 import { identity4, invert4, multiply4 } from '../src/math/mat4';
 import type { Mat4, Vec3 } from '../src/math/types';
 import { createCube } from '../src/mesh/primitives';
@@ -141,6 +142,52 @@ function withBall(b: SceneBrief, name: string, description: string): SceneBrief 
   b.shots[0].elementIds = [...b.shots[0].elementIds, BALL];
   return b;
 }
+
+/**
+ * Brief `b` with the kite the ball `name` (`description`) Mira carries in her hand where she ran with
+ * the kite; `firstOnly`: she is in the first shot only (Pip has the close-up), so she lets it go at
+ * the cut and it is hidden after.
+ */
+function heldBall(
+  b: SceneBrief,
+  name: string,
+  description: string,
+  o: { firstOnly?: boolean } = {},
+): SceneBrief {
+  const el = b.elements.find((e) => e.id === KITE)!;
+  el.name = name;
+  el.description = description;
+  for (const s of b.shots) s.description = s.description.replace(/\bkite\b/g, 'ball');
+  if (o.firstOnly) {
+    b.shots[1].castIds = [PIP];
+    b.shots[1].description = 'Close-up: Pip looks up.';
+  }
+  return b;
+}
+
+/** Adds keys of the person's (Bezier) to object `id`'s channel `path`[`index`], beside any there. */
+function keyMore(doc: SceneDoc, id: string, path: string, index: number, keys: [number, number][]) {
+  doc.transact(() => {
+    const fc = doc
+      .listFCurves(id)
+      .find((c) => c.target_type === 'object' && c.path === path && c.index === index);
+    let curve = fc ?? {
+      target_type: 'object' as const,
+      target_id: id,
+      path,
+      index,
+      keyframes: [],
+      extrapolation: 'CONSTANT' as const,
+      mute: false,
+    };
+    for (const [frame, value] of keys) curve = insertKeyframe(curve, frame, value, 'BEZIER');
+    doc.setFCurve(curve);
+  });
+}
+
+/** How far object `id`'s own channels lift it from frame 1 to frame 60 (what its keys do, holds aside). */
+const ownRise = (doc: SceneDoc, id: string): number =>
+  new FrameState(doc, 60).local(id)[14] - new FrameState(doc, 1).local(id)[14];
 
 describe("what the person put on a words' prop or landmark stays when a later brief builds it anew or drops it", () => {
   it('a prop described anew is built anew with them on it, nested and keyed, in one undo step; a reopened scene keeps them', () => {
@@ -369,6 +416,100 @@ describe("what the person put on a words' prop or landmark stays when a later br
     expect(r.warnings.join('\n')).not.toMatch(/Reed|animated|follow/);
     // the same brief again changes nothing more
     expect(briefChanges(doc, b2)).toBeNull();
+  });
+});
+
+describe('keys of the person on a prop the staging holds or flies, which go with it when the words build it anew', () => {
+  it('a held ball the person also keyed to rise, described anew and held again by the same holder: what rose with it is named', () => {
+    const doc = stagedDoc(heldBall(openBrief(), 'Red ball', 'A small red rubber ball.'));
+    const ball = propOf(doc, KITE);
+    expect(ball.name).toBe('Red ball');
+    expect(prop(ball, 'desk_rideo_held_by')).toBe(MIRA);
+    expect(ball.constraints.some((c) => c.type === 'CHILD_OF' && c.name.startsWith('Hold '))).toBe(true);
+    // the person keys the ball rising 1 m in her hand over the first shot, and puts a sticker on it
+    const z = new FrameState(doc, 1).local(ball.id)[14];
+    keyMore(doc, ball.id, 'location', 2, [
+      [1, z],
+      [60, z + 1],
+    ]);
+    const sticker = mine(doc, 'Sticker', ball.id, [0, 0, 0.3]);
+    const at = restWorld(doc, sticker);
+    expect(ownRise(doc, ball.id)).toBeCloseTo(1, 9);
+    // the words describe it anew; the shots still put it in Mira's hand
+    const r = update(doc, heldBall(openBrief(), 'Blue ball', 'A small blue rubber ball.'));
+    const blue = propOf(doc, KITE);
+    expect(blue.id).not.toBe(ball.id);
+    expect(prop(blue, 'desk_rideo_held_by')).toBe(MIRA);
+    expect(blue.constraints.some((c) => c.type === 'CHILD_OF' && c.name.startsWith('Hold '))).toBe(true);
+    expect(doc.getObject(sticker)?.parent).toBe(blue.id);
+    sameWorld(restWorld(doc, sticker), at);
+    // the keys went with the red ball: the sticker no longer rises in her hand, and that is said
+    expect(ownRise(doc, blue.id)).toBeCloseTo(0, 9);
+    expect(r.warnings).toEqual(
+      expect.arrayContaining([
+        "Blue ball: keeps 'Sticker', which is not part of the prop it replaces",
+        "Blue ball: 'Sticker' no longer follows the animation of 'Red ball'",
+      ]),
+    );
+  });
+
+  it('a kite the person also keyed in its flight, described anew and flown again by the same holder: what was on it is named', () => {
+    const doc = stagedDoc();
+    const kite = propOf(doc, KITE);
+    // the person lifts the kite 2 m higher at frame 30 of its flight, a key of their own among the flight's
+    const z = new FrameState(doc, 30).local(kite.id)[14];
+    keyMore(doc, kite.id, 'location', 2, [[30, z + 2]]);
+    const ribbon = mine(doc, 'Ribbon', kite.id, [0.1, 0, -0.2]);
+    const at = restWorld(doc, ribbon);
+    const r = update(doc, retyped(openBrief(), { balloonWords: true }));
+    const balloon = propOf(doc, KITE);
+    expect([prop(kite, 'desk_rideo_held_by'), prop(balloon, 'desk_rideo_held_by')]).toEqual([MIRA, MIRA]);
+    expect(prop(balloon, 'desk_tether_flights')).toBeTruthy();
+    expect(doc.getObject(ribbon)?.parent).toBe(balloon.id);
+    sameWorld(restWorld(doc, ribbon), at);
+    expect(r.warnings).toContain("Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'");
+  });
+
+  it('a held ball only the staging keyed, described anew and held again, keeps what was on it following it, unnamed, also after a ripple', () => {
+    const doc = stagedDoc(heldBall(openBrief(), 'Red ball', 'A small red rubber ball.'));
+    const ball = propOf(doc, KITE);
+    const sticker = mine(doc, 'Sticker', ball.id, [0, 0, 0.3]);
+    const at = restWorld(doc, sticker);
+    const r = update(doc, heldBall(openBrief(), 'Blue ball', 'A small blue rubber ball.'));
+    const blue = propOf(doc, KITE);
+    expect(blue.id).not.toBe(ball.id);
+    expect(doc.getObject(sticker)?.parent).toBe(blue.id);
+    sameWorld(restWorld(doc, sticker), at);
+    expect(r.warnings).toContain("Blue ball: keeps 'Sticker', which is not part of the prop it replaces");
+    expect(r.warnings.join('\n')).not.toMatch(/no longer follow/);
+
+    // Mira lets it go at the cut and it is hidden after: a ripple moves those keys of the staging's,
+    // in the update that builds it anew and in an update before it, and neither reads as the person's
+    const once = stagedDoc(
+      heldBall(openBrief(), 'Red ball', 'A small red rubber ball.', { firstOnly: true }),
+    );
+    const twice = stagedDoc(
+      heldBall(openBrief(), 'Red ball', 'A small red rubber ball.', { firstOnly: true }),
+    );
+    for (const d of [once, twice]) mine(d, 'Sticker', propOf(d, KITE).id, [0, 0, 0.3]);
+    const longer = (name: string, description: string) => {
+      const b = heldBall(openBrief(), name, description, { firstOnly: true });
+      b.shots[0].durationSec += 1;
+      return b;
+    };
+    const keysOf = (d: SceneDoc) =>
+      d.listFCurves(propOf(d, KITE).id).map((fc) => fc.keyframes.map((k) => k.frame));
+    const was = keysOf(twice);
+    const r1 = update(twice, longer('Red ball', 'A small red rubber ball.'));
+    expect(r1.warnings).toEqual([]);
+    expect(keysOf(twice)).not.toEqual(was);
+    for (const d of [once, twice]) {
+      const red = propOf(d, KITE).id;
+      const r2 = update(d, longer('Blue ball', 'A small blue rubber ball.'));
+      expect(propOf(d, KITE).id).not.toBe(red);
+      expect(r2.warnings).toContain("Blue ball: keeps 'Sticker', which is not part of the prop it replaces");
+      expect(r2.warnings.join('\n')).not.toMatch(/no longer follow/);
+    }
   });
 });
 
@@ -620,5 +761,27 @@ describe('what the person put on what a rideo re-import builds anew or drops sta
     sameWorld(restWorld(doc, ribbon), at);
     expect(travel(doc, ribbon)).toBeLessThan(1e-9);
     expect(r.warnings).toContain("balloon: 'Ribbon' no longer follows the animation of 'kite'");
+  });
+
+  it('names what followed a prop the person keyed by hand that it builds anew, though the clip flies the new one alike', () => {
+    const doc = SceneDoc.create({ empty: true });
+    const kite = importClip(doc, kiteClip()).props[0].id;
+    // a key of the person's among the flight's: the kite 2 m higher at frame 30
+    const z = new FrameState(doc, 30).local(kite)[14];
+    keyMore(doc, kite, 'location', 2, [[30, z + 2]]);
+    const ribbon = mine(doc, 'Ribbon', kite, [0.1, 0, -0.2]);
+    const at = restWorld(doc, ribbon);
+    const r = importClip(doc, changedClip());
+    const balloon = r.props[0].id;
+    expect(balloon).not.toBe(kite);
+    expect(r.props[0].held_by).toBe(SAM);
+    expect(doc.getObject(ribbon)?.parent).toBe(balloon);
+    sameWorld(restWorld(doc, ribbon), at);
+    expect(r.warnings).toEqual(
+      expect.arrayContaining([
+        "balloon: keeps 'Ribbon', which is not part of the prop it replaces",
+        "balloon: 'Ribbon' no longer follows the animation of 'kite'",
+      ]),
+    );
   });
 });

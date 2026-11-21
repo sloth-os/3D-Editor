@@ -162,6 +162,8 @@ export const RIDEO_PROPS = {
   /**
    * A digest of what the import left an actor, prop, landmark or shot camera doing (motionDigest):
    * a re-import, which rebuilds them from rideo's blocking, says which were changed in the desk since.
+   * On a prop it is followed by a space and the digest of the keys on its own transform channels
+   * (ownKeysDigest): keys of the person's there are what the staging did not write (recordedMotion).
    */
   motion: 'desk_rideo_motion',
   /**
@@ -476,15 +478,93 @@ export function motionDigest(doc: SceneDoc, root: string): string {
   return digestOf(JSON.stringify(parts));
 }
 
+/** The transform channels of an object that a hold, a flight or a hide key writes (and the person may key). */
+const OWN_CHANNELS: ReadonlySet<string> = new Set(['location', 'rotation_euler', 'scale']);
+
+/** A number as ownKeysDigest reads it: to 1e-6, so that a channel read back from a matrix keeps its ulps out. */
+function digestNumber(v: number): number {
+  const r = Math.round(v * 1e6) / 1e6;
+  return Object.is(r, -0) ? 0 : r;
+}
+
+/**
+ * A digest of the keys and drivers on object `id`'s own transform channels (location, rotation,
+ * scale; frames and values to 1e-6): on a prop, what the staging keyed there (its hold, its flight,
+ * its hiding) and any key the person added since. RIDEO_PROPS.motion records it after a prop's
+ * motion; recordedMotion's `own`.
+ */
+export function ownKeysDigest(doc: SceneDoc, id: string): string {
+  const curves = doc
+    .listFCurves(id)
+    .filter((fc) => fc.target_type === 'object' && OWN_CHANNELS.has(fc.path))
+    .map(
+      (fc) =>
+        [
+          fc.path,
+          fc.index,
+          fc.keyframes.map((k) => [
+            digestNumber(k.frame),
+            digestNumber(k.value),
+            k.interpolation,
+            k.easing ?? null,
+          ]),
+          fc.extrapolation,
+          fc.mute,
+          fc.modifiers ?? null,
+        ] as const,
+    )
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
+  const drivers = doc
+    .listDrivers(id)
+    .filter((d) => d.target_type === 'object' && OWN_CHANNELS.has(d.path))
+    .map((d) => [d.path, d.index, d.expression, d.variables, d.mute] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
+  return digestOf(JSON.stringify([curves, drivers]));
+}
+
+/**
+ * What RIDEO_PROPS.motion records of an object: `all`, the digest of what it did (motionDigest), and
+ * on a prop `own`, the digest of the keys on its own transform channels (ownKeysDigest); null for a
+ * part not recorded (`own` of a staging recorded before props had it).
+ */
+export function recordedMotion(o: ObjectData | null | undefined): { all: string | null; own: string | null } {
+  const [all, own] = prop(o, RIDEO_PROPS.motion).split(' ');
+  return { all: all || null, own: own || null };
+}
+
+/**
+ * Records on object `id` what the staging left it doing (RIDEO_PROPS.motion): `all` its motion
+ * digest, `own` (on a prop) the digest of its own transform channels' keys; a part not asked for keeps
+ * what was recorded before.
+ */
+export function recordMotionOf(
+  doc: SceneDoc,
+  id: string,
+  parts: { all: boolean; own: boolean } = { all: true, own: true },
+): void {
+  const o = doc.getObject(id);
+  const isProp = prop(o, DESK_PROPS.role) === 'prop';
+  if (!o || !(parts.all || (parts.own && isProp))) return;
+  const was = recordedMotion(o);
+  const all = parts.all ? motionDigest(doc, id) : was.all;
+  const own = !isProp ? null : parts.own ? ownKeysDigest(doc, id) : was.own;
+  const value = [all ?? '', ...(own ? [own] : [])].join(' ');
+  doc.updateObject(id, { custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: value } });
+}
+
+/**
+ * Whether the keys on prop `id`'s own transform channels are those the staging left there
+ * (recordedMotion's `own`): false when the person keyed it since (their keys move it too). A prop
+ * recorded without them counts as left so.
+ */
+export function ownKeysAsStaged(doc: SceneDoc, id: string): boolean {
+  const own = recordedMotion(doc.getObject(id)).own;
+  return own === null || own === ownKeysDigest(doc, id);
+}
+
 /** Records on each of `ids` what the import left it doing (RIDEO_PROPS.motion). */
 function recordMotion(doc: SceneDoc, ids: Iterable<string>): void {
-  for (const id of new Set(ids)) {
-    const o = doc.getObject(id);
-    if (o)
-      doc.updateObject(id, {
-        custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: motionDigest(doc, id) },
-      });
-  }
+  for (const id of new Set(ids)) recordMotionOf(doc, id);
 }
 
 /** Removes the hold and ride constraints the import put on objects (and their influence curves). */
@@ -811,18 +891,24 @@ export function importRideoBlocking(
   // what was changed in the desk since the last import (keys, poses, holds, mounts, flights, a
   // camera solved again): the import rebuilds them from rideo's blocking, so their changes are lost
   const changedSince = new Set<string>();
+  // the earlier props the person keyed by hand (keys the staging did not write on their own transform
+  // channels), read before anything changes: what followed one does not follow the prop built in its
+  // place, whose staging moves it without those keys
+  const byHand = new Set<string>();
   if (update) {
     const changed: string[] = [];
     const seen = new Set<string>();
     const check = (o: ObjectData | undefined, label: string) => {
       if (!o || seen.has(o.id)) return;
       seen.add(o.id);
-      const recorded = prop(doc.getObject(o.id), RIDEO_PROPS.motion);
+      const recorded = recordedMotion(doc.getObject(o.id)).all;
       if (recorded && motionDigest(doc, o.id) !== recorded) {
         changed.push(label);
         changedSince.add(o.id);
       }
     };
+    for (const o of oldProps.values() as Iterable<ObjectData>)
+      if (!ownKeysAsStaged(doc, o.id)) byHand.add(o.id);
     for (const o of oldActors.values()) check(o, `'${o.name}'`);
     for (const o of oldProps.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
     for (const o of oldLandmarks.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
@@ -1060,7 +1146,18 @@ export function importRideoBlocking(
     const unit = units.prop?.(p);
     // the holds below hold or fly it while its holder is in a shot (every cast member is), else hide it
     const move = propMove(p, flies, !!p.heldBy && cast.includes(p.heldBy));
-    const made = buildProp(doc, p, elementName, castNames, stamp, flies, move, old, unit);
+    const made = buildProp(
+      doc,
+      p,
+      elementName,
+      castNames,
+      stamp,
+      flies,
+      move,
+      old,
+      unit,
+      !!old && byHand.has(old.id),
+    );
     if (unit && made.failed !== undefined) units.failed?.(unit.key, made.failed);
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     props.set(p.id, { ...made, plan: p, flies });
@@ -2058,6 +2155,11 @@ export interface PropMove {
   /** The holder's character id. */
   by: string;
   how: 'held' | 'flown' | 'hidden';
+  /**
+   * The person keyed the prop too (its own transform channels carry keys the staging did not write,
+   * ownKeysAsStaged): those keys move it beside its holder, and go with it.
+   */
+  byHand?: boolean;
 }
 
 /**
@@ -2079,26 +2181,30 @@ const FLIGHTS = 'desk_tether_flights';
 /**
  * How the staging moved an earlier prop (see PropMove), read before it goes: by the holder it records
  * (RIDEO_PROPS.heldBy), flown when it carries a flight, held when it carries a hold, else hidden;
- * null when it records no holder (the staging left it where it stands).
+ * null when it records no holder (the staging left it where it stands). `byHand`: the person keyed
+ * it too (read before the update or import changed anything: ownKeysAsStaged).
  */
-function movedBy(doc: SceneDoc, id: string): PropMove | null {
+function movedBy(doc: SceneDoc, id: string, byHand: boolean): PropMove | null {
   const o = doc.getObject(id);
   const by = prop(o, RIDEO_PROPS.heldBy);
   if (!o || !by) return null;
-  if (prop(o, FLIGHTS).trim()) return { by, how: 'flown' };
-  if ((o.constraints ?? []).some((c) => !c.mute && c.type === 'CHILD_OF' && c.name.startsWith('Hold ')))
-    return { by, how: 'held' };
-  return { by, how: 'hidden' };
+  const how: PropMove['how'] = prop(o, FLIGHTS).trim()
+    ? 'flown'
+    : (o.constraints ?? []).some((c) => !c.mute && c.type === 'CHILD_OF' && c.name.startsWith('Hold '))
+      ? 'held'
+      : 'hidden';
+  return byHand ? { by, how, byHand } : { by, how };
 }
 
 /**
  * Whether the staging moves a prop built anew as it moved the one it takes the place of (KeptWords'
- * `restaged`): held, or flown, again by the same holder, or hidden again. What was on the old one
- * then follows the new one; otherwise what moved it with the old one is named (a flight or a hold
- * lost with the holder, keys the person gave the old prop).
+ * `restaged`): held, or flown, again by the same holder, or hidden again, and the old one carried no
+ * keys of the person's (their keys moved it too, and go with it). What was on the old one then
+ * follows the new one; otherwise what moved it with the old one is named (a flight or a hold lost
+ * with the holder, keys the person gave the old prop).
  */
 const movesAlike = (was: PropMove | null, now: PropMove | null): boolean =>
-  !!was && !!now && was.by === now.by && was.how === now.how;
+  !!was && !!now && !was.byHand && was.by === now.by && was.how === now.how;
 
 /**
  * A prop staged from a library unit (see buildProp): the instance with key `unit.key`, its root at the
@@ -2110,7 +2216,8 @@ const movesAlike = (was: PropMove | null, now: PropMove | null): boolean =>
  * which no update turns into the other, takes the instance's place as another item's unit does, with
  * a warning. What the person put on the prop a unit takes the place of (objects of their own below
  * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`), and
- * follows the root's motion where the staging moves it (`move`) as it moved that prop (movesAlike).
+ * follows the root's motion where the staging moves it (`move`) as it moved that prop (movesAlike;
+ * `byHand`: the person keyed that prop too, see buildProp).
  */
 function buildUnitProp(
   doc: SceneDoc,
@@ -2121,6 +2228,7 @@ function buildUnitProp(
   move: PropMove | null,
   old: ObjectData | undefined,
   unit: StagedProp,
+  byHand: boolean,
 ): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings: string[] } {
   const model = `unit:${unit.pin.ref}@${unit.pin.version}`;
   const build = JSON.stringify(['prop', model, label, flies]);
@@ -2170,7 +2278,7 @@ function buildUnitProp(
         ? {
             remove: [cur.id],
             keep: oldLook(doc, cur.id).kept,
-            restaged: movesAlike(movedBy(doc, cur.id), move),
+            restaged: movesAlike(movedBy(doc, cur.id, byHand), move),
           }
         : {}),
       rootProps: own,
@@ -2220,6 +2328,9 @@ const stampFacts = (
  * named it name the new one. `move`: how the staging moves the prop once it is built (its hold or
  * flight comes after); what was on the prop it replaces follows the new one's motion where it moves
  * it as it moved that one (movesAlike), and is named as no longer following that one's otherwise.
+ * `byHand`: the person keyed `old` by hand (keys the staging did not write on its own transform
+ * channels, read by the caller before anything changed: ownKeysAsStaged); those keys go with it, so
+ * what was on it is named whatever moves the new prop.
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2231,6 +2342,7 @@ export function buildProp(
   move: PropMove | null,
   old?: ObjectData,
   unit?: StagedProp | null,
+  byHand = false,
 ): {
   root: string;
   baseScale: Vec3;
@@ -2257,9 +2369,13 @@ export function buildProp(
         move,
         old,
         unit,
+        byHand,
       );
     } catch (err) {
-      return { ...buildProp(doc, p, elementName, castNames, stamp, flies, move, old), failed: err };
+      return {
+        ...buildProp(doc, p, elementName, castNames, stamp, flies, move, old, undefined, byHand),
+        failed: err,
+      };
     }
   // null: the element has no unit (any more): an instance of one goes, for the words' prop (the
   // shots that named it name the new prop), but for what the person put on it (objects of their own
@@ -2276,7 +2392,7 @@ export function buildProp(
     (readInstance(doc, old.id) || unitBuildOf(doc, old.id))
   ) {
     replaced = old.id;
-    was = movedBy(doc, old.id);
+    was = movedBy(doc, old.id, byHand);
     kept = keptPlaces(doc, readInstance(doc, old.id) ? oldLook(doc, old.id).kept : [], [old.id]);
     removeTrees(doc, [old.id], kept.ids);
     old = undefined;
@@ -2306,7 +2422,7 @@ export function buildProp(
     // built otherwise now: the prop goes for the one built in its place, but for what the person put
     // on it (objects of their own below it, not its look), which the new prop takes over where it is
     replaced = prior;
-    was = movedBy(doc, prior);
+    was = movedBy(doc, prior, byHand);
     kept = removeKeeping(doc, [prior]);
     of = 'the prop it replaces';
     old = undefined;

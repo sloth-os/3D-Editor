@@ -30,8 +30,11 @@ import {
   hiddenSpans,
   holderSpans,
   motionDigest,
+  ownKeysAsStaged,
   parseRideoBlocking,
   propMove,
+  recordMotionOf,
+  recordedMotion,
   rideoHeightRatio,
   shotMove,
   tetherPartsOf,
@@ -166,17 +169,13 @@ import {
 
 /** Whether object `id` animates as the desk last staged it (its recorded motion digest). */
 function asStaged(doc: SceneDoc, id: string): boolean {
-  const recorded = doc.getObject(id)?.custom_props?.[RIDEO_PROPS.motion];
-  return typeof recorded === 'string' && recorded === motionDigest(doc, id);
+  const recorded = recordedMotion(doc.getObject(id)).all;
+  return recorded !== null && recorded === motionDigest(doc, id);
 }
 
 /** Records what object `id` animates as now, as staged by the desk. */
 function recordMotion(doc: SceneDoc, id: string): void {
-  const o = doc.getObject(id);
-  if (o)
-    doc.updateObject(id, {
-      custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: motionDigest(doc, id) },
-    });
+  recordMotionOf(doc, id);
 }
 
 /** The shots of the cut in time order (enabled), as the import's span helpers read them, with their cast ids. */
@@ -319,6 +318,13 @@ export function updateFromBriefIn(
   for (const s of hostShots(doc, sceneId).values())
     if (s.camera) staged.set(s.camera, asStaged(doc, s.camera));
   for (const o of [...actors.values(), ...props.values()]) staged.set(o.id, asStaged(doc, o.id));
+  // whether each prop's own transform channels carry only the keys the staging wrote, read before
+  // anything moves them (a ripple below shifts the staging's keys and the person's alike): a prop the
+  // person keyed too moves by those keys, which go with it when the words build it anew
+  const ownStaged = new Map<string, boolean>();
+  for (const o of props.values()) ownStaged.set(o.id, ownKeysAsStaged(doc, o.id));
+  // the props this update builds or stages again (their animation is the staging's anew)
+  const restagedProps = new Set<string>();
   const deskBefore = hostShots(doc, sceneId);
   // the shots past the scene's last frame (a range the person shortened in the desk stays so)
   const sceneEnd = doc.getScene().frame_end;
@@ -764,7 +770,9 @@ export function updateFromBriefIn(
     // stageHeld below holds or flies it while its holder has an actor in a shot, else hides it
     const holderActor = p.heldBy ? actors.get(p.heldBy) : undefined;
     const move = propMove(p, flies, !!holderActor && holderSpans(cut, p.heldBy!).length > 0);
-    const made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit);
+    const byHand = !!current && ownStaged.get(current.id) === false;
+    const made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand);
+    restagedProps.add(made.root);
     if (slot && made.failed !== undefined) warnings.push(...slotFailed(slot, made.failed, done));
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     const rest = { ...doc.getObject(made.root)!.custom_props };
@@ -821,8 +829,16 @@ export function updateFromBriefIn(
     });
   for (const s of desk.values())
     if (s.camera && (solve.has(s.id) || staged.get(s.camera) === true)) recordMotion(doc, s.camera);
-  for (const o of [...actors.values(), ...props.values()])
+  for (const o of actors.values())
     if (doc.getObject(o.id) && staged.get(o.id) !== false) recordMotion(doc, o.id);
+  // a prop's own keys are the staging's when they were at the start (a ripple moved them with the
+  // rest) or when this update staged it again; the person's keys on one it left stay theirs
+  for (const o of props.values())
+    if (doc.getObject(o.id))
+      recordMotionOf(doc, o.id, {
+        all: staged.get(o.id) !== false,
+        own: ownStaged.get(o.id) !== false || restagedProps.has(o.id),
+      });
 
   const kinds = new Map<string, { kind: ActorKind; actorName?: string }>();
   for (const [cid, o] of actors) {
