@@ -968,6 +968,57 @@ describe('the desk controller', () => {
     expect(t.sent.slice(sentBefore)).toEqual([]);
   });
 
+  it("puts an Update shots' notice away, warnings and all, when Ctrl+Z takes the update back; a notice given since stays", async () => {
+    const warned = ["Red balloon: keeps 'Ribbon', which is not part of the prop it replaces"];
+    let undone: (() => void) | null = null;
+    let failNext = false;
+    const t = setup({
+      workspace: {
+        warnings: vi.fn(() => warned),
+        onUpdateUndone: (cb: () => void) => {
+          undone = cb;
+          return () => (undone = null);
+        },
+        updateFromBrief: vi.fn(async () => {
+          if (failNext) throw new Error('the worker stopped');
+          return null;
+        }),
+      },
+    });
+    await opened(t);
+    expect(undone).not.toBeNull();
+    await t.c.updateShots();
+    expect(t.c.notice.value).toMatchObject({
+      level: 'warning',
+      message: 'The shots were updated to the brief (Ctrl+Z undoes it). The update gave 1 warning:',
+      details: warned,
+    });
+    // Ctrl+Z takes the update back: its notice goes, with the list
+    undone!();
+    expect(t.c.notice.value).toBeNull();
+    // an update without warnings: its notice goes the same way
+    warned.length = 0;
+    await t.c.updateShots();
+    expect(t.c.notice.value).toMatchObject({ level: 'info' });
+    undone!();
+    expect(t.c.notice.value).toBeNull();
+    // a notice given after the update (here a failed one's) stays when the update is undone
+    warned.push("Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'");
+    await t.c.updateShots();
+    failNext = true;
+    await t.c.updateShots();
+    const failed = t.c.notice.value;
+    expect(failed).toMatchObject({
+      level: 'error',
+      message: 'The shots could not be updated: the worker stopped',
+    });
+    undone!();
+    expect(t.c.notice.value).toBe(failed);
+    // the desk gone, it listens no more
+    t.c.dispose();
+    expect(undone).toBeNull();
+  });
+
   it("sends the contract's lists in opened.changes, null when they are all empty; the banner keeps the desk's own notes", async () => {
     const onlyOther = {
       added: [],

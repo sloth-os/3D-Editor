@@ -510,7 +510,7 @@ test.describe('the embeddable desk', () => {
     await second.close();
   });
 
-  test("Update shots keeps the person's object on a prop built anew: the notice counts the warnings and lists them, on a desktop and a 360 px phone", async ({
+  test("Update shots keeps the person's object on a prop built anew: the notice counts the warnings and lists them, on a desktop and a 360 px phone; Ctrl+Z of the update puts them away", async ({
     page,
   }) => {
     test.setTimeout(240_000);
@@ -562,14 +562,29 @@ test.describe('the embeddable desk', () => {
       'The shots were updated to the brief (Ctrl+Z undoes it). The update gave 2 warnings:',
     );
     const items = frame.getByTestId('desk-notice-warnings').locator('li');
-    await expect(items).toHaveText([
+    const warned = [
       "Red balloon: keeps 'Ribbon', which is not part of the prop it replaces",
       "Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'",
-    ]);
+    ];
+    await expect(items).toHaveText(warned);
     // nothing of them went to the host: no message says them
     const said = JSON.stringify(await portMessages(page));
     expect(said).not.toContain("keeps 'Ribbon'");
     expect(said).not.toContain('no longer follows');
+
+    // on the desktop, Ctrl+Z takes the update back and puts its notice away, warnings and all; the
+    // brief's changes are back (a click on the notice's text gives the frame the keyboard)
+    expect(await frame.evaluate(() => innerWidth)).toBeGreaterThan(1000);
+    await notice.getByText('The shots were updated to the brief').click();
+    await page.keyboard.press('Control+z');
+    await expect(notice).toHaveCount(0);
+    await expect(frame.getByTestId('desk-notice-warnings')).toHaveCount(0);
+    await expect(frame.getByTestId('desk-changes')).toBeVisible({ timeout: 30_000 });
+    // Update shots again gives them again
+    await frame.getByTestId('desk-update-shots').click();
+    await expect(frame.getByTestId('desk-changes')).toHaveCount(0, { timeout: 60_000 });
+    await expect(notice).toContainText('The update gave 2 warnings:');
+    await expect(items).toHaveText(warned);
 
     /** Where the notice, its list and the header's buttons are, and what is at each button's centre. */
     const layout = () =>

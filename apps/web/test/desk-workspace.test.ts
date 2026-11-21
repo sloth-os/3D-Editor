@@ -748,6 +748,61 @@ describe('the desk workspace', { timeout: 30_000 }, () => {
     expect(ws.warnings()).toEqual([]);
   });
 
+  it('takes back what an Update shots warned of when Ctrl+Z takes the update back, and tells its listeners; undoing another step or a redo does not', async () => {
+    const host = origin();
+    const first = workspace();
+    await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    // the person hangs an object of theirs on the kite; a later brief describes the kite anew
+    const doc = first.session!.doc;
+    const kite = doc
+      .listObjects()
+      .find((o) => o.custom_props?.desk_role === 'prop' && o.custom_props?.desk_element_id === KITE)!;
+    doc.transact(() => {
+      doc.addObject({ type: 'EMPTY', name: 'Ribbon', parent: kite.id, location: [0.1, 0, -0.2] });
+    });
+    first.close();
+    const retyped = EXAMPLE();
+    const el = retyped.elements.find((e) => e.id === KITE)!;
+    el.name = 'Red balloon';
+    el.description = 'A big red balloon on a string.';
+    const ws = workspace();
+    await ws.open({ hostOrigin: host, brief: retyped, state: null });
+    let undone = 0;
+    const stop = ws.onUpdateUndone(() => undone++);
+    expect(await ws.updateFromBrief()).toBeNull();
+    const warned = [
+      "Red balloon: keeps 'Ribbon', which is not part of the prop it replaces",
+      "Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'",
+    ];
+    expect(ws.warnings()).toEqual(warned);
+    // an edit after the update: Ctrl+Z takes the edit back, the update and its warnings stay
+    const s = ws.session!;
+    edit(ws, 'x', 1);
+    expect(s.undo.undoStack.length).toBe(2);
+    s.undo.undo();
+    expect(ws.warnings()).toEqual(warned);
+    expect(undone).toBe(0);
+    // Ctrl+Z again takes the update back: its warnings go, and the listener is told once
+    s.undo.undo();
+    expect(ws.changes()).not.toBeNull();
+    expect(ws.warnings()).toEqual([]);
+    expect(undone).toBe(1);
+    // a redo brings the update back without its warnings, and tells nobody; nor does undoing it again
+    s.undo.redo();
+    expect(ws.changes()).toBeNull();
+    expect(ws.warnings()).toEqual([]);
+    s.undo.undo();
+    expect(ws.changes()).not.toBeNull();
+    expect(undone).toBe(1);
+    // Update shots again warns again; undone, its warnings go, and a listener let go is not told
+    expect(await ws.updateFromBrief()).toBeNull();
+    expect(ws.warnings()).toEqual(warned);
+    stop();
+    s.undo.undo();
+    expect(ws.warnings()).toEqual([]);
+    expect(undone).toBe(1);
+  });
+
   it('tells its listener about every change of the scene', async () => {
     const ws = workspace();
     await ws.open({ hostOrigin: origin(), brief: EXAMPLE(), state: null });

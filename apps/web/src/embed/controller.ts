@@ -125,6 +125,11 @@ export interface SceneWorkspace {
   updateFromBrief(): Promise<BriefChanges | null>;
   /** What the last staging or Update shots warned of (core's report.warnings), for the notice. */
   warnings?(): string[];
+  /**
+   * Calls `cb` when Ctrl+Z takes the last Update shots back (its undo step undone; DeskWorkspace
+   * onUpdateUndone): its notice goes. Returns the unsubscribe.
+   */
+  onUpdateUndone?(cb: () => void): () => void;
   results(update: Uint8Array, shots?: string[]): Promise<ShotResultMeta[]>;
   readonly projectId: string | null;
   /** Lets go of the scene (an open cancelled by Close); a later open opens it again. */
@@ -428,6 +433,10 @@ export class DeskController {
   private deskSeq = 0;
   private abort: AbortController | null = null;
   private stopEdits: (() => void) | null = null;
+  /** Stops listening for an Update shots that Ctrl+Z takes back (SceneWorkspace.onUpdateUndone). */
+  private readonly stopUpdateUndone: (() => void) | null;
+  /** The notice the last Update shots gave (null: none since; updateUndone puts it away). */
+  private updateNotice: Notice | null = null;
   private stateTimer: unknown = null;
   private changesTimer: unknown = null;
   private lastChangeAt = 0;
@@ -462,6 +471,7 @@ export class DeskController {
     this.timers = deps.timers ?? realTimers;
     this.log =
       deps.log ?? ((level, message) => (level === 'info' ? console.info : console.warn)(`[desk] ${message}`));
+    this.stopUpdateUndone = deps.workspace.onUpdateUndone?.(() => this.updateUndone()) ?? null;
   }
 
   private error(code: ErrorCode, message: string, id?: string): void {
@@ -867,6 +877,8 @@ export class DeskController {
       if (missed) said.push(missed);
       if (warned.length) said.push(warningCount('The update', warned.length));
       this.tell(missed || warned.length ? 'warning' : 'info', said.join(' '), warned);
+      // Ctrl+Z that takes this update back puts its notice away (updateUndone)
+      this.updateNotice = this.notice.peek();
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err);
       // the scene closed while the update waited for its turn or ran: it ends quietly
@@ -876,6 +888,16 @@ export class DeskController {
       this.updating.value = false;
       this.refreshLibrary();
     }
+  }
+
+  /**
+   * Ctrl+Z took the last Update shots back: the notice it gave goes, with the warnings it lists (they
+   * were of the update, which is no longer in the scene). A notice something else gave since stays.
+   */
+  private updateUndone(): void {
+    const notice = this.updateNotice;
+    this.updateNotice = null;
+    if (notice && this.notice.peek() === notice) this.notice.value = null;
   }
 
   // ---------------------------------------------------------------- library units
@@ -1496,6 +1518,7 @@ export class DeskController {
     for (const settle of [...this.acks.values()]) settle({ kind: 'closed' });
     this.stopEdits?.();
     this.stopEdits = null;
+    this.stopUpdateUndone?.();
     if (this.stateTimer !== null) this.timers.clearTimeout(this.stateTimer);
     this.stateTimer = null;
     if (this.changesTimer !== null) this.timers.clearTimeout(this.changesTimer);

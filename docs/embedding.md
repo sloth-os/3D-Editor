@@ -952,7 +952,9 @@ animation, notes edited in the desk that an update keeps over the brief's, or a 
 is not here or cannot be used) the desk shows the person: after the open's staging and after each
 Update shots, its notice says how many warnings there are and lists each one under it (the list
 scrolls past a few lines, below the header). A staging or an Update shots that warns of nothing
-lists none, so the list of an earlier one goes with the notice it replaces. The host is sent
+lists none, so the list of an earlier one goes with the notice it replaces. Ctrl+Z that takes an
+Update shots back puts its notice away too, warnings and all, as they were of the update; a notice
+something else gave since stays, and a redo brings the update back without them. The host is sent
 nothing of them: the protocol has no message for them, and `opened` and `state` are as without.
 
 ### Send and export

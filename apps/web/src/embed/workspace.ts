@@ -91,7 +91,9 @@ import {
  *   opened from (when nothing of the local copy was added to them) or last written are kept with
  *   what the document held then (Y.snapshot), and sent again as they are.
  * - The staging is applied to the session's document in one transaction that undo does not track
- *   (it is where the scene starts); an update from a later brief is one undo step.
+ *   (it is where the scene starts); an update from a later brief is one undo step. Ctrl+Z that
+ *   takes that step back takes back what the update warned of too (warnings() is [] then) and tells
+ *   the onUpdateUndone listeners (the controller puts the update's notice away).
  * - The worker's writes of the open scene (Update shots, the adoption of a saved unit, Make local)
  *   run one at a time (queueWrite), each reading the document and the brief when its turn starts:
  *   two changes worked out from the same document could each rewrite one record (the brief's
@@ -355,6 +357,12 @@ export class DeskWorkspace {
   private lastUnitRows: StageUnitRow[] | null = null;
   /** What the last staging or Update shots warned of (report.warnings; [] before either). */
   private lastWarnings: string[] = [];
+  /** The last Update shots' undo step (null: it made none, or Ctrl+Z took it back): watchUndo. */
+  private updateStep: Y.UndoManager['undoStack'][number] | null = null;
+  /** Stops watching the open scene's undo (watchUndo). */
+  private stopUndoWatch: (() => void) | null = null;
+  /** Told when Ctrl+Z takes the last Update shots back (onUpdateUndone). */
+  private readonly updateUndoneListeners = new Set<() => void>();
   /** The end of the last write of the scene queued (queueWrite); settles, never rejects. */
   private writes: Promise<void> = Promise.resolve();
   private readonly locks: SceneLocks | null;
@@ -650,6 +658,9 @@ export class DeskWorkspace {
     this.unitSourceCache = null;
     this.lastUnitRows = null;
     this.lastWarnings = [];
+    this.stopUndoWatch?.();
+    this.stopUndoWatch = null;
+    this.updateStep = null;
     // a write of this scene still queued or running is not applied (queueWrite): the next scene's
     // writes do not wait for it
     this.writes = Promise.resolve();
@@ -754,6 +765,7 @@ export class DeskWorkspace {
       }
       s.undo.clear();
       this.session = s;
+      this.watchUndo(s);
       this.release = release;
       this.kept = kept && { session: s, ...kept };
       this.lastUnitRows = unitRows;
@@ -852,6 +864,35 @@ export class DeskWorkspace {
     return () => s.doc.ydoc.off('update', handler);
   }
 
+  /**
+   * Calls `cb` each time Ctrl+Z takes the last Update shots of the open scene back (its undo step is
+   * undone): what it warned of is gone from warnings() by then. Returns the unsubscribe.
+   */
+  onUpdateUndone(cb: () => void): () => void {
+    const listener = () => cb();
+    this.updateUndoneListeners.add(listener);
+    return () => this.updateUndoneListeners.delete(listener);
+  }
+
+  /**
+   * Watches the undo of the scene `s` opened for the last Update shots' step (runUpdate keeps it):
+   * when an undo takes that very step back, what the update warned of goes (warnings() is []) and
+   * the onUpdateUndone listeners are told. Undoing another step leaves them, and so does a redo: it
+   * brings the update's changes back as a new step, without its warnings.
+   */
+  private watchUndo(s: ProjectSession): void {
+    this.stopUndoWatch?.();
+    const popped = (e: { stackItem: unknown; type: 'undo' | 'redo' }) => {
+      if (e.type !== 'undo' || !this.updateStep || e.stackItem !== this.updateStep) return;
+      if (this.session !== s) return;
+      this.updateStep = null;
+      this.lastWarnings = [];
+      for (const listener of [...this.updateUndoneListeners]) listener();
+    };
+    s.undo.on('stack-item-popped', popped);
+    this.stopUndoWatch = () => s.undo.off('stack-item-popped', popped);
+  }
+
   /** The host's shot ids staged in the scene, in brief order. */
   stagedShots(): string[] {
     const s = this.session;
@@ -928,8 +969,13 @@ export class DeskWorkspace {
       // else changed the scene meanwhile (else shown as out of date until the next check)
       const edited = s.revision.peek() !== asked;
       s.undo.stopCapturing();
+      const steps = s.undo.undoStack.length;
       Y.applyUpdate(s.doc.ydoc, r.diff, s.doc.origin);
       s.undo.stopCapturing();
+      // the update's one undo step (none when it changed nothing): Ctrl+Z of it takes back its
+      // warnings (watchUndo)
+      this.updateStep =
+        s.undo.undoStack.length > steps ? s.undo.undoStack[s.undo.undoStack.length - 1] : null;
       this.keepCheck(s, r.check, edited ? asked : s.revision.peek());
       // the files stay held: Ctrl+Z may take a unit the update placed out again
       if (this.units) this.lastUnitRows = r.summary.units ?? [];
