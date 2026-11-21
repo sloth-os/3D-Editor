@@ -1,6 +1,7 @@
 import { closeSync, openSync, readSync } from 'node:fs';
 import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import {
   BUILTIN_PROVIDER,
@@ -27,7 +28,6 @@ import { STORE_PROVIDER_IDS, type ServerConfig, type StoreProviderId } from '../
 import { errorMessage } from '../observability/tracing';
 import { StorageUnavailableError } from '../sync/room-manager';
 import { ProjectMemoryError } from '../sync/project-memory';
-import { PACKAGE_VERSION } from '../version';
 import { ModelCache, type CacheHandle, type CachedFile } from './cache';
 import { MAX_MODEL_BYTES, contentTypeFor, downloadPlan } from './download';
 import {
@@ -272,6 +272,8 @@ export interface ModelStoreOptions {
    * without the network); null: names are not resolved (addresses are still checked).
    */
   resolveHost?: HostResolver | null;
+  /** The build in the cache keys of built-in thumbnails (default: serverCodeBuild()). */
+  thumbnailBuild?: string;
 }
 
 /** Message of a store without configuration (as the phase-0 stub answered). */
@@ -372,6 +374,35 @@ interface Internals {
 export function thumbnailPath(id: string): string {
   return `/api/store/models/${encodeURIComponent(id).replace(/%3A/gi, ':')}/thumbnail`;
 }
+
+/** The build of a server run from its TypeScript sources (development, tests): one per start. */
+const SOURCE_BUILD = `src-${Date.now().toString(36)}`;
+
+/**
+ * The build of the code that makes the built-in thumbnails, for their cache keys: a digest of the
+ * bundle that runs (dist/main.js: core's catalog, store.add and framing) and of the render
+ * processes' bundle beside it (dist/render-worker.js: the renderer), so a server of another build
+ * renders them again instead of serving PNGs an older one made, whatever its version says. Run
+ * from the sources, each start of the server is a build of its own.
+ */
+export async function serverCodeBuild(moduleUrl: string = import.meta.url): Promise<string> {
+  if (!moduleUrl.startsWith('file:') || /\.[cm]?tsx?$/.test(new URL(moduleUrl).pathname)) return SOURCE_BUILD;
+  const main = fileURLToPath(moduleUrl);
+  const hash = createHash('sha256');
+  try {
+    hash.update(await readFile(main));
+  } catch {
+    return SOURCE_BUILD;
+  }
+  try {
+    hash.update(await readFile(path.join(path.dirname(main), 'render-worker.js')));
+  } catch {
+    // no render processes' bundle beside it: the server renders with its own
+  }
+  return hash.digest('hex').slice(0, 16);
+}
+
+let codeBuild: Promise<string> | null = null;
 
 /** `model` with the store's thumbnail route as its thumbnail (when it has one). */
 function proxied<M extends StoreResult>(model: M): M {
@@ -794,11 +825,14 @@ export class ModelStore {
     if (r.id === BUILTIN_PROVIDER) {
       const entry = await r.provider.details(r.local, this.env(opts.signal));
       const id = entry.model.id.slice(BUILTIN_PROVIDER.length + 1);
-      // a new server version (models may have changed) renders thumbnails again
+      const build = this.opts.thumbnailBuild ?? (await (codeBuild ??= serverCodeBuild()));
+      // a server of another version or build (its models, framing or renderer may have changed)
+      // renders thumbnails again: its PNG is the one the browser of its build makes, never an
+      // older server's
       handle = await s.cache.entry(
         'thumbs',
         BUILTIN_PROVIDER,
-        `builtin:${id}:v${THUMBNAIL_VERSION}:${PACKAGE_VERSION}:${THUMBNAIL_SIZE}`,
+        `builtin:${id}:v${THUMBNAIL_VERSION}:${this.ctx.config.version}:${build}:${THUMBNAIL_SIZE}`,
         (dir, signal) =>
           s.renders.run(
             async () => {

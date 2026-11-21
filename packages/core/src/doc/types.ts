@@ -501,6 +501,11 @@ export interface SceneSettings {
   shots: ShotData[];
   /** Director's desk settings (desk/shots.ts getDeskSettings / setDeskSettings). */
   desk: DeskSettings;
+  /**
+   * What the scene was staged from when a host's SceneBrief staged it (desk/brief record.ts reads and
+   * writes it: the host's scene id, the brief's hash, its shots, cast and elements); absent otherwise.
+   */
+  brief?: unknown;
 }
 
 /*
@@ -583,9 +588,18 @@ export interface DeskLayoutEntry {
   facing: DeskFacing;
 }
 
-/** Where a shot came from outside the editor (a rideo clip's shot), for round trips. */
+/**
+ * Where a shot came from outside the editor, so that results name the shot as its source does:
+ * 'host', a shot of an embedding host's SceneBrief (desk/brief stageBrief: `clip` the host's scene id,
+ * `shot` its shot id, `index` its index); 'rideo', a shot of a SceneBlocking v1 clip
+ * (desk.import_rideo_blocking, and projects stored before briefs existed: `project` and `clip` the
+ * clip's).
+ */
+export const SHOT_EXTERNAL_SOURCES = ['host', 'rideo'] as const;
+export type ShotExternalSource = (typeof SHOT_EXTERNAL_SOURCES)[number];
+
 export interface ShotExternalRef {
-  source: 'rideo';
+  source: ShotExternalSource;
   project: string | null;
   clip: string | null;
   shot: string | null;

@@ -1,10 +1,13 @@
-import type { Vec3, Vec4 } from '../math/types';
+import type { Mat4, Vec3, Vec4 } from '../math/types';
 import type { SceneDoc } from '../doc/scene-doc';
+import type { ObjectData } from '../doc/types';
 import { createMesh } from '../mesh/types';
 import { srgbToLinear } from '../render/color';
 import { DESK_PROPS } from './props';
 import { deskProp, rideoSunVector } from './layout';
 import { setDeskSettings } from './shots';
+import { listUnits, unitOf } from './units/list';
+import { hangKept, keptPlaces, oldLook, restWorld, sameWorld, type KeptPlaces } from './units/remove';
 
 /*
  * The set of a scene (spec §4 desk.set_build, §1 sun): rideo's set rebuilt in the editor.
@@ -23,7 +26,16 @@ import { setDeskSettings } from './shots';
  *   omitted and every wall closes the room for cameras inside it.
  *
  * Everything the builder makes has desk_role 'set' and desk_label ground | wall | sun; building again
- * replaces it (and the materials only it used).
+ * replaces it (and the materials only it used). What the person put on those pieces (objects of their
+ * own below them) stays, hung from the piece built in its place where it is in the world (the ground
+ * for a wall or a sun the new set has not), and the warnings name it.
+ *
+ * A library set (desk/units: an instance with key 'set', placed by brief staging from a pinned unit)
+ * is the scene's ground and walls: with one in the scene buildSet builds and removes no ground and
+ * no walls (they are the unit's, owned by unit actions only), lights the set (lightSet: the sky or a
+ * sun lamp, removing only sun lamps outside units) and records the set's size and interior, and
+ * returns the set's root as the ground (the SceneBlocking import writes the ground's name on it).
+ * Objects inside any unit instance are never removed as the previous set.
  */
 
 export interface DeskSetOptions {
@@ -44,10 +56,17 @@ export interface DeskSetResult {
   sun: string | null;
   /** Objects of the previous set that were removed. */
   removed: string[];
+  /** The warnings naming what the person put on the pieces removed, which stays on the new ones. */
+  warnings: string[];
 }
 
 /** Height of interior walls (m), as rideo's. */
 export const WALL_HEIGHT_M = 3.2;
+/**
+ * The ground's material slot of the world beyond the set (groundMesh: its ring out to the horizon),
+ * which is no part of the set's size (a library set's meta, desk/units/extract.ts).
+ */
+export const GROUND_BEYOND_SLOT = 1;
 /** Colour of interior walls (sRGB), as rideo's. */
 export const WALL_COLOR = '#c9c6bf';
 
@@ -85,7 +104,103 @@ export function skySunRotation(azimuthDeg: number): number {
   return ((r % turn) + turn) % turn;
 }
 
-const SET_LABELS = new Set(['ground', 'wall', 'sun']);
+const SET_LABELS: ReadonlySet<string> = new Set(['ground', 'wall', 'sun']);
+const SUN_LABELS: ReadonlySet<string> = new Set(['sun']);
+
+/** The pieces of the set with a label of `labels` (those buildSet replaces), never one inside a unit instance. */
+function setPieces(doc: SceneDoc, labels: ReadonlySet<string>): ObjectData[] {
+  return doc
+    .listObjects()
+    .filter(
+      (x) =>
+        deskProp(x, DESK_PROPS.role) === 'set' &&
+        labels.has(deskProp(x, DESK_PROPS.label)) &&
+        unitOf(doc, x.id) === null,
+    );
+}
+
+/** What stays below the set's pieces that go (keptOn), by the piece of the new set it hangs from. */
+interface KeptOnSet {
+  /** 'ground', 'sun' or 'wall:<name>'. */
+  on: string;
+  places: KeptPlaces;
+  /** The piece that went (its name and world matrix at rest), when it was one. */
+  was: { name: string; world: Mat4 } | null;
+}
+
+/**
+ * What the person put on set pieces `old` (objects of their own below them: remove.ts oldLook's
+ * `kept`), read before they go, by the piece of the new set it is to hang from (hangOnSet).
+ */
+function keptOn(doc: SceneDoc, old: readonly ObjectData[]): KeptOnSet[] {
+  const ids = new Map<string, string[]>();
+  const tops = new Map<string, ObjectData[]>();
+  for (const piece of old) {
+    const label = deskProp(piece, DESK_PROPS.label);
+    const on = label === 'wall' ? `wall:${piece.name}` : label;
+    ids.set(on, [...(ids.get(on) ?? []), ...oldLook(doc, piece.id).kept]);
+    tops.set(on, [...(tops.get(on) ?? []), piece]);
+  }
+  return [...ids]
+    .map(([on, list]) => {
+      const pieces = tops.get(on)!;
+      const was = pieces.length === 1 ? { name: pieces[0].name, world: restWorld(doc, pieces[0].id) } : null;
+      return {
+        on,
+        places: keptPlaces(
+          doc,
+          list,
+          pieces.map((x) => x.id),
+        ),
+        was,
+      };
+    })
+    .filter((k) => k.places.ids.length);
+}
+
+/**
+ * Hangs what `kept` holds from the pieces of the set built anew, where it was in the world, in the
+ * caller's transaction (remove.ts hangKept): what was on the ground from the new ground, on a wall from
+ * the new wall of its name, on the sun from the new sun, else (the new set has no such piece) from
+ * `pieces.ground` (the scene when there is none). Returns the warnings naming it; what hangs from a
+ * piece with the name and the place of the one it was on (a set built again as it was, as every
+ * rideo import builds it) is not named, as nothing changed for it.
+ */
+function hangOnSet(
+  doc: SceneDoc,
+  kept: readonly KeptOnSet[],
+  pieces: { ground: string | null; walls: readonly string[]; sun: string | null },
+): string[] {
+  const out: string[] = [];
+  for (const { on, places, was } of kept) {
+    const piece = on.startsWith('wall:')
+      ? (pieces.walls.find((id) => `wall:${doc.getObject(id)?.name}` === on) ?? null)
+      : on === 'sun'
+        ? pieces.sun
+        : pieces.ground;
+    const root = piece ?? pieces.ground;
+    const same =
+      !!piece &&
+      !!was &&
+      doc.getObject(piece)?.name === was.name &&
+      sameWorld(restWorld(doc, piece), was.world);
+    const words = {
+      of: 'the set built before',
+      on: root ? `'${doc.getObject(root)?.name}'` : 'the scene',
+      listed: same,
+    };
+    out.push(...hangKept(doc, root, places, words).map((w) => `the set: ${w}`));
+  }
+  return out;
+}
+
+/**
+ * The set's ground: a library set's root while the scene holds one, else the ground of the words'
+ * set (null: there is none).
+ */
+export function setGround(doc: SceneDoc): string | null {
+  return setUnitRoot(doc) ?? setPieces(doc, new Set(['ground']))[0]?.id ?? null;
+}
 
 /**
  * Builds the set: ground, sky or sun lamp, interior walls; replaces the set built before and records
@@ -94,10 +209,17 @@ const SET_LABELS = new Set(['ground', 'wall', 'sun']);
 export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
   const width = Math.max(0.01, o.width);
   const depth = Math.max(0.01, o.depth);
-  // the previous set (and the materials nothing else uses)
-  const old = doc
-    .listObjects()
-    .filter((x) => deskProp(x, DESK_PROPS.role) === 'set' && SET_LABELS.has(deskProp(x, DESK_PROPS.label)));
+  const unitRoot = setUnitRoot(doc);
+  if (unitRoot) {
+    // a library set: its ground and walls are the unit's; only the light and the settings change
+    const lit = lightSet(doc, o);
+    setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
+    return { ground: unitRoot, walls: [], sun: lit.sun, removed: lit.removed, warnings: lit.warnings };
+  }
+  // the previous set (and the materials nothing else uses), never a piece of a unit instance; what
+  // the person put on it stays, on the pieces built in its place (hangOnSet)
+  const old = setPieces(doc, SET_LABELS);
+  const kept = keptOn(doc, old);
   const oldMaterials = new Set(old.flatMap((x) => x.material_slots.filter((m): m is string => !!m)));
   doc.removeObjects(old.map((x) => x.id));
   const used = new Set(doc.listObjects().flatMap((x) => x.material_slots));
@@ -182,7 +304,42 @@ export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
     }
   }
 
-  let sun: string | null = null;
+  const sun = lightUp(doc, o);
+  setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
+  const warnings = hangOnSet(doc, kept, { ground, walls, sun });
+  return { ground, walls, sun, removed: old.map((x) => x.id), warnings };
+}
+
+/** The root of the scene's library set (the unit instance with key 'set'), else null. */
+export function setUnitRoot(doc: SceneDoc): string | null {
+  for (const i of listUnits(doc)) if (i.key === 'set' && i.kind === 'set') return i.root;
+  return null;
+}
+
+/**
+ * Lights the set: the procedural SKY whose sun is the key light (`sky`), else the world's own
+ * environment (a SKY one becomes STUDIO) and a 'Set Sun' lamp. Sun lamps of an earlier set are
+ * removed first, never one inside a unit instance (a library set's own lights stay); what the person
+ * put on one stays, on the new sun lamp (the set's ground with `sky`). Returns the sun lamp (null with
+ * `sky`), the objects removed and the warnings naming what stays.
+ */
+export function lightSet(
+  doc: SceneDoc,
+  o: Pick<DeskSetOptions, 'sun_azimuth_deg' | 'sun_elevation_deg' | 'sky'>,
+): { sun: string | null; removed: string[]; warnings: string[] } {
+  const old = setPieces(doc, SUN_LABELS);
+  const kept = keptOn(doc, old);
+  doc.removeObjects(old.map((x) => x.id));
+  const sun = lightUp(doc, o);
+  const warnings = hangOnSet(doc, kept, { ground: setGround(doc), walls: [], sun });
+  return { sun, removed: old.map((x) => x.id), warnings };
+}
+
+/** The sky or the sun lamp of a set (see lightSet), with no old one removed. */
+function lightUp(
+  doc: SceneDoc,
+  o: Pick<DeskSetOptions, 'sun_azimuth_deg' | 'sun_elevation_deg' | 'sky'>,
+): string | null {
   const world = doc.getWorld();
   if (o.sky) {
     doc.updateWorld({
@@ -191,35 +348,33 @@ export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
       sun_rotation: skySunRotation(o.sun_azimuth_deg),
       sun_elevation: (Math.max(0, Math.min(90, o.sun_elevation_deg)) * Math.PI) / 180,
     });
-  } else {
-    if (world.environment === 'SKY') doc.updateWorld({ environment: 'STUDIO' });
-    const toward = rideoSunVector(o.sun_azimuth_deg, o.sun_elevation_deg);
-    // a sun lamp shines along its −Z: its +Z (Rz(yaw)·Rx(pitch)·Z = (sin yaw sin pitch, −cos yaw sin
-    // pitch, cos pitch)) points towards the sun
-    const yaw = Math.atan2(toward[0], -toward[1]);
-    const pitch = Math.acos(Math.max(-1, Math.min(1, toward[2])));
-    const data = doc.addLight({
-      name: 'Set Sun',
-      type: 'SUN',
-      energy: world.sun_intensity || 3,
-      use_shadow: true,
-    });
-    sun = doc.addObject({
-      type: 'LIGHT',
-      name: 'Set Sun',
-      data,
-      location: [0, 0, 10],
-      rotation_euler: [pitch, 0, yaw],
-      custom_props: { [DESK_PROPS.role]: 'set', [DESK_PROPS.label]: 'sun' },
-    });
+    return null;
   }
-  setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
-  return { ground, walls, sun, removed: old.map((x) => x.id) };
+  if (world.environment === 'SKY') doc.updateWorld({ environment: 'STUDIO' });
+  const toward = rideoSunVector(o.sun_azimuth_deg, o.sun_elevation_deg);
+  // a sun lamp shines along its −Z: its +Z (Rz(yaw)·Rx(pitch)·Z = (sin yaw sin pitch, −cos yaw sin
+  // pitch, cos pitch)) points towards the sun
+  const yaw = Math.atan2(toward[0], -toward[1]);
+  const pitch = Math.acos(Math.max(-1, Math.min(1, toward[2])));
+  const data = doc.addLight({
+    name: 'Set Sun',
+    type: 'SUN',
+    energy: world.sun_intensity || 3,
+    use_shadow: true,
+  });
+  return doc.addObject({
+    type: 'LIGHT',
+    name: 'Set Sun',
+    data,
+    location: [0, 0, 10],
+    rotation_euler: [pitch, 0, yaw],
+    custom_props: { [DESK_PROPS.role]: 'set', [DESK_PROPS.label]: 'sun' },
+  });
 }
 
 /**
  * The ground: the set's plane (material 0) and around it a ring out to the horizon, 2 cm lower
- * (material 1; rideo draws it 6 × the set's size + 60 m away).
+ * (material GROUND_BEYOND_SLOT; rideo draws it 6 × the set's size + 60 m away).
  */
 function groundMesh(width: number, depth: number): ReturnType<typeof createMesh> {
   const w = width / 2;
@@ -273,7 +428,8 @@ function groundMesh(width: number, depth: number): ReturnType<typeof createMesh>
     [10, 11, 7, 6],
     [11, 8, 4, 7],
   ];
-  return createMesh({ positions, faces, faceMaterials: [0, 1, 1, 1, 1] });
+  const beyond = GROUND_BEYOND_SLOT;
+  return createMesh({ positions, faces, faceMaterials: [0, beyond, beyond, beyond, beyond] });
 }
 
 function wallMesh(quad: Vec3[]): ReturnType<typeof createMesh> {

@@ -1,0 +1,13 @@
+{
+  "type": "state",
+  "id": "save-1",
+  "sceneId": "clp_0123456789abcdef",
+  "state": {
+    "format": "3d-editor.desk-state",
+    "version": 1,
+    "data": {
+      "$bytes": "AG9wYXF1ZSBkZXNrIHN0YXRlIGJ5dGVzAw=="
+    }
+  },
+  "shots": 2
+}

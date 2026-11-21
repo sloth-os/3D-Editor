@@ -1,4 +1,5 @@
 import { PathFilm, type PathTile, type SceneDoc } from '@3d-editor/core';
+import { exportsHeld } from '../export/held';
 import {
   estimateRender,
   estimatedNeeds,
@@ -135,7 +136,10 @@ export function stopsAdopters(
 /** What the path traced renders running now hold, by job (their {@link renderMemory}). */
 const running = new Map<number, { total: number; heap: number }>();
 
-/** `memory` with what the renders running now, other than `job`, hold. */
+/**
+ * `memory` with what the path traced renders running now, other than `job`, and the browser video
+ * exports hold (those running, and the files of finished ones kept in memory: `held.kept`).
+ */
 function withRunning(memory: TabMemory, job: number): TabMemory {
   const held = { ...memory.held };
   for (const [id, m] of running)
@@ -143,13 +147,18 @@ function withRunning(memory: TabMemory, job: number): TabMemory {
       held.total += m.total;
       held.heap += m.heap;
     }
+  const exports = exportsHeld();
+  held.total += exports.total;
+  held.heap += exports.heap;
+  held.kept = (held.kept ?? 0) + exports.kept;
   return { ...memory, held };
 }
 
 /**
  * The tab's memory now ({@link tabMemory}, with `pageHeap` the page's own heap estimated from its
- * scene), with what the path traced renders running in it hold: for a render that starts now on the
- * page (a RASTER render).
+ * scene), with what the path traced renders and the browser video exports of the tab hold (those
+ * running, and the files of finished exports kept in memory): for a render that starts now on the
+ * page (a RASTER render, an export).
  */
 export function tabMemoryWithRenders(pageHeap = 0): TabMemory {
   return withRunning(tabMemory(pageHeap), 0);

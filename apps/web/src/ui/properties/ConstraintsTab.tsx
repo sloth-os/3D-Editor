@@ -27,6 +27,7 @@ import {
   sourceErrors,
   withField,
 } from './ObjectTab';
+import { readStorage, writeStorage } from '../../app/safe-storage';
 
 /*
  * Object Constraints tab (Blender's Properties > Object Constraints): the constraint stack of the
@@ -322,12 +323,12 @@ function ConstraintPanel(p: {
   const info = getConstraintTypeInfo(c.type);
   const storageKey = `3d-editor:constraint:${c.id}`;
   const [open, setOpen] = useState(() => {
-    const stored = localStorage.getItem(storageKey);
+    const stored = readStorage(storageKey);
     return stored === null ? c.show_expanded !== false : stored === '1';
   });
   const toggle = () => {
     setOpen(!open);
-    localStorage.setItem(storageKey, open ? '0' : '1');
+    writeStorage(storageKey, open ? '0' : '1');
   };
   const error = constraintError(p.errors, c, index);
   const ref = { object: o.id, constraint: c.id };

@@ -62,7 +62,8 @@ const MOTION = [
   'desk.vehicle_drive',
 ];
 const STORE = ['store.add', 'store.search', 'store.insert_files'];
-const READ_ONLY = ['desk.check', 'desk.export_rideo_blocking', 'store.search'];
+const BRIEF = ['desk.stage_brief', 'desk.update_from_brief', 'desk.shot_results'];
+const READ_ONLY = ['desk.check', 'desk.export_rideo_blocking', 'desk.shot_results', 'store.search'];
 /** The shot operators DESK-CORE implements (all but the phase-2 rideo import and export). */
 const SHOT_OPERATORS = SHOTS.filter((id) => !id.includes('rideo'));
 
@@ -83,6 +84,37 @@ const SAMPLE: Record<string, Record<string, unknown>> = {
     shots: [{ id: 's1', index: 0, duration_s: 4 }],
   },
   'desk.export_rideo_blocking': {},
+  'desk.stage_brief': {
+    brief: {
+      id: 'scene-1',
+      name: 'Sample',
+      fps: 24,
+      width: 640,
+      height: 360,
+      set: { description: 'A meadow.', interior: false, timeOfDay: null },
+      cast: [{ id: 'ada', name: 'Ada', description: 'A woman.', kind: 'person', heightM: null }],
+      elements: [],
+      shots: [
+        {
+          id: 's1',
+          index: 0,
+          durationSec: 1,
+          description: 'Wide: Ada waits.',
+          action: '',
+          castIds: ['ada'],
+          elementIds: [],
+          framing: 'wide',
+          movement: 'static',
+          move: null,
+          lensMm: null,
+          continuity: 'cut',
+          layout: [],
+        },
+      ],
+    },
+  },
+  'desk.update_from_brief': { brief: { id: 'scene-1' } },
+  'desk.shot_results': {},
   'desk.actor_add': { kind: 'adult' },
   'desk.actor_pose': { actor: 'Cube', pose: 'sit' },
   'desk.actor_move': { actor: 'Cube', points: [[2, 0, 0]], frame_start: 1 },
@@ -174,7 +206,7 @@ describe('desk and store operators', () => {
       .list()
       .map((d) => d.id)
       .filter((id) => id.startsWith('desk.') || id.startsWith('store.'));
-    expect(ids.sort()).toEqual([...SHOTS, ...ACTORS, ...MOTION, ...STORE].sort());
+    expect(ids.sort()).toEqual([...SHOTS, ...ACTORS, ...MOTION, ...STORE, ...BRIEF].sort());
     expect(Object.keys(SAMPLE).sort()).toEqual(ids);
     for (const id of ids) {
       const d = reg.get(id)!;
@@ -289,7 +321,7 @@ describe('desk and store memory estimates', () => {
     estimateOperator(id, t.ctx, t.reg.parseParams(id, params));
 
   it('cover every desk and store operator: an estimate or a reason', () => {
-    for (const id of [...SHOTS, ...ACTORS, ...MOTION, ...STORE])
+    for (const id of [...SHOTS, ...ACTORS, ...MOTION, ...STORE, ...BRIEF])
       expect(!!OPERATOR_ESTIMATES[id] || !!unestimatedReason(id), id).toBe(true);
     expect(OPERATOR_ESTIMATES['desk.shot_add']).toBe(DESK_SHOT_ESTIMATES['desk.shot_add']);
     for (const id of [

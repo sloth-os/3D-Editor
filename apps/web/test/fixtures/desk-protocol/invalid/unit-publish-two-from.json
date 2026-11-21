@@ -1,0 +1,36 @@
+{
+  "type": "unit-publish",
+  "id": "pub-4",
+  "kind": "figure",
+  "name": "Mira",
+  "newVersionOf": {
+    "ref": "lib_0123456789mira",
+    "version": 2
+  },
+  "from": {
+    "castId": "chr_0123456789mira",
+    "elementId": null,
+    "set": true
+  },
+  "unit": {
+    "format": "3d-editor.desk-unit",
+    "version": 1,
+    "data": {
+      "$bytes": "M0QtRWRpdG9yIGRlc2sgdW5pdCBmaXh0dXJlOiBNaXJhLCBhIG5ldyBsb29rIChub3QgYSB1bml0IGZpbGUpCg=="
+    }
+  },
+  "sha256": "ec6c7379442197846637f809d2c5783b6d19f47c849db38aff8a8d91eaef6cc0",
+  "thumbnail": null,
+  "meta": {
+    "dimensionsM": [0.42, 0.25, 1.24],
+    "objects": 23,
+    "triangles": 2380,
+    "actor": {
+      "kind": "child",
+      "heightM": 1.24
+    },
+    "credits": [],
+    "deskVersion": "0.2.0",
+    "digest": "9f9ffc11f4b57a3742de48497e3f2429fb77a8240a8d7543151eb6d11f0c4b65"
+  }
+}

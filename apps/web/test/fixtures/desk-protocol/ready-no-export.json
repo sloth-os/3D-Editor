@@ -1,0 +1,15 @@
+{
+  "type": "ready",
+  "deskVersion": "0.2.0",
+  "protocol": 1,
+  "capabilities": {
+    "export": {
+      "available": false,
+      "reason": "This browser cannot encode H.264 video (WebCodecs).",
+      "container": "mp4",
+      "videoCodec": "avc1",
+      "modes": ["motion", "pose", "camera"]
+    },
+    "offline": true
+  }
+}

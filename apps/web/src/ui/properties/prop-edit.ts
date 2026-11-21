@@ -3,12 +3,16 @@ import type { AnimTargetType, DatablockKind } from '@3d-editor/core';
 import { evaluateFCurve, hasKeyframeAt, readChannel } from '@3d-editor/core';
 import type { ProjectSession } from '../../project/session';
 import { run } from '../../editor/editor';
+import { pageGuard } from '../../editor/page-guard';
 import { foldStep, replacedNewer, undoAlone } from '../../editor/runner';
 import type { FieldState } from '../fields/fields';
 import { animatedBlock } from './animated';
 
 type Kind = DatablockKind | 'scene' | 'render' | 'world';
 type Step = Y.UndoManager['undoStack'][number];
+
+/** The operator that stores a value set in a field ({@link setProp}). */
+const SET_PROPERTY = 'data.set_property';
 
 /**
  * A slider drag in progress: the field it is for, how to put the field back as it was before the
@@ -80,6 +84,12 @@ function ownChange(s: ProjectSession, step: Step | null, write: () => void): Ste
  * other entries of the same list (constraints, particle systems, keyframes) meanwhile. When they
  * wrote the dragged entry itself meanwhile, the operator's step alone is the drag's step: undoing it
  * brings back what the restore wrote, their change included.
+ *
+ * A live value is a change to the scene made past the operator registry. Where the page refuses
+ * such changes (the read-only embeddable desk refuses every operator that makes one, the
+ * `data.set_property` a field's value goes through among them: editor/page-guard.ts), no live
+ * value is written and no drag starts: the final value runs `commit` alone, whose operator says
+ * why it refuses.
  */
 export function dragEdit(
   s: ProjectSession,
@@ -90,6 +100,7 @@ export function dragEdit(
   commit: () => void,
 ): void {
   if (!final) {
+    if (pageGuard.refusal(SET_PROPERTY) !== null) return;
     if (!drag || drag.key !== key || drag.session !== s) {
       const start = Y.decodeStateVector(Y.encodeStateVector(s.doc.ydoc));
       drag = { key, session: s, restore: capture(), step: null, start };
@@ -128,8 +139,8 @@ function dropDrag(s: ProjectSession, key: string): void {
 
 /**
  * Sets a datablock property from the UI. Non-final values (while dragging) are written live, as
- * {@link dragEdit} does; the final value runs `data.set_property`, and the whole drag is one undo
- * step.
+ * {@link dragEdit} does (none where the page refuses changes to the scene); the final value runs
+ * `data.set_property`, and the whole drag is one undo step.
  */
 export function setProp(
   s: ProjectSession,
@@ -155,7 +166,7 @@ export function setProp(
       const original = readField(s, kind, target, field);
       return () => writeField(s, kind, target, field, original);
     },
-    () => run('data.set_property', { kind, target: target ?? undefined, values: { [field]: value } }, 'ui'),
+    () => run(SET_PROPERTY, { kind, target: target ?? undefined, values: { [field]: value } }, 'ui'),
   );
 }
 

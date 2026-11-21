@@ -188,7 +188,7 @@ export interface RasterGuardRefusal extends Omit<GuardRefusal, 'needs'> {
  * The check of a RASTER render's evaluation on the page (F12, Render Animation and agents' renders
  * with the WebGL rasterizer): like {@link EvaluationGuard}, every modifier is checked right before it
  * runs, from its real input, against what the evaluation adds to the page's heap (`rasterNeeds`) and
- * the room the tab's heap has (`memory`: the page's own heap and what the path traced renders running
+ * the room the tab's heap has (`memory`: the page's own heap and what the renders and exports running
  * in it hold).
  */
 export class RasterEvaluationGuard implements ModifierGuard {

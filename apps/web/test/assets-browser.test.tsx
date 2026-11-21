@@ -8,16 +8,28 @@ import type { ServerConfig } from '../src/app/server-config';
 import { EditorStateSignals, ViewState } from '../src/editor/state';
 import type { ProjectSession } from '../src/project/session';
 import type { StoreProviderStatus } from '../src/io/store-client';
-import { AssetBrowser, SHORT_BROWSER_PX, lastAssetQuery } from '../src/ui/assets/AssetBrowser';
+import {
+  AssetBrowser,
+  SHORT_BROWSER_PX,
+  THUMBNAIL_MARGIN,
+  lastAssetQuery,
+} from '../src/ui/assets/AssetBrowser';
 import { ASSET_DRAG_TYPE } from '../src/ui/assets/drop';
 import { SEARCH_DEBOUNCE_MS } from '../src/ui/assets/search';
+import { failedThumbnailTitle } from '../src/ui/assets/thumbnail';
+import { ThumbnailService, setThumbnailService } from '../src/assets/thumbnails';
+import { MemoryThumbnailCache } from '../src/assets/thumbnails/cache';
+import { ThumbnailWorkerPool, type ThumbnailWorkerLike } from '../src/assets/thumbnails/pool';
+import type { ThumbnailWorkerRequest } from '../src/assets/thumbnails/protocol';
 
 /*
  * The Asset Browser: model cards (thumbnail, name, provider, licence badge with its credit),
  * debounced search words, category chips, a provider choice with each provider's state, thumbnails
- * fetched once their card shows, the next page once the end of the list shows, empty and error
- * states, cards dragged as application/x-3d-editor-asset and Add at the 3D cursor; without a server
- * the built-in catalog alone, searched in the browser.
+ * once their card comes near the visible part of the list (built-in models' made in this browser by
+ * its thumbnail service, never asked of the server, the cards on screen first and let go when they
+ * leave; other providers' from the server's store), the next page once the end of the list shows,
+ * empty and error states, cards dragged as application/x-3d-editor-asset and Add at the 3D cursor;
+ * without a server the built-in catalog alone, searched in the browser, with its thumbnails.
  */
 
 const SERVER: ServerConfig = {
@@ -38,7 +50,10 @@ const SERVER: ServerConfig = {
 class FakeIO {
   static all: FakeIO[] = [];
   readonly observed = new Set<Element>();
-  constructor(private readonly cb: IntersectionObserverCallback) {
+  constructor(
+    private readonly cb: IntersectionObserverCallback,
+    readonly opts: IntersectionObserverInit = {},
+  ) {
     FakeIO.all.push(this);
   }
   observe(el: Element) {
@@ -53,18 +68,53 @@ class FakeIO {
   takeRecords() {
     return [];
   }
-  /** Shows every observed element that matches `selector` (or contains a match). */
-  static show(selector: string): number {
+  /**
+   * Shows (or hides) every observed element that matches `selector` (or contains a match), to the
+   * observers with root margin `margin` (default: all of them).
+   */
+  static show(selector: string, margin?: string, isIntersecting = true): number {
     let n = 0;
-    for (const io of FakeIO.all)
+    for (const io of FakeIO.all) {
+      if (margin !== undefined && io.opts.rootMargin !== margin) continue;
       for (const el of [...io.observed])
         if (el.matches(selector) || el.querySelector(selector)) {
           n++;
-          io.cb([{ target: el, isIntersecting: true } as unknown as IntersectionObserverEntry], io as never);
+          io.cb([{ target: el, isIntersecting } as unknown as IntersectionObserverEntry], io as never);
         }
+    }
     return n;
   }
+  static hide(selector: string, margin?: string): number {
+    return FakeIO.show(selector, margin, false);
+  }
 }
+
+/** A thumbnail worker the test answers for (the page's thumbnail service runs on these). */
+class FakeWorker implements ThumbnailWorkerLike {
+  static all: FakeWorker[] = [];
+  onmessage: ((e: MessageEvent<unknown>) => void) | null = null;
+  onerror: ((e: ErrorEvent) => void) | null = null;
+  readonly posted: ThumbnailWorkerRequest[] = [];
+  constructor() {
+    FakeWorker.all.push(this);
+  }
+  postMessage(msg: ThumbnailWorkerRequest): void {
+    this.posted.push(msg);
+  }
+  terminate(): void {}
+  /** Answers the request being rendered with a PNG (its first byte names it), or an error. */
+  answer(res: { byte?: number; error?: string; code?: string } = {}): void {
+    const id = this.posted.at(-1)!.id;
+    this.onmessage?.({
+      data: res.error
+        ? { type: 'error', id, message: res.error, code: res.code ?? 'FAILED' }
+        : { type: 'done', id, png: new Uint8Array([res.byte ?? 1]), width: 1, height: 1, ms: 1 },
+    } as MessageEvent<unknown>);
+  }
+}
+/** The models the thumbnail workers were asked for, in order. */
+const rendered = () => FakeWorker.all.flatMap((w) => w.posted.map((m) => m.model));
+let thumbnails: ThumbnailService;
 
 const SHEEN: StoreResult = {
   id: 'khronos:SheenChair',
@@ -171,6 +221,15 @@ afterAll(() => {
 });
 
 beforeEach(() => {
+  FakeWorker.all = [];
+  // the page's thumbnail service with one worker the test answers for
+  thumbnails = new ThumbnailService({
+    build: 'test',
+    cache: new MemoryThumbnailCache(),
+    pool: new ThumbnailWorkerPool({ factory: () => new FakeWorker(), workers: 1 }),
+    urls: { create: (png) => `blob:thumb/${png[0]}`, revoke: () => undefined },
+  });
+  setThumbnailService(thumbnails);
   searches = [];
   answer = () => json({ results: [CHAIR, SHEEN], providers: [], next_cursor: null });
   fetchMock.mockClear();
@@ -184,6 +243,8 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
+  thumbnails.dispose();
+  setThumbnailService(null);
   vi.unstubAllGlobals();
   serverConfig.value = null;
   sessionSignal.value = null;
@@ -272,31 +333,143 @@ describe('Asset Browser', () => {
     expect(searches[3].get('category')).toBeNull();
   });
 
-  it('fetches a thumbnail only once its card comes into view', async () => {
+  it("fetches another provider's thumbnail from the server once its card comes into view", async () => {
     const { container } = render(<AssetBrowser />);
-    await waitFor(() => expect(byTestId(container, 'asset-thumb-builtin:chair')).not.toBeNull());
-    const img = byTestId(container, 'asset-thumb-builtin:chair') as HTMLImageElement;
+    await waitFor(() => expect(byTestId(container, 'asset-thumb-khronos:SheenChair')).not.toBeNull());
+    const img = byTestId(container, 'asset-thumb-khronos:SheenChair') as HTMLImageElement;
+    const box = byTestId(container, 'asset-thumb-box-khronos:SheenChair')!;
     expect(img.getAttribute('src')).toBeNull();
     expect(img.getAttribute('loading')).toBe('lazy');
+    expect(box.dataset.thumbState).toBe('idle');
     // (observed once the card's effects ran)
-    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-builtin:chair"]')).toBe(1));
+    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-khronos:SheenChair"]')).toBe(1));
     await waitFor(() =>
-      expect(img.getAttribute('src')).toBe('/api/store/models/builtin:chair/thumbnail?token=tk'),
+      expect(img.getAttribute('src')).toBe('/api/store/models/khronos:SheenChair/thumbnail?token=tk'),
     );
-    // the other card is still waiting
-    expect(byTestId(container, 'asset-thumb-khronos:SheenChair')!.getAttribute('src')).toBeNull();
+    expect(box.dataset.thumbSource).toBe('server');
     // the category's icon shows until the thumbnail has loaded
-    const thumb = (id: string) => byTestId(container, `asset-card-${id}`)!.querySelector('.asset-thumb')!;
-    expect(thumb('builtin:chair').querySelector('svg')).not.toBeNull();
+    expect(box.querySelector('svg')).not.toBeNull();
     expect(img.classList.contains('loaded')).toBe(false);
     fireEvent.load(img);
-    await waitFor(() => expect(thumb('builtin:chair').querySelector('svg')).toBeNull());
+    await waitFor(() => expect(box.querySelector('svg')).toBeNull());
     expect(img.classList.contains('loaded')).toBe(true);
-    // a thumbnail that fails to load leaves the category icon
-    const sheen = byTestId(container, 'asset-thumb-khronos:SheenChair')!;
-    fireEvent.error(sheen);
+    expect(box.dataset.thumbState).toBe('ready');
+    // a thumbnail that fails to load leaves the category icon (no warning: it is the server's)
+    fireEvent.error(img);
     await waitFor(() => expect(byTestId(container, 'asset-thumb-khronos:SheenChair')).toBeNull());
-    expect(thumb('khronos:SheenChair').querySelector('svg')).not.toBeNull();
+    expect(box.querySelector('svg')).not.toBeNull();
+    expect(byTestId(container, 'asset-thumb-error-khronos:SheenChair')).toBeNull();
+  });
+
+  it("makes a built-in model's thumbnail in this browser once its card comes near, never asking the server", async () => {
+    const { container } = render(<AssetBrowser />);
+    await waitFor(() => expect(byTestId(container, 'asset-thumb-builtin:chair')).not.toBeNull());
+    const box = byTestId(container, 'asset-thumb-box-builtin:chair')!;
+    const img = () => byTestId(container, 'asset-thumb-builtin:chair') as HTMLImageElement;
+    expect(img().getAttribute('src')).toBeNull();
+    expect(box.dataset.thumbState).toBe('idle');
+    expect(rendered()).toEqual([]);
+    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-builtin:chair"]')).toBe(2));
+    // a placeholder while the worker renders it
+    await waitFor(() => expect(box.dataset.thumbState).toBe('pending'));
+    expect(box.classList.contains('pending')).toBe(true);
+    expect(box.getAttribute('aria-busy')).toBe('true');
+    expect(box.querySelector('svg')).not.toBeNull();
+    expect(rendered()).toEqual(['chair']);
+    expect(FakeWorker.all[0].posted[0]).toMatchObject({ model: 'chair', size: 256 });
+    FakeWorker.all[0].answer({ byte: 7 });
+    await waitFor(() => expect(img().getAttribute('src')).toBe('blob:thumb/7'));
+    expect(box.dataset.thumbSource).toBe('render');
+    fireEvent.load(img());
+    await waitFor(() => expect(box.dataset.thumbState).toBe('ready'));
+    expect(box.querySelector('svg')).toBeNull();
+    expect(img().classList.contains('loaded')).toBe(true);
+    expect(box.classList.contains('pending')).toBe(false);
+    // the server's thumbnail route of the built-in model was never asked for
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes('/thumbnail'))).toBe(false);
+    // another browser on the page shows it from memory at once
+    const other = render(<AssetBrowser compact />);
+    await waitFor(() => expect(byTestId(other.container, 'asset-thumb-builtin:chair')).not.toBeNull());
+    // (the first browser's card stopped following: it has its thumbnail)
+    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-builtin:chair"]')).toBe(2));
+    await waitFor(() =>
+      expect(byTestId(other.container, 'asset-thumb-box-builtin:chair')!.dataset.thumbSource).toBe('memory'),
+    );
+    expect(rendered()).toEqual(['chair']);
+  });
+
+  it('says when a thumbnail could not be made, keeping the category icon', async () => {
+    const { container } = render(<AssetBrowser />);
+    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-builtin:chair"]')).toBe(2));
+    await waitFor(() => expect(rendered()).toEqual(['chair']));
+    FakeWorker.all[0].answer({ error: 'The thumbnail of builtin:chair could not be made: boom' });
+    const box = byTestId(container, 'asset-thumb-box-builtin:chair')!;
+    await waitFor(() => expect(box.dataset.thumbState).toBe('failed'));
+    expect(box.classList.contains('failed')).toBe(true);
+    // core's message says what failed: the tooltip says it once
+    expect(box.title).toBe('The thumbnail of builtin:chair could not be made: boom');
+    // a reason that does not say it (a worker's failure) is introduced
+    expect(failedThumbnailTitle('Thumbnail worker failed: out of memory')).toBe(
+      'The thumbnail could not be made: Thumbnail worker failed: out of memory',
+    );
+    expect(failedThumbnailTitle(null)).toBe('The thumbnail could not be made: unknown error');
+    expect(byTestId(container, 'asset-thumb-error-builtin:chair')).not.toBeNull();
+    expect(byTestId(container, 'asset-thumb-builtin:chair')).toBeNull();
+    expect(box.querySelector('svg')).not.toBeNull();
+  });
+
+  it("falls back to the server's thumbnail of a built-in model this browser does not know", async () => {
+    const newer: StoreResult = {
+      ...CHAIR,
+      id: 'builtin:hover_bike',
+      name: 'Hover bike',
+      thumbnail_url: '/api/store/models/builtin:hover_bike/thumbnail',
+    };
+    answer = () => json({ results: [newer], providers: [], next_cursor: null });
+    const { container } = render(<AssetBrowser />);
+    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-builtin:hover_bike"]')).toBe(2));
+    await waitFor(() => expect(rendered()).toEqual(['hover_bike']));
+    FakeWorker.all[0].answer({ error: "No built-in model 'builtin:hover_bike'", code: 'NOT_FOUND' });
+    const img = () => byTestId(container, 'asset-thumb-builtin:hover_bike') as HTMLImageElement;
+    await waitFor(() =>
+      expect(img().getAttribute('src')).toBe('/api/store/models/builtin:hover_bike/thumbnail?token=tk'),
+    );
+    expect(byTestId(container, 'asset-thumb-box-builtin:hover_bike')!.dataset.thumbSource).toBe('server');
+  });
+
+  it('makes the thumbnails of the cards on screen first, and lets go of those that leave', async () => {
+    const models: StoreResult[] = Array.from({ length: 4 }, (_, i) => ({
+      ...CHAIR,
+      id: `builtin:m${i}`,
+      name: `Model ${i}`,
+    }));
+    answer = () => json({ results: models, providers: [], next_cursor: null });
+    const { container } = render(<AssetBrowser />);
+    await waitFor(() => expect(container.querySelectorAll('.asset-thumb img')).toHaveLength(4));
+    // every card comes near (the next screenful); none is on screen yet
+    await waitFor(() =>
+      expect(FakeIO.show('[data-testid^="asset-thumb-builtin:m"]', THUMBNAIL_MARGIN)).toBe(4),
+    );
+    await waitFor(() => expect(rendered()).toEqual(['m0']));
+    expect(thumbnails.stats().queued).toBe(3);
+    // m3 comes on screen: it goes first; m2 leaves before its turn: it never renders
+    FakeIO.show('[data-testid="asset-thumb-builtin:m3"]', '0px');
+    FakeIO.hide('[data-testid="asset-thumb-builtin:m2"]', THUMBNAIL_MARGIN);
+    await waitFor(() =>
+      expect(byTestId(container, 'asset-thumb-box-builtin:m2')!.dataset.thumbState).toBe('idle'),
+    );
+    FakeWorker.all[0].answer();
+    await waitFor(() => expect(rendered()).toEqual(['m0', 'm3']));
+    FakeWorker.all[0].answer();
+    await waitFor(() => expect(rendered()).toEqual(['m0', 'm3', 'm1']));
+    FakeWorker.all[0].answer();
+    await waitFor(() =>
+      expect(thumbnails.stats()).toMatchObject({ queued: 0, running: 0, renders: 3, cancelled: 1 }),
+    );
+    expect(rendered()).toEqual(['m0', 'm3', 'm1']);
+    // m2 comes back near: asked for again
+    FakeIO.show('[data-testid="asset-thumb-builtin:m2"]', THUMBNAIL_MARGIN);
+    await waitFor(() => expect(rendered()).toEqual(['m0', 'm3', 'm1', 'm2']));
   });
 
   it('asks for the next page when the end of the list shows', async () => {
@@ -410,17 +583,17 @@ describe('Asset Browser', () => {
     expect(roots()).toBe(3);
   });
 
-  it('fetches the thumbnails of the cards in view and of the next row only', async () => {
+  it("fetches other providers' thumbnails of the cards in view and of the next row only", async () => {
     // a page of 24 models, laid out as rows of four 48 px tall cards (52 px apart) in a list 73 px
     // tall (the bottom area's), as in the browser
     const ROW = 52;
     const CARD = 48;
     const LIST = 73;
     const many: StoreResult[] = Array.from({ length: 24 }, (_, i) => ({
-      ...CHAIR,
-      id: `builtin:m${i}`,
+      ...SHEEN,
+      id: `khronos:m${i}`,
       name: `Model ${i}`,
-      thumbnail_url: `/api/store/models/builtin:m${i}/thumbnail`,
+      thumbnail_url: `/api/store/models/khronos:m${i}/thumbnail`,
     }));
     answer = () => json({ results: many, providers: [], next_cursor: null });
     /** An IntersectionObserver that intersects the layout above with its root and root margin. */
@@ -478,8 +651,8 @@ describe('Asset Browser', () => {
     await waitFor(() => expect(asked()).toBe(12));
     await new Promise((r) => setTimeout(r, 20));
     expect(asked()).toBe(12);
-    expect(byTestId(container, 'asset-thumb-builtin:m11')!.getAttribute('src')).not.toBeNull();
-    expect(byTestId(container, 'asset-thumb-builtin:m12')!.getAttribute('src')).toBeNull();
+    expect(byTestId(container, 'asset-thumb-khronos:m11')!.getAttribute('src')).not.toBeNull();
+    expect(byTestId(container, 'asset-thumb-khronos:m12')!.getAttribute('src')).toBeNull();
   });
 
   it('without a server, offers the built-in models alone, searched in the browser', async () => {
@@ -496,9 +669,13 @@ describe('Asset Browser', () => {
     fireEvent.input(input, { target: { value: 'chair' } });
     fireEvent.keyDown(input, { key: 'Enter' });
     await waitFor(() => expect(byTestId(container, 'asset-card-builtin:chair')).not.toBeNull());
-    // no thumbnails without a server: the category's icon
-    expect(container.querySelector('.asset-thumb img')).toBeNull();
-    expect(byTestId(container, 'asset-card-builtin:chair')!.querySelector('.asset-thumb svg')).not.toBeNull();
+    // the built-in models' thumbnails are made here, as with a server
+    await waitFor(() => expect(FakeIO.show('[data-testid="asset-thumb-builtin:chair"]')).toBe(2));
+    await waitFor(() => expect(rendered()).toEqual(['chair']));
+    FakeWorker.all[0].answer({ byte: 4 });
+    await waitFor(() =>
+      expect(byTestId(container, 'asset-thumb-builtin:chair')!.getAttribute('src')).toBe('blob:thumb/4'),
+    );
     expect(fetchMock).not.toHaveBeenCalled();
   });
 

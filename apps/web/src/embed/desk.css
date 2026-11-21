@@ -1,0 +1,526 @@
+/* The embeddable desk (desk.html): its header, banners, overlays and phone layout, in the editor's look. */
+
+.desk-app {
+  position: relative;
+}
+.desk-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 2px 8px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+/* the title gets the room the actions leave; what does not fit in it is cut short, never pushed out */
+.desk-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.desk-title .logo {
+  flex: none;
+}
+.desk-scene {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.desk-pill {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 9px;
+  background: var(--bg-panel);
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+.desk-pill.warn {
+  color: var(--warn);
+}
+.desk-pill.lock {
+  color: var(--select-active);
+}
+/* the notes that can be long (where the scene was opened from, whether the host has its latest
+   state) give way as the scene's name does, each in proportion to its length, cut short (their
+   tooltips have them whole) but never to less than 6em, about their first word (a fifth of the
+   title where that is less); the short ones (Opening…, Read-only) stay whole. On a phone all of
+   them give way first (below) */
+.desk-title .desk-pill {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.desk-title .desk-pill.note {
+  flex: 0 1 auto;
+  min-width: min(6em, 20%);
+}
+/* the actions keep one line: only Send's label gives way (the host's name cut short), so Done and
+   Close are always in the frame, whatever the host's name (up to 40 characters) */
+.desk-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.desk-actions > * {
+  flex: none;
+}
+.desk-actions .btn {
+  white-space: nowrap;
+}
+.desk-actions .desk-send {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.desk-send-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desk-mode {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-dim);
+  margin-right: 4px;
+}
+.desk-mode select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  height: 22px;
+}
+.desk-export {
+  padding: 3px 8px 4px;
+  background: var(--bg-header);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.desk-export-text {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text-dim);
+}
+.desk-bar {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-input-dark);
+  overflow: hidden;
+  margin-top: 3px;
+}
+.desk-bar > div {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.2s;
+}
+.desk-bar.indeterminate > div {
+  width: 30%;
+  animation: desk-slide 1.2s linear infinite;
+}
+@keyframes desk-slide {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+.desk-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--bg-panel-header);
+  border-bottom: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  flex: none;
+}
+.desk-banner.ok {
+  border-left-color: var(--ok);
+}
+.desk-banner.warn {
+  border-left-color: var(--warn);
+}
+.desk-banner.err {
+  border-left-color: var(--danger);
+}
+.desk-banner > span:nth-child(2) {
+  flex: 1;
+  min-width: 0;
+}
+.desk-banner-actions {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+.desk-refused {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+/* the notice's warnings: a few lines, then the list scrolls (the editor below keeps its room) */
+.desk-warnings {
+  max-height: min(9em, 30vh);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
+.desk-main {
+  min-height: 0;
+}
+.desk-side {
+  background: var(--bg-area);
+}
+/* the viewport's wrapper (it takes the viewport's keys back on focus) fills the column as the viewport does */
+.desk-viewport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+.desk-modal > div {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.desk-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-faint);
+}
+.desk-work,
+.desk-modal-back {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 1500;
+}
+.desk-work-box,
+.desk-modal {
+  width: min(440px, calc(100% - 32px));
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 14px 16px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.5);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.desk-work-time {
+  color: var(--text-faint);
+}
+/* a modal window takes the focus itself when it opens (useModalFocus): no ring around all of it */
+.desk-modal:focus {
+  outline: none;
+}
+.desk-modal h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.desk-modal p {
+  margin: 0;
+  color: var(--text-dim);
+}
+.desk-modal ul {
+  margin: 0;
+  padding-left: 18px;
+  max-height: 40vh;
+  overflow: auto;
+}
+.desk-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.desk-sample {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 4px 8px;
+  background: #2d2a1f;
+  color: var(--key);
+  border-bottom: 1px solid var(--border);
+  flex: none;
+}
+.desk-sample a {
+  color: var(--text);
+}
+.desk-standalone a.btn {
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+}
+
+/* the Library tab (LibraryTab.tsx): a toolbar, how the last Save to library went, the rows */
+.desk-library {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--bg-area);
+}
+.desk-lib-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  flex: none;
+  min-width: 0;
+}
+.desk-lib-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+.desk-lib-count {
+  color: var(--text-faint);
+  flex: none;
+}
+.desk-lib-grow {
+  flex: 1;
+}
+.desk-lib-toolbar .btn,
+.desk-lib-row .btn {
+  flex: none;
+  white-space: nowrap;
+}
+.desk-lib-line {
+  flex: none;
+  padding: 0 8px 4px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.desk-lib-line.linked {
+  color: var(--ok);
+}
+.desk-lib-line.unlinked {
+  color: var(--warn);
+}
+.desk-lib-line.failed {
+  color: #ff8d8d;
+}
+.desk-lib-line.unknown {
+  color: var(--text);
+}
+.desk-lib-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 8px 8px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.desk-lib-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px;
+  border-bottom: 1px solid #262626;
+  min-width: 0;
+}
+.desk-lib-icon {
+  flex: none;
+  color: var(--text-dim);
+}
+.desk-lib-main {
+  flex: 1;
+  min-width: 0;
+}
+.desk-lib-head {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.desk-lib-name {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.desk-lib-kind,
+.desk-lib-version {
+  flex: none;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.desk-lib-status {
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.desk-lib-status.current {
+  color: var(--ok);
+}
+.desk-lib-status.update,
+.desk-lib-status.pending {
+  color: var(--warn);
+}
+.desk-lib-status.refused {
+  color: #ff8d8d;
+}
+.desk-lib-empty {
+  padding: 4px 8px;
+  color: var(--text-faint);
+}
+
+/* Save to library (SaveToLibraryDialog.tsx): in the desk's modal, scrolling past the frame's height */
+.desk-modal.desk-save {
+  max-height: calc(100% - 32px);
+  overflow-y: auto;
+}
+.desk-save > .desk-save-preview,
+.desk-save > .desk-modal-actions {
+  flex-direction: row;
+}
+.desk-save-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.desk-save-field > span {
+  color: var(--text-dim);
+}
+.desk-save-field .select {
+  width: 100%;
+}
+.desk-save-field .textfield[readonly] {
+  color: var(--text-dim);
+}
+.desk-save-description {
+  height: auto;
+  min-height: 44px;
+  padding: 4px 6px;
+  font: inherit;
+  resize: vertical;
+}
+.desk-save-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  cursor: pointer;
+}
+.desk-save-dim {
+  color: var(--text-faint);
+}
+.desk-save-preview {
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+.desk-save-thumb {
+  flex: none;
+  width: 96px;
+  height: 96px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  background: var(--bg-input-dark);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+.desk-save-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.desk-save-summary {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.desk-modal .desk-save-warnings {
+  color: var(--warn);
+  max-height: 20vh;
+}
+.desk-save-progress {
+  color: var(--text-dim);
+}
+.desk-save-result {
+  padding: 6px 8px;
+  border-radius: var(--radius);
+  background: var(--bg-panel-header);
+  border-left: 3px solid var(--accent);
+  overflow-wrap: anywhere;
+}
+.desk-save-result.linked {
+  border-left-color: var(--ok);
+}
+.desk-save-result.unlinked {
+  border-left-color: var(--warn);
+}
+.desk-save-result.failed {
+  border-left-color: var(--danger);
+}
+.desk-save-result.unknown {
+  border-left-color: var(--text-faint);
+}
+.desk-modal .desk-save-error {
+  color: #ff8d8d;
+  overflow-wrap: anywhere;
+}
+.desk-modal .desk-save-note {
+  color: var(--select-active);
+}
+
+/* phones (the editor's phone layout starts at 760 px): the header keeps its buttons and Follow on
+   one line, Follow without its label, Send without the host's name (in its title), Close without
+   its word, the scene's name and the notes cut short to make room, the notes first */
+@media (max-width: 760px) {
+  .hide-narrow {
+    display: none !important;
+  }
+  .desk-header {
+    padding: 2px 6px;
+    gap: 4px;
+  }
+  .desk-mode {
+    margin-right: 0;
+  }
+  .desk-actions .btn {
+    padding-left: 6px;
+    padding-right: 6px;
+  }
+  .desk-title .desk-pill,
+  .desk-title .desk-pill.note {
+    flex: 0 4 auto;
+    min-width: 0;
+  }
+  .desk-banner {
+    flex-wrap: wrap;
+  }
+  /* the Library tab's rows keep Make local in the frame; the Save dialog's thumbnail is smaller */
+  .desk-lib-row {
+    padding: 4px 2px;
+  }
+  .desk-save-thumb {
+    width: 72px;
+    height: 72px;
+  }
+}

@@ -21,20 +21,29 @@ _Bottom area → Diagnostics_ shows the live numbers and recent spans in the app
 
 ## Server
 
-- **Logs**: structured JSON (pino) with `trace_id`/`span_id` correlation; authorization headers
-  are redacted.
+- **Logs**: structured JSON (pino) with `trace_id`/`span_id` correlation; authorization headers and
+  `token` query parameters are redacted. Each HTTP request gets one `request completed` line
+  (method, url, route, status, time): at debug for static files, health, readiness, metrics and
+  telemetry ingestion that succeed, info for the others, warn for 507 and error for other 5xx.
+  WebSocket upgrades (`/sync/<projectId>`) never reach those hooks: the sync server writes one
+  `upgrade completed` line per handshake, accepted or refused, with the method, the url, the route
+  (`/sync/:projectId`, else `unmatched`), the status (101 when it takes the connection; 400, 401,
+  404 or 405 when it refuses it; 500 or 503 when it cannot answer), the reason (`not found`,
+  `invalid project id`, `unauthorized`, ws's message for a malformed handshake, `connected`, or why
+  it closed a connection at once, with the `closeCode`), the time to the answer and `aborted` when
+  the client left before it: at debug for 101, info for 4xx and warn for 5xx.
 - **Traces**: HTTP requests, WebSocket message handling, persistence load/save, MCP tool calls and
   RPC round trips, exported with OTLP when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
 - **Metrics** (`/metrics`, Prometheus):
   - server: `sync_connections`, `sync_rooms`, `sync_messages_total{type,direction}`,
     `sync_update_bytes`, `sync_rpc_requests_total`, `persistence_operations_total{op,status}`,
-    `persistence_duration_seconds{op}`, `http_requests_total`, `http_request_duration_seconds`,
-    `mcp_sessions`, `mcp_tool_calls_total{tool,status}`, `mcp_tool_duration_seconds{tool}`,
+    `persistence_duration_seconds{op}`, `http_requests_total{method,route,status}` and
+    `http_request_duration_seconds{method,route}` (each WebSocket handshake too, under its route and
+    status), `mcp_sessions`, `mcp_tool_calls_total{tool,status}`, `mcp_tool_duration_seconds{tool}`,
     `telemetry_payloads_total`, `telemetry_forward_failures_total`, plus Node.js runtime metrics
-  - video export, model store and rideo: `video_exports_total{status}`,
-    `video_export_frames_total`, `video_export_seconds`, `video_exports_active`,
-    `store_searches_total{provider,status}`, `store_downloads_total{provider,status}`,
-    `store_download_bytes_total`, `rideo_requests_total{op,status}`
+  - video export and model store: `video_exports_total{status}`, `video_export_frames_total`,
+    `video_export_seconds`, `video_exports_active`, `store_searches_total{provider,status}`,
+    `store_downloads_total{provider,status}`, `store_download_bytes_total`
   - aggregated from browsers: `editor_operator_executions_total{operator,source,status}`,
     `editor_operator_duration_seconds{operator}`, `editor_client_spans_total`,
     `editor_client_logs_total{severity}`, `editor_fps`, `editor_frame_time_seconds`,

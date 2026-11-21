@@ -10,6 +10,10 @@ import type { ExportJob, ExportStatus } from './index';
  * was running cannot go on (its render state is gone) and becomes failed 'server restarted'; a
  * queued one waits again with its snapshot. Finished jobs are deleted after EXPORT_TTL_HOURS, and
  * the oldest finished ones first when all exports together take more than EXPORT_MAX_MB.
+ *
+ * Jobs that servers with the rideo bridge (retired) exported may hold its `push` block (rideo_push's
+ * results). A loaded job leaves it out, so export_status and list_exports return only the fields
+ * documented today, and the job's saves write it back: nothing of it is deleted here.
  */
 
 export const JOB_FILE = 'job.json';
@@ -97,10 +101,15 @@ interface SaveQueue {
 /** Temporary file names of one process, each write its own. */
 let tmpCounter = 0;
 
+/** Fields of job.json that only servers with the retired rideo bridge wrote (see the header). */
+const RETIRED_FIELDS = ['push'] as const;
+
 /** Reads, writes and deletes the jobs of one export directory. */
 export class JobStore {
   /** The saves of each job (by directory) in progress. */
   private readonly saves = new Map<string, SaveQueue>();
+  /** The retired fields each loaded job had in job.json, written back by its saves. */
+  private readonly retired = new WeakMap<ExportJob, Record<string, unknown>>();
 
   constructor(
     readonly root: string,
@@ -150,7 +159,8 @@ export class JobStore {
     await mkdir(dir, { recursive: true });
     const tmp = path.join(dir, `.${JOB_FILE}.${process.pid}.${++tmpCounter}.tmp`);
     try {
-      await writeFile(tmp, JSON.stringify(job, null, 2));
+      const retired = this.retired.get(job);
+      await writeFile(tmp, JSON.stringify(retired ? { ...job, ...retired } : job, null, 2));
       await rename(tmp, path.join(dir, JOB_FILE));
     } catch (err) {
       await rm(tmp, { force: true }).catch(() => undefined);
@@ -185,13 +195,27 @@ export class JobStore {
         if (!safeName(id)) continue;
         try {
           const raw = JSON.parse(await readFile(path.join(pdir, id, JOB_FILE), 'utf8')) as ExportJob;
-          if (raw && raw.id === id && raw.project === project && typeof raw.status === 'string')
+          if (raw && raw.id === id && raw.project === project && typeof raw.status === 'string') {
+            this.setAsideRetired(raw);
             out.push(raw);
+          }
         } catch (err) {
           this.log.warn({ job: id, project, err: String(err) }, 'video export job not readable: skipped');
         }
       }
     }
     return out;
+  }
+
+  /** Takes the retired fields out of a loaded job (kept for its saves). */
+  private setAsideRetired(job: ExportJob): void {
+    const fields = job as unknown as Record<string, unknown>;
+    const kept: Record<string, unknown> = {};
+    for (const name of RETIRED_FIELDS)
+      if (Object.hasOwn(fields, name)) {
+        kept[name] = fields[name];
+        delete fields[name];
+      }
+    if (Object.keys(kept).length > 0) this.retired.set(job, kept);
   }
 }

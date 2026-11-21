@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { run, registry, canRun, popupMenu, paletteOpen } from '../editor/editor';
 import { availableItems, menuByName, type MenuItem } from '../editor/menus';
+import { pageGuard } from '../editor/page-guard';
 import { session } from '../app/store';
 import { composing } from './fields/fields';
 
@@ -47,11 +48,13 @@ export function MenuList(p: {
                 {it.title}
               </div>
             );
-          const enabled = it.enabled
-            ? it.enabled()
-            : it.op
-              ? canRun(it.op) || !!registry.get(it.op)?.uiOnly
-              : true;
+          // what the page refuses (the embeddable desk: the chrome it hides, and in a read-only open
+          // every change) is greyed out, its reason as the tooltip; UI operators are enabled
+          // otherwise whatever their poll says, which needs the viewport the menu does not have
+          const refused = it.op ? pageGuard.refusal(it.op) : null;
+          const enabled =
+            refused === null &&
+            (it.enabled ? it.enabled() : it.op ? canRun(it.op) || !!registry.get(it.op)?.uiOnly : true);
           const hasSub = !!it.submenu;
           // greyed out like a disabled item, but a click still runs it (Blender's layout.active); its
           // colours are in styles.css ([data-inactive]), readable under the pointer too
@@ -61,7 +64,9 @@ export function MenuList(p: {
               key={i}
               class={`menu-item ${enabled || hasSub ? '' : 'disabled'} ${sub?.index === i ? 'hover' : ''}`}
               title={
-                inactive ? `${it.label}: ${inactive}` : it.op ? registry.get(it.op)?.description : undefined
+                inactive
+                  ? `${it.label}: ${inactive}`
+                  : (refused ?? (it.op ? registry.get(it.op)?.description : undefined))
               }
               data-inactive={inactive ? 'true' : undefined}
               data-testid={`menu-${(it.label ?? '').toLowerCase().replace(/[^a-z0-9]+/g, '-')}`}

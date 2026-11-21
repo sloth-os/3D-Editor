@@ -6,6 +6,7 @@ import {
   decodeFloat32,
   decompose4,
   evaluateFCurve,
+  exportedCustomProps,
   isMeshMemoryError,
   isModifierEnabled,
   meshStats,
@@ -1642,7 +1643,7 @@ function objectDescription(scene: SceneDoc, o: ObjectData, frame: number | undef
         ),
       };
     }),
-    custom_props: o.custom_props,
+    custom_props: exportedCustomProps(o.custom_props),
     display: {
       display_type: o.display_type,
       show_wire: o.show_wire,

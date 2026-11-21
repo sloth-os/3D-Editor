@@ -38,8 +38,7 @@ export interface McpHubOptions {
   rooms: RoomManager;
   /**
    * The server's services (services.ts): the operator registry, the renderer (the process-wide one
-   * unless the app was given another), the render store, video exports, the model store and the
-   * rideo bridge.
+   * unless the app was given another), the render store, video exports and the model store.
    */
   services: ServerServices;
   config: ServerConfig;
@@ -166,7 +165,6 @@ export class McpHub {
       renderStore: services.renderStore,
       exports: services.exports,
       store: services.store,
-      rideo: services.rideo,
       historyLimits: resolveHistoryLimits(this.opts.history),
     };
     registerTools(server, ctx);

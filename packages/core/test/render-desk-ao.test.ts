@@ -213,7 +213,9 @@ describe('ambientOcclusion (screen space)', () => {
       expect(same(halfRes, fullRes)).toBe(false);
       expect(auto.subarray(0, bw * 40).every((x) => x === 1)).toBe(true);
     }
-  });
+    // 4.4 s beside core's suite; under coverage, as CI runs the suites, 6–7.4 s, and 17 s beside
+    // core's suite, more than half the project's 30 s
+  }, 60_000);
 
   it('is deterministic, scales with the radius and is off for a zero radius', () => {
     const pix = planeBuffers(view, W, H, [floor, wall]);

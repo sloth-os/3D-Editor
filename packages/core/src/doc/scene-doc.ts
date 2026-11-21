@@ -362,6 +362,48 @@ export class SceneDoc {
     return this.map(kind).has(id);
   }
 
+  /**
+   * The stored fields of a datablock (without `id`), as stored: no defaults filled in. A deep copy
+   * (byte arrays copied too); null when there is none. Library units (desk/units) read records with it.
+   */
+  readRecord(kind: DatablockKind, id: string): Record<string, unknown> | null {
+    const y = this.map(kind).get(id) as Y.Map<any> | undefined;
+    if (!y) return null;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of y.entries()) if (k !== 'id') out[k] = cloneJson(v);
+    return out;
+  }
+
+  /**
+   * Adds a datablock with an explicit id and these stored fields, its name made unique as every new
+   * datablock's is (inside a transaction, in constant time per datablock). Throws when the id is taken.
+   */
+  addRecord(kind: DatablockKind, id: string, fields: Record<string, unknown> & { name: string }): string {
+    if (this.map(kind).has(id)) throw new Error(`${kind} ${id} already exists`);
+    const { id: _ignore, ...rest } = fields;
+    return this.createBlock(kind, { ...rest, name: String(fields.name) }, id);
+  }
+
+  /**
+   * Makes a datablock's stored fields `fields`: sets each field whose value differs (byte arrays
+   * compared byte for byte), deletes stored fields `fields` lacks (`id` stays) and renames it (kept
+   * unique) when its name differs. Fields set to the value they hold are not written, so nothing is
+   * recorded for them (sync, undo). Throws when there is no such datablock.
+   */
+  replaceRecord(kind: DatablockKind, id: string, fields: Record<string, unknown>): void {
+    const y = this.map(kind).get(id) as Y.Map<any> | undefined;
+    if (!y) throw new Error(`${kind} ${id} not found`);
+    this.transact(() => {
+      for (const [k, v] of Object.entries(fields)) {
+        if (k === 'id' || k === 'name' || v === undefined) continue;
+        if (!sameStoredValue(y.get(k), v)) y.set(k, v instanceof Uint8Array ? v.slice() : cloneJson(v));
+      }
+      for (const k of [...y.keys()]) if (k !== 'id' && k !== 'name' && fields[k] === undefined) y.delete(k);
+      if (typeof fields.name === 'string' && fields.name !== y.get('name'))
+        this.rename(kind, id, fields.name);
+    });
+  }
+
   // ---------------------------------------------------------------- meta / settings
 
   getMeta(): ProjectMeta {
@@ -1682,6 +1724,30 @@ export function changedChannels(
     if (v.every(Number.isFinite) && v.some(differs)) patch[k] = [v[0], v[1], v[2]];
   }
   return Object.keys(patch).length ? patch : null;
+}
+
+/** Whether two stored values are equal: JSON values structurally, byte arrays byte for byte. */
+function sameStoredValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a instanceof Uint8Array || b instanceof Uint8Array) {
+    if (!(a instanceof Uint8Array) || !(b instanceof Uint8Array) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) {
+    const bb = b as unknown[];
+    if (a.length !== bb.length) return false;
+    for (let i = 0; i < a.length; i++) if (!sameStoredValue(a[i], bb[i])) return false;
+    return true;
+  }
+  const ka = Object.keys(a as object).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
+  const kb = Object.keys(b as object).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka)
+    if (!sameStoredValue((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k])) return false;
+  return true;
 }
 
 /** Convenience: location of the object's world-space origin from stored properties. */

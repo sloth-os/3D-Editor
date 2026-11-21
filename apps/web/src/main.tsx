@@ -5,13 +5,15 @@ import { serverConfig, serverChecked, session, toast } from './app/store';
 import { fetchServerConfig } from './app/server-config';
 import { setupTelemetry } from './telemetry/setup';
 import { registerUiOperators } from './editor/ui-operators';
-import { registry } from './editor/editor';
+import * as Y from 'yjs';
+import { registry, runResult } from './editor/editor';
 import { installKeymap } from './editor/keymap';
 import { installRpcHandler } from './editor/rpc';
 import { openProject, projectFromUrl } from './project/manager';
 import { registerPWA } from './pwa/register';
 import { telemetry } from './telemetry/telemetry';
 import { importFiles } from './io/import-export';
+import { exportDebugHook } from './export/debug';
 
 registerUiOperators(registry);
 installKeymap();
@@ -57,5 +59,14 @@ async function boot(): Promise<void> {
 
 void boot();
 
-// expose a small debugging/scripting hook (also used by end-to-end tests)
-Object.assign(window, { __editor: { registry, telemetry } });
+// expose a small debugging/scripting hook (also used by end-to-end tests): the operators, the
+// telemetry, the open project's state as a Yjs update, and the browser video export's frame digests
+Object.assign(window, {
+  __editor: {
+    registry,
+    telemetry,
+    run: runResult,
+    snapshot: () => (session.value ? Y.encodeStateAsUpdate(session.value.doc.ydoc) : null),
+    export: exportDebugHook(),
+  },
+});

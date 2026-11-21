@@ -23,12 +23,14 @@ export function clientConfig(
       mcp: config.mcpEnabled,
       telemetry: config.telemetryEnabled,
       webdavProxy: config.webdavProxy,
-      /** Server video export (ffmpeg was found at startup). */
+      /**
+       * The server's video export (ffmpeg was found at startup). Browsers export on their own
+       * device by default (WebCodecs, no server needed); this tells them the server can export
+       * the projects it holds too, which they offer as a second choice.
+       */
       videoExport: startup.videoExport,
       /** The model store (built-in models always; external providers per STORE_PROVIDERS). */
       modelStore: true,
-      /** The rideo bridge (RIDEO_URL is set). */
-      rideo: config.rideoUrl !== null,
     },
     webdav:
       config.webdavProxy && config.webdav

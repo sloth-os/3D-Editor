@@ -126,9 +126,16 @@ export function delayedBodyRecords(doc: SceneDoc, frameStart: number, frame: num
  * Bytes the simulation of `doc` keeps once it has simulated to `frame` from the world's frame_start
  * (0 when the world is disabled or nothing is simulated at that frame): its frames
  * ({@link simulationCacheBytes}) and the matrices its delayed bodies follow before their start
- * ({@link delayedBodyRecords}); an upper bound, as if nothing were cached yet.
+ * ({@link delayedBodyRecords}); an upper bound, as if nothing were cached yet. With `outsideHeap`,
+ * only the part outside the JavaScript heap ({@link simulationOutsideHeapBytes}, and every delayed
+ * body's record: longer than the heap keeps inside it), as rigid-body.ts rigidBodyCachesBytes counts
+ * a cache.
  */
-export function documentSimulationBytes(doc: SceneDoc, frame: number): number {
+export function documentSimulationBytes(
+  doc: SceneDoc,
+  frame: number,
+  opts: { outsideHeap?: boolean } = {},
+): number {
   const scene = doc.getScene();
   if (!sanitizeRigidBodyWorld(scene.rigidbody_world).enabled || !Number.isFinite(frame)) return 0;
   const params = worldParams(scene);
@@ -136,7 +143,7 @@ export function documentSimulationBytes(doc: SceneDoc, frame: number): number {
   if (!bodies.simulated) return 0;
   const frames = Math.ceil(Math.min(frame, simulatedFrameEnd(params))) - params.frameStart;
   return (
-    simulationCacheBytes(bodies, frames) +
+    (opts.outsideHeap ? simulationOutsideHeapBytes(bodies, frames) : simulationCacheBytes(bodies, frames)) +
     SIMULATION_BYTES_PER_KINEMATIC_FRAME *
       delayedBodyRecords(doc, params.frameStart, params.frameStart + frames)
   );

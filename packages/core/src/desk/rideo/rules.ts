@@ -14,13 +14,18 @@ import type { RideoBlockingPose, RideoCharacterInput, RideoMovement, RideoShotIn
 
 // ---------------------------------------------------------------- text
 
-/** Lower-case text with accents folded and apostrophes made plain. */
-export function plainText(text: string): string {
-  return text.normalize('NFKD').replace(/\p{M}/gu, '').replace(/[‘’ʼ]/g, "'").toLowerCase();
+/** Text with accents folded and apostrophes made plain, in its own case. */
+export function foldText(text: string): string {
+  return text.normalize('NFKD').replace(/\p{M}/gu, '').replace(/[‘’ʼ]/g, "'");
 }
 
-/** The text of a character: its name, summary and identity (rideo's identity fields, or one string). */
-export function characterText(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'identity'>): string {
+/** Lower-case text with accents folded and apostrophes made plain. */
+export function plainText(text: string): string {
+  return foldText(text).toLowerCase();
+}
+
+/** The words of a character in their own case: its name, summary and identity (rideo's identity fields, or one string). */
+function characterWords(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'identity'>): string {
   const identity =
     typeof c.identity === 'string'
       ? c.identity
@@ -29,17 +34,189 @@ export function characterText(c: Pick<RideoCharacterInput, 'name' | 'summary' | 
             .filter((v): v is string => typeof v === 'string')
             .join('. ')
         : '';
-  return plainText([c.name, c.summary ?? '', identity].join('. '));
+  return [c.name, c.summary ?? '', identity].join('. ');
 }
 
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+/** The text of a character as plainText: its name, summary and identity (rideo's identity fields, or one string). */
+export function characterText(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'identity'>): string {
+  return plainText(characterWords(c));
+}
 
-/** Sentences of a text (split at . ! ? ; and line breaks). */
-const sentences = (text: string): string[] =>
-  text
-    .split(/[.!?;\n]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+export const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * Titles before a name, written with a capital ("Dr. Okafor", "St. Ives", "Elm St."): a period after
+ * one ends a sentence only before a word that opens one, written with a capital (OPENS). In lower
+ * case they are words ("the engine's rev.", "thanks, hon.").
+ */
+const TITLES = new Set([
+  'dr',
+  'mr',
+  'mrs',
+  'ms',
+  'mx',
+  'st',
+  'prof',
+  'rev',
+  'fr',
+  'capt',
+  'col',
+  'gen',
+  'lt',
+  'sgt',
+  'cpl',
+  'maj',
+  'adm',
+  'cmdr',
+  'det',
+  'insp',
+  'supt',
+  'sen',
+  'gov',
+  'hon',
+  'pres',
+  'mt',
+  'mme',
+  'mlle',
+]);
+
+/**
+ * Abbreviations: a period after one ends a sentence only when a capital comes next ("approx. 160 cm",
+ * "e.g. a scar", but "scars, tattoos etc. A retired boxer.").
+ */
+const ABBREVIATIONS = new Set([
+  'approx',
+  'appr',
+  'cf',
+  'eg',
+  'ie',
+  'etc',
+  'esp',
+  'incl',
+  'nos',
+  'nr',
+  'vs',
+  'viz',
+  'jr',
+  'sr',
+  'ft',
+  'lb',
+  'lbs',
+  'oz',
+  'cm',
+  'mm',
+  'km',
+  'kg',
+  'yrs',
+  'yr',
+  'mos',
+  'wks',
+  'wk',
+  'hrs',
+  'hr',
+  'avg',
+  'dept',
+  'ave',
+  'rd',
+]);
+
+/**
+ * Abbreviations that are also words or names that end sentences ("walks in.", "says no.", "runs to
+ * Max."): abbreviations only beside a number, on the side given ("6 ft 2 in.", "18 mo.", "No. 5",
+ * "max. 2 m", "ca. 1900", "est. 1990", "20 min." or "min. 20 kg"), and "al" after "et".
+ */
+const NUMBER_ABBREVIATIONS: Readonly<Record<string, 'before' | 'after' | 'either'>> = {
+  in: 'before',
+  mo: 'before',
+  yo: 'before',
+  no: 'after',
+  max: 'after',
+  ca: 'after',
+  est: 'after',
+  min: 'either',
+};
+
+/**
+ * Words that open a sentence (a pronoun, an article or determiner, a linking word), not a name: a
+ * period after a title or an initial ends a sentence before one written with a capital (CAPITAL_NEXT:
+ * "Elm St. A car stops", "Gate C. He waits", "Ocean Dr. He waves", but not "St. Ives", "J. Smith",
+ * "J. A. Smith", nor "Elm St. in the rain", "the U.S. in 1990"), and before a name spelled like one
+ * ("Dr. An arrives" is two sentences).
+ */
+const OPENS =
+  /^\s+["“'‘(]*(?:i|a|an|the|this|that|these|those|he|she|it|we|they|you|his|her|its|our|their|my|your|there|here|then|now|next|later|meanwhile|suddenly|finally|soon|again|also|when|while|as|after|before|but|in|on|at)\b(?!\.)/i;
+
+/** The next word (after spaces, opening quotes or brackets) is written with a capital. */
+const CAPITAL_NEXT = /^\s+["“'‘(]*\p{Lu}/u;
+
+/**
+ * Whether the period at `at` (its marks end at `next`) ends a sentence (see sentenceBreak). A period
+ * inside a number ("1.85 m") is never seen here: no space follows it.
+ */
+function periodEnds(text: string, at: number, next: number): boolean {
+  const after = text.slice(next);
+  // the period that ends the text
+  if (!after.trim()) return true;
+  const lead = text.slice(Math.max(0, at - 40), at);
+  const word = /(\p{N}+(?:st|nd|rd|th)|\p{L}+(?:\.\p{L}+)*|\p{N}+(?:[.,]\p{N}+)*)$/iu.exec(lead)?.[1];
+  // after a number or an ordinal ("aged 45. A boxer.", "finishes 1st. He waves."), or other marks
+  if (!word || /^\p{N}/u.test(word)) return true;
+  const parts = word.split('.');
+  const w = parts.join('').toLowerCase();
+  if (parts.every((p) => p.length === 1 && p !== p.toLowerCase()) || (TITLES.has(w) && /^\p{Lu}/u.test(word)))
+    return CAPITAL_NEXT.test(after) && OPENS.test(after);
+  const before = lead.slice(0, lead.length - word.length);
+  const side = NUMBER_ABBREVIATIONS[w];
+  const abbreviation =
+    ABBREVIATIONS.has(w) ||
+    (side !== undefined &&
+      ((side !== 'after' && /\p{N}\s*$/u.test(before)) || (side !== 'before' && /^\s+\p{N}/u.test(after)))) ||
+    (w === 'al' && /\bet\s+$/i.test(before));
+  if (abbreviation || parts.length > 1 || word.length === 1) return CAPITAL_NEXT.test(after);
+  return true;
+}
+
+/**
+ * Where the first sentence of `text` ends: `end`, where its end mark starts (the text's length when it
+ * has none), and `next`, where the text after it starts. A sentence ends at a line break, at ".", "!",
+ * "?" or "…" followed by a space or the end of the text (closing quotes or brackets between), and
+ * with `semicolons` at ";". A period does not end it inside a number; after a title written with a
+ * capital ("Dr.", "Mrs.", "St.") or an initial ("J.", "U.S.") unless the next word opens a sentence
+ * and is written with a capital (OPENS: "He", "The", "Then" …; not "Elm St. in the rain"); after an
+ * abbreviation ("approx.", "e.g.", "6 ft 2 in.", "No. 5") unless a capital follows. Read in the
+ * text's own case: lowered, "walks in. he" and "approx. he" look alike.
+ */
+export function sentenceBreak(text: string, semicolons = false): { end: number; next: number } {
+  const re = semicolons ? /[.!?…]+["”'’)\]]*(?=\s|$)|[\n;]/g : /[.!?…]+["”'’)\]]*(?=\s|$)|\n/g;
+  for (let m = re.exec(text); m; m = re.exec(text)) {
+    const next = m.index + m[0].length;
+    if (/^\.+["”'’)\]]*$/.test(m[0]) && !periodEnds(text, m.index, next)) continue;
+    return { end: m.index, next };
+  }
+  return { end: text.length, next: text.length };
+}
+
+/** The sentences of a text, trimmed, without their end marks (see sentenceBreak). */
+export function sentencesOf(text: string, semicolons = false): string[] {
+  const out: string[] = [];
+  let rest = text;
+  while (rest.trim()) {
+    const b = sentenceBreak(rest, semicolons);
+    const s = rest.slice(0, b.end).trim();
+    if (s) out.push(s);
+    rest = rest.slice(b.next);
+  }
+  return out;
+}
+
+/** Sentences of a text (split at . ! ? ; and line breaks as sentenceBreak reads them). */
+const sentences = (text: string): string[] => sentencesOf(text, true);
+
+/**
+ * The sentences of a text as plainText (lower case, accents folded), split before lowering it: its
+ * capitals tell a sentence's end from an abbreviation's period ("walks in. He").
+ */
+export const plainSentences = (text: string): string[] => sentences(foldText(text)).map(plainText);
 
 // ---------------------------------------------------------------- actor kinds
 
@@ -122,8 +299,8 @@ export function speciesOf(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'ide
 
 /** Whether a character's words say it acts as a person (talks, holds things, dresses, is a toy or a panda). */
 export function actsAsPerson(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'identity'>): boolean {
-  const text = characterText(c);
-  for (const s of sentences(text)) {
+  // split in the words' own case, then read lowered (see plainSentences)
+  for (const s of plainSentences(characterWords(c))) {
     const m = PERSON_CUES.exec(s);
     if (!m) continue;
     // "wears a bridle", "a red saddle blanket": animal gear
@@ -133,8 +310,8 @@ export function actsAsPerson(c: Pick<RideoCharacterInput, 'name' | 'summary' | '
   return false;
 }
 
-/** Ages written out ("an eight-year-old girl"). */
-const AGE_WORDS: Readonly<Record<string, number>> = {
+/** Numbers written out ("an eight-year-old girl", "forty-five", "thirty"). */
+const NUMBER_WORDS: Readonly<Record<string, number>> = {
   one: 1,
   two: 2,
   three: 3,
@@ -147,22 +324,122 @@ const AGE_WORDS: Readonly<Record<string, number>> = {
   ten: 10,
   eleven: 11,
   twelve: 12,
+  thirteen: 13,
+  fourteen: 14,
+  fifteen: 15,
+  sixteen: 16,
+  seventeen: 17,
+  eighteen: 18,
+  nineteen: 19,
+  twenty: 20,
+  thirty: 30,
+  forty: 40,
+  fifty: 50,
+  sixty: 60,
+  seventy: 70,
+  eighty: 80,
+  ninety: 90,
 };
 
+/** Decades written out ("in her twenties", "late sixties"). */
+const DECADE_WORDS: Readonly<Record<string, number>> = {
+  twenties: 20,
+  thirties: 30,
+  forties: 40,
+  fifties: 50,
+  sixties: 60,
+  seventies: 70,
+  eighties: 80,
+  nineties: 90,
+};
+
+/** Where in a decade "early", "mid" and "late" put an age ("late 60s": 68), and "-something" (35). */
+const DECADE_PART: Readonly<Record<string, number>> = { early: 2, mid: 5, late: 8, something: 5 };
+
+/** Units of a baby's age, in years ("18 months": 1). */
+const SMALL_UNITS: readonly (readonly [RegExp, number])[] = [
+  [/^months?$|^mos?$/, 12],
+  [/^weeks?$|^wks?$/, 52],
+  [/^days?$/, 365],
+];
+
 /**
- * A person's kind from its words: its age (identity.age, else "<n>-year-old"), else what its own
- * words call it (toddler, child, elder), else its gender (identity.gender, else its words), else adult.
+ * The age a text gives, in years, or null: a number ("45", "about 30", "30-ish", "45 years old"), a
+ * decade ("30s", "early 30s", "mid-forties", "late sixties": early, mid and late put it 2, 5 and 8
+ * years in), a number written out ("forty-five", "thirty-something") or a baby's months, weeks or
+ * days ("18 months": 1). Teens ("teenage", "late teens") and words such as "elderly" or "young" are
+ * not read as an age: what they say is read from the words (humanKindOf).
+ */
+export function ageOf(text: string): number | null {
+  const words = plainText(text)
+    .replace(/(\d)\s*'?s\b/g, '$1 decade')
+    .replace(/(\w)-?ish\b/g, '$1')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  const part = words.map((w) => DECADE_PART[w]).find((v) => v !== undefined) ?? 0;
+  for (const [i, w] of words.entries()) {
+    let n: number | null = null;
+    let decade = false;
+    if (/^\d{1,3}$/.test(w)) {
+      n = Number(w);
+      decade = words[i + 1] === 'decade' || words[i + 1] === 'something';
+    } else if (DECADE_WORDS[w] !== undefined) {
+      n = DECADE_WORDS[w];
+      decade = true;
+    } else if (NUMBER_WORDS[w] !== undefined) {
+      n = NUMBER_WORDS[w];
+      const unit = NUMBER_WORDS[words[i + 1]];
+      // "forty-five", "thirty-something"
+      if (n >= 20 && unit !== undefined && unit < 10) n += unit;
+      else if (n >= 20 && words[i + 1] === 'something') decade = true;
+    }
+    if (n === null) continue;
+    const small = SMALL_UNITS.find(([re]) => words.slice(i + 1, i + 3).some((x) => re.test(x)));
+    if (small) return Math.floor(n / small[1]);
+    return decade ? n + part : n;
+  }
+  return null;
+}
+
+/** Words an age may have besides its number ("about 30", "early 30s", "45 years old"). */
+const AGE_FILLER =
+  /^(?:decade|early|mid|late|something|about|around|roughly|nearly|almost|just|over|under|past|approx|approximately|circa|ca|c|aged?|in|his|her|their|years?|yrs?|y|o|old|months?|mos?|weeks?|wks?|days?|and|a|half)$/;
+
+/** Whether a text is an age and nothing else ("8", "early 30s", "thirty", "6 years old"; not "two dogs"). */
+export function isAgeText(text: string): boolean {
+  const words = plainText(text)
+    .replace(/(\d)\s*'?s\b/g, '$1 decade')
+    .replace(/(\w)-?ish\b/g, '$1')
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+  return (
+    ageOf(text) !== null &&
+    words.every(
+      (w) =>
+        /^\d{1,3}$/.test(w) ||
+        NUMBER_WORDS[w] !== undefined ||
+        DECADE_WORDS[w] !== undefined ||
+        AGE_FILLER.test(w),
+    )
+  );
+}
+
+/**
+ * A person's kind from its words: its age (identity.age, else "<n>-year-old"; ageOf reads numbers,
+ * decades and ages written out), else what its own words call it (toddler, child, elder), else its
+ * gender (identity.gender, else its words), else adult.
  */
 export function humanKindOf(c: Pick<RideoCharacterInput, 'name' | 'summary' | 'identity'>): ActorKind {
   const own = ownTexts(c);
   const fields = c.identity && typeof c.identity === 'object' ? c.identity : null;
   const ageField = typeof fields?.age === 'string' ? fields.age : '';
-  const ageMatch =
-    /(\d{1,3})/.exec(ageField) ??
-    own.map((t) => /\b(\d{1,3}|[a-z]+)[- ]?(?:years?|yrs?)[- ]?old\b/.exec(t)).find(Boolean) ??
-    null;
-  const said = ageMatch?.[1] ?? '';
-  const age = /^\d+$/.test(said) ? Number(said) : (AGE_WORDS[said] ?? null);
+  let age = ageOf(ageField);
+  for (const t of own) {
+    if (age !== null) break;
+    // "an eight-year-old", "a forty-five-year-old"
+    const said = /\b(\d{1,3}|[a-z]+(?:-[a-z]+)?)[- ]?(?:years?|yrs?)[- ]?old\b/.exec(t);
+    if (said) age = ageOf(said[1]);
+  }
   if (age !== null) {
     if (age <= 3) return 'toddler';
     if (age <= 12) return 'child';
@@ -384,6 +661,15 @@ export function ridersByText(
   people: readonly { id: string; name: string }[],
   mounts: readonly { id: string; name: string; kind: ActorKind }[],
 ): { rider: string; mount: string }[] {
+  return ridersIn(plainSentences(text), people, mounts);
+}
+
+/** ridersByText over sentences already split and lowered (plainSentences). */
+function ridersIn(
+  sentenceList: readonly string[],
+  people: readonly { id: string; name: string }[],
+  mounts: readonly { id: string; name: string; kind: ActorKind }[],
+): { rider: string; mount: string }[] {
   const out: { rider: string; mount: string }[] = [];
   if (!people.length || !mounts.length) return out;
   const taken = new Set<string>();
@@ -397,7 +683,7 @@ export function ridersByText(
     const free = mounts.filter((m) => !taken.has(m.id));
     return free.length === 1 ? free[0].id : null;
   };
-  for (const s of sentences(plainText(text))) {
+  for (const s of sentenceList) {
     const who = mentions(s, people);
     const steeds = mentions(s, mounts);
     for (const w of riderWords(s)) {
@@ -447,10 +733,11 @@ export function ridingDenied(
   if (!person.name.trim()) return false;
   const p = { id: 'p', name: person.name };
   const m = { id: 'm', name: mount.name, kind: mount.kind };
-  for (const s of sentences(plainText(text))) {
+  for (const s of plainSentences(text)) {
     if (!nameRe(person.name).test(s)) continue;
     const named = (mount.name.trim() && nameRe(mount.name).test(s)) || kindWord(mount.kind).test(s);
-    if (!named || ridersByText(s, [p], [m]).length) continue;
+    // the sentence as split, not split again lowered ("Dr. Okafor rides Pepper beside the fence")
+    if (!named || ridersIn([s], [p], [m]).length) continue;
     if (BUSY.test(s)) return true;
   }
   return false;
@@ -458,6 +745,76 @@ export function ridingDenied(
 
 /** A person's mark this close to a mount's (m) seats them on it (rideo's riders stand beside their ponies). */
 export const MOUNT_DISTANCE_M = 0.6;
+
+// ---------------------------------------------------------------- holding
+
+/*
+ * Who holds what by a shot's words, read like riding: the subject of a holding word (a character of
+ * the shot named before it, or after it when it opens the sentence: "Holding the kite, Mira runs")
+ * holds the prop it names right after it, through determiners and adjectives only ("carries the big
+ * red box", "runs across the meadow with the kite", "a girl with a balloon"). A word that is denied
+ * or not yet done ("never carries", "wants to hold") says nothing, nor does one whose object is not a
+ * prop of the shot ("walks with Pip").
+ */
+
+/** Holding words: their subject holds the prop they name. */
+const HOLDS =
+  /\b(?:holds?|holding|held|carr(?:y|ies|ying|ied)|grips?|gripping|gripped|clutch(?:es|ing|ed)?|cradl(?:e|es|ing|ed)|brandish(?:es|ing|ed)?|wields?|wielding|wielded|flies|flying|flew|fly|tows?|towing|towed|tugs? (?:at|on)|tugging (?:at|on)|picks? up|picking up|picked up|lifts?|lifting|lifted|raises?|raising|raised|grabs?|grabbing|grabbed|takes?|taking|took|swings?|swinging|swung|waves?|waving|waved|with)\b/g;
+
+/**
+ * Who holds which prop by a shot's text (see above): pairs of a character of `cast` and a prop of
+ * `props` (named by its name or one of its `words`, plurals included), each prop held by the first
+ * character the text says holds it.
+ */
+export function holdersByText(
+  text: string,
+  cast: readonly { id: string; name: string }[],
+  props: readonly { id: string; name: string; words?: readonly string[] }[],
+): { holder: string; prop: string }[] {
+  const out: { holder: string; prop: string }[] = [];
+  if (!cast.length || !props.length) return out;
+  const named = (p: (typeof props)[number]) =>
+    [p.name, ...(p.words ?? [])].map((w) => plainText(w).trim()).filter((w) => w.length >= 2);
+  const held = new Set<string>();
+  for (const s of plainSentences(text)) {
+    const who = mentions(s, cast);
+    const things: Mention[] = [];
+    for (const p of props)
+      for (const w of named(p)) {
+        const re = new RegExp(`\\b${escapeRe(w)}(?:s|es)?\\b`, 'g');
+        for (let m = re.exec(s); m; m = re.exec(s))
+          things.push({ id: p.id, at: m.index, end: m.index + m[0].length, possessive: false });
+      }
+    things.sort((a, b) => a.at - b.at || b.end - a.end);
+    HOLDS.lastIndex = 0;
+    for (let v = HOLDS.exec(s); v; v = HOLDS.exec(s)) {
+      const lead = s.slice(0, v.index);
+      if (NOT_NOW.test(lead)) continue;
+      const end = v.index + v[0].length;
+      // the prop it names: the first one after it in its clause, through two words at most that are
+      // not prepositions ("the big red box", not "past the box")
+      const rest = s.slice(end);
+      const stop = CLAUSE_END.exec(rest);
+      const clauseEnd = end + (stop ? stop.index : rest.length);
+      const object = things.find((t) => {
+        if (t.at < end || t.at >= clauseEnd) return false;
+        const gap = s.slice(end, t.at).trim();
+        const words = gap ? gap.split(/\s+/) : [];
+        return words.length <= 3 && !words.some((x) => NOT_OBJECT.test(x));
+      });
+      if (!object || held.has(object.id)) continue;
+      // the subject: the character named last before the word (after it when it opens the sentence)
+      const before = who.filter((m) => m.end <= v!.index && !m.possessive);
+      let subject: Mention | null = before.length ? before[before.length - 1] : null;
+      if (!subject && /^\s*(?:\w+ly\s+)?$/.test(lead))
+        subject = who.find((m) => m.at >= object.end && !m.possessive) ?? null;
+      if (!subject) continue;
+      out.push({ holder: subject.id, prop: object.id });
+      held.add(object.id);
+    }
+  }
+  return out;
+}
 
 // ---------------------------------------------------------------- camera moves
 
@@ -469,11 +826,12 @@ const TILTS = /\btilt(?:s|ed|ing)?\b/;
  * Which way a camera move goes by its words (`a` or `b`; null when its sentence says neither): in the
  * first sentence where `verb` names the move, where it goes to ("from left to right", "to the
  * right", "rightwards", "pans right"), else the other way from where it starts ("from the left").
+ * The text is split in its own case (plainSentences), so give it as written.
  */
 export function directionOf(text: string, verb: RegExp, a: string, b: string): string | null {
   const dir = `(${a}|${b})`;
   const other = (d: string) => (d === a ? b : a);
-  for (const s of sentences(text)) {
+  for (const s of plainSentences(text)) {
     const v = verb.exec(s);
     if (!v) continue;
     const rest = s.slice(v.index + v[0].length);
@@ -511,19 +869,18 @@ export function moveOfMovement(movement: RideoMovement, text: string): DeskMove 
       // "anti-clockwise" and "counter-clockwise" contain "clockwise": they are tested first
       if (/\b(?:anti|counter)[- ]?clockwise\b/.test(t)) return 'orbit_left';
       if (/\bclockwise\b/.test(t)) return 'orbit_right';
-      return directionOf(t, ORBITS, 'left', 'right') === 'right' ? 'orbit_right' : 'orbit_left';
+      return directionOf(text, ORBITS, 'left', 'right') === 'right' ? 'orbit_right' : 'orbit_left';
     case 'pan':
-      return directionOf(t, PANS, 'left', 'right') === 'left' ? 'pan_left' : 'pan_right';
+      return directionOf(text, PANS, 'left', 'right') === 'left' ? 'pan_left' : 'pan_right';
     case 'tilt':
-      return directionOf(t, TILTS, 'up', 'down') === 'down' ? 'tilt_down' : 'tilt_up';
+      return directionOf(text, TILTS, 'up', 'down') === 'down' ? 'tilt_down' : 'tilt_up';
     case 'zoom':
       return /\bzoom(s|ing)? out\b/.test(t) ? 'pull_out' : 'push_in';
   }
 }
 
 /** Whether a pan's text names its direction (else the import pans the way the action goes). */
-export const panDirectionSaid = (text: string): boolean =>
-  directionOf(plainText(text), PANS, 'left', 'right') !== null;
+export const panDirectionSaid = (text: string): boolean => directionOf(text, PANS, 'left', 'right') !== null;
 
 /** The shot's text: description and action. */
 export const shotText = (s: Pick<RideoShotInput, 'description' | 'action'>): string =>

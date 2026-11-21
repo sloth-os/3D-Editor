@@ -1,0 +1,40 @@
+{
+  "type": "state",
+  "sceneId": "clp_0123456789abcdef",
+  "state": {
+    "format": "3d-editor.desk-state",
+    "version": 1,
+    "data": {
+      "$bytes": "AG9wYXF1ZSBkZXNrIHN0YXRlIGJ5dGVzAg=="
+    }
+  },
+  "shots": 2,
+  "units": [
+    {
+      "slot": "cast:chr_0123456789mira",
+      "ref": "lib_0123456789mira",
+      "version": 2,
+      "sha256": "99e2c8b2dc01e9f692f598cc823d00279567c67a536b2276cef9ffa07bd6ac2b",
+      "staged": "unit",
+      "local": true
+    },
+    {
+      "slot": "el:ele_0123456789kite",
+      "ref": "lib_0123456789kite",
+      "version": 1,
+      "sha256": "5c2759e0ef1e79aa93a8b40f1fd312a76464d404d3822737af1acef5e7f202ed",
+      "staged": "words",
+      "local": false,
+      "why": "missing"
+    },
+    {
+      "slot": "set",
+      "ref": "lib_0123456789mead",
+      "version": 3,
+      "sha256": "f6cd47ae2c534ee3445559d6be6a77bf502b58a73c15e9bb8dfcac54717c9011",
+      "staged": "refused",
+      "local": false,
+      "why": "set_ground"
+    }
+  ]
+}

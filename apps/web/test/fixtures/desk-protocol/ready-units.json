@@ -1,0 +1,21 @@
+{
+  "type": "ready",
+  "deskVersion": "0.2.0",
+  "protocol": 1,
+  "capabilities": {
+    "export": {
+      "available": true,
+      "reason": null,
+      "container": "mp4",
+      "videoCodec": "avc1",
+      "modes": ["motion", "pose", "camera"]
+    },
+    "offline": true,
+    "units": {
+      "versions": [1],
+      "kinds": ["set", "prop", "figure"],
+      "maxBytes": 33554432,
+      "publish": true
+    }
+  }
+}

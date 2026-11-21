@@ -7,6 +7,7 @@ import {
   TextureCache,
   autoFrameView,
   contactSheet,
+  createExportRenderDocument,
   denoiseFilm,
   encodeGIF,
   encodePNG,
@@ -14,23 +15,25 @@ import {
   evaluatedOrco,
   exportScene,
   filmToRGBA8,
+  measureDeskShot,
   preparePathTrace,
+  renderExportFrame,
   renderItems,
   renderPathTracedImage,
   renderSceneSoftware,
   resolveView,
   sampleFrameIndices,
+  simulateRigidBodies,
+  softwareOptions,
+  useFramePhysics,
   viewCameraData,
   type ExportFormat,
-  type Mat4,
+  type ExportRenderDocument,
   type PathTile,
   type PathTraceProgress,
   type PathTraceRenderInput,
-  type RigidBodyHost,
-  type SoftwareRenderOptions,
   type Vec3,
 } from '@3d-editor/core';
-import { deskShotInfo, renderDeskFrame } from './desk';
 import type {
   APNGInit,
   AutoViewResult,
@@ -45,7 +48,6 @@ import type {
   FinishOptions,
   FrameOptions,
   ImageResult,
-  PhysicsFrame,
   PreparedInfo,
   RawFrame,
   SimulatedFrames,
@@ -71,66 +73,14 @@ const AUTO_VIEW_SAMPLES = 64;
 
 const now = () => performance.now();
 
-interface CachedDocument {
-  doc: SceneDoc;
-  evaluator: SceneEvaluator;
+/**
+ * A cached document: core's export render document (its evaluator, and the physics shared with the
+ * thread for the frame it renders: `FrameOptions.physics`) with its version and last use.
+ */
+interface CachedDocument extends ExportRenderDocument {
   /** `DocRef.version` of the last applied state. */
   version: number;
   used: number;
-  /**
-   * Rigid body matrices of the frame being rendered, simulated once for every thread (see
-   * `FrameOptions.physics`): the evaluator uses them instead of simulating.
-   */
-  physics: { frame: number; matrices: Map<string, Mat4> | null } | null;
-}
-
-/** The world matrices of a physics frame by object id (null: nothing simulated at the frame). */
-function physicsMatrices(p: PhysicsFrame): Map<string, Mat4> | null {
-  if (!p.ids.length) return null;
-  const out = new Map<string, Mat4>();
-  p.ids.forEach((id, i) => out.set(id, Array.from(p.matrices.subarray(i * 16, i * 16 + 16)) as Mat4));
-  return out;
-}
-
-/** Whether evaluating the scene runs the rigid body simulation (as `SceneEvaluator` decides). */
-function simulatesRigidBodies(doc: SceneDoc): boolean {
-  return !!doc.getScene().rigidbody_world?.enabled && doc.listObjects().some((o) => o.rigid_body?.enabled);
-}
-
-/** The scene access the rigid body simulator needs (as `SceneEvaluator.evaluate` provides it). */
-function rigidBodyHost(doc: SceneDoc, evaluator: SceneEvaluator): RigidBodyHost {
-  return {
-    transformsAt: (f) => evaluator.transformsAt(f),
-    meshOf: (id) => {
-      const o = doc.getObject(id);
-      return o?.type === 'MESH' && o.data ? doc.getMesh(o.data) : null;
-    },
-  };
-}
-
-/**
- * Converts frame options to the core software renderer options (engine always explicit). The desk
- * options of video exports (`o.desk`) are added by desk.ts.
- */
-export function softwareOptions(o: FrameOptions): SoftwareRenderOptions {
-  return {
-    width: o.width,
-    height: o.height,
-    frame: o.frame,
-    engine: o.engine,
-    cameraId: o.cameraId,
-    view: o.view
-      ? { position: o.view.position, target: o.view.target, up: o.view.up, fovY: o.view.fovY }
-      : undefined,
-    shading: o.shading,
-    wireframe: o.wireframe,
-    samples: o.samples,
-    max_bounces: o.max_bounces,
-    denoise: o.denoise,
-    time_limit: o.time_limit,
-    seed: o.seed,
-    background: o.background,
-  };
 }
 
 /** True when a render with these options path traces (SOLID shading and wireframes rasterize). */
@@ -194,22 +144,11 @@ export class RenderEngine {
       if (!update) throw new MissingDocumentError(ref.key, ref.version);
       if (entry) entry.doc.applyUpdate(update, 'render');
       else {
-        const doc = SceneDoc.fromUpdate(update);
-        const created: CachedDocument = {
-          doc,
-          evaluator: new SceneEvaluator(doc),
+        // matrices simulated once for every thread (FrameOptions.physics) replace the simulation
+        entry = Object.assign(createExportRenderDocument(SceneDoc.fromUpdate(update)), {
           version: ref.version,
           used: 0,
-          physics: null,
-        };
-        // matrices simulated once for every thread (FrameOptions.physics) replace the simulation
-        const sim = created.evaluator.rigidBodies;
-        const simulate = sim.evaluate.bind(sim);
-        sim.evaluate = (d, frame, host) =>
-          created.physics && created.physics.frame === frame
-            ? created.physics.matrices
-            : simulate(d, frame, host);
-        entry = created;
+        });
         this.docs.set(ref.key, entry);
       }
       entry.version = ref.version;
@@ -226,49 +165,25 @@ export class RenderEngine {
   /** The cached document of `ref`, set up to use the physics of `options` (if any) for its frame. */
   private documentFor(ref: DocRef, options: FrameOptions): CachedDocument {
     const entry = this.document(ref);
-    const p = options.physics;
-    entry.physics = p && p.frame === options.frame ? { frame: p.frame, matrices: physicsMatrices(p) } : null;
+    useFramePhysics(entry, options);
     return entry;
   }
 
   /**
    * Simulates the rigid body world up to `frames` (incrementally, cached per document like every
-   * evaluation) and returns the world matrices of the simulated objects at each of them.
+   * evaluation) and returns the world matrices of the simulated objects at each of them (core
+   * `simulateRigidBodies`).
    */
   simulate(ref: DocRef, frames: number[]): SimulatedFrames {
-    const t0 = now();
-    const { doc, evaluator } = this.document(ref);
-    const host = rigidBodyHost(doc, evaluator);
-    const out: PhysicsFrame[] = [];
-    for (const frame of [...frames].sort((a, b) => a - b)) {
-      let m: Map<string, Mat4> | null;
-      try {
-        m = evaluator.rigidBodies.evaluate(doc, frame, host);
-      } catch {
-        // frames left out are simulated (and the error reported) by the threads rendering them
-        break;
-      }
-      const ids = m ? [...m.keys()] : [];
-      const matrices = new Float64Array(ids.length * 16);
-      ids.forEach((id, i) => matrices.set(m!.get(id)!, i * 16));
-      out.push({ frame, ids, matrices });
-    }
-    return { frames: out, ms: now() - t0 };
+    return simulateRigidBodies(this.document(ref), frames);
   }
 
   /**
-   * Measures one shot of a video export (desk.ts deskShotInfo): its depth range and shadow box.
-   * The samples are evaluated without the rigid body simulation.
+   * Measures one shot of a video export (core `measureDeskShot`): its depth range, shadow box and
+   * occlusion reach. The samples are evaluated without the rigid body simulation.
    */
   deskShot(ref: DocRef, options: DeskShotOptions): DeskShotInfo {
-    const entry = this.document(ref);
-    try {
-      return deskShotInfo(entry, options, (frame) => {
-        entry.physics = { frame, matrices: null };
-      });
-    } finally {
-      entry.physics = null;
-    }
+    return measureDeskShot(this.document(ref), options);
   }
 
   private evictDocuments(): void {
@@ -359,25 +274,7 @@ export class RenderEngine {
   image(ref: DocRef, options: FrameOptions, png = false): ImageResult {
     const entry = this.documentFor(ref, options);
     const { doc, evaluator } = entry;
-    if (options.desk)
-      return renderDeskFrame(
-        {
-          doc,
-          evaluator,
-          simulated: (frame) => {
-            if (!simulatesRigidBodies(doc)) return null;
-            try {
-              // the frame's shared matrices (FrameOptions.physics), else the thread's cached simulation
-              return evaluator.rigidBodies.evaluate(doc, frame, rigidBodyHost(doc, evaluator));
-            } catch {
-              return null;
-            }
-          },
-        },
-        { ...softwareOptions(options), frame: options.frame },
-        options.desk,
-        png,
-      );
+    if (options.desk) return renderExportFrame(entry, { ...options, desk: options.desk }, png);
     let last: PathTraceProgress | undefined;
     const onProgress = (p: PathTraceProgress) => {
       last = p;

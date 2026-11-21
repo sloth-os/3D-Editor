@@ -8,12 +8,14 @@ export interface ServerConfig {
     mcp: boolean;
     telemetry: boolean;
     webdavProxy: boolean;
-    /** Video export (the server found ffmpeg); absent on older servers. */
+    /**
+     * The server's own video export (it found ffmpeg); absent on older servers. The Export Video
+     * window exports on this device by default (apps/web/src/export) and offers the server as a
+     * second choice only where this is true and the server holds the project.
+     */
     videoExport?: boolean;
     /** The model store (Asset Browser); absent on older servers. */
     modelStore?: boolean;
-    /** The rideo bridge (RIDEO_URL is set); absent on older servers. */
-    rideo?: boolean;
   };
   webdav: { url: string; basePath: string } | null;
   persistence: string;

@@ -1,5 +1,6 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { availableParallelism } from 'node:os';
+import { fpsRational, fpsValue, type RawPixelFormat, type StreamCodec } from '@3d-editor/core';
 import { ToolError } from '../mcp/agent';
 
 /*
@@ -7,6 +8,13 @@ import { ToolError } from '../mcp/agent';
  * checks, the encoder command lines (frame-exact H.264 for stream-copy cuts, VP9, lossless RGB) and
  * a process wrapper that streams raw frames into ffmpeg's stdin with backpressure.
  */
+
+/**
+ * Frame rates as rationals (NTSC rates exact: 23.976 → 24000/1001), the raw formats of the passes
+ * and the streams' codecs: core's (export/timing.ts, export/passes.ts), shared with the browser
+ * export.
+ */
+export { fpsRational, fpsValue, type RawPixelFormat, type StreamCodec };
 
 /** How long `ffmpeg -version` may take before ffmpeg counts as missing. */
 const VERSION_TIMEOUT_MS = 5000;
@@ -103,27 +111,6 @@ export async function requireFfmpeg(path: string): Promise<Set<string>> {
 
 // ---------------------------------------------------------------- command lines
 
-/** A frame rate as ffmpeg's rational (NTSC rates exact: 23.976 → 24000/1001). */
-export function fpsRational(fps: number): { num: number; den: number; text: string } {
-  if (!(Number.isFinite(fps) && fps > 0)) throw new Error(`invalid frame rate ${fps}`);
-  for (const base of [24, 30, 48, 60, 120]) {
-    const ntsc = (base * 1000) / 1001;
-    if (Math.abs(fps - ntsc) < 0.0015) return { num: base * 1000, den: 1001, text: `${base * 1000}/1001` };
-  }
-  if (Math.abs(fps - Math.round(fps)) < 1e-9) {
-    const n = Math.round(fps);
-    return { num: n, den: 1, text: `${n}/1` };
-  }
-  const num = Math.round(fps * 1000);
-  return { num, den: 1000, text: `${num}/1000` };
-}
-
-/** The exact rate of a rational (frames per second). */
-export function fpsValue(r: { num: number; den: number }): number {
-  return r.num / r.den;
-}
-
-export type RawPixelFormat = 'rgba' | 'rgb24' | 'gray';
 export type VideoQuality = 'draft' | 'standard' | 'high';
 
 /** x264 / VP9 rate control per quality (SPEC §9: CRF 28 veryfast, 23 medium, 18 slow). */
@@ -134,9 +121,6 @@ export const QUALITY_ENCODING: Readonly<
   standard: { preset: 'medium', crf: 23, vp9Crf: 33, vp9Speed: 4 },
   high: { preset: 'slow', crf: 18, vp9Crf: 28, vp9Speed: 2 },
 };
-
-/** How a stream is encoded: H.264 or VP9 for viewing, lossless RGB H.264 for data passes. */
-export type StreamCodec = 'h264' | 'vp9' | 'lossless';
 
 /**
  * The encoder threads of an x264 stream (libx264, libx264rgb) `height` pixels high: x264's own

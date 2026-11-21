@@ -88,10 +88,9 @@ describe('REST API', () => {
         mcp: true,
         telemetry: true,
         webdavProxy: false,
-        // video export when the server found ffmpeg (FFMPEG_PATH); the rideo bridge with RIDEO_URL
+        // video export when the server found ffmpeg (FFMPEG_PATH)
         videoExport: expect.any(Boolean),
         modelStore: true,
-        rideo: false,
       },
       webdav: null,
       persistence: 'memory',

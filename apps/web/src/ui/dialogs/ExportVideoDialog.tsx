@@ -23,18 +23,33 @@ import {
   type VideoExportParams,
 } from '../../io/store-client';
 import { Checkbox, EnumButtons, NumberField, Row, SelectField, TextField } from '../fields/fields';
+import { browserExportSupport, zipExport, type BrowserExportFile } from '../../export';
+import { BITS_PER_PIXEL, VP9_QUANTIZER, videoBitrate } from '../../export/codec';
+import {
+  browserJob,
+  browserJobBlocked,
+  cancelBrowserJob,
+  startBrowserJob,
+  type BrowserJob,
+} from './browser-export-job';
 import { Modal } from './Dialogs';
 
 /*
  * The Export Video window (SPEC §9, §13; wm.export_video, Render › Export Video…, Ctrl+Shift+F12).
- * The editor server renders the project as it holds it (a snapshot taken at the start) and encodes
- * it with ffmpeg: the whole sequence, one frame-exact clip per shot, posters, control passes, a
- * contact sheet and a manifest. This window sets the export's parameters (§9), starts the job
- * (POST …/video-exports), follows it (frames, speed, time left, the shot rendered) with Cancel,
- * then lists the files as download links with a preview of the sequence. Recent exports of the
- * project can be opened again or deleted. Without a server, or a server without ffmpeg, it says
- * why it cannot export. The export goes on on the server when the window is closed; opening the
- * window again follows it again.
+ * By default the export runs on this device (apps/web/src/export): render workers render the
+ * project as it is when the export starts and WebCodecs encodes it, with no server; where the
+ * editor server can export video (it found ffmpeg) and holds the project, the server is offered as
+ * a second choice, which renders the project as the server holds it and encodes it with ffmpeg.
+ * Either writes the whole sequence, one frame-exact clip per shot, posters, control passes, a
+ * contact sheet and a manifest. This window sets the export's parameters (§9), starts the export,
+ * follows it (frames, speed, time left, the shot rendered) with Cancel, then lists the files as
+ * download links with a preview of the sequence ("Download all" zips a device export's files).
+ * Recent server exports of the project can be opened again or deleted. When this browser cannot
+ * export (no secure page, no WebCodecs H.264 encoder) the window says why, and offers the server
+ * where it can export. Both exports go on when the window is closed (a device export while the tab
+ * stays open); opening the window again follows them again. A tab runs one export on this device at
+ * a time, whichever project it exports: while it runs, every project's window shows it (its
+ * progress and Cancel) instead of offering Export.
  */
 
 /** Seconds a status request waits on the server for the job to change (long poll). */
@@ -323,14 +338,12 @@ export function buildExportParams(s: ExportSettings, ctx: ExportContext): VideoE
   return params;
 }
 
-/** Why this editor cannot export video (null: it can). */
-export function exportUnavailableReason(cfg: ServerConfig | null, hasProject: boolean): string | null {
-  if (!cfg)
-    return (
-      'Video export runs on the editor server, and this editor runs without one. Open the editor from ' +
-      'its server to export video (Render › Render Animation, Ctrl+F12, makes an animated PNG or GIF ' +
-      'in the browser).'
-    );
+/**
+ * Why the editor server cannot export this project (null: it can): no server, an old one, one
+ * without ffmpeg, or a project it does not hold (kept only in this browser).
+ */
+export function serverExportReason(cfg: ServerConfig | null, onServer: boolean): string | null {
+  if (!cfg) return 'This editor runs without its server.';
   if (cfg.features.videoExport === undefined)
     return 'This editor server is too old to export video: update it.';
   if (!cfg.features.videoExport)
@@ -338,8 +351,14 @@ export function exportUnavailableReason(cfg: ServerConfig | null, hasProject: bo
       'The editor server cannot export video: it did not find ffmpeg. Install ffmpeg on the server ' +
       '(or set FFMPEG_PATH) and restart it.'
     );
-  if (!hasProject) return 'Open a project first: the export renders its shots.';
+  if (!onServer)
+    return 'The server exports the projects it holds, and this project is kept only in this browser.';
   return null;
+}
+
+/** Whether the server holds the project (it syncs with it). */
+export function projectOnServer(session: Pick<ProjectSession, 'provider'>): boolean {
+  return !!session.provider?.enabled;
 }
 
 /** A length in seconds: "4.5 s" under a minute, else "1:05" or "1:02:05". */
@@ -539,11 +558,49 @@ function ProgressBar({ fraction, label }: { fraction: number; label: string }) {
   );
 }
 
-const QUALITY_TITLES: Record<ExportQuality, string> = {
-  draft: 'Fastest: 1 sample, shadows, no ambient occlusion, CRF 28',
-  standard: '2 samples, shadows and ambient occlusion, CRF 23',
-  high: '4 samples up to 1280×720 (else 2), CRF 18, slower encoding',
+/** What each quality renders (core qualityPreset; the same on this device and on the server). */
+const QUALITY_RENDER: Record<ExportQuality, string> = {
+  draft: 'Fastest: 1 sample, shadows, no ambient occlusion',
+  standard: '2 samples, shadows and ambient occlusion',
+  high: '4 samples up to 1280×720 (else 2), shadows and ambient occlusion',
 };
+
+/** How the server's ffmpeg encodes each quality (apps/server/src/video/ffmpeg.ts QUALITY_ENCODING). */
+const SERVER_ENCODING: Record<ExportQuality, { crf: number; preset: string; vp9Crf: number }> = {
+  draft: { crf: 28, preset: 'veryfast', vp9Crf: 40 },
+  standard: { crf: 23, preset: 'medium', vp9Crf: 33 },
+  high: { crf: 18, preset: 'slow', vp9Crf: 28 },
+};
+
+/** Bits per second in words: "1.1 Mbit/s", "150 kbit/s". */
+const bitrateText = (bps: number) =>
+  bps >= 1_000_000 ? `${Math.round(bps / 100_000) / 10} Mbit/s` : `${Math.round(bps / 1000)} kbit/s`;
+
+/**
+ * The Quality buttons' tooltip: what the quality renders, and how the export that would run encodes
+ * it: on this device at a bit rate (H.264; VP9 at a quantizer where the browser has one), on the
+ * server with x264's constant quality (CRF) or VP9's.
+ */
+export function qualityTitle(
+  quality: ExportQuality,
+  where: ExportWhere,
+  codec: ExportCodec,
+  size: { width: number; height: number; fps: number },
+): string {
+  const render = QUALITY_RENDER[quality];
+  if (where === 'server') {
+    const e = SERVER_ENCODING[quality];
+    return codec === 'vp9'
+      ? `${render}; the server encodes VP9 at CRF ${e.vp9Crf}`
+      : `${render}; the server encodes H.264 at CRF ${e.crf} (x264 preset ${e.preset})`;
+  }
+  const h264 =
+    `H.264 at ${bitrateText(videoBitrate(quality, size.width, size.height, size.fps))} ` +
+    `(${BITS_PER_PIXEL[quality]} bits per pixel and frame at 1280×720)`;
+  return codec === 'vp9'
+    ? `${render}; this device encodes VP9 at quantizer ${VP9_QUANTIZER[quality]} (where the browser has no VP9 encoder, ${h264})`
+    : `${render}; this device encodes ${h264}`;
+}
 
 const PASS_TITLES: Record<PassName, string> = {
   beauty: 'The picture',
@@ -561,18 +618,41 @@ const OUTPUT_LABELS: Record<keyof ExportOutputs, string> = {
   contact_sheet: 'Contact sheet',
 };
 
+/** Where an export runs: this device (the default), or the editor server. */
+export type ExportWhere = 'device' | 'server';
+
+/** Whether this browser can export a video of this size and rate (null while it is asked). */
+function useBrowserSupport(
+  width: number,
+  height: number,
+  fps: number,
+): { available: boolean; reason: string | null } | null {
+  const key = `${width}x${height}@${fps}`;
+  const [state, setState] = useState<{
+    key: string;
+    value: { available: boolean; reason: string | null };
+  } | null>(null);
+  useEffect(() => {
+    let live = true;
+    void browserExportSupport({ width, height, fps }).then((value) => {
+      if (live) setState({ key, value });
+    });
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  return state?.key === key ? state.value : null;
+}
+
 /** Ctrl+Shift+F12: the Export Video window. */
 export function ExportVideoDialog() {
   const s = sessionSignal.value;
-  const cfg = serverConfig.value;
-  const reason = exportUnavailableReason(cfg, !!s);
-  if (reason || !s)
+  if (!s)
     return (
       <Modal title="Export Video" width="min(560px, 96vw)" testId="export-video-dialog">
         <div class="hint" style={{ fontSize: '12px' }} data-testid="export-video-unavailable">
-          {reason}
+          Open a project first: the export renders its shots.
         </div>
-        {cfg && s && <RecentExports project={s.id} shotName={(id) => id} onOpen={null} refresh={0} />}
       </Modal>
     );
   const preselect = Array.isArray(dialogProps.value.shots)
@@ -586,9 +666,25 @@ function ExportVideoPanel({ session, preselect }: { session: ProjectSession; pre
   void session.revision.value;
   const ctx = exportContext(session.doc);
   const project = session.id;
+  const cfg = serverConfig.value;
+  const onServer = projectOnServer(session);
+  const serverOk = serverExportReason(cfg, onServer) === null;
+  // the server's exports of the project are listed where it exports video (or did: ffmpeg may be gone)
+  const listed = !!cfg && cfg.features.videoExport !== undefined && onServer;
   const [settings, setSettingsState] = useState<ExportSettings>(() => initialSettings(ctx, preselect));
+  const [whereChosen, setWhere] = useState<ExportWhere>('device');
+  const where: ExportWhere = serverOk ? whereChosen : 'device';
   const [job, setJob] = useState<ExportJob | null>(null);
-  const [showJob, setShowJob] = useState(false);
+  const bj = browserJob.value;
+  // the export on this device the window follows: the one it started or showed (until New Export)
+  const [followed, setFollowed] = useState<number | null>(() =>
+    bj && (bj.project === project || bj.status === 'running') ? bj.id : null,
+  );
+  // the export on this device shown: this project's, any project's while it runs (a tab runs one
+  // at a time), and the one followed once it ended
+  const device = bj && (bj.project === project || bj.status === 'running' || bj.id === followed) ? bj : null;
+  // the export shown: one on this device (its job runs in the page), one on the server, or none
+  const [showJob, setShowJob] = useState<ExportWhere | null>(() => (device ? 'device' : null));
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -601,20 +697,21 @@ function ExportVideoPanel({ session, preselect }: { session: ProjectSession; pre
     });
   };
 
-  // an export of this project that still runs: follow it
+  // an export of this project that still runs on the server: follow it
   useEffect(() => {
+    if (!listed) return;
     const ctrl = new AbortController();
     listVideoExports(project, ctrl.signal)
       .then((list) => {
         const active = list.find((j) => !exportFinished(j.status));
         if (active && !ctrl.signal.aborted) {
           setJob((cur) => cur ?? active);
-          setShowJob(true);
+          setShowJob((cur) => cur ?? 'server');
         }
       })
       .catch(() => undefined);
     return () => ctrl.abort();
-  }, [project]);
+  }, [project, listed]);
 
   /** Exports cancelled here: a status answer sent before the cancel took effect is stale. */
   const cancelled = useRef(new Set<string>());
@@ -623,24 +720,48 @@ function ExportVideoPanel({ session, preselect }: { session: ProjectSession; pre
     setJob((cur) => (cur && cur.id !== j.id ? cur : j));
     if (exportFinished(j.status)) setRefresh((n) => n + 1);
   }, []);
-  useExportPolling(project, job, onJob, setError);
-  const running = !!job && !exportFinished(job.status);
-  useTicker(running);
+  useExportPolling(listed ? project : null, job, onJob, setError);
+  const serverRunning = !!job && !exportFinished(job.status);
+  const deviceRunning = device?.status === 'running';
+  useTicker(serverRunning || deviceRunning);
 
   const shotName = (id: string) =>
     ctx.shots.find((x) => x.id === id)?.name ?? (id === 'range' ? 'Frame range' : id);
   const problem = exportSettingsProblem(settings, ctx);
   const est = estimateExport(settings, ctx);
+  const support = useBrowserSupport(est.width, est.height, est.fps);
+  const deviceBlocked = where === 'device' && !support?.available;
 
+  const startOnServer = async () => {
+    const j = await startVideoExport(project, buildExportParams(settings, ctx));
+    setJob(j);
+    setShowJob('server');
+    setRefresh((n) => n + 1);
+  };
   const start = async () => {
-    if (problem || starting) return;
+    if (problem || starting || deviceBlocked) return;
+    if (where === 'device' && browserJobBlocked()) {
+      // an export runs on this device already (a second press, or another project's): show it
+      setFollowed(browserJob.value?.id ?? null);
+      setShowJob('device');
+      return;
+    }
     setStarting(true);
     setError(null);
     try {
-      const j = await startVideoExport(project, buildExportParams(settings, ctx));
-      setJob(j);
-      setShowJob(true);
-      setRefresh((n) => n + 1);
+      if (where === 'server') await startOnServer();
+      else {
+        const params = buildExportParams(settings, ctx);
+        const label = settings.label.trim() || null;
+        // the export runs in the page (browserJob follows it): registered at once, not awaited here
+        const started = startBrowserJob(session, params, label);
+        setFollowed(browserJob.value?.id ?? null);
+        setShowJob('device');
+        void started.catch((err: unknown) => {
+          setError(err instanceof Error ? err.message : String(err));
+          setShowJob(null);
+        });
+      }
     } catch (err) {
       setError(requestMessage(err));
     } finally {
@@ -648,6 +769,7 @@ function ExportVideoPanel({ session, preselect }: { session: ProjectSession; pre
     }
   };
   const cancel = async () => {
+    if (showJob === 'device') return cancelBrowserJob();
     if (!job) return;
     setCancelling(true);
     try {
@@ -663,70 +785,103 @@ function ExportVideoPanel({ session, preselect }: { session: ProjectSession; pre
   };
   const open = (j: ExportJob) => {
     setJob(j);
-    setShowJob(true);
+    setShowJob('server');
     setError(null);
   };
 
-  const footer =
-    showJob && job ? (
-      running ? (
-        <button
-          class="btn"
-          data-testid="export-video-cancel"
-          disabled={cancelling}
-          title="Stop the export on the server and delete what it wrote"
-          onClick={() => void cancel()}
-        >
-          {cancelling ? 'Cancelling…' : 'Cancel Export'}
-        </button>
-      ) : (
-        <button class="btn" data-testid="export-video-new" onClick={() => setShowJob(false)}>
-          New Export
-        </button>
-      )
+  const shown = showJob === 'device' ? device : showJob === 'server' ? job : null;
+  const running = showJob === 'device' ? deviceRunning : serverRunning;
+  const footer = shown ? (
+    running ? (
+      <button
+        class="btn"
+        data-testid="export-video-cancel"
+        disabled={cancelling}
+        title={
+          showJob === 'device'
+            ? 'Stop the export and delete what it wrote'
+            : 'Stop the export on the server and delete what it wrote'
+        }
+        onClick={() => void cancel()}
+      >
+        {cancelling ? 'Cancelling…' : 'Cancel Export'}
+      </button>
     ) : (
-      <>
-        <span class="hint" style={{ marginRight: 'auto' }} data-testid="export-video-estimate">
-          {est.frames} frame{est.frames === 1 ? '' : 's'} · {formatSeconds(est.seconds)} at{' '}
-          {Math.round(est.fps * 100) / 100} fps · {est.width} × {est.height}
-          {est.shots > 1 ? ` · ${est.shots} shots` : ''}
-        </span>
-        <button
-          class="btn primary"
-          data-testid="export-video-start"
-          disabled={!!problem || starting}
-          title={problem ?? 'Export on the server'}
-          onClick={() => void start()}
-        >
-          {starting ? 'Starting…' : 'Export'}
-        </button>
-      </>
-    );
+      <button
+        class="btn"
+        data-testid="export-video-new"
+        onClick={() => {
+          setShowJob(null);
+          setFollowed(null);
+        }}
+      >
+        New Export
+      </button>
+    )
+  ) : (
+    <>
+      <span class="hint" style={{ marginRight: 'auto' }} data-testid="export-video-estimate">
+        {est.frames} frame{est.frames === 1 ? '' : 's'} · {formatSeconds(est.seconds)} at{' '}
+        {Math.round(est.fps * 100) / 100} fps · {est.width} × {est.height}
+        {est.shots > 1 ? ` · ${est.shots} shots` : ''}
+      </span>
+      <button
+        class="btn primary"
+        data-testid="export-video-start"
+        disabled={!!problem || starting || deviceBlocked || (where === 'device' && deviceRunning)}
+        title={
+          problem ??
+          (where === 'device'
+            ? deviceRunning
+              ? `An export of ${device.projectName} runs on this device: wait for it, or cancel it`
+              : (support?.reason ?? 'Export on this device')
+            : 'Export on the server')
+        }
+        onClick={() => void start()}
+      >
+        {starting ? 'Starting…' : 'Export'}
+      </button>
+    </>
+  );
 
   return (
     <Modal title="Export Video" width="min(760px, 96vw)" testId="export-video-dialog" footer={footer}>
-      {showJob && job ? (
+      {showJob === 'device' && device ? (
+        <BrowserJobView job={device} project={project} shotName={shotName} />
+      ) : showJob === 'server' && job ? (
         <JobView job={job} shotName={shotName} />
       ) : (
-        <SettingsForm settings={settings} ctx={ctx} set={set} problem={problem} />
+        <SettingsForm
+          settings={settings}
+          ctx={ctx}
+          set={set}
+          problem={problem}
+          where={where}
+          serverOk={serverOk}
+          setWhere={setWhere}
+          support={support}
+          estimate={est}
+        />
       )}
       {error && (
         <div class="error-text" role="alert" data-testid="export-video-error" style={{ marginTop: '6px' }}>
           {error}
         </div>
       )}
-      <RecentExports
-        project={project}
-        shotName={shotName}
-        onOpen={open}
-        onDeleted={(id) => {
-          if (job?.id !== id) return;
-          setJob(null);
-          setShowJob(false);
-        }}
-        refresh={refresh}
-        current={job?.id}
-      />
+      {listed && (
+        <RecentExports
+          project={project}
+          shotName={shotName}
+          onOpen={open}
+          onDeleted={(id) => {
+            if (job?.id !== id) return;
+            setJob(null);
+            if (showJob === 'server') setShowJob(null);
+          }}
+          refresh={refresh}
+          current={showJob === 'server' ? job?.id : undefined}
+        />
+      )}
     </Modal>
   );
 }
@@ -736,11 +891,24 @@ function SettingsForm({
   ctx,
   set,
   problem,
+  where,
+  serverOk,
+  setWhere,
+  support,
+  estimate,
 }: {
   settings: ExportSettings;
   ctx: ExportContext;
   set: (patch: Partial<ExportSettings>) => void;
   problem: string | null;
+  where: ExportWhere;
+  /** The server can export the project too (it is offered). */
+  serverOk: boolean;
+  setWhere: (w: ExportWhere) => void;
+  /** Whether this browser can export (null while it is asked). */
+  support: { available: boolean; reason: string | null } | null;
+  /** The export's frame size and rate (estimateExport). */
+  estimate: { width: number; height: number; fps: number };
 }) {
   const hasShots = ctx.shots.some((x) => x.enabled);
   const mode = effectiveShotsMode(s, ctx);
@@ -748,6 +916,40 @@ function SettingsForm({
   const size = exportOutputSize(s, ctx);
   return (
     <div data-testid="export-video-settings" style={{ maxWidth: '560px', margin: '0 auto' }}>
+      {serverOk && (
+        <Row label="Export On">
+          <EnumButtons
+            value={where}
+            testId="export-video-where"
+            options={[
+              { value: 'device', label: 'This device' },
+              { value: 'server', label: 'Server' },
+            ]}
+            onChange={setWhere}
+          />
+        </Row>
+      )}
+      {where === 'device' && support && !support.available && (
+        <div
+          class="error-text"
+          data-testid="export-video-browser-unsupported"
+          style={{ margin: '4px 0 8px' }}
+        >
+          {support.reason}
+          {serverOk && (
+            <>
+              {' '}
+              <button
+                class="btn flat"
+                data-testid="export-video-use-server"
+                onClick={() => setWhere('server')}
+              >
+                Export on the server instead
+              </button>
+            </>
+          )}
+        </div>
+      )}
       {hasShots && (
         <Row label="Shots">
           <EnumButtons
@@ -888,7 +1090,7 @@ function SettingsForm({
         <EnumButtons
           value={s.quality}
           testId="export-video-quality"
-          title={QUALITY_TITLES[s.quality]}
+          title={qualityTitle(s.quality, where, s.codec, estimate)}
           options={[
             { value: 'draft', label: 'Draft' },
             { value: 'standard', label: 'Standard' },
@@ -981,9 +1183,13 @@ function SettingsForm({
           {problem}
         </div>
       )}
-      <div class="hint" style={{ marginTop: '6px' }}>
-        The server renders the project as it holds it when the export starts; it goes on when this window is
-        closed.
+      <div class="hint" style={{ marginTop: '6px' }} data-testid="export-video-where-hint">
+        {where === 'device'
+          ? 'This device renders the project as it is when the export starts, in render workers (one to two ' +
+            'seconds per 1280 × 720 frame on each core, draft to standard quality), and encodes the videos; ' +
+            'it goes on when this window is closed, as long as this tab stays open.'
+          : 'The server renders the project as it holds it when the export starts; it goes on when this ' +
+            'window is closed.'}
       </div>
     </div>
   );
@@ -1081,6 +1287,260 @@ function FileList({ files, shotName }: { files: ExportFile[]; shotName: (id: str
                     f.frames ? `${f.frames} frames` : null,
                     f.duration_s ? formatSeconds(f.duration_s) : null,
                     formatBytes(f.bytes),
+                  ]
+                    .filter(Boolean)
+                    .join(' · ')}
+                </span>
+              </div>
+            ))}
+          </div>
+        ))}
+    </div>
+  );
+}
+
+/** A device export's files by what they are. */
+export interface BrowserFileGroups {
+  sequence: BrowserExportFile[];
+  clips: BrowserExportFile[];
+  posters: BrowserExportFile[];
+  stills: BrowserExportFile[];
+  passes: BrowserExportFile[];
+  contactSheet: BrowserExportFile[];
+  manifest: BrowserExportFile[];
+}
+
+export function groupBrowserFiles(files: readonly BrowserExportFile[]): BrowserFileGroups {
+  const g: BrowserFileGroups = {
+    sequence: [],
+    clips: [],
+    posters: [],
+    stills: [],
+    passes: [],
+    contactSheet: [],
+    manifest: [],
+  };
+  for (const f of files) {
+    if (f.kind === 'sequence' && f.pass === 'beauty') g.sequence.push(f);
+    else if (f.kind === 'sequence' || f.kind === 'frames') g.passes.push(f);
+    else if (f.kind === 'clip') g.clips.push(f);
+    else if (f.kind === 'poster') g.posters.push(f);
+    else if (f.kind === 'still') g.stills.push(f);
+    else if (f.kind === 'contact_sheet') g.contactSheet.push(f);
+    else if (f.kind === 'manifest') g.manifest.push(f);
+  }
+  return g;
+}
+
+/** The video a device export's window previews: the sequence, else the first beauty clip. */
+export function browserPreviewFile(files: readonly BrowserExportFile[]): BrowserExportFile | null {
+  return (
+    files.find((f) => f.kind === 'sequence' && f.pass === 'beauty') ??
+    files.find((f) => f.kind === 'clip' && f.pass === 'beauty') ??
+    null
+  );
+}
+
+/** What a device export's state says. */
+export function browserJobStatusText(job: BrowserJob, shotName: (id: string) => string): string {
+  const p = job.progress;
+  switch (job.status) {
+    case 'running': {
+      if (!p || p.phase === 'prepare') return 'Preparing the render workers…';
+      if (p.phase === 'encode') return 'Finishing the videos…';
+      if (p.phase === 'finish') return 'Writing the contact sheet and the manifest…';
+      const parts = [`Rendering frame ${Math.min(p.done + 1, p.total)} of ${p.total}`];
+      if (job.fps > 0) {
+        parts.push(`${job.fps.toFixed(job.fps < 10 ? 1 : 0)} frames/s`);
+        parts.push(`about ${formatSeconds((p.total - p.done) / job.fps)} left`);
+      }
+      if (p.shot) parts.push(`shot ${shotName(p.shot)}`);
+      return parts.join(' · ');
+    }
+    case 'done': {
+      const frames = (job.result?.manifest as { frames?: unknown } | null)?.frames;
+      return `Done: ${typeof frames === 'number' ? frames : (p?.total ?? 0)} frames`;
+    }
+    case 'cancelled':
+      return 'Cancelled';
+    case 'failed':
+      return `Failed: ${job.error ?? 'unknown error'}`;
+  }
+}
+
+/** A file name of the project's title ('Kite Day' → 'kite-day'). */
+function fileBase(title: string): string {
+  const base = title
+    .normalize('NFKD')
+    .replace(/[̀-ͯ]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return base || 'export';
+}
+
+/** Saves a Blob as a download named `name`. */
+function saveBlob(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = name;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // the download has read the URL by then
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
+}
+
+/** An export running or done on this device: progress, then its files with a preview and one zip of all. */
+function BrowserJobView({
+  job,
+  project,
+  shotName: windowShotName,
+}: {
+  job: BrowserJob;
+  /** The project of the window (the export may be another project's). */
+  project: string;
+  shotName: (id: string) => string;
+}) {
+  // the shots' names when the export started (another project's shots are not in this window's)
+  const shotName = (id: string) => job.shotNames[id] ?? windowShotName(id);
+  const other = job.project !== project;
+  const finished = job.status !== 'running';
+  const elapsed = Math.max(0, ((job.finishedAt ?? Date.now()) - job.startedAt) / 1000);
+  const p = job.progress;
+  const fraction =
+    !p || p.phase === 'prepare' ? 0 : p.phase === 'render' ? (p.total ? p.done / p.total : 1) : 1;
+  const result = job.status === 'done' ? job.result : null;
+  const preview = result ? browserPreviewFile(result.files) : null;
+  const [zipping, setZipping] = useState(false);
+  const [zipError, setZipError] = useState<string | null>(null);
+  const downloadAll = async () => {
+    if (!result) return;
+    setZipping(true);
+    setZipError(null);
+    try {
+      const name = (result.manifest as { project?: { name?: string } } | null)?.project?.name ?? 'export';
+      saveBlob(await zipExport(result), `${fileBase(name)}-export.zip`);
+    } catch (err) {
+      setZipError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setZipping(false);
+    }
+  };
+  return (
+    <div data-testid="export-video-job" data-status={job.status} data-where="device">
+      <div style={{ fontWeight: 600 }}>{job.label ?? 'Export on this device'}</div>
+      {other && (
+        <div class="hint" data-testid="export-video-other-project" style={{ fontSize: '12px' }}>
+          {job.status === 'running'
+            ? `This export is of ${job.projectName}: this tab runs one export on this device at a time.`
+            : job.status === 'done'
+              ? `This export was of ${job.projectName}; its files are released when the next export starts.`
+              : // a cancelled or failed export deleted its files when it ended
+                `This export was of ${job.projectName}.`}
+        </div>
+      )}
+      {!finished && <ProgressBar fraction={fraction} label="Export progress" />}
+      <div
+        class={job.status === 'failed' ? 'error-text' : 'hint'}
+        data-testid="export-video-status"
+        style={{ fontSize: '12px' }}
+      >
+        {browserJobStatusText(job, shotName)} · {elapsedText(job.status, elapsed)}
+      </div>
+      {result && result.warnings.length > 0 && (
+        <ul class="hint" data-testid="export-video-warnings" style={{ margin: '4px 0', paddingLeft: '18px' }}>
+          {result.warnings.slice(0, 8).map((w) => (
+            <li key={w}>{w}</li>
+          ))}
+        </ul>
+      )}
+      {preview && job.urls[preview.name] && (
+        <video
+          key={job.urls[preview.name]}
+          src={job.urls[preview.name]}
+          controls
+          muted
+          playsInline
+          preload="metadata"
+          data-testid="export-video-preview"
+          style={{
+            width: '100%',
+            maxHeight: '42vh',
+            background: '#000',
+            borderRadius: '4px',
+            margin: '8px 0',
+          }}
+        />
+      )}
+      {result && (
+        <>
+          <button
+            class="btn"
+            data-testid="export-video-download-all"
+            disabled={zipping}
+            title="Every file of the export in one ZIP archive"
+            onClick={() => void downloadAll()}
+          >
+            {zipping ? 'Packing…' : 'Download all (.zip)'}
+          </button>
+          {zipError && <div class="error-text">{zipError}</div>}
+          <BrowserFileList files={result.files} urls={job.urls} shotName={shotName} />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** The files of a device export as download links, by kind. */
+function BrowserFileList({
+  files,
+  urls,
+  shotName,
+}: {
+  files: BrowserExportFile[];
+  urls: Record<string, string>;
+  shotName: (id: string) => string;
+}) {
+  const g = groupBrowserFiles(files);
+  const sections: [string, BrowserExportFile[]][] = [
+    ['Sequence', g.sequence],
+    ['Clips', g.clips],
+    ['Posters', g.posters],
+    ['Stills', g.stills],
+    ['Passes', g.passes],
+    ['Contact sheet', g.contactSheet],
+    ['Manifest', g.manifest],
+  ];
+  return (
+    <div data-testid="export-video-files">
+      {sections
+        .filter(([, list]) => list.length)
+        .map(([title, list]) => (
+          <div key={title} style={{ marginTop: '6px' }}>
+            <div class="hint" style={{ fontWeight: 600 }}>
+              {title}
+            </div>
+            {list.map((f) => (
+              <div key={f.name} style={{ display: 'flex', gap: '8px', alignItems: 'baseline' }}>
+                <a
+                  href={urls[f.name]}
+                  download={f.name}
+                  data-testid={`export-video-file-${f.name}`}
+                  style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                >
+                  {f.name}
+                </a>
+                <span class="hint">
+                  {[
+                    f.shot && f.shot !== 'range' ? shotName(f.shot) : null,
+                    f.pass && f.pass !== 'beauty' ? f.pass : null,
+                    f.kind === 'frames' ? 'PNG frames' : null,
+                    f.frames ? `${f.frames} frames` : null,
+                    f.duration_s ? formatSeconds(f.duration_s) : null,
+                    formatBytes(f.size),
                   ]
                     .filter(Boolean)
                     .join(' · ')}

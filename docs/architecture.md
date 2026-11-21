@@ -7,7 +7,7 @@
 │  F3, console     undo manager      y-indexeddb (always)    three.js viewport    │
 │                  (own changes)     WebDAV merge-sync (opt)                      │
 │                                    SyncProvider (WebSocket + BroadcastChannel)  │
-│  render workers (Web Workers): path tracing, APNG/GIF encoding                  │
+│  render workers (Web Workers): path tracing, APNG/GIF encoding, thumbnails      │
 │  telemetry ──────────────────┐                                                  │
 └──────────────────────────────┼───────────────────┬──────────────────────────────┘
                                │ OTLP/JSON         │ binary Yjs protocol + RPC
@@ -30,7 +30,7 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | Package         | Purpose                                                                                                                                                                                                                                                                                         |
 | --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `packages/core` | Isomorphic TypeScript: math, mesh kernel, document model, operators, modifiers, curves and text, constraints, armatures, instancing, physics, materials, animation, scene evaluation, generators, CPU rasterizer and path tracer, import/export, sync protocol, WebDAV client and project store |
-| `apps/web`      | The PWA: Preact UI, three.js viewport, interaction, browser render workers, persistence, sync, telemetry, service worker                                                                                                                                                                        |
+| `apps/web`      | The PWA: Preact UI, three.js viewport, interaction, browser render workers, persistence, sync, telemetry, service worker, the embeddable desk page (`desk.html`)                                                                                                                                |
 | `apps/server`   | Fastify server: hosts the PWA, real-time sync hub, MCP endpoint, REST API, render processes, WebDAV proxy, telemetry ingestion, Prometheus metrics                                                                                                                                              |
 | `e2e`           | Playwright tests against the production builds, a real WebDAV server and real MCP clients                                                                                                                                                                                                       |
 | `scripts`       | `mcp.mjs`, a small MCP client (CLI and module) used by the [example projects](../examples)                                                                                                                                                                                                      |
@@ -67,14 +67,18 @@ renderers and the importers/exporters are isomorphic (no DOM, no Node APIs).
 | MCP tools, instructions, scene summaries, operator groups, editor commands, bounded undo histories                                                                                    | `apps/server/src/mcp`                                         |
 | Render processes (renders and exports), their CPU priority, the server's memory checks                                                                                                | `apps/server/src/render`                                      |
 | REST API, WebDAV proxy, observability                                                                                                                                                 | `apps/server/src/api`, `dav`, `observability`                 |
-| Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, rideo blocking import and export                   | `packages/core/src/desk`                                      |
+| Director's desk: shots and their timing, camera solver, plan fitting, the 180° line, camera moves, continuity checks, set builder, brief staging, SceneBlocking import and export     | `packages/core/src/desk`                                      |
 | Actors: mannequin rigs, poses, gaits, locomotion, holding and riding, keypoints                                                                                                       | `packages/core/src/desk/characters`                           |
 | Physics presets: start frames, drop, throw, push, bake, kites and balloons, vehicles                                                                                                  | `packages/core/src/desk/physics`                              |
-| Built-in model catalog, catalog search, store inserts                                                                                                                                 | `packages/core/src/store`                                     |
+| Library units: the unit file, extraction, insertion, updates, adoption, Make local                                                                                                    | `packages/core/src/desk/units`                                |
+| Built-in model catalog, catalog search, store inserts, framing of the built-in thumbnails                                                                                             | `packages/core/src/store`                                     |
 | Director workspace, Asset Browser, Export Video window, Follow Shots                                                                                                                  | `apps/web/src/ui/director`, `ui/assets`, `viewport`           |
-| Video export jobs: plan, frame loop, ffmpeg, passes, manifest, memory                                                                                                                 | `apps/server/src/video`                                       |
+| Embeddable desk: its page, the host protocol and bridge, the desk state, the staging worker, its export, library units, the Library tab                                               | `apps/web/src/embed`, `apps/server/src/desk-embed.ts`         |
+| Video export of server and browser: parameters, plan, desk frames, passes, frame loop, manifest, estimates                                                                            | `packages/core/src/export`                                    |
+| Browser video export: render workers, WebCodecs encoders, MP4/WebM muxing, files, memory plan                                                                                         | `apps/web/src/export`                                         |
+| Built-in thumbnails in the browser: thumbnail workers, queue, IndexedDB cache                                                                                                         | `apps/web/src/assets/thumbnails`                              |
+| Video export jobs: queue, render processes, ffmpeg encoders, memory                                                                                                                   | `apps/server/src/video`                                       |
 | Model store: providers, search, downloads, cache, thumbnails                                                                                                                          | `apps/server/src/store`                                       |
-| rideo bridge: client, import, push, previs jobs                                                                                                                                       | `apps/server/src/rideo`                                       |
 
 ## Document model
 
@@ -312,42 +316,43 @@ refreshes the preview row by row; at the end a worker denoises and tone maps the
 
 The tab's memory decides how many workers a render uses (`memory.ts`): the JavaScript heap, whose
 limit the page and its workers share (Chrome's `performance.memory`), and a budget of half the
-device memory the browser reports (at most 4 GB), next to the path traced renders already running
-in the tab. Only the workers an estimate of the document leaves room for start with the render, more
-once the first worker reports the compiled scene; the render window shows "(memory)" after the
-thread count when the memory allows fewer threads than the pool has. A render that does not fit one
-worker is refused with the reason instead of ending the tab (V8 ends the whole tab when a worker
-runs out of heap): before any worker starts, when the estimate shows it (the document at the
-render's frame, with its animated and driven values); else on the first worker, before a modifier
-that would not fit runs, counted from its real input (`guard.ts`: the edges a Bevel limited by angle
-bevels, for one), or once the scene is evaluated, before it is compiled. After a render, the workers
-that adopted copies of the compiled scene are stopped when the copies take an eighth of the budget
-or more, and those a refused render started are stopped at once, unless another path traced render
-runs in the tab.
+device memory the browser reports (at most 4 GB), next to what the path traced renders and browser
+video exports running in the tab hold, and the files of finished browser exports it keeps in memory
+until they are released. Only the workers an estimate of the document leaves room for start with the
+render, more once the first worker reports the compiled scene; the render window shows "(memory)"
+after the thread count when the memory allows fewer threads than the pool has. A render that does
+not fit one worker is refused with the reason instead of ending the tab (V8 ends the whole tab when
+a worker runs out of heap): before any worker starts, when the estimate shows it (the document at
+the render's frame, with its animated and driven values); else on the first worker, before a
+modifier that would not fit runs, counted from its real input (`guard.ts`: the edges a Bevel limited
+by angle bevels, for one), or once the scene is evaluated, before it is compiled. After a render,
+the workers that adopted copies of the compiled scene are stopped when the copies take an eighth of
+the budget or more, and those a refused render started are stopped at once, unless another path
+traced render runs in the tab.
 
 A RASTER render (F12, Ctrl+F12, or an RPC request for the WebGL rasterizer) evaluates the scene with
 the render settings on the page itself, with an evaluator of its own next to the viewport's
 (`ViewportEngine.evaluateFinal`). The geometry it builds and keeps (curve and text surfaces,
 modifier and shape key results; meshes as stored are the page's already) must fit the part of the
-heap limit a render may fill, less the page's own heap and what the path traced renders running in
-the tab hold. The page's own heap, here and in the plan of a path traced render, is estimated from
-its scene, as Chrome holds it (measured: 12 MiB for a new project, 31 to 34 KB per object, 84 to 89
-bytes per triangle of its meshes and of the geometry its viewport evaluation builds; counted with a
-quarter more), not read from Chrome's `usedJSHeapSize`, which counts the page's ArrayBuffers too
-(631 MiB for a page whose heap held 262 MiB). The RASTER render is checked like the first worker of
-a path traced render, and refused with the reason when it does not fit: before the evaluation, from
-the document at the frame it renders (120 bytes of heap per triangle built; Chrome took 88 to 94),
-and during it, before each modifier, from its real input (`RasterEvaluationGuard`). A render that
-builds nothing beyond what the page holds (no curve or text surface, modifier or shape key result,
-no particle or collection instances) is not refused, whatever the estimate of the page says
-(measured with V8's old space limited to 400 MB: a page of four grids of 1,036,800 triangles each,
-estimated at 0.449 GB while its heap held 345 MiB after a garbage collection, rendered from F12 in
-7.8 s, where it was refused before). The geometry an earlier final render kept goes first when it
-and the new one would not fit together, or when a modifier does not fit next to it: the scene is
-then evaluated once more without it. A path traced render counts that geometry as part of the
-page's heap; this check leaves it out, and a path tracing refusal suggests the RASTER engine only
-where this check passes. The MCP `render_image` with `renderer: auto` renders on the server when the
-editor refuses.
+heap limit a render may fill, less the page's own heap and what the path traced renders and browser
+video exports running in the tab hold. The page's own heap, here and in the plan of a path traced
+render, is estimated from its scene, as Chrome holds it (measured: 12 MiB for a new project, 31 to
+34 KB per object, 84 to 89 bytes per triangle of its meshes and of the geometry its viewport
+evaluation builds; counted with a quarter more), not read from Chrome's `usedJSHeapSize`, which
+counts the page's ArrayBuffers too (631 MiB for a page whose heap held 262 MiB). The RASTER render
+is checked like the first worker of a path traced render, and refused with the reason when it does
+not fit: before the evaluation, from the document at the frame it renders (120 bytes of heap per
+triangle built; Chrome took 88 to 94), and during it, before each modifier, from its real input
+(`RasterEvaluationGuard`). A render that builds nothing beyond what the page holds (no curve or text
+surface, modifier or shape key result, no particle or collection instances) is not refused, whatever
+the estimate of the page says (measured with V8's old space limited to 400 MB: a page of four grids
+of 1,036,800 triangles each, estimated at 0.449 GB while its heap held 345 MiB after a garbage
+collection, rendered from F12 in 7.8 s, where it was refused before). The geometry an earlier final
+render kept goes first when it and the new one would not fit together, or when a modifier does not
+fit next to it: the scene is then evaluated once more without it. A path traced render counts that
+geometry as part of the page's heap; this check leaves it out, and a path tracing refusal suggests
+the RASTER engine only where this check passes. The MCP `render_image` with `renderer: auto` renders
+on the server when the editor refuses.
 
 Animation frames are rendered one after the other (path traced on the workers, or rasterized with
 WebGL) and streamed to an APNG or GIF encoder on a worker, so the main thread keeps no frames.
@@ -355,6 +360,19 @@ Canceling keeps the samples or frames finished so far. The editor's RPC handler 
 workers when a request asks for `engine: PATHTRACER`: the server's MCP `render_image` sends such
 requests with `renderer: browser` (with `renderer: auto` it path traces on the server and sends only
 raster renders to browsers).
+
+### Thumbnail workers
+
+The Asset Browser renders the thumbnails of the built-in models in the browser
+(`apps/web/src/assets/thumbnails`), with core's `renderBuiltinThumbnailPng`
+(`packages/core/src/store/thumbnail.ts`), the code the server's store renders them with, so a model
+is the same PNG wherever it is made. One module worker renders them, two from four cores up, one
+thumbnail at a time each; they start on first use and stop after 30 seconds without work or when the
+page goes away. A queue on the page puts the cards in view first and drops a card's request when it
+scrolls away before its turn. The PNGs are kept in an IndexedDB database of their own under the
+build of the worker (the hash in its file name), the model, its parameters and the size, within
+16 MiB, the least recently used going first. [model-store.md](model-store.md#thumbnails) has the
+details and measurements.
 
 ### Server render processes
 
@@ -877,6 +895,216 @@ Rigid bodies gained a start frame (`start_frame`, `initial_*_velocity`, `inherit
 it a body follows its animation, parent or constraints, and from it it is simulated with the
 velocity it had.
 
+## Video export
+
+Two exporters write the same files from the same code. `packages/core/src/export` holds what
+they share, free of Node and the DOM: the parameters and presets (one zod schema for the MCP tool,
+the REST body and the browser), the plan (shots, size, frames, padding), the desk frame
+(`renderDeskFrame`: beauty and passes from one RASTER evaluation, the subject boxes and camera of
+the metadata), the render document of a snapshot (`createExportRenderDocument`,
+`measureDeskShot`, `simulateRigidBodies`, `renderExportFrame`), the passes and their palette, the
+ordered frame loop (`renderInOrder`: frames rendered ahead on every thread within a count and a
+byte cap, written in order, a thread's death handled), the manifest and the memory estimates. Its
+errors carry the codes `INVALID_PARAMS` and `NOT_FOUND`, which each exporter maps to its own.
+
+- **The server** (`apps/server/src/video`, [server](#server)) leases render processes, which run
+  `renderExportFrame` on the snapshot, and pipes each stream's raw frames into an ffmpeg process.
+- **The browser** (`apps/web/src/export`) runs the same functions in module Web Workers
+  (`export.worker.ts`; one per core that the tab's memory holds, at most 8), each holding the
+  snapshot (a Yjs update applied once). The first worker plans, measures the shots, simulates
+  the rigid bodies once per segment for every worker, and makes the contact sheet and the
+  manifest; every worker converts its frames for the page (I420 in BT.709 limited range for
+  video, PNG for the lossless passes, posters, stills and tiles). The page (`engine.ts`) runs
+  `renderInOrder` over the workers, encodes each stream with one WebCodecs `VideoEncoder`
+  (`encode.ts`; key frames at every shot start), muxes the chunks with mediabunny into the
+  sequence and the clip of their shot without encoding again (`mux.ts`), and writes the files to
+  the Origin Private File System or memory with their SHA-256 (`store.ts`). The Export Video window
+  uses it by default and the server as a second choice ([video-export.md](video-export.md)).
+
+## Embeddable desk
+
+`desk.html` is the web app's second page (a second Vite input; [embedding.md](embedding.md)): the
+Director workspace for another application's frame. Its entry, `apps/web/src/embed/main.tsx`,
+shares the editor's modules but none of its start-up: `data-runtime="desk"` on the page's root
+element (`app/runtime.ts`) tells the shared modules before any of them runs, so the preferences
+are the desk's own (never `3d-editor:prefs:v1`), and nothing asks for `/api/config` or starts
+telemetry, RPC, live sync, WebDAV or the server probe. The pieces, each tested on its own:
+
+- `protocol.ts`: the zod schemas of every message of the frozen protocol, checked against the
+  contract's fixtures; `bridge.ts`: `hello`, the one `connect` from the parent, then the port;
+  `controller.ts`: what the desk answers and when (states after edits, progress, Send, Done).
+- `workspace.ts`: a `ProjectSession` per host origin and scene (IndexedDB, or memory where the
+  browser blocks storage), opened by the merge rule of `state.ts` (the desk state's container and
+  lineage). `staging-engine.ts` runs core's `stageBrief`, `updateFromBrief`, `shotResults` and the
+  checks on a document made from a snapshot, in `stage.worker.ts`, and answers with a Yjs diff
+  that the page applies (`staging.ts` is the worker's client).
+- `export.ts`: one run of the browser export engine per shot (preset `reference`), its files
+  renamed for the host and checked for the shot's frames; `guards.ts`: the operators the desk
+  hides, and in a read-only open every operator that changes the scene, refused in the
+  registry's poll and told to the editor's UI through `editor/page-guard.ts` (menus grey them
+  out, a slider drag writes no live value, a dropped model file is refused unread; the editor
+  refuses nothing there), and the keys of the chrome it hides, which its keymap ignores.
+- `units.ts`: [library units](#library-units) in the desk, on only after an open with
+  `options.units`. It reads `open.units` entry by entry (each file's SHA-256 checked) and hands the
+  files the open holds to the staging worker with each staging and update (transferred), where
+  core places and updates the units. The worker also makes a unit of the scene for Save to library
+  with its thumbnail (`unit-extract`, read only; the thumbnail shows the unit alone in colour, the
+  material look rather than the clay of the model store's thumbnails), links the scene to a
+  version the host saved (`unit-adopt`) and cuts an instance's link (`unit-local`), the last two
+  answered with a Yjs diff. Each save sent from a slot stays in the scene document, one record per
+  save, until the host refuses that save or the scene takes a unit of the slot in (core
+  `recordPublish`), so that the Update shots of a brief that pins one of them after the desk
+  stopped waiting adopts the scene's own objects (`adoptLinkedPublishes`) rather than adding a
+  copy. `units.ts` also gives `state.units` from the scene's record, the
+  Library tab's rows (`libraryRows`) and what Save to library can save (`saveTargets`).
+  `LibraryTab.tsx` and `SaveToLibraryDialog.tsx` are their UI: a tab the desk adds to the editor's
+  bottom area (`ExtraBottomTab` in `ui/App.tsx`; the editor adds none) and a modal dialog over the
+  desk. While it or the Send check is open (`deskModals` in `DeskApp.tsx`) the desk blocks the
+  editor's keymap (`installKeymap`'s `blocked`; the editor passes none) and keeps the keyboard
+  focus in the window (`useModalFocus`).
+  A desk state's container is version 1, or 2 once the scene holds library units, so a desk from
+  before units refuses that state rather than drop instances it cannot keep.
+
+The server, the Vite dev and preview servers and the PWA's service worker share
+`apps/server/src/desk-embed.ts` (no imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the
+page's COEP, CORP and CSP `frame-ancestors` and the built files' COEP and CORP, and `/desk` maps
+to `desk.html`, never to the editor's `index.html` (`/desk/` and `/desk.html/` are the editor's,
+as any other path). The PWA's service worker (`apps/web/src/pwa/sw.ts`: Workbox's precaching and
+routing, the desk's rules in `sw-desk.ts`) precaches `desk.html` and answers it (also at `/desk`,
+with any query) with the precached copy and the server's current headers when the server answers
+within 4 s, else with the headers it was last served with, so a browser never freezes the
+deployment's settings; a worker script it serves without a COEP gets `require-corp`, and a new
+version refuses the editor's Update while a desk page is open and tells the editor, which says
+why (`update-waits.ts`). The build drops the web app manifest's link from `desk.html`.
+
+## Library units
+
+A library unit is a set, a prop or a figure saved from a scene so that other scenes can use it
+(`packages/core/src/desk/units`; the host's library and the protocol are in
+[embedding.md](embedding.md)). A unit file is the desk's container (`desk/container`: the magic
+`3DUNIT\r\n`, a version and a codec byte, a canonical JSON header, the payload) around a body
+gzipped deterministically: a manifest of every datablock's stored fields under the unit's source
+ids, and a blob table holding each distinct byte array (meshes, shape keys, weights, images) once.
+The same content gives the same bytes in Node, the page and the staging worker; `header.digest`
+is the body's SHA-256 and the protocol pins the file's. Reading is bounded: at most 32 MiB of
+file, 64 KiB of header and 128 MiB of body, unpacked in 4 KiB slices into one buffer of exactly
+the declared size, every reference checked to stay inside the unit before anything is inserted.
+Decoding is the gate, so what decodes inserts: a manifest nested deeper than 64, a number that is
+not finite, a key `__proto__`, `constructor` or `prototype`, a reference to an id only
+`Object.prototype` has, or a figure whose body is not the actor its header names (role, kind,
+height within 5 mm, rig) is refused as damaged. The custom props the scene owns (`unit_*`,
+`desk_element_id` and the rest that `ownership.ts` lists) are left out of every part as it goes
+in, so no part is a second instance, and an insert works out every record before it writes one,
+so one that fails leaves the scene as it was.
+
+An instance is a root object with `unit_*` custom props: the library item, its version, the file's
+SHA-256, the body digest, the kind, the key, the name, `unit_parts` (each source id's scene id and a
+16-digit stamp of the fields the unit owns), `unit_drivers` (each driver the unit gave, by its
+target's source id, path and index, with its stamp) and, for an instance whose parts took ids of a
+later generation (below), `unit_gen`. glTF node extras and `get_object` give the two tables as how
+many entries they hold (`unit_parts_count`, `unit_drivers_count`, about 56 bytes a part saved).
+Insertion derives every id from the instance key and the source id (`deriveUnitId`), so two
+replicas inserting the same unit agree. Taking an instance out removes all of it (`remove.ts`): its
+objects and the datablocks its part table lists that nothing left in the scene uses, so a unit
+placed in the slot again finds its ids free. A datablock at a derived id that nothing uses counts as
+free and goes in the insert's transaction. A part the scene still uses keeps its id when its
+instance goes (the person gave its material to an object of their own, or moved one of its objects
+out from under it), so a slot's ids come in generations (`derivePartId`): generation 0 is
+`deriveUnitId(key, sourceId)`, generation n hashes the key as `<key>#<n>`, which no key can be, and
+an insert takes the first of the 65 generations (0 to 64) whose ids are all free and keeps it in
+`unit_gen`. The root's id is the same in every generation, so shots, holds and the set's root keep
+finding it; only an object of the scene's own at the root's id, or a part whose ids are taken in
+every generation, refuses the insert (`UNIT_ID_TAKEN`). The choice depends on the document alone,
+so replicas agree. An insert that takes the place of what was there (a library set over the words'
+set, a prop's new look) removes the old objects in its own transaction, and a staging or an update
+puts each slot in on its own: a unit that does not go in (the scene in its way, a body that does
+not read) leaves its slot as it was or staged from the words, with its reason in the record, and
+the other slots, the shots and the rest of an update go on; one the scene was in the way of is
+pending `unavailable`, tried again at the next open or update. A prop's version whose root is
+another type of object than the instance's (a set's root is always an empty, a figure's an armature)
+is no update in place: it takes the instance's place in the insert's transaction, as another item
+does; an instance the scene changed so that no version fits it (its root's type changed by other
+means) leaves the slot pending `unavailable`. What the person put on a set or a prop whose look goes
+(objects of their own below its root or its parts, not its look: remove.ts `oldLook`), for another
+item, a version of another type, a library set in place of the words' set, or the words' set or prop
+back when the pin is dropped, stays in the same transaction (insertUnit's `keep`, removeObjectTrees'
+`keep`): `hangKept` hangs it from what takes the look's place (the new root, the words' ground or
+prop) where it is in the world, or leaves it where it was, under its parent of the moment, when the
+new root's uneven scale would change it there, and a warning names it. Its keys are in its parent's
+space: where the new parent is the old one moved and scaled along its axes, `keepMotion` rewrites its
+location and scale keys so that it moves as it did; otherwise (a keyed turn under a root scaled
+unevenly, keys under a modifier that changes values, a driven channel) they stay as they are and the
+warning says that its keyed motion now follows the new root. Places are read at rest
+(`restWorld`: an object hung from a bone sits at the bone's tail in the armature's rest position,
+which `SceneDoc.worldMatrix` leaves out), with what moved each one on its own above it (`moversOf`:
+keys, drivers, constraints, an active rigid body, or the pose of the bones it hung from); one whose
+mover went and that nothing above it moves alike now is named as no longer following it, unless the
+staging moves what takes the piece's place as it moved the piece (`restaged`: a prop held or flown
+again as the old one was, by the same holder, which the import reads from the holder the old prop
+records and the flight or holds it carries before it goes, and from the plan for the new one, when
+the old prop's own transform channels carry no keys of the person's: its motion record
+(`RIDEO_PROPS.motion`) keeps a digest of the keys the staging wrote there (`ownKeysDigest`), read
+before an update's ripple shifts them; an actor built anew on its marks). One that followed a bone
+through the pieces that went (a hat on a mannequin's head part) hangs from the same bone of the new
+root when the root is that armature or takes its place. One skewed by an uneven scale above it,
+which no parent holds, keeps its origin and is named as changing shape. The same steps keep what the
+person put on what staging and updates build anew or take out without a library unit (`keptPlaces`,
+then `hangKept`): a words' prop or landmark built anew or dropped, the words' ground, walls and sun
+built again (`buildSet` and `lightSet`, which name nothing when a piece comes back with its name and
+place), a cast member's actor or a shot's camera an update drops, a kite's string flown again, an
+actor a rideo re-import builds anew, and an old look's parts when a figure or the mannequin takes
+their place (insertUnit's `replace`, `restyleActor`); what goes with nothing in its place hangs from
+the set's ground, or from the scene when there is none. A shot's camera hung from (or under) such a
+piece is held on a re-import as a blocked camera is (rideo/import.ts `cameraHold`): it stays on what
+it hangs from while that stands still through the shot, scaled evenly, not mirrored and shown;
+otherwise it is taken off it, at scale 1, where it stands at the shot's first frame, and placed
+where the clip's blocking has it. An update holds so only a camera it solves, and solves it again
+(`updateCameraHold`): one still as staged in a shot it solves (a re-import records one it placed in
+its parent's space so), and one the person only hung from or under a piece the update built anew or
+staged again that now moves in the shot otherwise than it did (`hungMotion`, read before any piece
+is built anew and after, compared from the shot's first frame by `sameMotion`), which it takes off
+only when what it hangs from moves in the shot. To tell one only hung, beside a camera's motion
+digest its motion record keeps an `own` one (`cameraOwnDigest`: the digest without its hang, that is
+its parent and the channel values a hang with Keep Transform rewrites, so of its keys, its data's,
+its constraints and what hangs below it), which a hang leaves as recorded (`cameraOwnAsStaged`; a
+camera recorded without it counts as set by hand). Any other camera keeps its hang as `hangKept`
+leaves it; one set by hand is never solved: it keeps its keys (fitted only to a new length of its
+shot), and a warning says to check its framing when what it hangs from was built anew, staged again
+or no longer moves as it did. The warnings name what the person hung it from (`cameraParents`, read
+before any piece is built anew: `'kite' (built anew as 'balloon')`). An update replaces the
+parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it
+keeps parts edited or deleted in the scene, adds new parts at ids of the instance's generation (or
+of the next free one) and removes dropped untouched ones that nothing staying uses (a record that
+stays refers to it, such as another object, a camera's focus or a part the update keeps, or a key,
+driver, shot or the scene camera names it; then it stays with what it uses), and treats the unit's
+drivers the same way by their own table: a driver the new version drops together with the part it
+drives goes with that part, or stays on it when the part stays, and what it reads stays too.
+`unitStatus` names the parts and the drivers the scene edited or deleted. Extraction carries an
+instance's generation in its link plan, so linking the saved unit (adoption) keeps it; Make local
+drops it with the other `unit_*` props. What an update writes is stamped as written: a reference to
+a part that is not in the scene is cut, and the part still reads as left as it was. Linking a saved
+set (adoption) stamps the scene's set root, also one made local before: the root a new set would
+take is that one. A unit's driver writes only the unit's own datablocks (it may read the world or
+the scene), and drivers count toward the 20,000 records. Scene-owned fields (names, the collection
+and rigid body of every object, the root's placement, pose and constraints, the scene's `desk_*`
+props) never count as edits, and a unit holds no rigid body: a drop preset that makes a library
+set's ground the floor edits nothing of the set. Measured on the sample brief:
+
+| Unit                            | File      | Body      | Objects |
+| ------------------------------- | --------- | --------- | ------- |
+| set staged from the brief alone | 1.9 KiB   | 3.8 KiB   | 3       |
+| that set and 20 built-in models | 198.8 KiB | 772.4 KiB | 49      |
+| figure: a child                 | 23.9 KiB  | 130.7 KiB | 22      |
+| figure: a dog                   | 26.5 KiB  | 156.9 KiB | 21      |
+| prop: the red kite              | 3.3 KiB   | 12.6 KiB  | 9       |
+| prop: a park bench              | 3.4 KiB   | 8.6 KiB   | 2       |
+| prop: a house                   | 10.8 KiB  | 47.9 KiB  | 2       |
+
+The desk state (the gzipped Yjs update) grows by about what the units hold: with 2 shots from
+118.7 KiB staged to 326.8 KiB with the dressed set inserted and 342.5 KiB with both cast members
+replaced by figures; with 24 shots and 4 cast from 658.9 KiB to 867.5 KiB and 879.9 KiB.
+Extraction takes 24–117 ms, decoding the dressed set 51 ms and inserting it 11–17 ms.
+
 ## Server
 
 - **Sync rooms** (`apps/server/src/sync`): one room per open project holds a server-side replica of
@@ -895,28 +1123,34 @@ velocity it had.
   Scene summaries (`scene-summary.ts`) report evaluated values next to stored ones. See
   [mcp.md](mcp.md).
 - **REST API** (`apps/server/src/api`): project listing and management, snapshots, exports,
-  `render.png` and stored renders, video exports, the model store, rideo previs jobs,
-  `/api/config`, `/healthz`, `/readyz`, `/metrics`. Service failures answer `{error, code}`
+  `render.png` and stored renders, video exports, the model store, `/api/config`, `/healthz`,
+  `/readyz`, `/metrics`. Service failures answer `{error, code}`
   (`api/errors.ts`).
 - **Video export** (`apps/server/src/video`): background jobs, one rendering at a time (first
   come, first served, at most `EXPORT_MAX_QUEUED` waiting), each on a snapshot of the project
   taken when it was asked for and stored next to its `job.json` in `EXPORT_DIR`. A job measures
   each shot (depth range, shadow box, ambient occlusion reach), decides from the memory available
   how many render processes it leases (`video/memory.ts`), renders segments of at most 200 frames
-  (beauty and passes from one RASTER evaluation per frame, `render/desk.ts`), writes the frames in
-  order into one ffmpeg process per stream, cuts the clips by stream copy at the keyframes forced
-  at every shot start, and writes posters, the contact sheet and `manifest.json`
-  ([video-export.md](video-export.md)).
+  (beauty and passes from one RASTER evaluation per frame, core's `export/desk-frame.ts`), writes
+  the frames in order into one ffmpeg process per stream, cuts the clips by stream copy at the
+  keyframes forced at every shot start, and writes posters, the contact sheet and `manifest.json`
+  ([video-export.md](video-export.md), [video export](#video-export) below).
 - **Model store** (`apps/server/src/store`): provider adapters (built-in, Khronos, Poly Haven,
   Sketchfab, Poly Pizza, JSON catalogs) searched in parallel and merged with an opaque cursor;
   lazily fetched indexes cached for 24 hours; downloads through a guarded fetch (public hosts
   only), checked and kept in a least-recently-used disk cache; inserts run the core operators
   `store.add` and `store.insert_files` in the project ([model-store.md](model-store.md)).
-- **rideo bridge** (`apps/server/src/rideo`): a client of rideo's REST API, the import
-  (`desk.import_rideo_blocking` from rideo's documents), the push (blocking written back, clips
-  uploaded once per content, shots patched) and the previs jobs, each kept in
-  `DATA_DIR/rideo-previs` as it changes so that its status answers after a restart
-  ([rideo.md](rideo.md)).
+- **Brief tools** (`apps/server/src/mcp/brief-tools.ts`): `desk_stage_brief` and `desk_shot_results`
+  give agents what the embedded desk does in the browser with a host's scene brief: they run the
+  core operators `desk.stage_brief`, `desk.update_from_brief` and `desk.shot_results`
+  (`packages/core/src/desk/brief`, pure, so the same code runs in a web worker) in the agent's
+  project, each change one undo step. The server talks to no host: a brief comes in as a tool
+  argument, and the references go out through `export_video`
+  ([director-desk.md](director-desk.md#staging-from-a-brief), [embedding.md](embedding.md)).
+  Upgrading from a server with the retired rideo bridge: nothing reads `DATA_DIR/rideo-previs` (its
+  previs jobs) or `DATA_DIR/rideo-push` (what it pushed to each clip) any more, and both can be
+  deleted by hand; the server deletes neither. Exports of that time may keep a `push` block in their
+  `job.json`, which `export_status` and `list_exports` leave out (`video/jobs.ts`).
 
 ## Persistence & sync
 

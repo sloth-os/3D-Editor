@@ -52,9 +52,10 @@ ENV NODE_ENV=production \
 WORKDIR /app
 # ffmpeg encodes the server's video exports (docs/video-export.md). Alpine's package pulls in about
 # 100 libraries (x264, x265, libvpx, aom, dav1d, vulkan …): about 130 MB more image. Build with
-# --build-arg WITH_FFMPEG=0 for an image without video export (features.videoExport is then false
-# and exports answer FFMPEG_UNAVAILABLE). This is the runtime stage's only RUN: building for
-# arm64/armv7 runs it under emulation (QEMU, set up by the Docker workflow); the rest only copies.
+# --build-arg WITH_FFMPEG=0 for an image without the server's video export (features.videoExport is
+# then false and its exports answer FFMPEG_UNAVAILABLE; browsers still export on their device).
+# This is the runtime stage's only RUN: building for arm64/armv7 runs it under emulation (QEMU, set
+# up by the Docker workflow); the rest only copies.
 ARG WITH_FFMPEG=1
 RUN if [ "$WITH_FFMPEG" = 1 ]; then apk add --no-cache ffmpeg; fi
 # The server handles SIGTERM/SIGINT itself (graceful shutdown), so no init process is required.

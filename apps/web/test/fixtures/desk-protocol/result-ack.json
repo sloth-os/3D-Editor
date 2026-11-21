@@ -1,0 +1,12 @@
+{
+  "type": "result-ack",
+  "id": "exp-1",
+  "ok": true,
+  "message": "Attached 1 reference in rideo.",
+  "shots": [
+    {
+      "shotId": "sht_0123456789aaaa",
+      "ok": true
+    }
+  ]
+}

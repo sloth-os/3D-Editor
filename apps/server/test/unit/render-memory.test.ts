@@ -2,20 +2,12 @@ import { afterAll, describe, expect, it } from 'vitest';
 import {
   SceneDoc,
   SceneEvaluator,
-  createCube,
   createGrid,
   geometryMemoryCheck,
   setGeometryMemoryCheck,
   type ModifierData,
 } from '@3d-editor/core';
-import {
-  RenderOutOfMemoryError,
-  RenderPool,
-  Renderer,
-  estimateRenderMemory,
-  estimateRenderTriangles,
-  renderMemoryFromEnv,
-} from '../../src/render';
+import { RenderOutOfMemoryError, RenderPool, Renderer, renderMemoryFromEnv } from '../../src/render';
 import { RENDER_HEAP_BYTES_PER_TRIANGLE, geometryCheck, serverHeapReserve } from '../../src/render/memory';
 import { SINGLE_THREAD_RENDER_ADVICE, renderToolError } from '../../src/mcp/rendering';
 
@@ -71,79 +63,6 @@ describe('RENDER_WORKER_MEMORY_MB', () => {
 });
 
 describe('renders in the server process', () => {
-  it('estimate the triangles of a render from the stored meshes and their generating modifiers', () => {
-    const doc = scene();
-    const grid = addGrid(doc, 10); // 200 triangles
-    expect(estimateRenderTriangles(doc)).toBe(200);
-    doc.updateObject(grid, {
-      modifiers: [
-        {
-          id: 'm1',
-          name: 'Subdivision',
-          type: 'SUBSURF',
-          show_viewport: true,
-          show_render: true,
-          show_in_editmode: true,
-          show_expanded: true,
-          params: { levels: 1, render_levels: 2 },
-        },
-        {
-          id: 'm2',
-          name: 'Array',
-          type: 'ARRAY',
-          show_viewport: true,
-          show_render: true,
-          show_in_editmode: true,
-          show_expanded: true,
-          params: { count: 3 },
-        },
-        {
-          id: 'm3',
-          name: 'Mirror',
-          type: 'MIRROR',
-          show_viewport: true,
-          show_render: true,
-          show_in_editmode: true,
-          show_expanded: true,
-          params: { use_axis: [true, true, false] },
-        },
-        {
-          id: 'm4',
-          name: 'Off',
-          type: 'SUBSURF',
-          show_viewport: true,
-          show_render: false,
-          show_in_editmode: true,
-          show_expanded: true,
-          params: { render_levels: 3 },
-        },
-      ],
-    });
-    expect(estimateRenderTriangles(doc)).toBe(200 * 16 * 3 * 4);
-    // objects hidden from renders are left out; a linked duplicate with the same stack counts once
-    const cube = doc.addObject({ type: 'MESH', name: 'Cube', data: doc.addMesh('Cube', createCube()) });
-    doc.addObject({ type: 'MESH', name: 'Cube 2', data: doc.getObject(cube)!.data! });
-    expect(estimateRenderTriangles(doc)).toBe(200 * 16 * 3 * 4 + 12);
-    doc.updateObject(cube, { hide_render: true });
-    expect(estimateRenderTriangles(doc)).toBe(200 * 16 * 3 * 4 + 12);
-  });
-
-  it('estimate the heap of a render: its meshes, the peak of their modifiers, the render of their result', () => {
-    const doc = scene();
-    const grid = addGrid(doc, 100); // 20,000 triangles
-    expect(estimateRenderMemory(doc)).toEqual({
-      triangles: 20_000,
-      bytes: 20_000 * RENDER_HEAP_BYTES_PER_TRIANGLE,
-    });
-    // one level: 40,000 quads (80,000 triangles); the subdivision's peak (700 bytes per face,
-    // 28,000,000) is more than the render of its result (320 bytes per triangle, 25,600,000)
-    doc.updateObject(grid, { modifiers: [subsurf({ levels: 0, render_levels: 1 })] });
-    expect(estimateRenderMemory(doc)).toEqual({
-      triangles: 80_000,
-      bytes: 20_000 * RENDER_HEAP_BYTES_PER_TRIANGLE + 40_000 * 700,
-    });
-  });
-
   it('refuse a render the free heap cannot hold, with an explained error, and render one it can', async () => {
     // a heap of 1,024 MB with 300 MB free: 256 MB stay for the rest of the server, 44 MB for the render
     const free = 300 * MB;

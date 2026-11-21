@@ -210,6 +210,8 @@ export class ProjectSession {
   provider: SyncProvider | null = null;
   webdav: WebDAVSync | null = null;
   private idb: IndexeddbPersistence | null = null;
+  /** Kept in IndexedDB and the local project list (false: in memory only; see open). */
+  private persist = true;
   private presenceTimer: ReturnType<typeof setTimeout> | null = null;
   private indexTimer: ReturnType<typeof setTimeout> | null = null;
   private disposers: (() => void)[] = [];
@@ -267,14 +269,24 @@ export class ProjectSession {
    */
   static remoteWaitMs = 4000;
 
-  static async open(id: string, opts: { initial?: SceneDoc; name?: string } = {}): Promise<ProjectSession> {
+  /**
+   * Opens project `id`. `persist: false` keeps it in memory only (no IndexedDB, no entry in the local
+   * project list): the embeddable desk where the browser blocks storage.
+   */
+  static async open(
+    id: string,
+    opts: { initial?: SceneDoc; name?: string; persist?: boolean } = {},
+  ): Promise<ProjectSession> {
     const span = telemetry.startSpan('project.open', { 'project.new': !!opts.initial });
     const s = new ProjectSession(id);
+    s.persist = opts.persist !== false;
     try {
-      s.idb = new IndexeddbPersistence(projectDbName(id), s.doc.ydoc);
-      await s.idb.whenSynced;
-      // the thumbnail the local project list has, kept until the viewport gives one
-      s.lastThumbnail = (await localIndex.get(id).catch(() => undefined))?.thumbnail;
+      if (s.persist) {
+        s.idb = new IndexeddbPersistence(projectDbName(id), s.doc.ydoc);
+        await s.idb.whenSynced;
+        // the thumbnail the local project list has, kept until the viewport gives one
+        s.lastThumbnail = (await localIndex.get(id).catch(() => undefined))?.thumbnail;
+      }
       if (opts.initial) Y.applyUpdate(s.doc.ydoc, opts.initial.encodeState(), s.storageOrigin);
       s.setupPresence();
       s.provider = new SyncProvider(id, s.doc.ydoc, s.awareness, null);
@@ -290,7 +302,7 @@ export class ProjectSession {
         await s.waitForRemote(ProjectSession.remoteWaitMs);
       }
       if (opts.name && !s.doc.getMeta().created_at) s.doc.setName(opts.name);
-      await localIndex.put({ ...s.projectInfo(), last_opened: new Date().toISOString() });
+      if (s.persist) await localIndex.put({ ...s.projectInfo(), last_opened: new Date().toISOString() });
       span.setAttribute('scene.objects', s.doc.objectIds().length).setOk();
       return s;
     } catch (err) {
@@ -566,7 +578,7 @@ export class ProjectSession {
    * once while the page is hidden (it draws no frames then).
    */
   private scheduleIndexUpdate(): void {
-    if (this.indexTimer) return;
+    if (this.indexTimer || !this.persist) return;
     const since = Date.now();
     const update = () => {
       this.indexTimer = null;

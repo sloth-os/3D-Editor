@@ -34,7 +34,7 @@ export type ErrorCode = OperatorError['code'];
  * video export without ffmpeg (FFMPEG_UNAVAILABLE), a model store provider that needs an API key
  * the server does not have (NEEDS_KEY), a model whose licence or provider does not allow
  * downloading it (NOT_DOWNLOADABLE), a full export queue (QUEUE_FULL) and an outside service (a
- * model provider, rideo) that failed or did not answer (UPSTREAM).
+ * model provider) that failed or did not answer (UPSTREAM).
  */
 export type ServiceErrorCode =
   'UNAVAILABLE' | 'FFMPEG_UNAVAILABLE' | 'NEEDS_KEY' | 'NOT_DOWNLOADABLE' | 'QUEUE_FULL' | 'UPSTREAM';

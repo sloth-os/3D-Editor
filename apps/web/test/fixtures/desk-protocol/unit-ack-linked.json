@@ -1,0 +1,9 @@
+{
+  "type": "unit-ack",
+  "id": "pub-1",
+  "ok": true,
+  "ref": "lib_0123456789mead",
+  "version": 4,
+  "linked": true,
+  "message": "Saved 'The meadow' v4; the scene's place uses it."
+}

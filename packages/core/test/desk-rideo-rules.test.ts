@@ -13,10 +13,14 @@ import {
   RIDEO_POSE_HEIGHT,
   RideoImportInputSchema,
   RideoSceneBlockingSchema,
+  actsAsPerson,
+  ageOf,
   editorPose,
   flyerKind,
+  holdersByText,
   humanKindOf,
   inferActorKind,
+  isAgeText,
   isRideoId,
   modelFor,
   moveOfMovement,
@@ -26,6 +30,7 @@ import {
   rideoPose,
   ridersByText,
   ridingDenied,
+  sentencesOf,
   speciesOf,
 } from '../src/desk/rideo';
 import { HIDDEN_SCALE, hideSpans, replaceKeys, setKey, truncateMotion } from '../src/desk/rideo/keys';
@@ -95,27 +100,31 @@ describe('rideo SceneBlocking v1 schema', () => {
   it('refuses what rideo refuses', () => {
     const base = dialogueBlocking();
     const bad: [string, unknown][] = [
-      ['an id that is not rideo’s', { ...base, actors: [{ ...base.actors![0], characterId: 'maya' }] }],
+      ['an id with a space', { ...base, actors: [{ ...base.actors![0], characterId: 'maya smith' }] }],
       ['a lens under 8 mm', { ...base, shots: { s: { camera: { ...cam(), lensMm: 4 } } } }],
       ['a colour name', { ...base, actors: [{ ...base.actors![0], color: 'orange' }] }],
       ['an unknown pose', { ...base, actors: [{ ...base.actors![0], pose: 'dance' }] }],
       ['a sun under 2°', { ...base, set: { ...base.set, sun: { azimuthDeg: 0, elevationDeg: 1 } } }],
-      ['nine actors', { ...base, actors: Array.from({ length: 9 }, (_, i) => actor(i)) }],
+      ['seventeen actors', { ...base, actors: Array.from({ length: 17 }, (_, i) => actor(i)) }],
       ['a coordinate beyond 500 m', { ...base, props: [{ id: 'p', x: 600, z: 0 }] }],
       ['version 2', { ...base, version: 2 }],
     ];
     for (const [what, value] of bad)
       expect(RideoSceneBlockingSchema.safeParse(value).success, what).toBe(false);
-    expect(() => parseRideoBlocking({ actors: 'none' })).toThrow(/not a rideo SceneBlocking v1: actors/);
+    expect(() => parseRideoBlocking({ actors: 'none' })).toThrow(/not a SceneBlocking v1: actors/);
     // rideo's draft has no updatedAt of its own: the import accepts it without one
     const { updatedAt: _, ...draft } = base;
     expect(parseRideoBlocking(draft).actors).toHaveLength(2);
   });
 
   it("keeps rideo's ids, moves and poses", () => {
+    // rideo's ids, and any other host's (the desk embed protocol's Id pattern)
     expect(RIDEO_ID_PATTERN.test('chr_maya0000001a')).toBe(true);
-    expect(isRideoId('chr_short')).toBe(false);
-    expect(isRideoId('CHR_MAYA0000001A')).toBe(false);
+    expect(isRideoId('chr_short')).toBe(true);
+    expect(isRideoId('proj:42.shot-7')).toBe(true);
+    expect(isRideoId('-leading-dash')).toBe(false);
+    expect(isRideoId('a b')).toBe(false);
+    expect(isRideoId('x'.repeat(101))).toBe(false);
     expect(RIDEO_CAMERA_MOVE_IDS).toEqual(DESK_MOVES);
     expect(RIDEO_CAMERA_MOVE_IDS).toHaveLength(20);
     for (const m of RIDEO_BLOCKING_MOVES.filter((x) => x !== 'none'))
@@ -189,6 +198,190 @@ describe('rideo reading rules', () => {
     expect(kindOf('Dad', 'A father who plays with his kids.')).toBe('man');
     expect(kindOf('Alex')).toBe('adult');
     expect(humanKindOf({ name: 'Jo', summary: 'An eight-year-old.' })).toBe('child');
+  });
+
+  it('reads ages written out, decades and a baby’s months by the same thresholds', () => {
+    expect(kindOf('Gus', '', { age: 'late sixties', gender: 'male' })).toBe('elder');
+    expect(kindOf('Gus', '', { age: 'late 60s', gender: 'male' })).toBe('elder');
+    expect(kindOf('Ned', '', { age: 'early 60s', gender: 'male' })).toBe('man');
+    expect(kindOf('Dee', '', { age: 'early twenties', gender: 'female' })).toBe('woman');
+    expect(kindOf('Bo', '', { age: 'six' })).toBe('child');
+    expect(kindOf('Kit', '', { age: '18 months' })).toBe('toddler');
+    // a forty-five-year-old is not a five-year-old
+    expect(humanKindOf({ name: 'Jo', summary: 'A forty-five-year-old.' })).toBe('adult');
+    expect(['thirty-something', 'mid-40s', '30-ish', 'about 30', 'seventy-two'].map(ageOf)).toEqual([
+      35, 45, 30, 30, 72,
+    ]);
+    // teens and words like "elderly" are read from the words, not as an age
+    expect(
+      ['teenage', 'late teens', 'elderly', 'two dogs and a cat'].map((t) => [ageOf(t), isAgeText(t)]),
+    ).toEqual([
+      [null, false],
+      [null, false],
+      [null, false],
+      [2, false],
+    ]);
+  });
+
+  it('ends a sentence where it ends, not after a title, an initial, a number or an abbreviation', () => {
+    // the words about a titled name are one sentence: its rider, its species
+    const okafor = { id: 'chr_okafor0000001', name: 'Dr. Okafor' };
+    const pepper = { id: PEPPER, name: 'Pepper', kind: 'pony' as const };
+    expect(ridersByText('Dr. Okafor rides Pepper to the clinic.', [okafor], [pepper])).toEqual([
+      { rider: okafor.id, mount: PEPPER },
+    ]);
+    expect(speciesOf({ name: 'Whiskers', summary: 'Mr. Whiskers is a tabby cat.' })).toBe('cat');
+    expect(sentencesOf('Dr. Okafor: 52 female, 1.85 m tall, approx. 90 kg; e.g. a scar. A surgeon.')).toEqual(
+      ['Dr. Okafor: 52 female, 1.85 m tall, approx. 90 kg; e.g. a scar', 'A surgeon'],
+    );
+    expect(
+      sentencesOf('Scars, tattoos etc. A boxer! Wears a U.S. Army jacket; aged 45. Kind.', true),
+    ).toEqual(['Scars, tattoos etc', 'A boxer', 'Wears a U.S. Army jacket', 'aged 45', 'Kind']);
+  });
+
+  // a word that is also an abbreviation or a title ends its sentence where it ends one: "walks in."
+  // is not "6 ft 2 in.", "Gate C. He" not "J. Smith", "1st." not "St. Ives"
+  it('ends a sentence after a word that may also be an abbreviation, a title or an initial', () => {
+    expect(
+      [
+        'He finished 1st. Then he left.',
+        'Mira finishes 3rd. 2 kids cheer.',
+        'Exit through Gate C. The dog barks.',
+        'She waits on Elm St. A car arrives.',
+        'He gives the engine a rev. It roars.',
+        'Thanks, hon. Let us go.',
+        'Mira walks in. 3 kids follow.',
+        'mira walks in. he grabs the kite.',
+        'Mira hugs Al. He smiles.',
+        'mira hugs al. he smiles.',
+        'She waits at Gate C.',
+      ].map((t) => sentencesOf(t, true)),
+    ).toEqual([
+      ['He finished 1st', 'Then he left'],
+      ['Mira finishes 3rd', '2 kids cheer'],
+      ['Exit through Gate C', 'The dog barks'],
+      ['She waits on Elm St', 'A car arrives'],
+      ['He gives the engine a rev', 'It roars'],
+      ['Thanks, hon', 'Let us go'],
+      ['Mira walks in', '3 kids follow'],
+      ['mira walks in', 'he grabs the kite'],
+      ['Mira hugs Al', 'He smiles'],
+      ['mira hugs al', 'he smiles'],
+      ['She waits at Gate C'],
+    ]);
+    // ... and does not where it is the abbreviation, title or initial
+    expect(
+      [
+        'Tom: 45 male, 6 ft. 2 in. tall; bull neck.',
+        'Bus No. 5 stops. J. A. Smith gets on at St. Ives.',
+        'A photo, ca. 1900, max. 2 m wide. Smith et al. agree.',
+        // an initial before a name: one sentence, as a name after a title
+        'Exit at Gate C. Pip barks.',
+      ].map((t) => sentencesOf(t)),
+    ).toEqual([
+      ['Tom: 45 male, 6 ft. 2 in. tall; bull neck'],
+      ['Bus No. 5 stops', 'J. A. Smith gets on at St. Ives'],
+      ['A photo, ca. 1900, max. 2 m wide', 'Smith et al. agree'],
+      ['Exit at Gate C. Pip barks'],
+    ]);
+  });
+
+  // after a title or an initial only a word that opens a sentence written with a capital ends it: in
+  // lower case the sentence goes on ("Elm St. in the rain", "the U.S. in 1990")
+  it('goes on after a title or an initial before a word in lower case', () => {
+    expect(
+      [
+        'Tom runs along Elm St. in the rain with the kite.',
+        'He moved to the U.S. in 1990.',
+        'They land in Washington D.C. at dawn.',
+        'She walks down Elm St. as the sun sets.',
+        // a capital opener still ends one after a street or an initial
+        'Elm St. A car stops.',
+        'Exit at Gate C. He waits.',
+      ].map((t) => sentencesOf(t, true)),
+    ).toEqual([
+      ['Tom runs along Elm St. in the rain with the kite'],
+      ['He moved to the U.S. in 1990'],
+      ['They land in Washington D.C. at dawn'],
+      ['She walks down Elm St. as the sun sets'],
+      ['Elm St', 'A car stops'],
+      ['Exit at Gate C', 'He waits'],
+    ]);
+    // the shot's reading: Tom holds the kite, the pan goes the way its sentence says
+    const tom = { id: 'tom', name: 'Tom' };
+    const kite = { id: 'kite', name: 'Kite' };
+    expect(holdersByText('Tom runs along Elm St. in the rain with the kite.', [tom], [kite])).toEqual([
+      { holder: 'tom', prop: 'kite' },
+    ]);
+    expect(moveOfMovement('pan', 'The camera pans down Elm St. as Mira runs left.')).toBe('pan_left');
+  });
+
+  // any title ends its sentence before a capitalised word that opens one, "Dr." and "Ms." too: they
+  // may be a street ("Ocean Dr.") or capitals that spell one ("MS", "the DR")
+  it('ends a sentence after a street, an illness or a country spelled like a title', () => {
+    expect(
+      [
+        'Mira skates down Ocean Dr. He grabs the kite.',
+        'Ruth has MS. She walks with a cane.',
+        'Tom drives to the DR. He swims.',
+      ].map((t) => sentencesOf(t, true)),
+    ).toEqual([
+      ['Mira skates down Ocean Dr', 'He grabs the kite'],
+      ['Ruth has MS', 'She walks with a cane'],
+      ['Tom drives to the DR', 'He swims'],
+    ]);
+    // "He" is not followed back to Mira: the kite goes to nobody
+    const mira = { id: 'mira', name: 'Mira' };
+    const kite = { id: 'kite', name: 'Kite' };
+    expect(holdersByText('Mira skates down Ocean Dr. He grabs the kite.', [mira], [kite])).toEqual([]);
+  });
+
+  // shot texts are split in their own case before they are lowered: lowered, "walks in. he" and
+  // "approx. he" look alike, and the subject of one sentence became the next one's
+  it("reads a shot's holders, riders and pan from the sentence that says them", () => {
+    const mira = { id: 'mira', name: 'Mira' };
+    const tom = { id: 'tom', name: 'Tom' };
+    const okafor = { id: 'okafor', name: 'Dr. Okafor' };
+    const kite = { id: 'kite', name: 'Kite' };
+    const pepper = { id: PEPPER, name: 'Pepper', kind: 'pony' as const };
+    for (const text of [
+      'Mira walks in. He grabs the kite.',
+      'Mira says no. He grabs the kite.',
+      'Mira runs to Max. He grabs the kite.',
+      'Mira waits at Gate C. He grabs the kite.',
+      'Mira finishes 1st. He grabs the kite.',
+      'Mira waits on Elm St. He grabs the kite.',
+      'Wide: Mira walks in. She grabs the kite and runs.',
+    ])
+      expect(holdersByText(text, [mira, tom], [kite]), text).toEqual([]);
+    expect(holdersByText('Mira walks in. Tom grabs the kite.', [mira, tom], [kite])).toEqual([
+      { holder: 'tom', prop: 'kite' },
+    ]);
+    expect(holdersByText('Dr. Okafor grabs the kite.', [okafor, tom], [kite])).toEqual([
+      { holder: 'okafor', prop: 'kite' },
+    ]);
+    for (const text of ['Mira steps in. He rides Pepper.', 'Mira comes in. He climbs onto Pepper.'])
+      expect(ridersByText(text, [mira, tom], [pepper]), text).toEqual([]);
+    expect(ridersByText('Mira steps in. Tom rides Pepper.', [mira, tom], [pepper])).toEqual([
+      { rider: 'tom', mount: PEPPER },
+    ]);
+    // a titled rider's sentence is not split again once lowered: riding, not busy beside the pony
+    expect(ridingDenied('Dr. Okafor rides Pepper beside the fence.', okafor, pepper)).toBe(false);
+    expect(ridingDenied('Dr. Okafor brushes Pepper.', okafor, pepper)).toBe(true);
+    // the pan's direction is the pan's sentence's ("in." ends it), not the next one's
+    expect(moveOfMovement('pan', 'The camera pans as Mira walks in. Tom turns left.')).toBe('pan_right');
+    expect(panDirectionSaid('The camera pans as Mira walks in. Tom turns left.')).toBe(false);
+    // "etc." ends a sentence before a capital, which only the text's own case shows
+    expect(moveOfMovement('pan', 'The camera pans over the tents, the huts etc. Tom turns left.')).toBe(
+      'pan_right',
+    );
+    expect(panDirectionSaid('The camera pans over the tents, the huts etc. Tom turns left.')).toBe(false);
+    expect(moveOfMovement('pan', 'The camera pans as Mira walks in, then left.')).toBe('pan_left');
+    // a character's words: "wears" in one sentence, its collar in the next ("cm." ends the first)
+    expect(
+      actsAsPerson({ name: 'Biscuit', summary: 'A beagle who wears a party hat, 20 cm. Her collar is red.' }),
+    ).toBe(true);
+    expect(actsAsPerson({ name: 'Biscuit', summary: 'A beagle who wears a red collar, 20 cm.' })).toBe(false);
   });
 
   it('makes quadrupeds of the animals rideo keeps as mounts and pets, and people of the others', () => {

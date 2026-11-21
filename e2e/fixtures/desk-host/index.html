@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fake desk host</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #101010;
+      }
+      iframe {
+        display: block;
+        width: 100%;
+        height: 100%;
+        border: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="module">
+      /*
+       * A host of the 3D desk embed protocol for the end-to-end test (e2e/tests/desk-embed.spec.ts):
+       * the host side of docs/embedding.md, served from another site than the desk, cross-origin
+       * isolated (COOP same-origin, COEP require-corp). It frames ?desk=<url>, answers the desk's
+       * hello with a connect and a MessageChannel, records every message the desk sends (binary
+       * data as {"$bytes": base64}, the fixtures' notation) and keeps the last state and the last
+       * result's files. The test drives it through window.host.
+       *
+       * Library units (docs/embedding.md "Library units"; e2e/tests/desk-library.spec.ts): `open`
+       * takes `units`, the open's files ({"$bytes"} entries, or "ref@version" of a unit saved here),
+       * sent transferred. A unit-publish is saved in this host's library (a new item lib_e2e<n> v1,
+       * or the next version of `newVersionOf`) and answered as `publishMode` says: 'linked' (as the
+       * link rule says: never from a read-only open, which is answered linked false with its
+       * reason), 'linked-always' (linked even from a read-only open, which the rule forbids: the
+       * desk's own guard is tested with it), 'unlinked', 'refused:<code>' (not saved), or 'never'
+       * (the test answers with ackPublish).
+       */
+      const deskUrl = new URLSearchParams(location.search).get('desk');
+      const deskOrigin = new URL(deskUrl).origin;
+      const s = {
+        frame: null,
+        port: null,
+        messages: [],
+        windowMessages: [],
+        files: new Map(),
+        state: null,
+        version: 1,
+        // library units: how unit-publish is answered, and what this host saved ('ref@version')
+        publishMode: 'linked',
+        // the last open's options.readOnly (the link rule's (a): a read-only open is never linked)
+        readOnly: false,
+        publishMessage: null,
+        library: new Map(),
+        latest: new Map(),
+        items: 0,
+      };
+
+      const b64 = (buf) => {
+        const bytes = new Uint8Array(buf);
+        let out = '';
+        for (let i = 0; i < bytes.length; i += 0x8000)
+          out += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+        return btoa(out);
+      };
+      /** A message as JSON with its ArrayBuffers (a result's files too) as {"$bytes": base64}. */
+      const plain = (m) =>
+        JSON.parse(JSON.stringify(m, (key, v) => (v instanceof ArrayBuffer ? { $bytes: b64(v) } : v)));
+
+      function record(m) {
+        if (m && m.type === 'result') s.files = new Map(m.files.map((f) => [f.name, f.data]));
+        if (m && m.type === 'state') s.state = m.state;
+        s.messages.push({ at: performance.now(), message: plain(m) });
+        if (m && m.type === 'unit-publish') setTimeout(() => answerPublish(m), 0);
+      }
+
+      /** A message given as JSON with {"$bytes": base64} for its ArrayBuffers, revived; `transfer` gets them. */
+      function revive(value, transfer) {
+        return JSON.parse(JSON.stringify(value), (_k, v) => {
+          if (v && typeof v === 'object' && typeof v.$bytes === 'string') {
+            const bin = atob(v.$bytes);
+            const out = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+            transfer.push(out.buffer);
+            return out.buffer;
+          }
+          return v;
+        });
+      }
+
+      /** Saves a published unit in this host's library: a new item, or the next version of newVersionOf. */
+      function saveUnit(m) {
+        const ref = m.newVersionOf ? m.newVersionOf.ref : `lib_e2e${String(++s.items).padStart(4, '0')}`;
+        const version = m.newVersionOf ? (s.latest.get(ref) ?? m.newVersionOf.version) + 1 : 1;
+        s.latest.set(ref, version);
+        s.library.set(`${ref}@${version}`, {
+          ref,
+          version,
+          sha256: m.sha256,
+          format: m.unit.format,
+          formatVersion: m.unit.version,
+          data: m.unit.data.slice(0),
+        });
+        return { ref, version };
+      }
+
+      function answerPublish(m) {
+        const mode = s.publishMode;
+        if (mode === 'never' || !s.port) return;
+        const message = s.publishMessage;
+        if (mode.startsWith('refused:')) {
+          const code = mode.slice('refused:'.length);
+          s.port.postMessage({
+            type: 'unit-ack',
+            id: m.id,
+            ok: false,
+            code,
+            message: message ?? `The host did not save it (${code}).`,
+          });
+          return;
+        }
+        const { ref, version } = saveUnit(m);
+        const readOnly = mode === 'linked' && s.readOnly;
+        s.port.postMessage({
+          type: 'unit-ack',
+          id: m.id,
+          ok: true,
+          ref,
+          version,
+          linked: mode === 'linked-always' || (mode === 'linked' && !readOnly),
+          ...(message ? { message } : readOnly ? { message: 'the scene is read-only' } : {}),
+        });
+      }
+
+      function connect(frame, version, transfer = true) {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = (e) => record(e.data);
+        if (transfer) s.port = channel.port1;
+        frame.contentWindow.postMessage({ protocol: '3d-desk', type: 'connect', version }, deskOrigin, [
+          channel.port2,
+        ]);
+        return channel.port1;
+      }
+
+      window.addEventListener('message', (e) => {
+        if (!s.frame || e.source !== s.frame.contentWindow) return;
+        s.windowMessages.push({ origin: e.origin, data: e.data });
+        if (e.origin !== deskOrigin) return;
+        const d = e.data;
+        if (!d || d.protocol !== '3d-desk' || d.type !== 'hello' || !Array.isArray(d.versions)) return;
+        if (!d.versions.includes(1) || s.port) return;
+        if (s.version !== 1) {
+          // first a version the desk does not speak, then 1
+          const bad = connect(s.frame, s.version, false);
+          bad.onmessage = (ev) =>
+            s.messages.push({ at: performance.now(), message: plain(ev.data), bad: true });
+          s.version = 1;
+        }
+        connect(s.frame, 1);
+      });
+
+      window.host = {
+        deskOrigin,
+        /**
+         * (Re)mounts the desk's iframe: a new page, a new connection. `opts.allow`: the frame's
+         * permissions (default: as docs/embedding.md shows, with screen-wake-lock).
+         */
+        mount(opts = {}) {
+          s.port?.close();
+          s.port = null;
+          s.frame?.remove();
+          s.version = opts.firstVersion ?? 1;
+          const f = document.createElement('iframe');
+          f.title = "3D director's desk";
+          f.allow = opts.allow ?? 'fullscreen; clipboard-write; screen-wake-lock';
+          f.dataset.desk = '';
+          f.src = deskUrl;
+          document.body.append(f);
+          s.frame = f;
+        },
+        unmount() {
+          s.port?.close();
+          s.port = null;
+          s.frame?.remove();
+          s.frame = null;
+        },
+        connected: () => !!s.port,
+        /** Posts on the port (ArrayBuffers given as {"$bytes": base64} are revived and transferred). */
+        send(message) {
+          const transfer = [];
+          const revived = revive(message, transfer);
+          s.port.postMessage(revived, transfer);
+        },
+        /**
+         * Opens `scene` with the last state the desk sent (a copy), or with none. `units`: the open's
+         * library units, each an entry with {"$bytes"} data or "ref@version" of a unit saved here
+         * (transferred).
+         */
+        open(scene, { withState = false, options, units } = {}) {
+          const state = withState && s.state ? { ...s.state, data: s.state.data.slice(0) } : null;
+          const m = { type: 'open', scene, state };
+          s.readOnly = options?.readOnly === true;
+          if (options) m.options = options;
+          const transfer = [];
+          if (units) {
+            m.units = units.map((u) => {
+              if (typeof u !== 'string') return revive(u, transfer);
+              const saved = s.library.get(u);
+              if (!saved) throw new Error(`no unit ${u} in this host's library`);
+              const data = saved.data.slice(0);
+              transfer.push(data);
+              return {
+                ref: saved.ref,
+                version: saved.version,
+                sha256: saved.sha256,
+                unit: { format: saved.format, version: saved.formatVersion, data },
+              };
+            });
+          }
+          s.port.postMessage(m, transfer);
+        },
+        /**
+         * How the next unit-publish messages are answered ('linked', 'linked-always', 'unlinked',
+         * 'refused:<code>', 'never'), with `message` as the answer's message.
+         */
+        publishMode(mode, message = null) {
+          s.publishMode = mode;
+          s.publishMessage = message;
+        },
+        /** Answers unit-publish `id` by hand (an ok answer without ref saves the unit first). */
+        ackPublish(id, ack) {
+          let fields = ack;
+          if (ack.ok && !ack.ref) {
+            const m = s.messages.map((r) => r.message).find((x) => x?.type === 'unit-publish' && x.id === id);
+            fields = { ...saveUnit(revive(m, [])), ...ack };
+          }
+          s.port.postMessage({ type: 'unit-ack', id, ...fields });
+        },
+        /** The units this host saved, as "ref@version" with their SHA-256. */
+        library: () =>
+          [...s.library.values()].map((u) => ({ key: `${u.ref}@${u.version}`, sha256: u.sha256 })),
+        /**
+         * A connect posted to the desk by another frame of this page (not the desk's parent), with a
+         * port whose replies are recorded as `sibling`.
+         */
+        connectFromSibling() {
+          return new Promise((resolve) => {
+            const sib = document.createElement('iframe');
+            sib.style.display = 'none';
+            sib.srcdoc =
+              '<!doctype html><script>addEventListener("message", (e) => {' +
+              'const desk = parent.document.querySelector("iframe[data-desk]").contentWindow;' +
+              'desk.postMessage({ protocol: "3d-desk", type: "connect", version: 1 }, "*", [e.ports[0]]);' +
+              '});<' +
+              '/script>';
+            sib.onload = () => {
+              const channel = new MessageChannel();
+              channel.port1.onmessage = (e) =>
+                s.messages.push({ at: performance.now(), message: plain(e.data), sibling: true });
+              sib.contentWindow.postMessage('go', '*', [channel.port2]);
+              resolve(true);
+            };
+            document.body.append(sib);
+          });
+        },
+        /** Posts a message on window to the desk, from this page (its parent). */
+        postToDesk(data, withPort = false) {
+          const channel = new MessageChannel();
+          channel.port1.onmessage = (e) =>
+            s.messages.push({ at: performance.now(), message: plain(e.data), extra: true });
+          s.frame.contentWindow.postMessage(data, deskOrigin, withPort ? [channel.port2] : []);
+        },
+        messages: () => s.messages,
+        windowMessages: () => s.windowMessages,
+        state: () =>
+          s.state ? { format: s.state.format, version: s.state.version, $bytes: b64(s.state.data) } : null,
+        fileNames: () => [...s.files.keys()],
+        file: (name) => (s.files.has(name) ? b64(s.files.get(name)) : null),
+        fileSizes: () => Object.fromEntries([...s.files].map(([n, d]) => [n, d.byteLength])),
+      };
+      window.host.mount();
+    </script>
+  </body>
+</html>

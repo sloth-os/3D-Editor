@@ -142,7 +142,7 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ SHUTDOWN_TIMEOUT_SECONDS: '0' }, noFiles)).toThrow(/SHUTDOWN_TIMEOUT_SECONDS/);
   });
 
-  it('applies the defaults of video export, the model store and the rideo bridge', () => {
+  it('applies the defaults of video export and the model store', () => {
     const c = loadConfig({}, noFiles);
     expect(c.ffmpegPath).toBe('ffmpeg');
     expect(c.exportDir).toBe(path.resolve('/srv/app', 'data', 'exports'));
@@ -156,15 +156,13 @@ describe('loadConfig', () => {
     expect(c.modelCacheDir).toBe(path.resolve('/srv/app', 'data', 'model-cache'));
     expect(c.modelCacheMaxBytes).toBe(2048 * 1024 * 1024);
     expect(c.storeFetchTimeoutMs).toBe(20_000);
-    expect(c.rideoUrl).toBeNull();
-    expect(c.rideoToken).toBeNull();
     // the export and cache folders follow DATA_DIR
     const d = loadConfig({ DATA_DIR: '/var/lib/editor' }, noFiles);
     expect(d.exportDir).toBe(path.resolve('/var/lib/editor', 'exports'));
     expect(d.modelCacheDir).toBe(path.resolve('/var/lib/editor', 'model-cache'));
   });
 
-  it('parses the settings of video export, the model store and the rideo bridge', () => {
+  it('parses the settings of video export and the model store', () => {
     const c = loadConfig(
       {
         FFMPEG_PATH: 'bin/ffmpeg',
@@ -179,8 +177,6 @@ describe('loadConfig', () => {
         MODEL_CACHE_DIR: '/cache/models',
         MODEL_CACHE_MAX_MB: '0',
         STORE_FETCH_TIMEOUT_MS: '5000',
-        RIDEO_URL: 'https://rideo.example/api/',
-        RIDEO_TOKEN: 'rt',
       },
       noFiles,
     );
@@ -199,8 +195,6 @@ describe('loadConfig', () => {
     expect(c.modelCacheDir).toBe('/cache/models');
     expect(c.modelCacheMaxBytes).toBe(0);
     expect(c.storeFetchTimeoutMs).toBe(5000);
-    expect(c.rideoUrl).toBe('https://rideo.example/api');
-    expect(c.rideoToken).toBe('rt');
     // catalog URLs without STORE_PROVIDERS add the catalog provider to the defaults
     expect(loadConfig({ STORE_CATALOG_URLS: 'https://a.example/c.json' }, noFiles).storeProviders).toEqual([
       'builtin',
@@ -212,14 +206,19 @@ describe('loadConfig', () => {
     ]);
   });
 
-  it('rejects invalid settings of video export, the model store and the rideo bridge', () => {
+  it('ignores the settings of the retired rideo bridge (RIDEO_URL, RIDEO_TOKEN)', () => {
+    // a deployment that still sets them starts as before; nothing of the server reads them
+    const c = loadConfig({ RIDEO_URL: 'ftp://not-checked', RIDEO_TOKEN: 'rt' }, noFiles);
+    expect(Object.keys(c).filter((k) => /rideo/i.test(k))).toEqual([]);
+  });
+
+  it('rejects invalid settings of video export and the model store', () => {
     expect(() => loadConfig({ EXPORT_MAX_MB: '0' }, noFiles)).toThrow(/EXPORT_MAX_MB/);
     expect(() => loadConfig({ EXPORT_TTL_HOURS: '-1' }, noFiles)).toThrow(/EXPORT_TTL_HOURS/);
     expect(() => loadConfig({ EXPORT_MAX_QUEUED: '1.5' }, noFiles)).toThrow(/EXPORT_MAX_QUEUED/);
     expect(() => loadConfig({ MODEL_CACHE_MAX_MB: '-5' }, noFiles)).toThrow(/MODEL_CACHE_MAX_MB/);
     expect(() => loadConfig({ STORE_FETCH_TIMEOUT_MS: '50' }, noFiles)).toThrow(/STORE_FETCH_TIMEOUT_MS/);
     expect(() => loadConfig({ STORE_FETCH_TIMEOUT_MS: '600001' }, noFiles)).toThrow(/STORE_FETCH_TIMEOUT_MS/);
-    expect(() => loadConfig({ RIDEO_URL: 'ftp://rideo' }, noFiles)).toThrow(/RIDEO_URL/);
     expect(() => loadConfig({ STORE_PROVIDERS: 'builtin,turbosquid' }, noFiles)).toThrow(
       /STORE_PROVIDERS: unknown provider 'turbosquid' \(known: builtin, khronos, polyhaven, sketchfab, polypizza, catalog\)/,
     );

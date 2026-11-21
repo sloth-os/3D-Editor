@@ -3567,7 +3567,7 @@ describe('RASTER final renders and the heap of the tab', () => {
       const page = pageHeapEstimate(s.doc, 1);
       withHeap(YOUNG_GENERATION_BYTES + page + needs + held - 1, () =>
         expect(() => e.renderPixels()).toThrow(
-          /and the page and the path traced renders running in it are estimated to use/,
+          /and the page and the renders and exports running in it are estimated to use/,
         ),
       );
       job.cancel();
