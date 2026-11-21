@@ -945,6 +945,8 @@ function setBuild(
   },
 ) {
   const r = buildSet(ctx.doc, p);
+  // what the person put on the set built before stays, on the new set
+  for (const w of r.warnings) ctx.report('WARNING', w);
   // exactly one key light: say which other lights light the set too
   const others = ctx.doc
     .listObjects()

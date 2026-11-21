@@ -5,7 +5,16 @@ import { DESK_PROPS } from '../props';
 import { FIGURE_HEIGHT_TOLERANCE_M, rigDigest, type UnitHeader, type UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance } from '../units/list';
-import { dataKey, deleteData, instanceData, keptWarning, oldLook, unusedData } from '../units/remove';
+import {
+  dataKey,
+  deleteData,
+  hangKept,
+  instanceData,
+  keptPlaces,
+  keptWarning,
+  oldLook,
+  unusedData,
+} from '../units/remove';
 import { makeLocal, updateUnit } from '../units/update';
 import { actorMaterials, buildActorParts, keyPose } from './actor';
 import { refreshAttached } from './index';
@@ -24,10 +33,11 @@ import type { ActorKind } from './types';
  *   its location and pose keys, holds, rides and the shots that name it: to a figure (the actor is
  *   made the unit's root, or its instance updated to another version), or back to the mannequin of
  *   its kind and height. Only the old look goes (units/remove.ts oldLook): what the person put on
- *   the actor stays and is named in a warning. It does so only when the figure's kind and height
- *   are the actor's (figureFits: the same kind, heights within 5 mm): a figure of another kind or
- *   height would need the actor rebuilt, which an update leaves to staging the brief in a new
- *   project.
+ *   the actor stays and is named in a warning; what they put on a part of the look hangs from the
+ *   bone that part hung from, where it was at rest (units/remove.ts hangKept). It does so only when
+ *   the figure's kind and height are the actor's (figureFits: the same kind, heights within 5 mm): a
+ *   figure of another kind or height would need the actor rebuilt, which an update leaves to staging
+ *   the brief in a new project.
  */
 
 /** Heights (m) closer than this are the same rig: a figure restyles an actor in place (units/format.ts). */
@@ -148,19 +158,29 @@ export function restyleActor(
       const figure = readInstance(doc, actorId);
       const old = oldLook(doc, actorId);
       const data = instanceData(doc, actorId);
+      // what the person put below a part of the look (a hat on its head), read before the part goes
+      const going = new Set(old.look);
+      const below = keptPlaces(
+        doc,
+        old.kept.filter((id) => going.has(doc.getObject(id)?.parent ?? '')),
+        old.look,
+      );
       if (figure) makeLocal(doc, actorId);
       for (const id of old.look)
         for (const m of doc.getObject(id)?.material_slots ?? []) if (m) data.push(dataKey('materials', m));
       doc.removeObjects(old.look);
       deleteData(doc, unusedData(doc, data));
-      if (old.named.length)
-        warnings.push(keptWarning(old.named, figure ? "the library figure's look" : 'its old look'));
+      const of = figure ? "the library figure's look" : 'its old look';
+      if (old.named.length) warnings.push(keptWarning(old.named, of));
       const kind = meta.kind as ActorKind;
       const bp = blueprintFor(kind, meta.height);
       const color = look.mannequin.color.toLowerCase();
       buildActorParts(doc, actorId, meta.name, bp, actorMaterials(doc, meta.name, color, bp));
       const o = doc.getObject(actorId)!;
       doc.updateObject(actorId, { custom_props: { ...o.custom_props, [DESK_PROPS.color]: color } });
+      // it hangs from the actor where it was at rest, from the bone the part hung from (so it follows
+      // it as before)
+      warnings.push(...hangKept(doc, actorId, below, { of, on: `'${meta.name}'`, listed: true }));
     }
     refreshAttached(doc, actorId);
   });

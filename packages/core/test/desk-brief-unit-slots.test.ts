@@ -576,11 +576,12 @@ describe("a later version whose root is another type of object than the instance
     const { doc } = staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
     const v1 = propOf(doc, KITE);
     // objects of the person's: one under the kite's root (with one of their own under it), one
-    // under a part of the kite
+    // under a part of the kite that moves on its own (a segment of its tail, keyed to flutter)
     const part = [...readInstance(doc, v1.id)!.parts.values()]
       .map((p) => p.id)
-      .find((id) => id !== v1.id && doc.getObject(id)?.parent === v1.id)!;
+      .find((id) => id !== v1.id && doc.getObject(id)?.parent === v1.id && doc.listFCurves(id).length > 0)!;
     expect(part).toBeTruthy();
+    const partName = doc.getObject(part)!.name;
     const lantern = mine(doc, 'Lantern', v1.id, [0.3, -0.2, 0.4], [0.2, 0.1, 0.5]);
     const wick = mine(doc, 'Wick', lantern, [0, 0, 0.2], [0, 0, 0.3]);
     const ribbon = mine(doc, 'Ribbon', part, [0.1, 0, -0.3], [0, 0.4, 0]);
@@ -603,6 +604,11 @@ describe("a later version whose root is another type of object than the instance
     expect(parents()).toEqual([kite.id, lantern, kite.id]);
     worlds().forEach((m, i) => sameWorld(m, before[i]));
     expect(doc.getObject(lantern)!.location).not.toEqual([0.3, -0.2, 0.4]);
+    // the staging holds and flies v2 as it did v1: what is on its root follows it, unnamed; what was on
+    // a part of v1 that moved on its own (the tail flutters) no longer follows that part, and is named
+    expect(u.r.warnings.filter((w) => /no longer follow/.test(w))).toEqual([
+      `${kite.name}: 'Ribbon' no longer follows the animation of '${partName}'`,
+    ]);
     // the warnings name what stays (the tops of what the person put there), not the objects below them
     const kept = u.r.warnings.find((w) =>
       / which are not part of the look the library prop replaces$/.test(w),
@@ -1022,5 +1028,23 @@ describe('what the person put on a library set stays when the brief links anothe
       "the library set: 'Buoy' and 'Pond cam' are animated: their keyed motion now follows the library set's root",
     );
     expect(u.r.warnings.join('\n')).not.toMatch(/'Duck' (is|and)/);
+  });
+
+  it("an object of the person's on a part of the set that moved on its own no longer follows it on the new root, and is named", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    // the pond bobs, a duck of the person's on it
+    const pond = partNamed(doc, 'pond');
+    keyed(doc, pond, 'location', 2, [0, 0.2, 0]);
+    const duck = mine(doc, 'Duck', pond, [0.1, 0, 0.02], [0, 0, 0]);
+    const at = doc.worldMatrix(duck);
+    const other = otherSet();
+    const u = update(doc, withPins(openBrief(), { set: other }), source(other));
+    expect(rowsOf(u.r)).toEqual(['set unit']);
+    expect(doc.getObject(duck)?.parent).toBe(SET_ROOT);
+    sameWorld(doc.worldMatrix(duck), at);
+    // it keeps its place at rest, but the new root does not bob: said so
+    FRAMES.forEach((f) => sameWorld(new FrameState(doc, f).world(duck)!, at));
+    expect(u.r.warnings).toContain("the library set: 'Duck' no longer follows the animation of 'pond'");
   });
 });

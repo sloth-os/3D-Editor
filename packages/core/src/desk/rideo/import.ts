@@ -13,7 +13,7 @@ import { DESK_PROPS } from '../props';
 import { MAX_SHOT_SUBJECTS, getShots, newShotId, setDeskSettings, setShots } from '../shots';
 import { DESK_SHAPE_PROP, DeskScene, isWaterLabel, toEditor } from '../layout';
 import { setInWaterSpans, type FrameSpan } from '../water';
-import { buildSet } from '../set';
+import { buildSet, setGround } from '../set';
 import { addDeskCamera, applyCameraMove, lookEuler, prepareDeskCamera } from '../moves';
 import { cameraMoveOf, FRAMING_TABLE } from '../solver';
 import { fitShotToPlan, planFit } from '../plan';
@@ -24,7 +24,14 @@ import type { UnitPayload } from '../units/format';
 import { insertUnit, type UnitPin } from '../units/insert';
 import { readInstance, unitOf } from '../units/list';
 import { UNIT_ROOT } from '../units/ids';
-import { hangKept, keptPlaces, oldLook, removeObjectTrees, type KeptPlaces } from '../units/remove';
+import {
+  hangKept,
+  keptPlaces,
+  oldLook,
+  removeKeeping,
+  removeObjectTrees,
+  type KeptPlaces,
+} from '../units/remove';
 import { unitStatus } from '../units/status';
 import { updateUnit, withArticle } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
@@ -108,7 +115,10 @@ import {
  * rideo no longer has are removed, shots rideo removed are disabled. A prop or landmark rideo still
  * describes the same way is kept with what was added to it (physics, materials, modifiers), else it is
  * built anew. The animation of imported actors and props is rebuilt from rideo's (keys added to them
- * by hand are lost).
+ * by hand are lost). What the person put on a piece that is built anew or goes (objects of their own
+ * below it, not its look) stays where it is in the world, hung from the piece built in its place, or
+ * from the set's ground for one that goes (hangOnGround), its keyed motion kept where it can be, and
+ * the warnings name it (units/remove.ts hangKept).
  *
  * Library units (code-level hooks, ImportUnits; the SceneBlocking JSON is unchanged): brief staging
  * hands the import a prop unit per element and a figure unit per cast member it places (desk/brief),
@@ -353,6 +363,27 @@ function subtree(doc: SceneDoc, id: string): string[] {
  */
 export function removeTrees(doc: SceneDoc, ids: readonly string[], keep: readonly string[] = []): void {
   removeObjectTrees(doc, ids, keep);
+}
+
+/**
+ * Hangs what stays of a piece that goes with nothing in its place (`kept`: a landmark or a prop the
+ * words drop, an actor or a shot's camera that goes, a flyer's old string; units/remove.ts
+ * removeKeeping) from the set's ground (`ground`, else the words' ground or a library set's root; the
+ * scene when there is none), where it was in the world, in the caller's transaction, and returns the
+ * warnings naming it ("'pond' goes; 'Lily' stays where it is, on the words' ground").
+ */
+export function hangOnGround(
+  doc: SceneDoc,
+  kept: KeptPlaces,
+  gone: string,
+  ground: string | null = setGround(doc),
+): string[] {
+  const on = !ground
+    ? 'the scene'
+    : readInstance(doc, ground)
+      ? "the library set's root"
+      : "the words' ground";
+  return hangKept(doc, ground, kept, { of: gone, on, gone });
 }
 
 const prop = (o: ObjectData | null | undefined, key: string): string => {
@@ -814,6 +845,8 @@ export function importRideoBlocking(
     sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
     sky: !set.interior,
   });
+  // what the person put on the set built before stays, on the new one
+  warnings.push(...built.warnings);
   const groundObj = doc.getObject(built.ground);
   if (groundObj) {
     const kept = { ...groundObj.custom_props };
@@ -848,13 +881,23 @@ export function importRideoBlocking(
   for (const l of blocking.set.landmarks) {
     const old = oldLandmarks.get(l.id) as ObjectData | undefined;
     if (old) keptLandmarks.add(l.id);
-    const made = buildLandmark(doc, l, elements.get(l.elementId ?? '')?.name ?? null, castNames, stamp, old);
+    const { warnings: kept, ...made } = buildLandmark(
+      doc,
+      l,
+      elements.get(l.elementId ?? '')?.name ?? null,
+      castNames,
+      stamp,
+      old,
+    );
+    for (const w of kept ?? []) warnings.push(`${made.name}: ${w}`);
     landmarkOut.push({ ...made, rideo_id: l.id, element_id: l.elementId, label: l.label });
   }
+  // a landmark rideo no longer has goes, but for what the person put on it, which stays on the ground
   for (const [rid, o] of oldLandmarks)
     if (!keptLandmarks.has(rid) && doc.getObject((o as ObjectData).id)) {
-      removed.push((o as ObjectData).name);
-      removeTrees(doc, [(o as ObjectData).id]);
+      const { id, name } = o as ObjectData;
+      removed.push(name);
+      warnings.push(...hangOnGround(doc, removeKeeping(doc, [id]), `'${name}'`, built.ground));
     }
 
   // ------------------------------------------------------------ actors
@@ -884,6 +927,8 @@ export function importRideoBlocking(
     const old = oldActors.get(id);
     let actorId: string | null = null;
     let created = false;
+    // what the person put on an actor built anew stays, on the new one (the import keys it on its marks)
+    let rebuilt: KeptPlaces | null = null;
     if (old) {
       const sameKind = prop(old, DESK_PROPS.kind) === kind;
       const oldH = Number(old.custom_props?.[DESK_PROPS.heightM]);
@@ -902,7 +947,7 @@ export function importRideoBlocking(
         actorId = old.id;
         resetActor(doc, old.id, nameOf(id), color);
       } else {
-        removeTrees(doc, [old.id]);
+        rebuilt = removeKeeping(doc, [old.id]);
       }
     }
     if (!actorId && figure) {
@@ -949,6 +994,13 @@ export function importRideoBlocking(
         [DESK_PROPS.characterId]: id,
       }),
     });
+    if (rebuilt)
+      for (const w of hangKept(doc, actorId, rebuilt, {
+        of: 'the actor it replaces',
+        on: 'the new actor',
+        restaged: true,
+      }))
+        warnings.push(`${nameOf(id)}: ${w}`);
     actors.set(id, {
       characterId: id,
       name: doc.getObject(actorId)!.name,
@@ -969,10 +1021,11 @@ export function importRideoBlocking(
       created,
     });
   }
+  // an actor rideo no longer stages goes, but for what the person put on it, which stays on the ground
   for (const [cid, o] of oldActors)
     if (!actors.has(cid) && doc.getObject(o.id)) {
       removed.push(o.name);
-      removeTrees(doc, [o.id]);
+      warnings.push(...hangOnGround(doc, removeKeeping(doc, [o.id]), `'${o.name}'`, built.ground));
     }
 
   // ------------------------------------------------------------ props
@@ -993,7 +1046,7 @@ export function importRideoBlocking(
     const elementName = elements.get(p.elementId ?? '')?.name ?? '';
     const flies = p.heldBy ? flyerKind(`${p.label} ${elementName}`) : null;
     if (old) {
-      for (const x of tetherPartsOf(doc, old.id)) removeTrees(doc, [x]);
+      warnings.push(...dropTether(doc, old.id, built.ground));
       keptProps.add(p.id);
     }
     const unit = units.prop?.(p);
@@ -1021,11 +1074,14 @@ export function importRideoBlocking(
       created: made.created,
     });
   }
+  // a prop rideo no longer has goes with its string, but for what the person put on them, which
+  // stays on the ground
   for (const [rid, o] of oldProps)
     if (!keptProps.has(rid) && doc.getObject((o as ObjectData).id)) {
-      removed.push((o as ObjectData).name);
-      for (const x of tetherPartsOf(doc, (o as ObjectData).id)) removeTrees(doc, [x]);
-      removeTrees(doc, [(o as ObjectData).id]);
+      const { id, name } = o as ObjectData;
+      removed.push(name);
+      const gone = removeKeeping(doc, [id, ...tetherPartsOf(doc, id)]);
+      warnings.push(...hangOnGround(doc, gone, `'${name}'`, built.ground));
     }
 
   // ------------------------------------------------------------ timeline
@@ -1852,14 +1908,24 @@ export function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
     .map((o) => o.id);
 }
 
-/** Whether an earlier import's object was built as `build` says, to be kept; one built otherwise is removed. */
+/**
+ * Takes out the string and tail desk.tether_fly made for flyer `flyer` (a flight flown again makes
+ * new ones), but for what the person put on them, which stays on the ground (hangOnGround). Returns
+ * the warnings naming it.
+ */
+export function dropTether(doc: SceneDoc, flyer: string, ground?: string | null): string[] {
+  const parts = tetherPartsOf(doc, flyer);
+  if (!parts.length) return [];
+  const gone = `'${doc.getObject(parts[0])?.name ?? parts[0]}'`;
+  return hangOnGround(doc, removeKeeping(doc, parts), gone, ground);
+}
+
+/** Whether an earlier import's object (in the scene) was built as `build` says, to be kept; one built otherwise is built anew. */
 function keepable(doc: SceneDoc, old: ObjectData | undefined, build: string): old is ObjectData {
   if (!old || !doc.getObject(old.id)) return false;
   if (prop(doc.getObject(old.id), RIDEO_PROPS.build) === build) return true;
   // a library unit instance is kept with its look (only unit actions change it)
-  if (readInstance(doc, old.id)) return true;
-  removeTrees(doc, [old.id]);
-  return false;
+  return !!readInstance(doc, old.id);
 }
 
 /** The library item and version an imported prop was built from ('unit:<ref>@<version>' recipes), else null. */
@@ -1951,7 +2017,7 @@ function buildUnitProp(
       location: at,
       rotation_euler: [0, 0, 0],
       ...(swap ? { replace: swap } : {}),
-      ...(cur && !swap ? { remove: [cur.id], keep: oldLook(doc, cur.id).kept } : {}),
+      ...(cur && !swap ? { remove: [cur.id], keep: oldLook(doc, cur.id).kept, restaged: true } : {}),
       rootProps: own,
     });
     root = r.root;
@@ -1994,7 +2060,9 @@ const stampFacts = (
  * without a unit (the words' prop, or that prop kept): `failed` holds the error. `unit` null: the
  * library prop the element had goes for the words' prop, and what the person put on it (objects of
  * their own below it, not its parts) stays, hung from the words' prop where it is in the world; the
- * warnings name it (units/remove.ts hangKept).
+ * warnings name it (units/remove.ts hangKept). So does what the person put on an earlier prop built
+ * otherwise (the words describe it anew), which goes for the prop built in its place; the shots that
+ * named it name the new one.
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2039,6 +2107,7 @@ export function buildProp(
   // below it, not its parts), which the words' prop takes over where it is
   let replaced: string | null = null;
   let kept: KeptPlaces | null = null;
+  let of = 'the library prop';
   if (
     unit === null &&
     old &&
@@ -2046,7 +2115,7 @@ export function buildProp(
     (readInstance(doc, old.id) || unitBuildOf(doc, old.id))
   ) {
     replaced = old.id;
-    kept = keptPlaces(doc, readInstance(doc, old.id) ? oldLook(doc, old.id).kept : []);
+    kept = keptPlaces(doc, readInstance(doc, old.id) ? oldLook(doc, old.id).kept : [], [old.id]);
     removeTrees(doc, [old.id], kept.ids);
     old = undefined;
   }
@@ -2070,14 +2139,24 @@ export function buildProp(
   });
   const at = floor(p.x, p.z);
   const model = found?.entry.id ?? null;
+  const prior = old && doc.getObject(old.id) ? old.id : null;
+  if (prior && !keepable(doc, old, build)) {
+    // built otherwise now: the prop goes for the one built in its place, but for what the person put
+    // on it (objects of their own below it, not its look), which the new prop takes over where it is
+    replaced = prior;
+    kept = removeKeeping(doc, [prior]);
+    of = 'the prop it replaces';
+    old = undefined;
+  }
   let root: string;
   let created = true;
   if (keepable(doc, old, build)) {
     root = old.id;
     created = false;
     const inst = readInstance(doc, root);
-    // a library unit's own parts carry no animation of the import's: only its root is cleared
-    for (const id of inst ? [root] : subtree(doc, root)) clearAnimation(doc, id);
+    // the import's own keys (holds, flights, hiding) are on the prop and its look (a model's tail): a
+    // library unit's parts carry none; what the person put on the prop keeps its own
+    for (const id of inst ? [root] : [root, ...oldLook(doc, root).look]) clearAnimation(doc, id);
     removeAttachments(doc, root);
     const o = doc.getObject(root)!;
     doc.updateObject(root, {
@@ -2112,7 +2191,8 @@ export function buildProp(
       custom_props: props,
     });
   }
-  const warnings = kept ? hangKept(doc, root, kept, { of: 'the library prop', on: "the words' prop" }) : [];
+  // the staging holds, flies or hides the new prop as it did the old one: what stays follows it
+  const warnings = kept ? hangKept(doc, root, kept, { of, on: "the words' prop", restaged: true }) : [];
   if (replaced) remapShotRefs(doc, replaced, root);
   const s = doc.getObject(root)!.scale;
   return { root, baseScale: [s[0], s[1], s[2]], model, created, ...(warnings.length ? { warnings } : {}) };
@@ -2121,7 +2201,9 @@ export function buildProp(
 /**
  * Adds a landmark: water as a flat plane, else a primitive, or the built-in model its label names
  * (its footprint centred on the mark); an earlier import's landmark built the same way is kept (with
- * what was added to it since) and put on its mark.
+ * what was added to it since) and put on its mark. One built otherwise goes for the one built in its
+ * place, but for what the person put on it (objects of their own below it, not its look), which the
+ * new landmark takes over where it is in the world; `warnings` names it (units/remove.ts hangKept).
  */
 export function buildLandmark(
   doc: SceneDoc,
@@ -2130,7 +2212,14 @@ export function buildLandmark(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   old?: ObjectData,
-): { id: string; name: string; shape: string; model: string | null; created: boolean } {
+): {
+  id: string;
+  name: string;
+  shape: string;
+  model: string | null;
+  created: boolean;
+  warnings?: string[];
+} {
   const label = l.label || elementName || l.id;
   const water = l.shape === 'water';
   const shape = water ? 'water' : l.shape;
@@ -2169,6 +2258,9 @@ export function buildLandmark(
   });
   const at = floor(l.x, l.z);
   const rotation: Vec3 = [0, 0, rad(l.rotationDeg)];
+  const prior = old && doc.getObject(old.id) ? old.id : null;
+  const kept = prior && !keepable(doc, old, build) ? removeKeeping(doc, [prior]) : null;
+  if (kept) old = undefined;
   let id: string;
   let created = true;
   if (keepable(doc, old, build)) {
@@ -2216,7 +2308,10 @@ export function buildLandmark(
     if (f) location = [o.location[0] + at[0] - f.x, o.location[1] + at[1] + f.z, o.location[2]];
   }
   doc.updateObject(id, { location, custom_props: { ...o.custom_props, ...props } });
-  return { id, name: o.name, shape, model, created };
+  const warnings = kept
+    ? hangKept(doc, id, kept, { of: 'the landmark it replaces', on: 'the new landmark' })
+    : [];
+  return { id, name: o.name, shape, model, created, ...(warnings.length ? { warnings } : {}) };
 }
 
 /**

@@ -1034,7 +1034,23 @@ new root's uneven scale would change it there, and a warning names it. Its keys 
 space: where the new parent is the old one moved and scaled along its axes, `keepMotion` rewrites its
 location and scale keys so that it moves as it did; otherwise (a keyed turn under a root scaled
 unevenly, keys under a modifier that changes values, a driven channel) they stay as they are and the
-warning says that its keyed motion now follows the new root. An update replaces the parts the
+warning says that its keyed motion now follows the new root. Places are read at rest
+(`restWorld`: an object hung from a bone sits at the bone's tail in the armature's rest position,
+which `SceneDoc.worldMatrix` leaves out), with what moved each one on its own above it (`moversOf`:
+keys, drivers, constraints, an active rigid body, or the pose of the bones it hung from); one whose
+mover went and that nothing above it moves alike now is named as no longer following it, unless the
+staging moves what takes the piece's place as it moved the piece (`restaged`: a prop held or flown
+again, an actor built anew on its marks). One that followed a bone through the pieces that went (a
+hat on a mannequin's head part) hangs from the same bone of the new root when the root is that
+armature or takes its place. One skewed by an uneven scale above it, which no parent holds, keeps
+its origin and is named as changing shape. The same steps keep what the person put on what staging
+and updates build anew or take out without a library unit (`keptPlaces`, then `hangKept`): a
+words' prop or landmark built anew or dropped, the words' ground, walls and sun built again
+(`buildSet` and `lightSet`, which name nothing when a piece comes back with its name and place), a
+cast member's actor or a shot's camera an update drops, a kite's string flown again, an actor a
+rideo re-import builds anew, and an old look's parts when a figure or the mannequin takes their
+place (insertUnit's `replace`, `restyleActor`); what goes with nothing in its place hangs from the
+set's ground, or from the scene when there is none. An update replaces the parts the
 scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it keeps parts
 edited or deleted in the scene, adds new parts at ids of the instance's generation (or of the next
 free one) and removes dropped untouched ones that nothing staying uses (a record that stays refers

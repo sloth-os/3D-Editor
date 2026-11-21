@@ -15,6 +15,7 @@ import {
   hangKept,
   instanceData,
   keptPlaces,
+  type KeptPlaces,
   keptWarning,
   oldLook,
   unusedData,
@@ -47,7 +48,10 @@ import { driverKeyOf, driverSum16 } from './drivers';
  * the world, under the root's parent, and `warnings` says so. One with keyed transform channels keeps
  * its motion in the world where its change of parent is a move and a scale along the parent's axes
  * (its keys are rewritten: remove.ts keepMotion); else `warnings` says its keyed motion now follows
- * the root.
+ * the root. One that followed the animation of what `remove` takes out (a part of it, or its root,
+ * keyed, driven, constrained or simulated) keeps its place at rest and no longer follows it, and
+ * `warnings` says so, unless the root moves alike or the staging moves it as it moved what it
+ * replaces (`restaged`).
  *
  * `replace` makes an existing object the root (a procedural actor or prop swapped for a library
  * one): its id, name, placement, parent, constraints, physics, pose, F-curves and scene-owned props
@@ -55,6 +59,9 @@ import { driverKeyOf, driverSum16 } from './drivers';
  * materials and those of the old look go when nothing else uses them (they are free for the unit's
  * even when the unit derives their ids). What the person put on the object stays and is named in
  * `warnings`, with the bones the scene's animation or attachments name that the unit's rig lacks.
+ * What they put below a part of the old look (a hat on a mannequin's head) hangs from the root where
+ * it was at rest, from the bone that part hung from while the unit's rig has it (so it follows it as
+ * before), its keyed motion kept as `keep`'s is (remove.ts hangKept).
  */
 
 /** A library version: the host's item id, its version number and the SHA-256 of its unit file. */
@@ -95,6 +102,12 @@ export interface InsertUnitOptions extends UnitPin {
    * the root where they are in the world (see the module comment). Others are ignored.
    */
   keep?: readonly string[];
+  /**
+   * The staging moves the root as it moved what `remove` takes out (a prop held, flown or hidden
+   * again): what `keep` hangs from it follows it, and is not named as no longer following that
+   * motion (remove.ts KeptWords' `restaged`).
+   */
+  restaged?: boolean;
 }
 
 export interface InsertUnitResult {
@@ -236,12 +249,14 @@ export function writeUnitRecords(
       !removing.has(id) && !!parent && removing.has(parent) && !(o.parent && doc.isAncestor(id, o.parent))
     );
   });
-  const places = keptPlaces(doc, hung);
+  const places = keptPlaces(doc, hung, o.remove ?? []);
 
   let old: UnitRecord | null = null;
   let doomed: string[] = [];
   let kept = new Set<string>();
   let named: string[] = [];
+  // what stays below a part of the old look (a hat on a mannequin's head), read before the part goes
+  let belowLook: KeptPlaces | null = null;
   if (o.replace) {
     old = doc.readRecord('objects', o.replace);
     if (!old || removing.has(o.replace))
@@ -257,6 +272,12 @@ export function writeUnitRecords(
     doomed = look.look.filter((id) => !removing.has(id));
     kept = new Set(look.kept);
     named = look.named;
+    const going = new Set(doomed);
+    belowLook = keptPlaces(
+      doc,
+      look.kept.filter((id) => going.has(doc.getObject(id)?.parent ?? '')),
+      doomed,
+    );
   } else if (doc.has('objects', rootId) && !removing.has(rootId)) {
     const props = doc.readRecord('objects', rootId)?.custom_props as Record<string, unknown> | undefined;
     if (props?.unit_key === key)
@@ -405,8 +426,22 @@ export function writeUnitRecords(
     if (named.length) warnings.push(keptWarning(named, replacedLook(kind)));
     if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
     warnings.push(
-      ...hangKept(doc, rootId, places, { of: replacedLook(kind), on: `the library ${kind}'s root` }),
+      ...hangKept(doc, rootId, places, {
+        of: replacedLook(kind),
+        on: `the library ${kind}'s root`,
+        restaged: o.restaged,
+      }),
     );
+    // what was below a part of the old look moved up as the part went: hung from the root (from the
+    // bone the part hung from, which it then still follows) where it was at rest
+    if (belowLook)
+      warnings.push(
+        ...hangKept(doc, rootId, belowLook, {
+          of: replacedLook(kind),
+          on: `the library ${kind}'s root`,
+          listed: true,
+        }),
+      );
   });
   return { root: rootId, ids, generation, warnings };
 }

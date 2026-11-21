@@ -593,6 +593,22 @@ and no other shot's keys are cut:
   staged, with a warning;
 - props whose element went go and new ones are placed; a held prop whose holder or holder's shots
   changed is held (or flown) again; the set is built again when its plan changed;
+- what the person put on a piece the update builds anew or takes out (objects of their own below a
+  prop the words describe anew or drop, a landmark, the ground, a wall or the sun lamp, a cast
+  member or a shot's camera that goes, a kite's string flown again) stays, in the same undo step:
+  hung from the piece built in its place, or from the set's ground when nothing takes its place,
+  where it was in the world at rest (from a bone's tail for one hung from a bone), and the warnings
+  name it (`'pond' goes; 'Duck' stays where it is, on the words' ground`); nothing is named for a
+  piece built again as it was. Its keyed motion is kept where the change of parent is a move and a
+  scale along the parent's axes, and otherwise a warning says that it now follows the new parent.
+  One that followed the animation of what went (its keys, drivers, constraints, physics or the
+  bones it hung from: an actor's walk, a camera's move, a kite's flight) keeps its place at rest
+  and is named as no longer following it (`'Hat' no longer follows the animation of 'Pip'`),
+  unless what takes the piece's place moves alike: a prop built anew is held or flown again as the
+  old one was, an actor a rideo re-import builds anew walks its marks again, and what hung from a
+  bone of the old actor or look hangs from the same bone of the new one. One turned on a piece
+  scaled unevenly was skewed by it, which no channels keep on another parent: it keeps its origin,
+  and a warning says it changes shape;
 - notes the desk did not edit follow the brief's words, and the desk's own shot names (`Shot 3`)
   follow the brief's order;
 - library pins act per slot ([library units](#library-units)): a set unit placed takes the place of
@@ -759,7 +775,10 @@ stays where it was, no longer on the set or the prop, and a warning says so. An 
 its keyed motion: where the new root is the old parent moved and scaled along its axes, its keys are
 rewritten in the same step so that it moves as it did, and otherwise a warning says that its keyed
 motion now follows the new root (a keyed turn under a root scaled unevenly, keys under a value
-modifier, a driven channel). A figure, a new version or another item, restyles its member's actor
+modifier, a driven channel). One that followed the animation of a part that goes (a kite's tail
+fluttering, a part keyed or driven) keeps its place at rest and is named as no longer following it;
+the root's own motion it keeps where the staging moves the new root as it moved the old one (a prop
+held or flown again). A figure, a new version or another item, restyles its member's actor
 in place (the same armature, keys, holds and shots) when its kind and height are the actor's, and is
 refused otherwise. A brief that drops the pin brings back the words' set, the mannequin or the
 words' prop, and what the person put on the library set or prop stays the same way, on the words'
@@ -767,7 +786,9 @@ ground or the words' prop; so does what they put on the words' set when a librar
 its place. A new look in place of an old one (a figure or a library prop where the words built the
 mannequin or the prop, the mannequin again where a figure was) takes away only the old look: what
 the person put on the actor or the prop in the desk stays where it is, and the update's warnings
-name it. A slot made local takes none of it;
+name it; what they put on a part of the old look (a hat on the mannequin's head) hangs from the bone
+that part hung from where it was at rest, so it follows the head as before, or from the root, named
+as no longer following it, when the new rig has no such bone. A slot made local takes none of it;
 [Updating from a later brief](#updating-from-a-later-brief) says the rest.
 
 #### Save to library
@@ -1029,9 +1050,10 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   figure of another kind or height (it keeps the actor and refuses the figure).
 - **SceneBlocking import**: the kind of each character and who rides whom are read from English
   text only; hand-made keys on imported actors and props are replaced on re-import (user objects,
-  shots, physics and materials are kept), and the re-import's warnings name the actors, props,
-  landmarks and shot cameras changed in the desk since the last import. Importing a long clip takes
-  seconds (about 5 s for 20 shots with 6 actors when it was measured).
+  shots, physics and materials are kept, and what the person put on an actor, prop or landmark
+  built anew or dropped stays as an update keeps it), and the re-import's warnings name the actors,
+  props, landmarks and shot cameras changed in the desk since the last import. Importing a long
+  clip takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
 - **Real video models**: whether the references improve a model's takes is not measured yet. A host
   should compare takes with and without them on its own scenes (the kite flights, riders on their
   mounts, and shot and reverse by water that motivated the desk), with the same seeds and blind

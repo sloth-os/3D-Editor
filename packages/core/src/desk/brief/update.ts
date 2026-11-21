@@ -12,9 +12,9 @@ import { RIDE_PREFIX } from '../characters/rig';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { addDeskCamera, prepareDeskCamera, retimeCameraRange } from '../moves';
 import { DESK_PROPS } from '../props';
-import { buildSet, lightSet, setUnitRoot } from '../set';
+import { buildSet, lightSet, setGround, setUnitRoot } from '../set';
 import { unitOf } from '../units/list';
-import { hangKept, keptPlaces, oldLook } from '../units/remove';
+import { hangKept, removeKeeping, type KeptPlaces } from '../units/remove';
 import { updateUnit } from '../units/update';
 import { FRAMING_TABLE } from '../solver';
 import { MAX_SHOT_SUBJECTS, getDeskSettings, getShots, newShotId, setDeskSettings, setShots } from '../shots';
@@ -23,13 +23,14 @@ import {
   RIDEO_PROPS,
   buildLandmark,
   buildProp,
+  dropTether,
   flyProp,
   freeRowSpot,
+  hangOnGround,
   hiddenSpans,
   holderSpans,
   motionDigest,
   parseRideoBlocking,
-  removeTrees,
   rideoHeightRatio,
   shotMove,
   tetherPartsOf,
@@ -124,6 +125,12 @@ import {
  *   warning;
  * - props whose element went go, new ones are placed, and a held prop whose holder or holder's shots
  *   changed is held (or flown) again; the set is rebuilt when its plan changed;
+ * - what the person put on a piece that goes or is built anew (objects of their own below a shot's
+ *   camera, an actor, a prop, a landmark, the ground, a wall or the sun: not the piece's own look)
+ *   stays where it is in the world, hung from the piece built in its place, or from the set's ground
+ *   once the set is staged (a piece that goes with nothing in its place), its keyed motion kept where
+ *   it can be, and the warnings name it, also when it no longer follows the animation of what went
+ *   (units/remove.ts hangKept);
  * - notes the desk did not edit follow the brief's words; shot names that are the desk's own
  *   ('Shot 3') follow the brief's order;
  * - riders are not seated by an update: a shot it stages, or whose words or cast change, that says
@@ -337,12 +344,19 @@ export function updateFromBriefIn(
   // ------------------------------------------------------------ shots the brief no longer has
   const inBrief = new Set(brief.shots.map((s) => s.id));
   const gone = [...deskBefore].filter(([host]) => !inBrief.has(host)).map(([, s]) => s);
+  // what the person put on the cameras and actors that go stays, hung from the set's ground once the
+  // set is staged (it may be built anew below)
+  const dropped: { kept: KeptPlaces; gone: string }[] = [];
+  const drop = (id: string) => {
+    const name = doc.getObject(id)?.name ?? id;
+    dropped.push({ kept: removeKeeping(doc, [id]), gone: `'${name}'` });
+  };
   if (gone.length) {
     const goneIds = new Set(gone.map((s) => s.id));
     const keep = getShots(doc).filter((x) => !goneIds.has(x.id));
     setShots(doc, keep);
     for (const s of gone)
-      if (s.camera && !keep.some((x) => x.camera === s.camera)) removeTrees(doc, [s.camera]);
+      if (s.camera && doc.getObject(s.camera) && !keep.some((x) => x.camera === s.camera)) drop(s.camera);
     // their frames go, but none another shot covers
     const spans = keep.map(shotSpan);
     warnings.push(
@@ -358,7 +372,7 @@ export function updateFromBriefIn(
   for (const [cid, o] of actors)
     if (!plan.order.includes(cid)) {
       removedActors.add(o.id);
-      removeTrees(doc, [o.id]);
+      drop(o.id);
       actors.delete(cid);
     }
   if (removedActors.size) {
@@ -677,7 +691,7 @@ export function updateFromBriefIn(
         ]);
         warnings.push(...placed.warnings.map((w) => `the library set: ${w}`));
       }
-      relightSet(doc, blocking);
+      warnings.push(...relightSet(doc, blocking));
       done.add(setSlot.key);
     } catch (err) {
       warnings.push(...slotFailed(setSlot, err, done));
@@ -685,20 +699,21 @@ export function updateFromBriefIn(
   } else if (setSlot && setAction === 'remove') {
     // the words' set comes back; what the person put on the library set (objects of their own below
     // it, not its parts) stays, hung from the words' ground where it is in the world
-    const root = setSlot.inst!.root;
-    const kept = keptPlaces(doc, oldLook(doc, root).kept);
-    removeTrees(doc, [root], kept.ids);
-    const ground = restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+    const kept = removeKeeping(doc, [setSlot.inst!.root]);
+    const staged = restageSet(doc, blocking, brief, castNames, stamp, sceneId);
     warnings.push(
-      ...hangKept(doc, ground, kept, { of: 'the library set', on: "the words' ground" }).map(
+      ...staged.warnings,
+      ...hangKept(doc, staged.ground, kept, { of: 'the library set', on: "the words' ground" }).map(
         (w) => `the set: ${w}`,
       ),
     );
   } else if (diff.set) {
     // a library set (or one made local) is relit; the words' set is built again
-    if (plan.set.unit) relightSet(doc, blocking);
-    else restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+    if (plan.set.unit) warnings.push(...relightSet(doc, blocking));
+    else warnings.push(...restageSet(doc, blocking, brief, castNames, stamp, sceneId).warnings);
   }
+  // the set is staged: what stays of the cameras and actors that went hangs from its ground
+  for (const d of dropped) warnings.push(...hangOnGround(doc, d.kept, d.gone, setGround(doc)));
   // the cameras still as staged see the new set: solved again (one set by hand is kept)
   if (setAction !== 'none')
     for (const d of hostShots(doc, sceneId).values()) {
@@ -712,10 +727,14 @@ export function updateFromBriefIn(
 
   // ------------------------------------------------------------ props
   const plannedProps = new Map(blocking.props.filter((p) => p.elementId).map((p) => [p.elementId!, p]));
+  // a prop whose element went goes with its string, but for what the person put on them, which
+  // stays on the set's ground
   for (const [eid, o] of props)
     if (!plannedProps.has(eid)) {
-      for (const x of tetherPartsOf(doc, o.id)) removeTrees(doc, [x]);
-      removeTrees(doc, [o.id]);
+      if (doc.getObject(o.id)) {
+        const kept = removeKeeping(doc, [o.id, ...tetherPartsOf(doc, o.id)]);
+        warnings.push(...hangOnGround(doc, kept, `'${doc.getObject(o.id)?.name ?? o.name}'`));
+      }
       props.delete(eid);
     }
   const shotsAfter = brief.shots.map((s) => ({ id: s.id, castIds: shotCast(s) }));
@@ -733,7 +752,7 @@ export function updateFromBriefIn(
           .flat()
           .some((id) => place.has(id)));
     if (!restage) continue;
-    if (old) for (const x of tetherPartsOf(doc, old.id)) removeTrees(doc, [x]);
+    if (old) warnings.push(...dropTether(doc, old.id));
     const current = old && doc.getObject(old.id) ? old : undefined;
     const slot = units.elements.get(eid);
     // the element's library prop: placed, updated or replaced; kept (another version not held, made
@@ -1011,8 +1030,10 @@ function stageHeld(
 }
 
 /**
- * Rebuilds the set as planned: ground, sky or sun, walls, and the landmarks (the water). Returns the
- * ground (a library set's root while the scene holds one).
+ * Rebuilds the set as planned: ground, sky or sun, walls, and the landmarks (the water). What the
+ * person put on a piece built anew stays on the new one, and on the ground when its landmark goes.
+ * Returns the ground (a library set's root while the scene holds one) and the warnings naming what
+ * stays.
  */
 function restageSet(
   doc: SceneDoc,
@@ -1021,7 +1042,7 @@ function restageSet(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   sceneId: string,
-): string {
+): { ground: string; warnings: string[] } {
   const set = blocking.set;
   const built = buildSet(doc, {
     width: set.width,
@@ -1032,8 +1053,9 @@ function restageSet(
     sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
     sky: !set.interior,
   });
+  const warnings = [...built.warnings];
   // a library set (an instance with key 'set', pinned or not) keeps its ground and pieces: lit only
-  if (setUnitRoot(doc)) return built.ground;
+  if (setUnitRoot(doc)) return { ground: built.ground, warnings };
   const ground = doc.getObject(built.ground);
   if (ground)
     doc.updateObject(built.ground, {
@@ -1048,22 +1070,30 @@ function restageSet(
   const kept = new Set<string>();
   for (const l of set.landmarks) {
     const element = l.elementId ? (brief.elements.find((e) => e.id === l.elementId)?.name ?? null) : null;
-    buildLandmark(doc, l, element, castNames, stamp, old.get(l.id));
+    const made = buildLandmark(doc, l, element, castNames, stamp, old.get(l.id));
+    for (const w of made.warnings ?? []) warnings.push(`${made.name}: ${w}`);
     kept.add(l.id);
   }
-  for (const [rid, o] of old) if (!kept.has(rid) && doc.getObject(o.id)) removeTrees(doc, [o.id]);
-  return built.ground;
+  // a landmark the words drop goes, but for what the person put on it, which stays on the ground
+  for (const [rid, o] of old)
+    if (!kept.has(rid) && doc.getObject(o.id))
+      warnings.push(...hangOnGround(doc, removeKeeping(doc, [o.id]), `'${o.name}'`, built.ground));
+  return { ground: built.ground, warnings };
 }
 
-/** Lights a set planned from a library unit (or made local) and records its size and interior: its ground and pieces stay. */
-function relightSet(doc: SceneDoc, blocking: ReturnType<typeof parseRideoBlocking>): void {
+/**
+ * Lights a set planned from a library unit (or made local) and records its size and interior: its
+ * ground and pieces stay. Returns the warnings naming what the person put on the sun lamp lit anew.
+ */
+function relightSet(doc: SceneDoc, blocking: ReturnType<typeof parseRideoBlocking>): string[] {
   const set = blocking.set;
-  lightSet(doc, {
+  const lit = lightSet(doc, {
     sun_azimuth_deg: set.sun.azimuthDeg,
     sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
     sky: !set.interior,
   });
   setDeskSettings(doc, { set_width: set.width, set_depth: set.depth, interior: set.interior });
+  return lit.warnings;
 }
 
 /**
