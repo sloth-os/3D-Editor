@@ -1030,6 +1030,72 @@ describe('what the person put on a library set stays when the brief links anothe
     expect(u.r.warnings.join('\n')).not.toMatch(/'Duck' (is|and)/);
   });
 
+  it("keeps the keyed scale of a turned object of the person's on a root scaled unevenly, along the object's own axes", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    // turned a quarter about Z: its own X runs along the root's Y, which the new root stretches
+    const turned = mine(doc, 'Turned', SET_ROOT, [1, 1, 0], [0, 0, Math.PI / 2]);
+    keyed(doc, turned, 'scale', 0, [1, 1.5, 2]);
+    keyed(doc, turned, 'scale', 1, [1, 1.2, 1.4]);
+    const grows = FRAMES.map((f) => new FrameState(doc, f).world(turned)!);
+    const other = otherSet([1, 2, 1]);
+    const u = update(doc, withPins(openBrief(), { set: other }), source(other));
+    expect(rowsOf(u.r)).toEqual(['set unit']);
+    expect(doc.getObject(SET_ROOT)!.scale).toEqual([1, 2, 1]);
+    expect(doc.getObject(turned)?.parent).toBe(SET_ROOT);
+    // it grows in the world as it did at every keyed frame and between them
+    FRAMES.forEach((f, i) => sameWorld(new FrameState(doc, f).world(turned)!, grows[i]));
+    // its own X keys are halved (they scale along the stretched axis), its own Y keys stay
+    const values = (index: number) =>
+      doc
+        .listFCurves(turned)
+        .find((fc) => fc.path === 'scale' && fc.index === index)!
+        .keyframes.map((k) => k.value);
+    values(0).forEach((v, i) => expect(v, `X key ${i}`).toBeCloseTo([0.5, 0.75, 1][i], 12));
+    values(1).forEach((v, i) => expect(v, `Y key ${i}`).toBeCloseTo([1, 1.2, 1.4][i], 12));
+    expect(u.r.warnings.join('\n')).not.toMatch(/animated|skew|stays where it was|no longer follow/);
+  });
+
+  it("the words' set brought back keeps what is nested on the person's objects, and a reopened scene keeps them with nothing more to update", () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    const ground = partNamed(doc, 'Set Ground');
+    const bench = mine(doc, 'Bench', SET_ROOT, [2, -1, 0], [0, 0, 0.6]);
+    const cushion = mine(doc, 'Cushion', bench, [0, 0, 0.5], [0.1, 0, 0]);
+    const moss = mine(doc, 'Moss', ground, [-3, 2, 0.01], [0, 0, 1.2]);
+    const sprout = mine(doc, 'Sprout', moss, [0, 0, 0.05], [0, 0.2, 0]);
+    const ours = [bench, cushion, moss, sprout];
+    const parents = (d: SceneDoc = doc) => ours.map((id) => d.getObject(id)?.parent);
+    const worlds = (d: SceneDoc = doc) => ours.map((id) => d.worldMatrix(id));
+    const before = worlds();
+    const undo = undoOf(doc);
+    const b2 = openBrief();
+    const off = update(doc, b2, source(L.set));
+    expect(listUnits(doc)).toEqual([]);
+    const words = doc.listObjects().filter((o) => prop(o, 'desk_label') === 'ground');
+    expect(words.map((o) => unitOf(doc, o.id))).toEqual([null]);
+    const back = [words[0].id, bench, words[0].id, moss];
+    expect(parents()).toEqual(back);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    expect(off.r.warnings).toContain(
+      "the set: keeps 'Bench' and 'Moss', which are not part of the library set",
+    );
+    expect(off.r.warnings.join('\n')).not.toMatch(/Cushion|Sprout/);
+    undo.undo();
+    expect(parents()).toEqual([SET_ROOT, bench, ground, moss]);
+    worlds().forEach((m, i) => sameWorld(m, before[i]));
+    undo.redo();
+    expect(parents()).toEqual(back);
+    // a reopened scene holds them so, and the brief it holds changes nothing more
+    const reopened = SceneDoc.fromUpdate(doc.encodeState());
+    expect(parents(reopened)).toEqual(back);
+    worlds(reopened).forEach((m, i) => sameWorld(m, before[i]));
+    const again = update(reopened, b2, source(L.set));
+    expect(again.changes).toBeNull();
+    expect(again.r.warnings.join('\n')).not.toMatch(/keeps|goes|follow/);
+    expect(parents(reopened)).toEqual(back);
+  });
+
   it("an object of the person's on a part of the set that moved on its own no longer follows it on the new root, and is named", () => {
     const L = library();
     const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
