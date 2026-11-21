@@ -511,6 +511,94 @@ describe('keys of the person on a prop the staging holds or flies, which go with
       expect(r2.warnings.join('\n')).not.toMatch(/no longer follow/);
     }
   });
+
+  it('a held ball the person keyed, which an update ripples before another builds it anew: what rose with it is named', () => {
+    const doc = stagedDoc(heldBall(openBrief(), 'Red ball', 'A small red rubber ball.', { firstOnly: true }));
+    const ball = propOf(doc, KITE);
+    // the person keys the ball rising 1 m in Mira's hand, and puts a sticker on it
+    const z = new FrameState(doc, 1).local(ball.id)[14];
+    keyMore(doc, ball.id, 'location', 2, [
+      [1, z],
+      [60, z + 1],
+    ]);
+    mine(doc, 'Sticker', ball.id, [0, 0, 0.3]);
+    const longer = (name: string, description: string) => {
+      const b = heldBall(openBrief(), name, description, { firstOnly: true });
+      b.shots[0].durationSec += 1;
+      return b;
+    };
+    // the first shot runs a second longer: a ripple moves the ball's keys, the person's with the staging's,
+    // and the ball stays the person's keyed one
+    const r1 = update(doc, longer('Red ball', 'A small red rubber ball.'));
+    expect(propOf(doc, KITE).id).toBe(ball.id);
+    expect(r1.warnings.join('\n')).not.toMatch(/no longer follow/);
+    // the words describe it anew: the keys go with the red ball, and what rose with it is named
+    const r2 = update(doc, longer('Blue ball', 'A small blue rubber ball.'));
+    expect(propOf(doc, KITE).id).not.toBe(ball.id);
+    expect(r2.warnings).toContain("Blue ball: 'Sticker' no longer follows the animation of 'Red ball'");
+  });
+
+  it('a prop the person keyed, which an update stages again before another builds it anew: what was on it is not named', () => {
+    /** A third shot: Mira runs back with the prop, which the staging flies or carries again in it. */
+    const back = (b: SceneBrief, what: string) => {
+      b.shots.push({
+        ...structuredClone(b.shots[0]),
+        id: 'sht_0123456789cccc',
+        index: b.shots.length,
+        description: `Wide: Mira runs back across the meadow with the ${what}, Pip chasing.`,
+      });
+      return b;
+    };
+    /** Pip carries the ball in the first shot where Mira did. */
+    const pip = (b: SceneBrief) => {
+      b.shots[0].description = 'Wide: Pip runs across the meadow with the ball, Mira chasing.';
+      return b;
+    };
+    const red = () => heldBall(openBrief(), 'Red ball', 'A small red rubber ball.');
+    const cases: [string, () => SceneBrief, () => SceneBrief, () => SceneBrief][] = [
+      [
+        'the kite flown again in a new shot',
+        openBrief,
+        () => back(openBrief(), 'kite'),
+        () => back(retyped(openBrief(), { balloonWords: true }), 'balloon'),
+      ],
+      [
+        'the ball carried by another',
+        red,
+        () => pip(red()),
+        () => pip(heldBall(openBrief(), 'Blue ball', 'A small blue rubber ball.')),
+      ],
+    ];
+    /** The keys on the prop's own transform channels. */
+    const ownKeys = (d: SceneDoc) =>
+      JSON.stringify(
+        d
+          .listFCurves(propOf(d, KITE).id)
+          .filter((c) => ['location', 'rotation_euler', 'scale'].includes(c.path))
+          .map((c) => [c.path, c.index, c.keyframes]),
+      );
+    for (const [what, first, again, anew] of cases) {
+      const doc = stagedDoc(first());
+      const ref = stagedDoc(first());
+      const p = propOf(doc, KITE);
+      // the person lifts it 2 m at frame 30, and puts a sticker on it
+      const z = new FrameState(doc, 1).local(p.id)[14];
+      keyMore(doc, p.id, 'location', 2, [[30, z + 2]]);
+      for (const d of [doc, ref]) mine(d, 'Sticker', propOf(d, KITE).id, [0, 0, 0.3]);
+      // staged again: the staging's keys take the place of the person's, as where they keyed nothing
+      for (const d of [doc, ref]) update(d, again());
+      expect(propOf(doc, KITE).id, what).toBe(p.id);
+      expect(ownKeys(doc), what).toBe(ownKeys(ref));
+      // built anew and staged alike: what was on it follows the new one as it followed the old
+      const r = update(doc, anew());
+      const now = propOf(doc, KITE);
+      expect(now.id, what).not.toBe(p.id);
+      expect(r.warnings, what).toContain(
+        `${now.name}: keeps 'Sticker', which is not part of the prop it replaces`,
+      );
+      expect(r.warnings.join('\n'), what).not.toMatch(/no longer follow/);
+    }
+  });
 });
 
 /** The brief's first shot as the desk has it. */
