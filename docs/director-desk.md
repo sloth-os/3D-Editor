@@ -1055,8 +1055,12 @@ What it gives, measured in three runs on a 4-core machine shared with other work
   text only; hand-made keys on imported actors and props are replaced on re-import (user objects,
   shots, physics and materials are kept, and what the person put on an actor, prop or landmark
   built anew or dropped stays as an update keeps it), and the re-import's warnings name the actors,
-  props, landmarks and shot cameras changed in the desk since the last import. Importing a long
-  clip takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
+  props, landmarks and shot cameras changed in the desk since the last import. A blocked shot
+  camera the person hung from another object stays on it, placed in its space where the blocking
+  has the camera, when that object stands still through the shot and is scaled evenly; one hung
+  from something that moves in the shot (a kite, an actor), or scaled unevenly or mirrored, is
+  taken off it to stand where the blocking has it, and a warning names it. Importing a long clip
+  takes seconds (about 5 s for 20 shots with 6 actors when it was measured).
 - **Real video models**: whether the references improve a model's takes is not measured yet. A host
   should compare takes with and without them on its own scenes (the kite flights, riders on their
   mounts, and shot and reverse by water that motivated the desk), with the same seeds and blind

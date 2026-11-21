@@ -1,4 +1,6 @@
-import type { Vec3 } from '../../math/types';
+import type { Mat4, Vec3 } from '../../math/types';
+import { compose4, determinant4, invert4, multiply4 } from '../../math/mat4';
+import { decomposeCompatible } from '../../generate/layout';
 import type { SceneDoc } from '../../doc/scene-doc';
 import type { DeskLayoutEntry, DeskMove, ObjectData, ShotData } from '../../doc/types';
 import { createCube, createCylinder, createPlane } from '../../mesh/primitives';
@@ -27,9 +29,11 @@ import { UNIT_ROOT } from '../units/ids';
 import {
   hangKept,
   keptPlaces,
+  moversOf,
   oldLook,
   removeKeeping,
   removeObjectTrees,
+  sameWorld,
   type KeptPlaces,
 } from '../units/remove';
 import { unitStatus } from '../units/status';
@@ -806,6 +810,7 @@ export function importRideoBlocking(
   const removed: string[] = [];
   // what was changed in the desk since the last import (keys, poses, holds, mounts, flights, a
   // camera solved again): the import rebuilds them from rideo's blocking, so their changes are lost
+  const changedSince = new Set<string>();
   if (update) {
     const changed: string[] = [];
     const seen = new Set<string>();
@@ -813,7 +818,10 @@ export function importRideoBlocking(
       if (!o || seen.has(o.id)) return;
       seen.add(o.id);
       const recorded = prop(doc.getObject(o.id), RIDEO_PROPS.motion);
-      if (recorded && motionDigest(doc, o.id) !== recorded) changed.push(label);
+      if (recorded && motionDigest(doc, o.id) !== recorded) {
+        changed.push(label);
+        changedSince.add(o.id);
+      }
     };
     for (const o of oldActors.values()) check(o, `'${o.name}'`);
     for (const o of oldProps.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
@@ -1293,7 +1301,7 @@ export function importRideoBlocking(
       toSolve.push(p.id);
       continue;
     }
-    placeCamera(doc, s, p);
+    placeCamera(doc, s, p, cameraSpace(doc, s, warnings, changedSince.has(s.camera!)));
   }
   const from = new Map<string, 'blocking' | 'solved' | 'refit'>();
   const agrees = new Map<string, boolean>();
@@ -1529,12 +1537,71 @@ function clearCameraAnimation(doc: SceneDoc, cameraId: string): void {
     for (const fc of doc.listFCurves(data)) if (fc.target_type === 'camera') doc.removeFCurve(fcurveKey(fc));
 }
 
+/** Whether matrix `m` turns and scales alike along every axis: no skew, no uneven scale, no mirror. */
+function evenAxes(m: Readonly<Mat4>): boolean {
+  const axis = (k: number): Vec3 => [m[k * 4], m[k * 4 + 1], m[k * 4 + 2]];
+  const [x, y, z] = [axis(0), axis(1), axis(2)];
+  const len = [x, y, z].map((v) => Math.hypot(v[0], v[1], v[2]));
+  const s = len[0];
+  if (!(s > 1e-9) || len.some((l) => Math.abs(l - s) > 1e-9 * s)) return false;
+  const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  if ([dot(x, y), dot(x, z), dot(y, z)].some((d) => Math.abs(d) > 1e-9 * s * s)) return false;
+  return determinant4(m) > 0;
+}
+
+/**
+ * The world matrix a shot's blocked camera is placed through: its parent's (null: it hangs from
+ * nothing). A camera the person hung from another object (a rig) stays on it while that object
+ * stands still through the shot, scaled evenly and not mirrored (evenAxes): the blocking's placement,
+ * turned into the parent's space (as CameraKeys.pose turns a solved one), then holds at every frame.
+ * Hung from something that moves in the shot (a kite, an actor), keys in its space would hold that
+ * placement at the keys only, and an uneven parent bends the camera: such a camera is taken off its
+ * parent, keeping its place in the world at the shot's first frame, and `warnings` says so. One kept
+ * on its parent that the re-import names as changed since the last import (`named`: hung from it
+ * since) is said to stay on it, as that warning says those changes are gone.
+ */
+function cameraSpace(doc: SceneDoc, shot: ShotData, warnings: string[], named: boolean): Mat4 | null {
+  const cam = shot.camera!;
+  const o = doc.getObject(cam);
+  const parent = o?.parent ? doc.getObject(o.parent) : null;
+  if (!o || !parent) return null;
+  const first = new FrameState(doc, shot.frame_start);
+  const space = first.parent(cam);
+  let still = true;
+  // nothing above it keyed, driven, constrained or simulated: it stands still at every frame
+  if (moversOf(doc, cam).length)
+    for (let f = shot.frame_start + 1; f <= shot.frame_end && still; f++)
+      still = sameWorld(new FrameState(doc, f).parent(cam), space);
+  if (still && evenAxes(space)) {
+    if (named)
+      warnings.push(
+        `${shot.name}: its camera stays hung from '${parent.name}', which stands still in the shot; ` +
+          "the import placed it in its space where the clip's blocking has it",
+      );
+    return space;
+  }
+  // where it stands at the shot's first frame, unless its parent squashes it there (a hidden actor)
+  const world = first.world(cam);
+  const placed =
+    world &&
+    world.every(Number.isFinite) &&
+    [0, 1, 2].every((k) => Math.hypot(world[k * 4], world[k * 4 + 1], world[k * 4 + 2]) > 1e-9);
+  doc.setParent(cam, null, true, placed ? { world, parentWorld: null } : undefined);
+  warnings.push(
+    `${shot.name}: its camera hung from '${parent.name}', which ${
+      still ? 'is scaled unevenly or mirrored' : 'moves during the shot'
+    }; the import took it off '${parent.name}' to place it where the clip's blocking has it`,
+  );
+  return null;
+}
+
 /**
  * Poses a shot's camera as rideo blocked it (position, target, lens) and keys its move: the blocked
  * end itself when it is the shot's move (an orbit along its arc; see endIsMove), else the shot's move
- * from the blocked start; a locked-off shot holds its pose.
+ * from the blocked start; a locked-off shot holds its pose. `space`: the parent's world matrix the
+ * camera hangs from (cameraSpace), still through the shot; its channels are the placement in it.
  */
-function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan): void {
+function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan, space: Mat4 | null): void {
   const cam = shot.camera!;
   const c = p.camera!;
   const data = doc.getObject(cam)?.data;
@@ -1550,10 +1617,11 @@ function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan): void {
     ],
     o.rotation_euler,
   );
-  doc.updateObject(cam, { location: start.position, rotation_euler: rotation });
+  const placed = inSpace(space, start.position, rotation, o.rotation_euler);
+  doc.updateObject(cam, { location: placed.location, rotation_euler: placed.rotation });
   const move = shot.move;
   if (end && endIsMove(move, start, end)) {
-    keyPlacedMove(doc, cam, start, end, shot.frame_start, shot.frame_end);
+    keyPlacedMove(doc, cam, start, end, shot.frame_start, shot.frame_end, rotation, space);
     return;
   }
   if (move && move !== 'locked_off')
@@ -1605,9 +1673,30 @@ function endIsMove(
 }
 
 /**
+ * The channels that stand an object hung from world matrix `space` (null: from nothing) at `position`
+ * turned by world Euler `euler`: local = inverse(space) × world, its rotation the Euler closest to
+ * `prev` (as CameraKeys.pose keys a camera through its parent).
+ */
+function inSpace(
+  space: Mat4 | null,
+  position: Vec3,
+  euler: Vec3,
+  prev: Readonly<Vec3>,
+): { location: Vec3; rotation: Vec3 } {
+  if (!space) return { location: position, rotation: euler };
+  const d = decomposeCompatible(
+    multiply4(invert4(space), compose4(position, euler, [1, 1, 1])),
+    prev,
+    [1, 1, 1],
+  );
+  return d ? { location: d.location, rotation: d.rotation } : { location: position, rotation: euler };
+}
+
+/**
  * Keys a camera from `start` to `end` over [f0, f1]: along the arc around the target when the target
  * stays and the distance to it does (an orbit), else straight; eased (smoothstep), at most 12 keys,
- * each looking at the target where it is then.
+ * each looking at the target where it is then. `euler`: the world rotation at `start`; `space`: the
+ * world matrix the camera hangs from (inSpace), which the keys are turned into.
  */
 function keyPlacedMove(
   doc: SceneDoc,
@@ -1616,6 +1705,8 @@ function keyPlacedMove(
   end: { position: Vec3; target: Vec3 },
   f0: number,
   f1: number,
+  euler: Vec3,
+  space: Mat4 | null,
 ): void {
   const len = (v: Vec3) => Math.hypot(v[0], v[1], v[2]);
   const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
@@ -1637,7 +1728,8 @@ function keyPlacedMove(
     Math.abs(da) > rad(5);
   const frames = Math.max(1, f1 - f0);
   const n = Math.min(12, Math.max(arc ? 8 : 2, Math.ceil(frames / 8) + 1));
-  let rot = doc.getObject(cam)!.rotation_euler as Vec3;
+  let rot = euler;
+  let local = doc.getObject(cam)!.rotation_euler as Vec3;
   const loc: number[][] = [[], [], []];
   const eul: number[][] = [[], [], []];
   const at: number[] = [];
@@ -1656,10 +1748,12 @@ function keyPlacedMove(
       ];
     } else pos = lerp(start.position, end.position, s);
     rot = lookEuler(sub(target, pos), rot);
+    const placed = inSpace(space, pos, rot, local);
+    local = placed.rotation;
     at.push(f0 + Math.round(u * frames * 1000) / 1000);
     for (let i = 0; i < 3; i++) {
-      loc[i].push(pos[i]);
-      eul[i].push(rot[i]);
+      loc[i].push(placed.location[i]);
+      eul[i].push(placed.rotation[i]);
     }
   }
   for (let i = 0; i < 3; i++) {
