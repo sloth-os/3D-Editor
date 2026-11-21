@@ -268,7 +268,17 @@ function NoticeLine({ c }: { c: DeskController }) {
       {...CHROME}
     >
       <Icon name={n.level === 'info' ? 'info' : 'warning'} size={13} />
-      <span>{n.message}</span>
+      <span>
+        {n.message}
+        {/* what the staging or an Update shots warned of, each on its own line (a few, then it scrolls) */}
+        {n.details && n.details.length > 0 && (
+          <ul class="desk-refused desk-warnings" data-testid="desk-notice-warnings">
+            {n.details.map((w, i) => (
+              <li key={i}>{w}</li>
+            ))}
+          </ul>
+        )}
+      </span>
       <span class="desk-banner-actions">
         <button class="btn flat" onClick={() => (c.notice.value = null)}>
           OK

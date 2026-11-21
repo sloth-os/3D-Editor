@@ -123,6 +123,8 @@ export interface SceneWorkspace {
   lengthMismatches(): LengthMismatch[];
   changes(): BriefChanges | null;
   updateFromBrief(): Promise<BriefChanges | null>;
+  /** What the last staging or Update shots warned of (core's report.warnings), for the notice. */
+  warnings?(): string[];
   results(update: Uint8Array, shots?: string[]): Promise<ShotResultMeta[]>;
   readonly projectId: string | null;
   /** Lets go of the scene (an open cancelled by Close); a later open opens it again. */
@@ -282,6 +284,8 @@ export interface AckNotice {
 export interface Notice {
   level: 'info' | 'warning' | 'error';
   message: string;
+  /** Lines listed under the message: what the staging or an Update shots warned of. */
+  details?: string[];
   at: number;
 }
 
@@ -378,6 +382,9 @@ type AckOutcome =
 const sceneClosed = (err: unknown): boolean =>
   typeof err === 'object' && err !== null && (err as { sceneClosed?: unknown }).sceneClosed === true;
 
+/** The notice's words before the warnings it lists: how many `what` (the staging, the update) gave. */
+const warningCount = (what: string, n: number): string => `${what} gave ${n} warning${n === 1 ? '' : 's'}:`;
+
 /** An ArrayBuffer holding exactly `bytes` (the view's own buffer when it is all of it). */
 const exactBuffer = (bytes: Uint8Array): ArrayBuffer =>
   bytes.byteOffset === 0 && bytes.byteLength === bytes.buffer.byteLength
@@ -461,8 +468,13 @@ export class DeskController {
     this.deps.send({ type: 'error', ...(id ? { id } : {}), code, message });
   }
 
-  private tell(level: Notice['level'], message: string): void {
-    this.notice.value = { level, message, at: this.timers.now() };
+  private tell(level: Notice['level'], message: string, details: readonly string[] = []): void {
+    this.notice.value = {
+      level,
+      message,
+      ...(details.length ? { details: [...details] } : {}),
+      at: this.timers.now(),
+    };
   }
 
   /** Why a request that needs the open scene is refused (not_open). */
@@ -682,7 +694,10 @@ export class DeskController {
     // library units the staging did not use (not sent, refused …): staged from the words
     const missed = units && r.units ? unitNotice(r.units, brief) : null;
     if (missed) notices.push(missed);
-    if (notices.length) this.tell('warning', notices.join(' '));
+    // what the staging warned of (core's report.warnings): counted last, each listed under it
+    const warned = r.warnings ?? [];
+    if (warned.length) notices.push(warningCount('The staging', warned.length));
+    if (notices.length) this.tell('warning', notices.join(' '), warned);
     this.refreshLibrary();
     // the contract's lists only (the banner shows the desk's own notes too)
     this.deps.send({
@@ -845,8 +860,13 @@ export class DeskController {
       const brief = this.brief.peek();
       const rows = this.units.peek() ? (this.deps.workspace.unitRows?.() ?? null) : null;
       const missed = rows && brief ? unitNotice(rows, brief) : null;
-      if (missed) this.tell('warning', `The shots were updated to the brief (Ctrl+Z undoes it). ${missed}`);
-      else this.tell('info', 'The shots were updated to the brief (Ctrl+Z undoes it).');
+      // what the update warned of, each listed under the notice; an update that warns of nothing
+      // says only that the shots were updated (the list of an earlier one goes with its notice)
+      const warned = this.deps.workspace.warnings?.() ?? [];
+      const said = ['The shots were updated to the brief (Ctrl+Z undoes it).'];
+      if (missed) said.push(missed);
+      if (warned.length) said.push(warningCount('The update', warned.length));
+      this.tell(missed || warned.length ? 'warning' : 'info', said.join(' '), warned);
     } catch (err) {
       const why = err instanceof Error ? err.message : String(err);
       // the scene closed while the update waited for its turn or ran: it ends quietly

@@ -167,6 +167,12 @@
   margin: 4px 0 0;
   padding-left: 18px;
 }
+/* the notice's warnings: a few lines, then the list scrolls (the editor below keeps its room) */
+.desk-warnings {
+  max-height: min(9em, 30vh);
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+}
 .desk-main {
   min-height: 0;
 }

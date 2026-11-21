@@ -44,6 +44,7 @@ const EXAMPLE = (): SceneBrief => structuredClone(fixture('open.json').scene);
 const SHOT_A = 'sht_0123456789aaaa';
 const SHOT_B = 'sht_0123456789bbbb';
 const SHOT_C = 'sht_0123456789cccc';
+const KITE = 'ele_0123456789kite';
 
 function changedBrief(): SceneBrief {
   const b = EXAMPLE();
@@ -697,6 +698,54 @@ describe('the desk workspace', { timeout: 30_000 }, () => {
     s.undo.undo();
     expect(hostShots(ws)).toEqual([SHOT_A, SHOT_B]);
     expect(frames(ws)).toEqual([72, 60]);
+  });
+
+  it("keeps what the staging warned of (the worker's summary.warnings) for the open's notice", async () => {
+    // a cast member in no shot: the staging warns that it is not staged
+    const brief = EXAMPLE();
+    brief.cast.push({ ...brief.cast[0], id: 'chr_0123456789nobo', name: 'Nobody', heightM: null });
+    const ws = workspace();
+    const r = await ws.open({ hostOrigin: origin(), brief, state: null });
+    expect(r.warnings).toEqual(['Nobody is in no shot: not staged']);
+    expect(ws.warnings()).toEqual(['Nobody is in no shot: not staged']);
+    ws.close();
+    expect(ws.warnings()).toEqual([]);
+  });
+
+  it("keeps what each Update shots warned of: the person's object on a prop built anew, named; nothing after an update that warns of nothing", async () => {
+    const host = origin();
+    const first = workspace();
+    const r = await first.open({ hostOrigin: host, brief: EXAMPLE(), state: null });
+    expect(r.warnings).toEqual([]);
+    // the person hangs an object of theirs on the kite
+    const doc = first.session!.doc;
+    const kite = doc
+      .listObjects()
+      .find((o) => o.custom_props?.desk_role === 'prop' && o.custom_props?.desk_element_id === KITE)!;
+    doc.transact(() => {
+      doc.addObject({ type: 'EMPTY', name: 'Ribbon', parent: kite.id, location: [0.1, 0, -0.2] });
+    });
+    first.close();
+    // a later brief describes the kite anew; the local copy opens, nothing staged: no warnings yet
+    const retyped = EXAMPLE();
+    const el = retyped.elements.find((e) => e.id === KITE)!;
+    el.name = 'Red balloon';
+    el.description = 'A big red balloon on a string.';
+    const ws = workspace();
+    expect(await ws.open({ hostOrigin: host, brief: retyped, state: null })).toMatchObject({
+      source: 'local',
+      warnings: [],
+    });
+    expect(ws.warnings()).toEqual([]);
+    // Update shots builds the prop anew: what stays of the person's is named
+    expect(await ws.updateFromBrief()).toBeNull();
+    expect(ws.warnings()).toEqual([
+      "Red balloon: keeps 'Ribbon', which is not part of the prop it replaces",
+      "Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'",
+    ]);
+    // an update that warns of nothing leaves none
+    await ws.updateFromBrief();
+    expect(ws.warnings()).toEqual([]);
   });
 
   it('tells its listener about every change of the scene', async () => {

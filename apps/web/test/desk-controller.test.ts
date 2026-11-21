@@ -906,6 +906,68 @@ describe('the desk controller', () => {
     expect(rw.c.changes.value).toBeNull();
   });
 
+  it("counts the staging's warnings in the open's notice and lists each under it; the host is sent nothing of them", async () => {
+    const warned = [
+      "Red balloon: keeps 'Ribbon', which is not part of the prop it replaces",
+      "Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'",
+    ];
+    const t = setup({
+      workspace: {
+        open: vi.fn(async () => ({ ...outcome, notice: 'Kept in memory only.', warnings: warned })),
+      },
+    });
+    await opened(t);
+    // after what else the open says, the count, the list under it
+    expect(t.c.notice.value).toEqual({
+      level: 'warning',
+      message: 'Kept in memory only. The staging gave 2 warnings:',
+      details: warned,
+      at: expect.any(Number),
+    });
+    expect(t.ofType('opened')[0]).toEqual({
+      type: 'opened',
+      sceneId: 'clp_1',
+      source: 'brief',
+      changes: null,
+    });
+    expect(JSON.stringify(t.sent.map((s) => s.message))).not.toMatch(/Ribbon|warnings/);
+    // one warning, nothing else to say
+    const one = setup({ workspace: { open: vi.fn(async () => ({ ...outcome, warnings: [warned[0]] })) } });
+    await opened(one);
+    expect(one.c.notice.value).toMatchObject({
+      level: 'warning',
+      message: 'The staging gave 1 warning:',
+      details: [warned[0]],
+    });
+    // a staging that warns of nothing: no notice, as before
+    const none = setup({ workspace: { open: vi.fn(async () => ({ ...outcome, warnings: [] })) } });
+    await opened(none);
+    expect(none.c.notice.value).toBeNull();
+  });
+
+  it("counts each Update shots' warnings in its notice and lists them; the next update without any says only that the shots were updated", async () => {
+    const lists = [["Red balloon: keeps 'Ribbon', which is not part of the prop it replaces"], []];
+    const t = setup({ workspace: { warnings: vi.fn(() => lists.shift() ?? []) } });
+    await opened(t);
+    const sentBefore = t.sent.length;
+    await t.c.updateShots();
+    expect(t.c.notice.value).toEqual({
+      level: 'warning',
+      message: 'The shots were updated to the brief (Ctrl+Z undoes it). The update gave 1 warning:',
+      details: ["Red balloon: keeps 'Ribbon', which is not part of the prop it replaces"],
+      at: expect.any(Number),
+    });
+    await t.c.updateShots();
+    expect(t.c.notice.value).toEqual({
+      level: 'info',
+      message: 'The shots were updated to the brief (Ctrl+Z undoes it).',
+      at: expect.any(Number),
+    });
+    // nothing of them goes to the host: the updates send what they sent before (no new messages
+    // here, the fake scene sends no edits)
+    expect(t.sent.slice(sentBefore)).toEqual([]);
+  });
+
   it("sends the contract's lists in opened.changes, null when they are all empty; the banner keeps the desk's own notes", async () => {
     const onlyOther = {
       added: [],

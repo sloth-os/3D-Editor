@@ -708,8 +708,10 @@ why. See [video-export.md](video-export.md).
 application's frame. The host's brief is staged in the browser (in a worker), the person directs
 it, **Update shots** brings the staging up to a later brief as one undo step, and **Send to …**
 renders every shot's reference clips in the browser and hands them to the host, which also keeps
-the scene's state; Done and Close end the session. Opened on its own, the page offers a sample
-scene. See [embedding.md](embedding.md). A host that keeps a library of 3D pieces adds the
+the scene's state; Done and Close end the session. What the staging and each Update shots warn of
+(the person's objects kept where a piece was built anew, for one) the desk's notice counts and
+lists for the person. Opened on its own, the page offers a sample scene. See
+[embedding.md](embedding.md). A host that keeps a library of 3D pieces adds the
 [Library tab](#the-library-tab).
 
 ### The Library tab

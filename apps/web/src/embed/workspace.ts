@@ -277,6 +277,8 @@ export interface OpenOutcome {
    * unit or the words and why); null when nothing was staged or units are off for the open.
    */
   units?: StageUnitRow[] | null;
+  /** What the staging warned of (core's report.warnings); [] when nothing was staged. */
+  warnings?: string[];
 }
 
 /** A brief shot whose length in the desk differs from the brief's. */
@@ -351,6 +353,8 @@ export class DeskWorkspace {
   private unitSourceCache: UnitSource | null = null;
   /** The brief's pins as the last staging or Update shots left them (report.units). */
   private lastUnitRows: StageUnitRow[] | null = null;
+  /** What the last staging or Update shots warned of (report.warnings; [] before either). */
+  private lastWarnings: string[] = [];
   /** The end of the last write of the scene queued (queueWrite); settles, never rejects. */
   private writes: Promise<void> = Promise.resolve();
   private readonly locks: SceneLocks | null;
@@ -500,7 +504,7 @@ export class DeskWorkspace {
     s: ProjectSession,
     brief: SceneBrief,
     signal: AbortSignal,
-  ): Promise<{ ms: number; units: StageUnitRow[] | null }> {
+  ): Promise<{ ms: number; units: StageUnitRow[] | null; warnings: string[] }> {
     this.onWork({
       label: `Staging ${brief.shots.length} shot${brief.shots.length === 1 ? '' : 's'}…`,
       startedAt: Date.now(),
@@ -531,7 +535,11 @@ export class DeskWorkspace {
       Y.applyUpdate(s.doc.ydoc, r.diff, s.storageOrigin);
       // nobody edits the scene before it opens: the checks are of the document as it is now
       this.keepCheck(s, r.check, s.revision.peek());
-      return { ms: r.ms, units: this.units ? (r.summary.units ?? []) : null };
+      return {
+        ms: r.ms,
+        units: this.units ? (r.summary.units ?? []) : null,
+        warnings: [...r.summary.warnings],
+      };
     } finally {
       this.onWork(null);
     }
@@ -641,6 +649,7 @@ export class DeskWorkspace {
     this.units = null;
     this.unitSourceCache = null;
     this.lastUnitRows = null;
+    this.lastWarnings = [];
     // a write of this scene still queued or running is not applied (queueWrite): the next scene's
     // writes do not wait for it
     this.writes = Promise.resolve();
@@ -736,16 +745,19 @@ export class DeskWorkspace {
       }
       let stageMs: number | null = null;
       let unitRows: StageUnitRow[] | null = null;
+      let warnings: string[] = [];
       if (plan === 'stage') {
         const staged = await this.stage(s, brief, signal);
         stageMs = staged.ms;
         unitRows = staged.units;
+        warnings = staged.warnings;
       }
       s.undo.clear();
       this.session = s;
       this.release = release;
       this.kept = kept && { session: s, ...kept };
       this.lastUnitRows = unitRows;
+      this.lastWarnings = warnings;
       // the units an Update shots may still place stay; the others are let go
       this.keepWantedUnits(s, brief);
       sessionSignal.value = s;
@@ -762,6 +774,7 @@ export class DeskWorkspace {
         persistent: stored.persistent,
         notice: this.notice,
         units: unitRows,
+        warnings: [...warnings],
       };
     } catch (err) {
       await s?.close(false).catch(() => undefined);
@@ -920,6 +933,7 @@ export class DeskWorkspace {
       this.keepCheck(s, r.check, edited ? asked : s.revision.peek());
       // the files stay held: Ctrl+Z may take a unit the update placed out again
       if (this.units) this.lastUnitRows = r.summary.units ?? [];
+      this.lastWarnings = [...r.summary.warnings];
       // the full checks (blocking lines, layouts) of the updated scene, in the background
       void this.refreshCheck();
       return briefChanges(s.doc, brief, this.unitOptions());
@@ -931,6 +945,11 @@ export class DeskWorkspace {
   /** The brief's library pins as the last staging or Update shots left them (null: none, or units are off). */
   unitRows(): StageUnitRow[] | null {
     return this.lastUnitRows;
+  }
+
+  /** What the last staging or Update shots of the open scene warned of (core's report.warnings). */
+  warnings(): string[] {
+    return [...this.lastWarnings];
   }
 
   /** The units held for an Update shots (their pins, `ref@version`), for tests and the Library tab. */

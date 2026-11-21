@@ -946,6 +946,15 @@ hides the banner. A read-only open shows the changes without the button. How a
 brief becomes a scene, and what an update keeps, is in
 [director-desk.md](director-desk.md#staging-from-a-brief).
 
+What the staging and each Update shots warn of (core's `report.warnings`, such as the person's
+objects that stay where a piece was built anew or taken out, what no longer follows a piece's
+animation, notes edited in the desk that an update keeps over the brief's, or a library unit that
+is not here or cannot be used) the desk shows the person: after the open's staging and after each
+Update shots, its notice says how many warnings there are and lists each one under it (the list
+scrolls past a few lines, below the header). A staging or an Update shots that warns of nothing
+lists none, so the list of an earlier one goes with the notice it replaces. The host is sent
+nothing of them: the protocol has no message for them, and `opened` and `state` are as without.
+
 ### Send and export
 
 An `export` from the host and the person's **Send to …** run the same export, in the browser, with

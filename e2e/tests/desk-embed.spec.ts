@@ -510,6 +510,129 @@ test.describe('the embeddable desk', () => {
     await second.close();
   });
 
+  test("Update shots keeps the person's object on a prop built anew: the notice counts the warnings and lists them, on a desktop and a 360 px phone", async ({
+    page,
+  }) => {
+    test.setTimeout(240_000);
+    await openHost(page);
+    await waitFor(page, 'ready');
+    const scene = smallBrief('clp_warnings0000001');
+    await send(page, { type: 'open', scene, state: null, options: OPTIONS });
+    await waitFor(page, 'opened', 1, 180_000);
+    await waitFor(page, 'state');
+    let frame = await deskFrame(page);
+    // the staging warned of nothing: no notice
+    await expect(frame.getByTestId('desk-notice')).toHaveCount(0);
+    // the person hangs a cube of theirs on the kite; its state goes to the host
+    const statesBefore = (await ofType(page, 'state')).length;
+    const runs = await frame.evaluate(() => {
+      const d = (window as any).__desk;
+      return [
+        d.run('mesh.primitive_cube_add', { size: 0.2, name: 'Ribbon' }),
+        d.run('object.parent_to', { objects: ['Ribbon'], parent: 'Red kite' }),
+      ].map((r: any) => r?.ok ?? false);
+    });
+    expect(runs).toEqual([true, true]);
+    await waitFor(page, 'state', statesBefore + 1, 60_000);
+    const hostState = await page.evaluate(() => (window as any).host.state());
+
+    // a later brief describes the kite anew: the desk opens again with the host's state
+    const retyped = structuredClone(scene);
+    const kite = retyped.elements.find((e: any) => e.id === 'ele_0123456789kite');
+    kite.name = 'Red balloon';
+    kite.description = 'A big red balloon on a string.';
+    await page.evaluate(() => (window as any).host.mount());
+    await waitFor(page, 'ready', 2);
+    await send(page, {
+      type: 'open',
+      scene: retyped,
+      state: { format: hostState.format, version: 1, data: { $bytes: hostState.$bytes } },
+      options: OPTIONS,
+    });
+    await waitFor(page, 'opened', 2, 60_000);
+    frame = await deskFrame(page);
+    await expect(frame.getByTestId('desk-changes')).toBeVisible();
+    await expect(frame.getByTestId('desk-notice')).toHaveCount(0);
+    await frame.getByTestId('desk-update-shots').click();
+    await expect(frame.getByTestId('desk-changes')).toHaveCount(0, { timeout: 60_000 });
+
+    // the notice says the shots were updated and how many warnings, and lists each under it
+    const notice = frame.getByTestId('desk-notice');
+    await expect(notice).toContainText(
+      'The shots were updated to the brief (Ctrl+Z undoes it). The update gave 2 warnings:',
+    );
+    const items = frame.getByTestId('desk-notice-warnings').locator('li');
+    await expect(items).toHaveText([
+      "Red balloon: keeps 'Ribbon', which is not part of the prop it replaces",
+      "Red balloon: 'Ribbon' no longer follows the animation of 'Red kite'",
+    ]);
+    // nothing of them went to the host: no message says them
+    const said = JSON.stringify(await portMessages(page));
+    expect(said).not.toContain("keeps 'Ribbon'");
+    expect(said).not.toContain('no longer follows');
+
+    /** Where the notice, its list and the header's buttons are, and what is at each button's centre. */
+    const layout = () =>
+      frame.evaluate(() => {
+        const box = (id: string) => document.querySelector(`[data-testid="${id}"]`)!.getBoundingClientRect();
+        const topmost = (id: string) => {
+          const el = document.querySelector(`[data-testid="${id}"]`)!;
+          const r = el.getBoundingClientRect();
+          const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+          return { right: r.right, bottom: r.bottom, top: !!hit && (el === hit || el.contains(hit)) };
+        };
+        const list = document.querySelector<HTMLElement>('[data-testid="desk-notice-warnings"]')!;
+        // the list scrolled to its end shows its last warning inside it
+        list.scrollTop = list.scrollHeight;
+        const last = list.lastElementChild!.getBoundingClientRect();
+        const shown = list.getBoundingClientRect();
+        const ok = [...document.querySelectorAll<HTMLElement>('[data-testid="desk-notice"] button')].find(
+          (b) => b.textContent === 'OK',
+        )!;
+        const okBox = ok.getBoundingClientRect();
+        return {
+          width: innerWidth,
+          height: innerHeight,
+          scroll: document.documentElement.scrollWidth,
+          header: box('desk-header').bottom,
+          notice: { top: box('desk-notice').top, right: box('desk-notice').right },
+          list: { height: shown.height, overflow: getComputedStyle(list).overflowY, right: shown.right },
+          lastInside: last.bottom <= shown.bottom + 1 && last.top >= shown.top - 1,
+          ok: {
+            right: okBox.right,
+            top: document.elementFromPoint(okBox.x + okBox.width / 2, okBox.y + okBox.height / 2) === ok,
+          },
+          buttons: { done: topmost('desk-done'), close: topmost('desk-close') },
+        };
+      });
+    for (const size of [null, { width: 360, height: 740 }]) {
+      if (size) await page.setViewportSize(size);
+      if (size) await expect.poll(() => frame.evaluate(() => innerWidth)).toBe(360);
+      const at = await layout();
+      // below the header, inside the width, never over Done and Close; OK is reachable
+      expect(at.notice.top).toBeGreaterThanOrEqual(at.header - 1);
+      expect(at.scroll).toBeLessThanOrEqual(at.width);
+      expect(at.notice.right).toBeLessThanOrEqual(at.width);
+      expect(at.list.right).toBeLessThanOrEqual(at.width);
+      for (const [id, b] of Object.entries(at.buttons)) {
+        expect(b.right, id).toBeLessThanOrEqual(at.width);
+        expect(b.bottom, id).toBeLessThanOrEqual(at.header);
+        expect(b.top, `${id} is the element at its centre`).toBe(true);
+      }
+      expect(at.ok).toEqual({ right: expect.any(Number), top: true });
+      expect(at.ok.right).toBeLessThanOrEqual(at.width);
+      // the list is a few lines at most and scrolls: its last warning can be read
+      expect(at.list.overflow).toBe('auto');
+      expect(at.list.height).toBeLessThanOrEqual(at.height * 0.3 + 1);
+      expect(at.lastInside).toBe(true);
+      await expect(items).toHaveCount(2);
+    }
+    // OK puts the notice away
+    await notice.getByRole('button', { name: 'OK' }).click();
+    await expect(notice).toHaveCount(0);
+    await expectValidMessages(page);
+  });
+
   test('what the desk ignores or refuses', async ({ page }) => {
     test.setTimeout(180_000);
     await openHost(page);
