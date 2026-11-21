@@ -132,11 +132,13 @@ import {
  * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
  *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
  *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
- *   the shot otherwise than it did. A camera it solves stays on what it hangs from while that stands
- *   still through the shot, scaled evenly, not mirrored and shown; off one that moves in the shot,
- *   is scaled unevenly or is hidden by its scale there (one only hung: off one that moves), it is
- *   taken off and solved again, with a warning naming what the person hung it from
- *   (rideo/import.ts updateCameraHold);
+ *   the shot otherwise than it did. One only hung counts as set by hand when its shot's cast, camera
+ *   plan or frame size, or the set, changes (kept, with that warning), unless the update solves it
+ *   so: then it is not kept, and only the warning that it was taken off and solved again names it. A
+ *   camera it solves stays on what it hangs from while that stands still through the shot, scaled
+ *   evenly, not mirrored and shown; off one that moves in the shot, is scaled unevenly or is hidden
+ *   by its scale there (one only hung: off one that moves), it is taken off and solved again, with a
+ *   warning naming what the person hung it from (rideo/import.ts updateCameraHold);
  * - cast members the brief no longer stages go; new ones stand on a free mark, shown in their shots
  *   (an actor removed in the desk is staged again only for a shot the update stages or recasts); a
  *   member the brief renames is renamed, unless the desk renamed it (it keeps the desk's name, with a
@@ -352,6 +354,12 @@ export function updateFromBriefIn(
   // what each shot's camera hangs from before any piece is built anew (a camera on the old piece
   // hangs from the new one then): what the warnings name as what the person hung it from
   const hungBefore = cameraParents(doc);
+  // the warnings that keep a shot's camera as set by hand because the shot's cast, camera plan or
+  // frame size, or the set, changed (where in `warnings`, by desk shot): one the person only hung
+  // that the camera loop below solves after all is not kept, and those warnings go
+  const keptByHand = new Map<string, number[]>();
+  const keepByHand = (shot: string, warning: string) =>
+    keptByHand.set(shot, [...(keptByHand.get(shot) ?? []), warnings.push(warning) - 1]);
   const deskBefore = hostShots(doc, sceneId);
   // where what each shot's camera hangs from is at each frame of the shot (hungMotion), and the
   // objects there are, read before anything is built or staged anew: whether that still moves in the
@@ -653,7 +661,8 @@ export function updateFromBriefIn(
     byId.set(d.id, next);
     if (recast || replanned || diff.resized) {
       if (d.camera && staged.get(d.camera) === false) {
-        warnings.push(
+        keepByHand(
+          d.id,
           `${next.name}: its camera was set by hand in the desk and is kept; its ${recast ? 'cast' : replanned ? 'camera plan' : 'frame size'} changed, so check its framing (solve it again with desk.shot_solve)`,
         );
       } else solve.add(d.id);
@@ -762,7 +771,8 @@ export function updateFromBriefIn(
     for (const d of hostShots(doc, sceneId).values()) {
       if (!d.camera || solve.has(d.id)) continue;
       if (staged.get(d.camera) === false)
-        warnings.push(
+        keepByHand(
+          d.id,
           `${d.name}: its camera was set by hand in the desk and is kept; the set changed, so check its framing (solve it again with desk.shot_solve)`,
         );
       else solve.add(d.id);
@@ -864,11 +874,14 @@ export function updateFromBriefIn(
   // it in its space). The update solves one whose shot it solves (a camera still as staged), and one
   // the person only hung (not set by hand: cameraOwnAsStaged) from or under a piece it built anew or
   // staged again that now moves in the shot otherwise than it did: it would ride a motion no one
-  // framed (taken off only when what it hangs from moves in the shot). Any other keeps its hang as the
-  // kept-objects rules (hangKept) left it, on the piece built in place of what it hung from and named
-  // when it no longer follows the animation of what went; one the person set by hand is never solved:
-  // kept with its keys, with a warning when what it hangs from was built anew, staged again or moves
-  // otherwise
+  // framed (taken off only when what it hangs from moves in the shot), also when its shot's cast,
+  // camera plan or frame size, or the set, changed, which kept it as set by hand above: it is not
+  // kept then, and only the warning that it was taken off and solved says what became of it. Any
+  // other keeps its hang as the kept-objects rules (hangKept) left it, on the piece built in place of
+  // what it hung from and named when it no longer follows the animation of what went; one the person
+  // set by hand is never solved: kept with its keys, with a warning when what it hangs from was built
+  // anew, staged again or moves otherwise
+  const notKept = new Set<number>();
   for (const s of desk.values()) {
     const cam = s.camera ? doc.getObject(s.camera) : null;
     if (!cam?.parent) continue;
@@ -888,7 +901,10 @@ export function updateFromBriefIn(
     const now = before?.camera === cam.id ? hungMotion(doc, s) : null;
     const moved = !!before && !!now && !sameMotion(before.worlds, now);
     if (ownCamera.get(cam.id) === true) {
-      if (restaged && moved && updateCameraHold(doc, s, was, warnings, { moving: true })) solve.add(s.id);
+      if (restaged && moved && updateCameraHold(doc, s, was, warnings, { moving: true })) {
+        solve.add(s.id);
+        for (const i of keptByHand.get(s.id) ?? []) notKept.add(i);
+      }
     } else if (restaged || moved) {
       const from = was.id === parent.id || builtNow ? hungFromName(doc, parent, was) : `'${parent.name}'`;
       warnings.push(
@@ -898,6 +914,8 @@ export function updateFromBriefIn(
       );
     }
   }
+  // (from the last, so that the places of the others hold)
+  for (const i of [...notKept].sort((a, b) => b - a)) warnings.splice(i, 1);
   if (solve.size)
     solveShotCameras(briefContext(ctx, warnings), [...solve], {
       enforce_line: false,

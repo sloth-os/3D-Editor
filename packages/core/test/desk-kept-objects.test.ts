@@ -720,6 +720,83 @@ describe('a shot camera the person hung from a prop that a later brief builds an
       "Red balloon: 'Shot 1' no longer follows the animation of 'Red kite'",
     ]);
   });
+
+  it("is taken off and solved with that one warning also when its shot's cast, framing or size or the set changes; kept as set by hand while the new prop stands still", () => {
+    // the meadow as a library set, which an update places in the words' set's stead
+    const src = stagedDoc();
+    const meadow = lib('lib_0123456789mead', 1, unitFrom(src, { kind: 'set', name: 'Meadow' }).ex.data);
+    src.destroy();
+    const both = ['sht_0123456789aaaa', 'sht_0123456789bbbb'];
+    /** Mira alone in the first shot. */
+    const recast = (b: SceneBrief) => {
+      b.shots[0].castIds = [MIRA];
+      b.shots[0].layout = b.shots[0].layout.filter((l) => l.castId === MIRA);
+    };
+    const changes: { what: string; change: (b: SceneBrief) => void; solved: string[]; units?: UnitSource }[] =
+      [
+        { what: 'its cast', change: recast, solved: ['sht_0123456789aaaa'] },
+        {
+          what: 'its framing',
+          change: (b) => (b.shots[0].framing = 'medium'),
+          solved: ['sht_0123456789aaaa'],
+        },
+        {
+          what: 'the frame size',
+          change: (b) => {
+            b.width = 1920;
+            b.height = 1080;
+          },
+          solved: both,
+        },
+        {
+          what: 'the set',
+          change: (b) => (b.set.unit = meadow.pin),
+          solved: both,
+          units: unitSourceOf([meadow.given]),
+        },
+        {
+          what: 'its cast and the set',
+          change: (b) => {
+            recast(b);
+            b.set.unit = meadow.pin;
+          },
+          solved: both,
+          units: unitSourceOf([meadow.given]),
+        },
+      ];
+    /** The kite described anew as a red balloon, which Mira flies when `flies`, with `change` made. */
+    const next = (change: (b: SceneBrief) => void, flies = true) => {
+      const b = retyped(openBrief(), { balloonWords: flies });
+      change(b);
+      return b;
+    };
+    for (const { what, change, solved, units } of changes) {
+      // the camera that never hung, after the same update
+      const ref = stagedDoc();
+      update(ref, next(change), units);
+      const { doc, cam } = cameraOnKite('first');
+      const r = update(doc, next(change), units);
+      // the balloon Mira flies moves in the shot otherwise than the kite did: the update solves the
+      // camera, so it does not keep it as set by hand
+      expect(doc.getObject(cam)!.parent, what).toBeNull();
+      expect(r.solved, what).toEqual(solved);
+      expect(largestGap(firstShotCamera(doc), firstShotCamera(ref)), what).toBeLessThan(1e-9);
+      expect(cameraWarnings(doc, cam, r.warnings), what).toEqual([
+        "Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again",
+      ]);
+      expect(r.warnings.join('\n'), what).not.toMatch(/set by hand/);
+    }
+    // the balloon no one flies stands still: the update does not solve the camera, which counts as
+    // set by hand as its shot's framing changed, kept on the balloon with that warning
+    const { doc, cam } = cameraOnKite('first');
+    const r = update(doc, next(changes[1].change, false));
+    expect(doc.getObject(cam)!.parent).toBe(propOf(doc, KITE).id);
+    expect(r.solved).toEqual([]);
+    expect(cameraWarnings(doc, cam, r.warnings)).toEqual([
+      'Shot 1: its camera was set by hand in the desk and is kept; its camera plan changed, so check its framing (solve it again with desk.shot_solve)',
+      "Red balloon: 'Shot 1' no longer follows the animation of 'Red kite'",
+    ]);
+  });
 });
 
 describe('a shot camera the person hung that a later brief does not solve', () => {
