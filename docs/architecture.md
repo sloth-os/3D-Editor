@@ -1054,13 +1054,24 @@ built again (`buildSet` and `lightSet`, which name nothing when a piece comes ba
 place), a cast member's actor or a shot's camera an update drops, a kite's string flown again, an
 actor a rideo re-import builds anew, and an old look's parts when a figure or the mannequin takes
 their place (insertUnit's `replace`, `restyleActor`); what goes with nothing in its place hangs from
-the set's ground, or from the scene when there is none. A shot's camera the person hung from such a
-piece is then held as a re-import holds a blocked camera (rideo/import.ts `cameraHold`): it stays on
-what it hangs from while that stands still through the shot, scaled evenly, not mirrored and shown;
+the set's ground, or from the scene when there is none. A shot's camera hung from (or under) such a
+piece is held on a re-import as a blocked camera is (rideo/import.ts `cameraHold`): it stays on what
+it hangs from while that stands still through the shot, scaled evenly, not mirrored and shown;
 otherwise it is taken off it, at scale 1, where it stands at the shot's first frame, and placed
-where the clip's blocking has it (a re-import) or solved again (an update, which does the same for a
-hung camera it solves), with a warning that names what the person hung it from (`cameraParents`,
-read before any piece is built anew: `'kite' (built anew as 'balloon')`). An update replaces the
+where the clip's blocking has it. An update holds so only a camera it solves, and solves it again
+(`updateCameraHold`): one still as staged in a shot it solves (a re-import records one it placed in
+its parent's space so), and one the person only hung from or under a piece the update built anew or
+staged again that now moves in the shot otherwise than it did (`hungMotion`, read before any piece
+is built anew and after, compared from the shot's first frame by `sameMotion`), which it takes off
+only when what it hangs from moves in the shot. To tell one only hung, beside a camera's motion
+digest its motion record keeps an `own` one (`cameraOwnDigest`: the digest without its hang, that is
+its parent and the channel values a hang with Keep Transform rewrites, so of its keys, its data's,
+its constraints and what hangs below it), which a hang leaves as recorded (`cameraOwnAsStaged`; a
+camera recorded without it counts as set by hand). Any other camera keeps its hang as `hangKept`
+leaves it; one set by hand is never solved: it keeps its keys (fitted only to a new length of its
+shot), and a warning says to check its framing when what it hangs from was built anew, staged again
+or no longer moves as it did. The warnings name what the person hung it from (`cameraParents`, read
+before any piece is built anew: `'kite' (built anew as 'balloon')`). An update replaces the
 parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it
 keeps parts edited or deleted in the scene, adds new parts at ids of the instance's generation (or
 of the next free one) and removes dropped untouched ones that nothing staying uses (a record that

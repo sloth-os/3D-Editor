@@ -452,31 +452,45 @@ function digestOf(text: string): string {
 /**
  * A digest of what an object does (RIDEO_PROPS.motion): the placement, constraints, pose and
  * animation (its own curves and its data's) of it and of everything parented below it, and a
- * camera's lens. Equal digests: nothing of it was changed.
+ * camera's lens. Equal digests: nothing of it was changed. `hang` false leaves out where `root`
+ * hangs (its parent) and the channel values a hang with Keep Transform rewrites to keep it where it
+ * is (cameraOwnDigest).
  */
-export function motionDigest(doc: SceneDoc, root: string): string {
+export function motionDigest(doc: SceneDoc, root: string, o: { hang?: boolean } = {}): string {
   const parts: unknown[] = [];
   for (const id of subtree(doc, root)) {
-    const o = doc.getObject(id);
-    if (!o) continue;
-    const curves = [...doc.listFCurves(id), ...(o.data ? doc.listFCurves(o.data) : [])]
+    const ob = doc.getObject(id);
+    if (!ob) continue;
+    const curves = [...doc.listFCurves(id), ...(ob.data ? doc.listFCurves(ob.data) : [])]
       .map((fc) => [fcurveKey(fc), fc.keyframes, fc.extrapolation, fc.mute, fc.modifiers ?? null] as const)
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
-    const camera = o.type === 'CAMERA' && o.data ? doc.getCamera(o.data) : null;
+    const camera = ob.type === 'CAMERA' && ob.data ? doc.getCamera(ob.data) : null;
+    const placed = o.hang !== false || id !== root;
     parts.push([
       id,
-      o.parent,
-      o.parent_bone,
-      o.location,
-      o.rotation_euler,
-      o.scale,
-      o.constraints,
-      o.pose ?? null,
+      placed ? ob.parent : null,
+      placed ? ob.parent_bone : null,
+      placed ? ob.location : null,
+      placed ? ob.rotation_euler : null,
+      placed ? ob.scale : null,
+      ob.constraints,
+      ob.pose ?? null,
       curves,
       camera,
     ]);
   }
   return digestOf(JSON.stringify(parts));
+}
+
+/**
+ * A digest of what the person may set on shot camera `id` besides where it hangs: motionDigest with
+ * its parent and the channel values a hang with Keep Transform rewrites left out, so its keys and its
+ * data's (lens, focus), its constraints and camera settings and what hangs below it. RIDEO_PROPS.motion
+ * records it after a camera's motion (recordedMotion's `own`): a camera hung from another object
+ * since whose `own` is as recorded was only hung there, not set by hand (cameraOwnAsStaged).
+ */
+export function cameraOwnDigest(doc: SceneDoc, id: string): string {
+  return motionDigest(doc, id, { hang: false });
 }
 
 /** The transform channels of an object that a hold, a flight or a hide key writes (and the person may key). */
@@ -525,8 +539,9 @@ export function ownKeysDigest(doc: SceneDoc, id: string): string {
 
 /**
  * What RIDEO_PROPS.motion records of an object: `all`, the digest of what it did (motionDigest), and
- * on a prop `own`, the digest of the keys on its own transform channels (ownKeysDigest); null for a
- * part not recorded (`own` of a staging recorded before props had it).
+ * `own`, on a prop the digest of the keys on its own transform channels (ownKeysDigest), on a camera
+ * that of what was set on it besides where it hangs (cameraOwnDigest); null for a part not recorded
+ * (`own` of a staging recorded before props, or cameras, had it).
  */
 export function recordedMotion(o: ObjectData | null | undefined): { all: string | null; own: string | null } {
   const [all, own] = prop(o, RIDEO_PROPS.motion).split(' ');
@@ -535,8 +550,8 @@ export function recordedMotion(o: ObjectData | null | undefined): { all: string 
 
 /**
  * Records on object `id` what the staging left it doing (RIDEO_PROPS.motion): `all` its motion
- * digest, `own` (on a prop) the digest of its own transform channels' keys; a part not asked for keeps
- * what was recorded before.
+ * digest, `own` (on a prop) the digest of its own transform channels' keys, (on a camera) the digest
+ * of what was set on it besides where it hangs; a part not asked for keeps what was recorded before.
  */
 export function recordMotionOf(
   doc: SceneDoc,
@@ -544,11 +559,17 @@ export function recordMotionOf(
   parts: { all: boolean; own: boolean } = { all: true, own: true },
 ): void {
   const o = doc.getObject(id);
-  const isProp = prop(o, DESK_PROPS.role) === 'prop';
-  if (!o || !(parts.all || (parts.own && isProp))) return;
+  const kind = prop(o, DESK_PROPS.role) === 'prop' ? 'prop' : o?.type === 'CAMERA' ? 'camera' : null;
+  if (!o || !(parts.all || (parts.own && kind))) return;
   const was = recordedMotion(o);
   const all = parts.all ? motionDigest(doc, id) : was.all;
-  const own = !isProp ? null : parts.own ? ownKeysDigest(doc, id) : was.own;
+  const own = !kind
+    ? null
+    : !parts.own
+      ? was.own
+      : kind === 'prop'
+        ? ownKeysDigest(doc, id)
+        : cameraOwnDigest(doc, id);
   const value = [all ?? '', ...(own ? [own] : [])].join(' ');
   doc.updateObject(id, { custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: value } });
 }
@@ -561,6 +582,17 @@ export function recordMotionOf(
 export function ownKeysAsStaged(doc: SceneDoc, id: string): boolean {
   const own = recordedMotion(doc.getObject(id)).own;
   return own === null || own === ownKeysDigest(doc, id);
+}
+
+/**
+ * Whether shot camera `id` is as the staging left it but for where it hangs (recordedMotion's `own`:
+ * cameraOwnDigest): false once the person keyed or set it by hand (its keys or its lens's, its
+ * settings, constraints or what hangs below it), and for a camera recorded without it (staged before
+ * cameras had it: then a hang cannot be told from what the person set on it).
+ */
+export function cameraOwnAsStaged(doc: SceneDoc, id: string): boolean {
+  const own = recordedMotion(doc.getObject(id)).own;
+  return own !== null && own === cameraOwnDigest(doc, id);
 }
 
 /** Records on each of `ids` what the import left it doing (RIDEO_PROPS.motion). */
@@ -1679,11 +1711,36 @@ export function cameraParents(doc: SceneDoc): Map<string, HungFrom> {
 }
 
 /**
+ * Where what the camera of `shot` hangs from (its parent, through what is above that) stands in the
+ * world at each frame of the shot, from its first (null: the camera hangs from nothing): read before
+ * a brief update builds or stages anything anew, to tell (sameMotion) whether that still moves in the
+ * shot as it did.
+ */
+export function hungMotion(doc: SceneDoc, shot: ShotData): Mat4[] | null {
+  const cam = shot.camera ? doc.getObject(shot.camera) : null;
+  if (!cam?.parent) return null;
+  const out: Mat4[] = [];
+  for (let f = shot.frame_start; f <= shot.frame_end; f++) out.push(new FrameState(doc, f).parent(cam.id));
+  return out;
+}
+
+/**
+ * Whether two hungMotion readings of a shot agree (sameWorld, to rounding) at each frame from the
+ * shot's first over the frames both hold: a shot made longer or shorter, or moved by a ripple, keeps
+ * the motion of what its camera hangs from when those frames do.
+ */
+export function sameMotion(a: readonly Mat4[], b: readonly Mat4[]): boolean {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (!sameWorld(b[i], a[i])) return false;
+  return true;
+}
+
+/**
  * How a warning names `now`, what a shot's camera hangs from: as the person hung it (`was`, read
  * before anything was built anew), and what was built in its place ("'kite' (built anew as
  * 'balloon')") or what it was renamed ("'Mira' (now 'Mira Jones')").
  */
-function hungFromName(doc: SceneDoc, now: ObjectData, was: HungFrom | undefined): string {
+export function hungFromName(doc: SceneDoc, now: ObjectData, was: HungFrom | undefined): string {
   if (!was || (was.id === now.id && was.name === now.name)) return `'${now.name}'`;
   if (was.id === now.id) return `'${was.name}' (now '${now.name}')`;
   if (doc.getObject(was.id)) return `'${now.name}'`;
@@ -1780,21 +1837,23 @@ function cameraSpace(
 }
 
 /**
- * A brief update's rule for the camera of `shot` (update.ts: one it solves, or one hanging from a
- * piece it built or staged anew): kept on what it hangs from while that stands still through the
- * shot, scaled evenly, not mirrored and shown (cameraHold; a solve keys it in that space, as
- * CameraKeys.pose does); else taken off it (takeCameraOff) for the caller to solve again, and
- * `warnings` says so, naming what the person hung it from (`was`, read before the update built
- * anything anew: hungFromName) and why. Returns whether it was taken off.
+ * A brief update's rule for the camera of `shot`, a camera it solves (update.ts): kept on what it
+ * hangs from while that stands still through the shot, scaled evenly, not mirrored and shown
+ * (cameraHold; a solve keys it in that space, as CameraKeys.pose does); else taken off it
+ * (takeCameraOff) for the caller to solve again, and `warnings` says so, naming what the person hung
+ * it from (`was`, read before the update built anything anew: hungFromName) and why. `moving`: taken
+ * off only when what it hangs from moves in the shot (the update solves it because that now moves
+ * otherwise than it did). Returns whether it was taken off.
  */
 export function updateCameraHold(
   doc: SceneDoc,
   shot: ShotData,
   was: HungFrom | undefined,
   warnings: string[],
+  o: { moving?: boolean } = {},
 ): boolean {
   const hold = cameraHold(doc, shot);
-  if (!hold?.why) return false;
+  if (!hold?.why || (o.moving && hold.why !== 'moves')) return false;
   const from = hungFromName(doc, hold.parent, was);
   takeCameraOff(doc, shot);
   warnings.push(

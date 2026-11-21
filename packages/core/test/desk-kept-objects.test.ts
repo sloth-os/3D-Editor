@@ -3,6 +3,7 @@ import * as Y from 'yjs';
 import { SceneDoc } from '../src/doc/scene-doc';
 import {
   briefChanges,
+  stageBrief,
   unitSourceOf,
   updateFromBrief,
   type BriefUnitPin,
@@ -617,25 +618,33 @@ const largestGap = (a: readonly Mat4[], b: readonly Mat4[]) =>
   Math.max(...a.map((m, i) => Math.max(...m.map((v, k) => Math.abs(v - b[i][k])))));
 
 /**
- * The staged scene with the first shot's camera hung from the kite, where the camera stands in the
- * world at rest (`at` 'rest') or at the shot's first frame ('first').
+ * Hangs the first shot's camera from `parent` where the camera stands in the world at rest (`at`
+ * 'rest') or at the shot's first frame ('first'); returns the camera.
  */
-function cameraOnKite(at: 'rest' | 'first'): { doc: SceneDoc; cam: string } {
-  const doc = stagedDoc();
-  const kite = propOf(doc, KITE).id;
+function hangCamera(doc: SceneDoc, parent: string, at: 'rest' | 'first'): string {
   const s = firstShot(doc);
   const cam = s.camera!;
   const fs = new FrameState(doc, s.frame_start);
   doc.setParent(
     cam,
-    kite,
+    parent,
     true,
     at === 'rest'
-      ? { world: doc.worldMatrix(cam), parentWorld: doc.worldMatrix(kite) }
-      : { world: fs.world(cam)!, parentWorld: fs.world(kite)! },
+      ? { world: doc.worldMatrix(cam), parentWorld: doc.worldMatrix(parent) }
+      : { world: fs.world(cam)!, parentWorld: fs.world(parent)! },
   );
-  return { doc, cam };
+  return cam;
 }
+
+/** The staged scene with the first shot's camera hung from the kite (hangCamera). */
+function cameraOnKite(at: 'rest' | 'first'): { doc: SceneDoc; cam: string } {
+  const doc = stagedDoc();
+  return { doc, cam: hangCamera(doc, propOf(doc, KITE).id, at) };
+}
+
+/** The warnings that speak of the first shot's camera `cam`: by what it is, or by its name. */
+const cameraWarnings = (doc: SceneDoc, cam: string, warnings: readonly string[]) =>
+  warnings.filter((w) => /camera/.test(w) || w.includes(`'${doc.getObject(cam)!.name}'`));
 
 describe('a shot camera the person hung from a prop that a later brief builds anew', () => {
   it('is taken off the new prop that flies in the shot and solved again, where the camera that never hung is', () => {
@@ -666,6 +675,132 @@ describe('a shot camera the person hung from a prop that a later brief builds an
     expect(largestGap(firstShotCamera(doc), firstShotCamera(ref))).toBeLessThan(1e-9);
     expect(r.warnings.filter((w) => w.includes('took it off'))).toEqual([]);
     expect(r.solved).toEqual([]);
+
+    // hung where it stood at the shot's first frame, from the kite in flight: the update does not
+    // solve it, as the balloon stands still in the shot (one only hung is solved off a piece built
+    // anew that moves), so it keeps the hang the kept-objects rule gives it, on the balloon where it
+    // was in the world at rest, named as no longer following the kite's flight
+    const first = cameraOnKite('first');
+    const atRest = restWorld(first.doc, first.cam);
+    const r2 = update(first.doc, retyped(openBrief()));
+    expect(first.doc.getObject(first.cam)!.parent).toBe(propOf(first.doc, KITE).id);
+    sameWorld(restWorld(first.doc, first.cam), atRest);
+    expect(r2.solved).toEqual([]);
+    expect(cameraWarnings(first.doc, first.cam, r2.warnings)).toEqual([
+      "Red balloon: 'Shot 1' no longer follows the animation of 'Red kite'",
+    ]);
+  });
+});
+
+describe('a shot camera the person hung that a later brief does not solve', () => {
+  it('keeps its hang and its path when what it hangs from is restyled, renamed, unpinned or flown again, or moves alike', () => {
+    // the kite as a library unit, for a staging that pins it and an update that unpins it
+    const src = stagedDoc();
+    const unit = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id, name: 'Red kite' });
+    src.destroy();
+    const kite = lib('lib_0123456789kite', 1, unit.ex.data);
+    const units = () => unitSourceOf([kite.given]);
+    const brief = (edit: (b: SceneBrief, kite: SceneBrief['elements'][number]) => void = () => {}) => {
+      const b = openBrief();
+      const k = b.elements.find((e) => e.id === KITE)!;
+      edit(b, k);
+      return b;
+    };
+    const onKite = (doc: SceneDoc) => propOf(doc, KITE).id;
+    const cases: {
+      what: string;
+      doc: () => SceneDoc;
+      hangFrom: (doc: SceneDoc) => string;
+      next: SceneBrief;
+      units?: UnitSource;
+    }[] = [
+      {
+        what: 'the kite restyled',
+        doc: () => stagedDoc(),
+        hangFrom: onKite,
+        next: brief((_, k) => (k.description = 'A blue diamond kite with a long tail.')),
+      },
+      {
+        what: 'the kite renamed, its shot longer',
+        doc: () => stagedDoc(),
+        hangFrom: onKite,
+        next: brief((b, k) => {
+          k.name = 'Big kite';
+          b.shots[0].durationSec += 1;
+        }),
+      },
+      {
+        what: 'the kite unpinned to the words',
+        doc: () => {
+          const d = SceneDoc.create({ empty: true });
+          const pinned = brief((_, k) => (k.unit = kite.pin));
+          stageBrief(d, pinned, { units: units() });
+          return d;
+        },
+        hangFrom: onKite,
+        next: brief(),
+        units: units(),
+      },
+      {
+        what: 'the kite flown again for a longer shot',
+        doc: () => stagedDoc(),
+        hangFrom: onKite,
+        next: brief((b) => (b.shots[0].durationSec += 1)),
+      },
+      {
+        what: "a rig of the person's, keyed, under a held ball built anew and held alike",
+        doc: () => stagedDoc(heldBall(openBrief(), 'Red ball', 'A small red rubber ball.')),
+        hangFrom: (d) => {
+          // an empty half a metre above the ball, keyed to slide 2 m aside as Mira carries it
+          let rig = '';
+          d.transact(() => {
+            rig = d.addObject({
+              type: 'EMPTY',
+              name: 'Rig',
+              parent: propOf(d, KITE).id,
+              location: [0, 0, 0.5],
+              rotation_euler: [0, 0, 0],
+              scale: [1, 1, 1],
+            });
+          });
+          keyed(d, rig, 'location', 0, [0, 1, 2]);
+          return rig;
+        },
+        next: heldBall(openBrief(), 'Blue ball', 'A small blue rubber ball.'),
+      },
+    ];
+    for (const c of cases) {
+      const doc = c.doc();
+      const from = c.hangFrom(doc);
+      const cam = hangCamera(doc, from, 'first');
+      const before = firstShotCamera(doc);
+      const r = update(doc, c.next, c.units);
+      // on what the person hung it from, or (the kite unpinned) on the prop built in its place
+      expect(doc.getObject(cam)!.parent, c.what).toBe(doc.getObject(from) ? from : onKite(doc));
+      // over the frames the shot had: where it is, frame by frame, is where it was
+      expect(largestGap(before, firstShotCamera(doc)), c.what).toBeLessThan(1e-9);
+      expect(r.solved, c.what).toEqual([]);
+      expect(cameraWarnings(doc, cam, r.warnings), c.what).toEqual([]);
+    }
+  });
+});
+
+describe('a shot camera the person hung from a prop and keyed by hand', () => {
+  it('is never taken off or solved: kept with its keys on the prop built anew, and the warning says to check its framing', () => {
+    const { doc, cam } = cameraOnKite('first');
+    // the person keys the camera half a metre aside ten frames into the shot
+    const f = firstShot(doc).frame_start + 10;
+    keyMore(doc, cam, 'location', 0, [[f, new FrameState(doc, f).local(cam)[12] + 0.5]]);
+    const keys = JSON.stringify(doc.listFCurves(cam));
+    const r = update(doc, retyped(openBrief(), { balloonWords: true }));
+    // the balloon flies in the shot otherwise than the kite did
+    expect(prop(propOf(doc, KITE), 'desk_tether_flights')).toBeTruthy();
+    expect(doc.getObject(cam)!.parent).toBe(propOf(doc, KITE).id);
+    expect(JSON.stringify(doc.listFCurves(cam))).toBe(keys);
+    expect(r.solved).toEqual([]);
+    expect(cameraWarnings(doc, cam, r.warnings)).toEqual([
+      "Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite' (built anew as 'Red balloon'), no longer moves as it did, so check its framing (solve it again with desk.shot_solve)",
+    ]);
   });
 });
 

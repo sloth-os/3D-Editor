@@ -16,7 +16,7 @@ import { readInstance, unitOf } from '../units/list';
 import { viewTarget } from '../moves';
 import { blueprintFor, posedBones, posesOf, requireBuiltKind } from '../characters/kinds';
 import { footprint, restSize, type PartsOf } from './footprint';
-import { RIDEO_PROPS, motionDigest, rideoHeightRatio, type RideoOffstage } from './import';
+import { RIDEO_PROPS, motionDigest, recordedMotion, rideoHeightRatio, type RideoOffstage } from './import';
 import { rideoPose } from './rules';
 import {
   RIDEO_BLOCKING_PALETTE,
@@ -587,13 +587,14 @@ function heightRatioOf(kind: string): number {
 
 /**
  * rideo's own blocked camera of a shot, as the import placed it (RIDEO_PROPS.camera), while the
- * camera is as the import left it (RIDEO_PROPS.motion); null once it was moved, keyed or solved again.
+ * camera is as the import left it (RIDEO_PROPS.motion's `all`); null once it was moved, keyed or
+ * solved again.
  */
 function importedCamera(doc: SceneDoc, s: ShotData): RideoBlockingShot['camera'] | null {
   const o = s.camera ? doc.getObject(s.camera) : null;
   const text = o?.custom_props?.[RIDEO_PROPS.camera];
-  const recorded = o?.custom_props?.[RIDEO_PROPS.motion];
-  if (!o || typeof text !== 'string' || typeof recorded !== 'string') return null;
+  const recorded = recordedMotion(o).all;
+  if (!o || typeof text !== 'string' || recorded === null) return null;
   if (!s.external?.shot) return null;
   if (motionDigest(doc, o.id) !== recorded) return null;
   try {

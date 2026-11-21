@@ -1,5 +1,6 @@
 import type { SceneDoc } from '../../doc/scene-doc';
 import type { DeskLayoutEntry, ObjectData, ShotData } from '../../doc/types';
+import type { Mat4 } from '../../math/types';
 import { OperatorError, type OperatorContext } from '../../operators/context';
 import { solveShotCameras } from '../../operators/desk-shots';
 import { checkShots } from '../checks';
@@ -23,6 +24,7 @@ import {
   RIDEO_PROPS,
   buildLandmark,
   buildProp,
+  cameraOwnAsStaged,
   cameraParents,
   dropTether,
   flyProp,
@@ -30,6 +32,8 @@ import {
   hangOnGround,
   hiddenSpans,
   holderSpans,
+  hungFromName,
+  hungMotion,
   motionDigest,
   ownKeysAsStaged,
   parseRideoBlocking,
@@ -37,6 +41,7 @@ import {
   recordMotionOf,
   recordedMotion,
   rideoHeightRatio,
+  sameMotion,
   shotMove,
   tetherPartsOf,
   updateCameraHold,
@@ -121,12 +126,17 @@ import {
  * - a shot whose camera plan changed (framing, movement, lens, move, layout, continuity; a lens or move
  *   the host gives back as staged is no change), or every shot when the render size changed, has its
  *   camera solved again;
- * - a camera set by hand in the desk is never solved again: the update keeps it and warns;
- * - a shot's camera the person hung from another object stays on it while that object stands still
- *   through the shot, scaled evenly, not mirrored and shown; hung from a piece the update builds
- *   anew or stages again (or one it solves) that moves in the shot, is scaled unevenly or is hidden
- *   by its scale there, it is taken off it and solved again, with a warning naming what the person
- *   hung it from (rideo/import.ts updateCameraHold);
+ * - a camera set by hand in the desk is never solved again: the update keeps it and its keys (fitted
+ *   only to a new length of its shot) and warns (one hung from or under another object also when
+ *   what it hangs from was built anew, staged again or no longer moves in the shot as it did);
+ * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
+ *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
+ *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
+ *   the shot otherwise than it did. A camera it solves stays on what it hangs from while that stands
+ *   still through the shot, scaled evenly, not mirrored and shown; off one that moves in the shot,
+ *   is scaled unevenly or is hidden by its scale there (one only hung: off one that moves), it is
+ *   taken off and solved again, with a warning naming what the person hung it from
+ *   (rideo/import.ts updateCameraHold);
  * - cast members the brief no longer stages go; new ones stand on a free mark, shown in their shots
  *   (an actor removed in the desk is staged again only for a shot the update stages or recasts); a
  *   member the brief renames is renamed, unless the desk renamed it (it keeps the desk's name, with a
@@ -322,8 +332,15 @@ export function updateFromBriefIn(
   const actors = stagedActors(doc, sceneId);
   const props = stagedBy(doc, 'prop', sceneId, (o) => o.custom_props?.[DESK_PROPS.elementId]);
   const staged = new Map<string, boolean>();
+  // whether each shot's camera is as the staging left it but for where the person hung it (its keys,
+  // lens and settings: cameraOwnAsStaged), read before a ripple or a kept hang moves its keys: one
+  // the person only hung from another object was not set by hand
+  const ownCamera = new Map<string, boolean>();
   for (const s of hostShots(doc, sceneId).values())
-    if (s.camera) staged.set(s.camera, asStaged(doc, s.camera));
+    if (s.camera) {
+      staged.set(s.camera, asStaged(doc, s.camera));
+      ownCamera.set(s.camera, cameraOwnAsStaged(doc, s.camera));
+    }
   for (const o of [...actors.values(), ...props.values()]) staged.set(o.id, asStaged(doc, o.id));
   // whether each prop's own transform channels carry only the keys the staging wrote, read before
   // anything moves them (a ripple below shifts the staging's keys and the person's alike): a prop the
@@ -336,6 +353,15 @@ export function updateFromBriefIn(
   // hangs from the new one then): what the warnings name as what the person hung it from
   const hungBefore = cameraParents(doc);
   const deskBefore = hostShots(doc, sceneId);
+  // where what each shot's camera hangs from is at each frame of the shot (hungMotion), and the
+  // objects there are, read before anything is built or staged anew: whether that still moves in the
+  // shot as it did, and which piece the update built in the place of what a camera hung from
+  const motionBefore = new Map<string, { camera: string; worlds: Mat4[] }>();
+  for (const s of deskBefore.values()) {
+    const worlds = hungMotion(doc, s);
+    if (worlds) motionBefore.set(s.id, { camera: s.camera!, worlds });
+  }
+  const objectsBefore = new Set(motionBefore.size ? doc.listObjects().map((o) => o.id) : []);
   // the shots past the scene's last frame (a range the person shortened in the desk stays so)
   const sceneEnd = doc.getScene().frame_end;
   const pastEnd = new Set(getShots(doc).flatMap((s) => (s.frame_end > sceneEnd ? [s.id] : [])));
@@ -831,19 +857,46 @@ export function updateFromBriefIn(
   }
 
   // ------------------------------------------------------------ cameras, motion records, checks
-  // a shot's camera the person hung from another object, when this update solves it or built anew or
-  // staged again what it hangs from: off that object when it moves in the shot, is scaled unevenly or
-  // is hidden there, and solved again in the world, as a re-import places it where the blocking has
-  // it (rideo/import.ts updateCameraHold); on one that stands still, evenly scaled, it stays (a solve
-  // keys it in that object's space)
+  // a shot's camera hung from (or under) another object is taken off it only when this update solves
+  // it: solveShotCameras keys it in that object's space, between whose keys it would drift if that
+  // moves (rideo/import.ts updateCameraHold, which takes it off one that moves in the shot, is scaled
+  // unevenly or is hidden there; on one that stands still, evenly scaled, it stays and the solve keys
+  // it in its space). The update solves one whose shot it solves (a camera still as staged), and one
+  // the person only hung (not set by hand: cameraOwnAsStaged) from or under a piece it built anew or
+  // staged again that now moves in the shot otherwise than it did: it would ride a motion no one
+  // framed (taken off only when what it hangs from moves in the shot). Any other keeps its hang as the
+  // kept-objects rules (hangKept) left it, on the piece built in place of what it hung from and named
+  // when it no longer follows the animation of what went; one the person set by hand is never solved:
+  // kept with its keys, with a warning when what it hangs from was built anew, staged again or moves
+  // otherwise
   for (const s of desk.values()) {
     const cam = s.camera ? doc.getObject(s.camera) : null;
     if (!cam?.parent) continue;
-    const rehung =
-      hungBefore.get(cam.id)?.id !== cam.parent ||
-      [...restagedProps].some((root) => root !== cam.id && doc.isAncestor(root, cam.id));
-    if ((solve.has(s.id) || rehung) && updateCameraHold(doc, s, hungBefore.get(cam.id), warnings))
-      solve.add(s.id);
+    const was = hungBefore.get(cam.id);
+    if (solve.has(s.id)) {
+      updateCameraHold(doc, s, was, warnings);
+      continue;
+    }
+    if (!was) continue;
+    const parent = doc.getObject(cam.parent)!;
+    // what it hangs from is a piece built in the place of what the person hung it from, or it hangs
+    // under one this update built anew or staged again
+    const builtNow = was.id !== parent.id && !objectsBefore.has(parent.id);
+    const restaged =
+      builtNow || [...restagedProps].some((root) => root !== cam.id && doc.isAncestor(root, cam.id));
+    const before = motionBefore.get(s.id);
+    const now = before?.camera === cam.id ? hungMotion(doc, s) : null;
+    const moved = !!before && !!now && !sameMotion(before.worlds, now);
+    if (ownCamera.get(cam.id) === true) {
+      if (restaged && moved && updateCameraHold(doc, s, was, warnings, { moving: true })) solve.add(s.id);
+    } else if (restaged || moved) {
+      const from = was.id === parent.id || builtNow ? hungFromName(doc, parent, was) : `'${parent.name}'`;
+      warnings.push(
+        `${s.name}: its camera was set by hand in the desk and is kept; what it hangs from, ${from}, ${
+          moved ? 'no longer moves as it did' : 'was staged anew'
+        }, so check its framing (solve it again with desk.shot_solve)`,
+      );
+    }
   }
   if (solve.size)
     solveShotCameras(briefContext(ctx, warnings), [...solve], {
@@ -851,8 +904,12 @@ export function updateFromBriefIn(
       fit_plan: true,
       keep_lens: false,
     });
+  // a camera the person only hung keeps its own record as the staging's (a ripple or its kept hang
+  // may have moved its keys); one they set by hand stays theirs
   for (const s of desk.values())
     if (s.camera && (solve.has(s.id) || staged.get(s.camera) === true)) recordMotion(doc, s.camera);
+    else if (s.camera && ownCamera.get(s.camera) === true)
+      recordMotionOf(doc, s.camera, { all: false, own: true });
   for (const o of actors.values())
     if (doc.getObject(o.id) && staged.get(o.id) !== false) recordMotion(doc, o.id);
   // a prop's own keys are the staging's when they were at the start (a ripple moved them with the
