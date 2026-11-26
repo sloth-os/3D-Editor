@@ -1076,6 +1076,55 @@ describe('a shot camera the person hung that a later brief does not solve', () =
   });
 });
 
+describe('a shot camera the person keyed by hand', () => {
+  it('is kept with its keys and warned of each change that would have solved it, in order: its cast and the set, or its frame size and the set', () => {
+    // the meadow as a library set, which an update places in the words' set's stead
+    const src = stagedDoc();
+    const meadow = lib('lib_0123456789mead', 1, unitFrom(src, { kind: 'set', name: 'Meadow' }).ex.data);
+    src.destroy();
+    const kept = (what: string) =>
+      `Shot 1: its camera was set by hand in the desk and is kept; ${what} changed, so check its framing (solve it again with desk.shot_solve)`;
+    const changes: { what: string; change: (b: SceneBrief) => void; warnings: string[] }[] = [
+      {
+        what: 'the cast and the set',
+        change: (b) => {
+          b.shots[0].castIds = [MIRA];
+          b.shots[0].layout = b.shots[0].layout.filter((l) => l.castId === MIRA);
+          b.set.unit = meadow.pin;
+        },
+        warnings: [kept('its cast'), kept('the set')],
+      },
+      {
+        what: 'the frame size and the set',
+        change: (b) => {
+          b.width = 1920;
+          b.height = 1080;
+          b.set.unit = meadow.pin;
+        },
+        warnings: [kept('its frame size'), kept('the set')],
+      },
+    ];
+    for (const { what, change, warnings } of changes) {
+      const doc = stagedDoc();
+      const cam = firstShot(doc).camera!;
+      // the person keys the camera half a metre aside ten frames into the shot
+      const f = firstShot(doc).frame_start + 10;
+      keyMore(doc, cam, 'location', 0, [[f, new FrameState(doc, f).local(cam)[12] + 0.5]]);
+      const keys = JSON.stringify(doc.listFCurves(cam));
+      const next = openBrief();
+      change(next);
+      const r = update(doc, next, unitSourceOf([meadow.given]));
+      // the second shot's camera, still as staged, is solved again; the first one's stays the person's
+      expect(r.solved, what).toEqual(['sht_0123456789bbbb']);
+      expect(JSON.stringify(doc.listFCurves(cam)), what).toBe(keys);
+      expect(
+        r.warnings.filter((w) => w.includes('set by hand')),
+        what,
+      ).toEqual(warnings);
+    }
+  });
+});
+
 describe('a shot camera the person hung from a prop and keyed by hand', () => {
   it('is never taken off or solved: kept with its keys on the prop built anew, and the warning says to check its framing', () => {
     const { doc, cam } = cameraOnKite('first');
