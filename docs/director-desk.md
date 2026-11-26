@@ -595,24 +595,27 @@ and no other shot's keys are cut:
   and where it stands) keeps its hang unless the update solves it. The update solves it when what it
   hangs from, or what is above that, is a piece the update built anew or staged again that now moves
   in the shot, and otherwise than it did: left there it would ride a motion no one framed. It is
-  solved so, with only the warning below, also when its shot's cast, camera plan or frame size
-  changes or the set changes; when it is not, such a change makes it count as set by hand (kept,
-  with the warning above). A camera the update solves (that one, or a hung one still as
-  staged in a shot it solves, as a rideo re-import leaves a camera it placed in its parent's space)
-  stays on what it hangs from while that stands still through the shot, scaled evenly, not mirrored
-  and shown (the solve keys it in that space); off one that moves in the shot, is scaled unevenly,
-  skewed or mirrored, or is hidden by its scale there, it is taken off, at scale 1, where it stands
-  at the shot's first frame, and solved again, and a warning names what the person hung it from and
-  why:
+  solved so also when its shot's cast, camera plan or frame size changes or the set changes, and
+  then the warning that it is kept as set by hand (above) does not name it: the one below, that the
+  update took it off and solved it again, does. When it is not solved, such a change makes it count
+  as set by hand (kept, with the warning above). A camera the update solves (that one, or a hung
+  one still as staged in a shot it solves, as a rideo re-import leaves a camera it placed in its
+  parent's space) stays on what it hangs from while that stands still through the shot, scaled
+  evenly, not mirrored and shown (the solve keys it in that space); off one that moves in the shot,
+  is scaled unevenly, skewed or mirrored, or is hidden by its scale there, it is taken off, at scale
+  1, where it stands at the shot's first frame, and solved again, and a warning names what the
+  person hung it from and why:
   `Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again`.
   One taken off that other shots use too (the brief's or the desk's own) is solved again for each
   of them, as their keys on it were in the space of what it hung from as well: none of them keeps
   the warning that it is kept as set by hand, and the one warning names them all
   (`…; the update took it off 'Red balloon' and solved it again, also for Shot 2, which uses the same camera`).
   A camera the update does not solve stays on what it hangs from, or on the piece built in its place
-  where it was in the world at rest (as what the person put on a piece built anew, below), and is
-  named when it no longer follows the animation of what went
-  (`Red balloon: 'Shot 1' no longer follows the animation of 'Red kite'`);
+  where it was in the world at rest (as what the person put on a piece built anew, below). Solved
+  or not, the camera, or the object of the person's it hangs under, is also named as no longer
+  following the animation of what went when what takes the piece's place does not move alike (the
+  rule for what the person put on a piece built anew, below), as when another holder now flies the
+  prop it hung from (`Red balloon: 'Shot 1' no longer follows the animation of 'Red kite'`);
 - cast members the brief drops go; new ones stand on a free spot of the front row, shown in their
   shots; one the brief renames is renamed, also one whose name was made unique (`Guard.001` beside
   another `Guard`: the record keeps the name the desk gave each actor), while one the desk renamed
