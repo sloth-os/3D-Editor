@@ -1841,24 +1841,28 @@ function cameraSpace(
  * hangs from while that stands still through the shot, scaled evenly, not mirrored and shown
  * (cameraHold; a solve keys it in that space, as CameraKeys.pose does); else taken off it
  * (takeCameraOff) for the caller to solve again, and `warnings` says so, naming what the person hung
- * it from (`was`, read before the update built anything anew: hungFromName) and why. `moving`: taken
- * off only when what it hangs from moves in the shot (the update solves it because that now moves
- * otherwise than it did). Returns whether it was taken off.
+ * it from (`was`, read before the update built anything anew: hungFromName) and why, and the other
+ * shots that use the camera (`also`, their names: the caller solves it again for them too).
+ * `moving`: taken off only when what it hangs from moves in the shot (the update solves it because
+ * that now moves otherwise than it did). Returns whether it was taken off.
  */
 export function updateCameraHold(
   doc: SceneDoc,
   shot: ShotData,
   was: HungFrom | undefined,
   warnings: string[],
-  o: { moving?: boolean } = {},
+  o: { moving?: boolean; also?: readonly string[] } = {},
 ): boolean {
   const hold = cameraHold(doc, shot);
   if (!hold?.why || (o.moving && hold.why !== 'moves')) return false;
   const from = hungFromName(doc, hold.parent, was);
   takeCameraOff(doc, shot);
+  const also = o.also ?? [];
+  const others = also.length > 1 ? `${also.slice(0, -1).join(', ')} and ${also[also.length - 1]}` : also[0];
   warnings.push(
     `${shot.name}: its camera hung from ${from}, which ${UNSTEADY[hold.why]}; ` +
-      `the update took it off '${hold.parent.name}' and solved it again`,
+      `the update took it off '${hold.parent.name}' and solved it again` +
+      (also.length ? `, also for ${others}, which ${also.length > 1 ? 'use' : 'uses'} the same camera` : ''),
   );
   return true;
 }

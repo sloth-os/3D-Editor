@@ -605,6 +605,10 @@ and no other shot's keys are cut:
   at the shot's first frame, and solved again, and a warning names what the person hung it from and
   why:
   `Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again`.
+  One taken off that other shots use too (the brief's or the desk's own) is solved again for each
+  of them, as their keys on it were in the space of what it hung from as well: none of them keeps
+  the warning that it is kept as set by hand, and the one warning names them all
+  (`…; the update took it off 'Red balloon' and solved it again, also for Shot 2, which uses the same camera`).
   A camera the update does not solve stays on what it hangs from, or on the piece built in its place
   where it was in the world at rest (as what the person put on a piece built anew, below), and is
   named when it no longer follows the animation of what went

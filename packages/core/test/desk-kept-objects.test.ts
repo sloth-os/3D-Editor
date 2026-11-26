@@ -13,15 +13,19 @@ import {
   type UnitSource,
 } from '../src/desk/brief';
 import { BRIEF_RECORD_KEY } from '../src/desk/brief/record';
+import { docContext } from '../src/desk/brief/stage';
 import { sha256Hex } from '../src/desk/container';
-import { getShots } from '../src/desk/shots';
+import { recordMotionOf } from '../src/desk/rideo/import';
+import { getShots, newShotId, setShots } from '../src/desk/shots';
 import { readInstance } from '../src/desk/units';
 import { restParentWorld, restWorld } from '../src/desk/units/remove';
 import { FrameState } from '../src/eval/frame-state';
 import { insertKeyframe } from '../src/anim/fcurve';
 import { identity4, invert4, multiply4 } from '../src/math/mat4';
 import type { Mat4, Vec3 } from '../src/math/types';
+import type { ShotData } from '../src/doc/types';
 import { createCube } from '../src/mesh/primitives';
+import { solveShotCameras } from '../src/operators/desk-shots';
 import { KITE, MIRA, PIP, actorOf, openBrief, prop, propOf, stagedDoc, unitFrom } from './desk-units-helpers';
 import { MUM, SAM, importClip, kiteClip } from './desk-rideo-fixtures';
 
@@ -602,16 +606,22 @@ describe('keys of the person on a prop the staging holds or flies, which go with
   });
 });
 
-/** The brief's first shot as the desk has it. */
-const firstShot = (doc: SceneDoc) => getShots(doc).find((s) => s.external?.shot === 'sht_0123456789aaaa')!;
+/** The brief's shot `host` as the desk has it. */
+const shotOf = (doc: SceneDoc, host: string) => getShots(doc).find((s) => s.external?.shot === host)!;
 
-/** The world matrix of the first shot's camera at every frame of the shot. */
-function firstShotCamera(doc: SceneDoc): Mat4[] {
-  const s = firstShot(doc);
+/** The brief's first shot as the desk has it. */
+const firstShot = (doc: SceneDoc) => shotOf(doc, 'sht_0123456789aaaa');
+
+/** The world matrix of the camera of the brief's shot `host` at every frame of the shot. */
+function shotCamera(doc: SceneDoc, host: string): Mat4[] {
+  const s = shotOf(doc, host);
   const out: Mat4[] = [];
   for (let f = s.frame_start; f <= s.frame_end; f++) out.push(new FrameState(doc, f).world(s.camera!)!);
   return out;
 }
+
+/** The world matrix of the first shot's camera at every frame of the shot. */
+const firstShotCamera = (doc: SceneDoc) => shotCamera(doc, 'sht_0123456789aaaa');
 
 /** The largest difference between two lists of world matrices, entry by entry (axes as they are). */
 const largestGap = (a: readonly Mat4[], b: readonly Mat4[]) =>
@@ -796,6 +806,147 @@ describe('a shot camera the person hung from a prop that a later brief builds an
       'Shot 1: its camera was set by hand in the desk and is kept; its camera plan changed, so check its framing (solve it again with desk.shot_solve)',
       "Red balloon: 'Shot 1' no longer follows the animation of 'Red kite'",
     ]);
+  });
+
+  it('that another shot uses too is taken off and solved again for both shots when the size or the set changes, its one warning naming both', () => {
+    // the meadow as a library set, which an update places in the words' set's stead
+    const src = stagedDoc();
+    const meadow = lib('lib_0123456789mead', 1, unitFrom(src, { kind: 'set', name: 'Meadow' }).ex.data);
+    src.destroy();
+    const both = ['sht_0123456789aaaa', 'sht_0123456789bbbb'];
+    /** The staged scene with the second shot shooting with the first shot's camera. */
+    const sharing = () => {
+      const doc = stagedDoc();
+      const cam = firstShot(doc).camera!;
+      setShots(
+        doc,
+        getShots(doc).map((s) => (s.external?.shot === both[1] ? { ...s, camera: cam } : s)),
+      );
+      return doc;
+    };
+    /** The camera's world matrices over each of the two shots. */
+    const paths = (doc: SceneDoc) => both.map((host) => shotCamera(doc, host));
+    const changes: { what: string; change: (b: SceneBrief) => void; units?: UnitSource }[] = [
+      {
+        what: 'the frame size',
+        change: (b) => {
+          b.width = 1920;
+          b.height = 1080;
+        },
+      },
+      { what: 'the set', change: (b) => (b.set.unit = meadow.pin), units: unitSourceOf([meadow.given]) },
+    ];
+    for (const { what, change, units } of changes) {
+      /** The kite described anew as a red balloon Mira flies, with `change` made. */
+      const next = () => {
+        const b = retyped(openBrief(), { balloonWords: true });
+        change(b);
+        return b;
+      };
+      // the camera both shots use, never hung, after the same update: solved for both
+      const ref = sharing();
+      expect(update(ref, next(), units).solved, what).toEqual(both);
+      const doc = sharing();
+      const cam = hangCamera(doc, propOf(doc, KITE).id, 'first');
+      const hung = {
+        cam: doc.getObject(cam),
+        keys: doc.listFCurves(cam),
+        shots: getShots(doc),
+        paths: paths(doc),
+      };
+      const undo = undoOf(doc);
+      const r = update(doc, next(), units);
+      // the balloon Mira flies moves in the first shot otherwise than the kite did: the camera comes
+      // off it and is solved again for each shot that uses it, as the camera that never hung is
+      expect(doc.getObject(cam)!.parent, what).toBeNull();
+      expect(r.solved, what).toEqual(both);
+      const solved = paths(doc);
+      paths(ref).forEach((p, i) =>
+        expect(largestGap(solved[i], p), `${what}: ${both[i]}`).toBeLessThan(1e-9),
+      );
+      expect(cameraWarnings(doc, cam, r.warnings), what).toEqual([
+        "Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again, also for Shot 2, which uses the same camera",
+      ]);
+      expect(r.warnings.join('\n'), what).not.toMatch(/set by hand/);
+      // one undo step puts the hang back as it was
+      undo.undo();
+      expect(doc.getObject(cam), what).toEqual(hung.cam);
+      expect(doc.listFCurves(cam), what).toEqual(hung.keys);
+      expect(getShots(doc), what).toEqual(hung.shots);
+      paths(doc).forEach((p, i) => expect(largestGap(p, hung.paths[i]), `${what}: ${both[i]}`).toBe(0));
+    }
+  });
+
+  it("still as staged on a rig scaled unevenly, is taken off for the shot the update solves and solved again for every other shot that uses it, the brief's or the desk's own", () => {
+    const doc = stagedDoc();
+    const cam = firstShot(doc).camera!;
+    const second = shotOf(doc, 'sht_0123456789bbbb');
+    // the second shot, and a cutaway of the desk's own after it, shoot with the first shot's camera
+    const cutaway: ShotData = {
+      ...second,
+      id: newShotId(),
+      name: 'Cutaway',
+      camera: cam,
+      frame_start: second.frame_end + 1,
+      frame_end: second.frame_end + 24,
+      notes: '',
+      layout: [],
+      external: null,
+    };
+    setShots(doc, [...getShots(doc).map((s) => (s.id === second.id ? { ...s, camera: cam } : s)), cutaway]);
+    doc.updateScene({ frame_end: cutaway.frame_end });
+    // hung from a dolly of the person's at the scene's root, recorded as staged there, as a rideo
+    // re-import leaves a camera it placed in its parent's space
+    let dolly = '';
+    doc.transact(() => {
+      dolly = doc.addObject({
+        type: 'EMPTY',
+        name: 'Dolly',
+        parent: null,
+        location: [0, -3, 0.5],
+        rotation_euler: [0, 0, 0],
+        scale: [1, 1.3, 0.8],
+      });
+    });
+    hangCamera(doc, dolly, 'first');
+    recordMotionOf(doc, cam);
+    const ids = getShots(doc).map((s) => s.id);
+    /** The camera's world matrices over each shot that uses it. */
+    const paths = (d: SceneDoc) =>
+      getShots(d).map((s) => {
+        const out: Mat4[] = [];
+        for (let f = s.frame_start; f <= s.frame_end; f++) out.push(new FrameState(d, f).world(cam)!);
+        return out;
+      });
+    const hung = {
+      cam: doc.getObject(cam),
+      keys: doc.listFCurves(cam),
+      shots: getShots(doc),
+      paths: paths(doc),
+    };
+    const undo = undoOf(doc);
+    // the brief changes the first shot's framing alone: the update solves that shot, off the dolly
+    const b = openBrief();
+    b.shots[0].framing = 'medium';
+    const r = update(doc, b);
+    expect(doc.getObject(cam)!.parent).toBeNull();
+    expect(doc.getObject(cam)!.scale).toEqual([1, 1, 1]);
+    // the report lists the brief's shots it solved; the cutaway is solved too, and named
+    expect(r.solved).toEqual(['sht_0123456789aaaa', 'sht_0123456789bbbb']);
+    expect(cameraWarnings(doc, cam, r.warnings)).toEqual([
+      "Shot 1: its camera hung from 'Dolly', which is scaled unevenly or mirrored; the update took it off 'Dolly' and solved it again, also for Shot 2 and Cutaway, which use the same camera",
+    ]);
+    // each shot is where a solve puts it: solving them all again moves none of them
+    const solved = paths(doc);
+    const again = SceneDoc.fromUpdate(doc.encodeState());
+    solveShotCameras(docContext(again), ids, { enforce_line: false, fit_plan: true, keep_lens: false });
+    paths(again).forEach((p, i) => expect(largestGap(p, solved[i]), ids[i]).toBeLessThan(1e-9));
+    // one undo step puts the hang back as it was
+    undo.undo();
+    expect(doc.getObject(cam)).toEqual(hung.cam);
+    expect(doc.listFCurves(cam)).toEqual(hung.keys);
+    expect(getShots(doc)).toEqual(hung.shots);
+    paths(doc).forEach((p, i) => expect(largestGap(p, hung.paths[i]), ids[i]).toBe(0));
   });
 });
 
