@@ -619,8 +619,11 @@ describe('project tools with storage shared by other writers', () => {
     const other = await connect(two);
     const slug = await ok(agent, 'create_project', { name: 'harbour-by-slug', empty: true });
     const spaced = await ok(agent, 'create_project', { name: 'Harbour By Name', empty: true });
-    await one.handle.rooms.get(slug.id)!.flush();
-    await one.handle.rooms.get(spaced.id)!.flush();
+    // every save the servers still owe, made now: one that an earlier test left (the undo of
+    // 'delete_project keeps the agent its undo history …' is saved 50 ms after it) and that lands
+    // between the two lookups below rewrites a project.json the first lookup read, so the second
+    // reads it again, as it should (a CI runner saw that read)
+    await Promise.all([one.handle.rooms.flushAll(), two.handle.rooms.flushAll()]);
     expect(two.handle.rooms.get(slug.id)).toBeUndefined();
     expect(two.handle.rooms.get(spaced.id)).toBeUndefined();
     const fs = two.handle.rooms.persistence.store!.fs;
@@ -658,7 +661,7 @@ describe('project tools with storage shared by other writers', () => {
       });
       // not an id: the listing in place of the first read of its project.json, which the lookup
       // before read (unchanged since: not read again)
-      expect(listing(0)).toEqual([]);
+      expect(listing(0), JSON.stringify(requests)).toEqual([]);
       expect(requests).toEqual([
         'list /projects',
         `read /projects/${spaced.id}/project.json`,
