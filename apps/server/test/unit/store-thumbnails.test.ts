@@ -1,3 +1,7 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   BUILTIN_CATALOG,
@@ -5,13 +9,18 @@ import {
   createEditorState,
   createOperatorRegistry,
   decodePNG,
+  renderBuiltinThumbnailPng,
+  threeQuarterView as coreThreeQuarterView,
   type CatalogEntry,
 } from '@3d-editor/core';
-import type { RenderImageRequest, RenderImageResult } from '../../src/render';
+import { Renderer, type RenderImageRequest, type RenderImageResult } from '../../src/render';
+import { RenderPool } from '../../src/render/pool';
 import { ToolError } from '../../src/mcp/agent';
+import { serverCodeBuild } from '../../src/store';
 import {
   THUMBNAIL_LOOK,
   THUMBNAIL_SIZE,
+  ThumbnailStage,
   renderBuiltinThumbnail,
   threeQuarterView,
 } from '../../src/store/thumbnails';
@@ -32,9 +41,10 @@ import {
 } from './store-fixtures';
 
 /*
- * Thumbnails: the three-quarter framing of built-in models, their render through the server's
- * renderer (once, then from the cache), and external thumbnails fetched through the store's proxy
- * (once, then from the cache) with their type sniffed from the bytes.
+ * Thumbnails: built-in models rendered through the server's renderer with core's framing and look
+ * (store/thumbnail.ts; the same PNG the browser's thumbnail workers make), once, then from the
+ * cache, and external thumbnails fetched through the store's proxy (once, then from the cache) with
+ * their type sniffed from the bytes.
  */
 
 type Vec3 = [number, number, number];
@@ -67,77 +77,37 @@ function fakeRenderer(o: { fail?: Error; delayMs?: number } = {}) {
   };
 }
 
-/** Where a world point lands on the image plane of a view (x, y in units of the half extent). */
-function project(view: { position: Vec3; target: Vec3; fovY: number }, p: Vec3, aspect = 1) {
-  const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
-  const cross = (a: Vec3, b: Vec3): Vec3 => [
-    a[1] * b[2] - a[2] * b[1],
-    a[2] * b[0] - a[0] * b[2],
-    a[0] * b[1] - a[1] * b[0],
-  ];
-  const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
-  const norm = (a: Vec3): Vec3 => {
-    const l = Math.hypot(...a);
-    return [a[0] / l, a[1] / l, a[2] / l];
-  };
-  const fwd = norm(sub(view.target, view.position));
-  const right = norm(cross(fwd, [0, 0, 1]));
-  const up = cross(right, fwd);
-  const r = sub(p, view.position);
-  const depth = dot(r, fwd);
-  const t = Math.tan(view.fovY / 2);
-  return { x: dot(r, right) / depth / (t * aspect), y: dot(r, up) / depth / t, depth };
-}
-
-describe('threeQuarterView', () => {
-  const corners = (min: Vec3, max: Vec3): Vec3[] =>
-    Array.from({ length: 8 }, (_, i) => [
-      i & 1 ? max[0] : min[0],
-      i & 2 ? max[1] : min[1],
-      i & 4 ? max[2] : min[2],
-    ]);
-
-  it('looks at the box centre from the front right and above, every corner in the frame', () => {
-    for (const [min, max] of [
-      [
-        [-0.3, -0.3, 0],
-        [0.3, 0.3, 0.9],
-      ],
-      [
-        [-2, -0.8, 0],
-        [2, 0.8, 1.4],
-      ],
-      [
-        [-0.05, -0.05, 0],
-        [0.05, 0.05, 3],
-      ],
-      [
-        [0, 0, 0],
-        [12, 6, 0.2],
-      ],
-    ] as [Vec3, Vec3][]) {
-      const v = threeQuarterView({ min, max }) as { position: Vec3; target: Vec3; fovY: number; up: Vec3 };
-      expect(v.target).toEqual([(min[0] + max[0]) / 2, (min[1] + max[1]) / 2, (min[2] + max[2]) / 2]);
-      // in front (−Y), to the right (+X), above
-      expect(v.position[1]).toBeLessThan(v.target[1]);
-      expect(v.position[0]).toBeGreaterThan(v.target[0]);
-      expect(v.position[2]).toBeGreaterThan(v.target[2]);
-      let widest = 0;
-      for (const c of corners(min, max)) {
-        const p = project(v, c);
-        expect(p.depth).toBeGreaterThan(0);
-        expect(Math.abs(p.x)).toBeLessThanOrEqual(0.87);
-        expect(Math.abs(p.y)).toBeLessThanOrEqual(0.87);
-        widest = Math.max(widest, Math.abs(p.x), Math.abs(p.y));
-      }
-      // as close as the margin allows: the model fills the frame
-      expect(widest).toBeGreaterThan(0.84);
-    }
+describe('built-in thumbnails: core framing, server renderer', () => {
+  it("uses core's framing and look (the browser's thumbnail workers use the same)", () => {
+    expect(threeQuarterView).toBe(coreThreeQuarterView);
+    expect(THUMBNAIL_SIZE).toBe(256);
+    expect(THUMBNAIL_LOOK).toMatchObject({ look: 'clay', shadows: true, ao: true });
   });
 
-  it('keeps a camera outside degenerate boxes', () => {
-    const v = threeQuarterView({ min: [1, 1, 1], max: [1, 1, 1] }) as { position: Vec3; target: Vec3 };
-    expect(Math.hypot(v.position[0] - 1, v.position[1] - 1, v.position[2] - 1)).toBeGreaterThan(0.04);
+  it("renders the same PNG as core's renderBuiltinThumbnailPng, byte for byte, for several models", async () => {
+    // the server's own path: one stage document, the renderer rebuilding it from its Yjs state on
+    // its render thread (here the main thread: render processes run the same RenderEngine)
+    const renderer = new Renderer(new RenderPool({ threads: 0 }));
+    const stage = new ThumbnailStage();
+    const registry = createOperatorRegistry();
+    // a static model, a person, an animal, a vehicle and a seeded plant
+    const ids = [
+      MODEL.id,
+      BUILTIN_CATALOG.find((e) => e.category === 'people')!.id,
+      BUILTIN_CATALOG.find((e) => e.category === 'animals')!.id,
+      BUILTIN_CATALOG.find((e) => e.rig === 'vehicle')!.id,
+      BUILTIN_CATALOG.find((e) => e.category === 'nature' && e.params)!.id,
+    ];
+    try {
+      for (const id of ids) {
+        const server = await renderBuiltinThumbnail({ id, registry, renderer, stage });
+        const browser = renderBuiltinThumbnailPng({ id }).png;
+        expect(Buffer.from(server).equals(Buffer.from(browser)), id).toBe(true);
+      }
+    } finally {
+      stage.close();
+      await renderer.close();
+    }
   });
 });
 
@@ -213,6 +183,70 @@ describe('ModelStore.thumbnail', () => {
     } finally {
       await again.cleanup();
     }
+  });
+
+  it("renders a built-in thumbnail again for a server of another version or build, never serving an older one's", async () => {
+    const renderer = fakeRenderer();
+    const services = { renderer: renderer as never, registry: createOperatorRegistry() };
+    t = await makeStore({
+      env: { APP_VERSION: '1.0.0-aaaaaaa' },
+      options: { thumbnailBuild: 'build-1' },
+      services,
+    });
+    await t.store.thumbnail(`builtin:${MODEL.id}`);
+    expect(renderer.calls).toHaveLength(1);
+    /** A server started on the same data directory (DATA_DIR kept across an upgrade). */
+    const restart = async (version: string, build: string) => {
+      const s = await makeStore({
+        dir: t!.dir,
+        env: { APP_VERSION: version },
+        options: { thumbnailBuild: build },
+        services,
+      });
+      try {
+        await s.store.thumbnail(`builtin:${MODEL.id}`);
+      } finally {
+        await s.cleanup();
+      }
+    };
+    // the same server again: its PNG from the cache
+    await restart('1.0.0-aaaaaaa', 'build-1');
+    expect(renderer.calls).toHaveLength(1);
+    // an upgrade (the CI images stamp APP_VERSION with the commit): made again
+    await restart('1.0.1-bbbbbbb', 'build-1');
+    expect(renderer.calls).toHaveLength(2);
+    // another build that says the same version (an image built without APP_VERSION): made again
+    await restart('1.0.1-bbbbbbb', 'build-2');
+    expect(renderer.calls).toHaveLength(3);
+  });
+
+  it('keys built-in thumbnails on a digest of the bundles that run, or one build per start from the sources', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'server-build-'));
+    try {
+      const main = path.join(dir, 'main.js');
+      await writeFile(main, 'console.log(1);\n');
+      const url = pathToFileURL(main).href;
+      const a = await serverCodeBuild(url);
+      expect(a).toMatch(/^[0-9a-f]{16}$/);
+      expect(await serverCodeBuild(url)).toBe(a);
+      // the render processes' bundle beside it (the renderer) counts
+      await writeFile(path.join(dir, 'render-worker.js'), 'render(1);\n');
+      const b = await serverCodeBuild(url);
+      expect(b).not.toBe(a);
+      await writeFile(path.join(dir, 'render-worker.js'), 'render(2);\n');
+      const c = await serverCodeBuild(url);
+      expect(c).not.toBe(b);
+      // and so does the server's own (catalog, store.add, framing)
+      await writeFile(main, 'console.log(2);\n');
+      expect(await serverCodeBuild(url)).not.toBe(c);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+    // run from the TypeScript sources (as here): one build per start of the server
+    const src = await serverCodeBuild();
+    expect(src).toMatch(/^src-[0-9a-z]+$/);
+    expect(await serverCodeBuild()).toBe(src);
+    expect(await serverCodeBuild(pathToFileURL(path.join(tmpdir(), 'missing', 'main.js')).href)).toBe(src);
   });
 
   it('renders built-in thumbnails one at a time in one document, holding only the model rendered', async () => {

@@ -5,6 +5,14 @@ import { cameraMoveKeys, isDeskMove } from '../desk/moves';
 import { actorOf, attachedTo, faceKeyBound, lookKeyBound, moveKeyBound } from '../desk/characters/estimate';
 import { getCatalogEntry } from '../store/catalog';
 import {
+  briefFrames,
+  elementDigest,
+  readBriefRecord,
+  shotCameraDigest,
+  type BriefRecord,
+} from '../desk/brief/record';
+import type { SceneBrief } from '../desk/brief/schema';
+import {
   deskBakeEstimate,
   deskReleaseEstimate,
   deskTetherEstimate,
@@ -454,7 +462,162 @@ export const DESK_SHOT_ESTIMATES: Readonly<Record<string, Estimator>> = {
   /** Reads the scene at the first and last frame of every enabled shot. */
   'desk.export_rideo_blocking': (ctx) =>
     sampling(ctx.doc, 2 * targetShots(ctx.doc, null).length, 'the number of shots'),
+  /** A brief's staging: its cast standing on their marks, its shots' cameras, its props and set (briefEstimate). */
+  'desk.stage_brief': (ctx, p) => briefEstimate(ctx, p.brief, null),
+  /**
+   * An update stages what the brief changed since the record of the one staged (briefUpdateScope),
+   * then checks every shot it keeps of the brief, as desk.check does (briefEstimate).
+   */
+  'desk.update_from_brief': (ctx, p) => {
+    const b = record(p.brief);
+    const r = readBriefRecord(ctx.doc);
+    return briefEstimate(ctx, b, r && r.sceneId === b.id ? briefUpdateScope(r, b) : null);
+  },
+  /** Reads the scene at the first and last frame of every enabled shot (the checks sample a few more). */
+  'desk.shot_results': (ctx) =>
+    sampling(ctx.doc, (DESK_FRAMES_PER_SHOT + 2) * targetShots(ctx.doc, null).length, 'the number of shots'),
 };
+
+// ---------------------------------------------------------------- briefs (desk/brief)
+
+/** What a brief can lower when the server refuses it for memory (its frames drive cameras and kites). */
+const BRIEF_LOWER =
+  "the number and length of the brief's shots (or its frame rate), and the number of its cast members, kites and balloons";
+
+/**
+ * Keys an actor writes per shot a brief stages, at most: where it stands (location and rotation, two
+ * keys each) and whether it is shown (its scale, three keys a channel). A brief's cast stands on its
+ * marks: nobody walks, so no gait is keyed.
+ */
+const BRIEF_ACTOR_KEYS_PER_SHOT = 6 * 2 + 3 * 3;
+
+/** Objects a brief's set adds besides desk.set_build's: its water and landmarks. */
+const BRIEF_LANDMARKS = 2;
+
+/** What an update stages of a brief (the rest stays as staged): host shot, cast and element ids. */
+interface BriefScope {
+  shots: ReadonlySet<string>;
+  cast: ReadonlySet<string>;
+  elements: ReadonlySet<string>;
+}
+
+const items = (v: unknown): Record<string, unknown>[] => (Array.isArray(v) ? v.map(record) : []);
+
+/** A brief shot's cast as the desk stages it: its castIds and the members its layout names. */
+const shotCastIds = (s: Record<string, unknown>): string[] => [
+  ...new Set([
+    ...(Array.isArray(s.castIds) ? s.castIds.map(String) : []),
+    ...items(s.layout).map((e) => String(e.castId)),
+  ]),
+];
+
+/**
+ * What an update to brief `b` stages, by record `r` of the brief staged before (desk/brief
+ * record.ts, as changes.ts compares them): shots new to it or whose frame count, cast or camera plan
+ * changed; new cast members; new or changed elements.
+ */
+function briefUpdateScope(r: BriefRecord, b: Record<string, unknown>): BriefScope {
+  const rate = num(b.fps, r.fps);
+  const before = new Map(r.shots.map((s) => [s.id, s]));
+  const shots = new Set<string>();
+  for (const s of items(b.shots)) {
+    const o = before.get(String(s.id));
+    const cast = shotCastIds(s);
+    if (
+      !o ||
+      o.frames !== briefFrames(num(s.durationSec, 0), rate) ||
+      o.castIds.length !== cast.length ||
+      o.castIds.some((id) => !cast.includes(id)) ||
+      o.camera !== shotCameraDigest(s as unknown as SceneBrief['shots'][number])
+    )
+      shots.add(String(s.id));
+  }
+  const cast = new Set(r.cast.map((c) => c.id));
+  const elements = new Map(r.elements.map((e) => [e.id, e.digest]));
+  return {
+    shots,
+    cast: new Set(
+      items(b.cast)
+        .map((c) => String(c.id))
+        .filter((id) => !cast.has(id)),
+    ),
+    elements: new Set(
+      items(b.elements)
+        .filter(
+          (e) => elements.get(String(e.id)) !== elementDigest(e as unknown as SceneBrief['elements'][number]),
+        )
+        .map((e) => String(e.id)),
+    ),
+  };
+}
+
+/**
+ * A brief's staging (desk/brief stage.ts; the brief unvalidated, as given): an actor per cast member,
+ * keyed once in its pose and in each shot where it stands and whether it is shown (nobody walks); a
+ * camera per shot, keyed as its move; a built-in model per prop, a held kite or balloon flown on every
+ * frame of the shots; the set and its water; three frames sampled per shot by the solve and the
+ * checks. `scope`: only what an update stages (null: the whole brief); an update solves only those
+ * shots, but checks every shot of the brief the desk holds afterwards (update.ts runs the checks
+ * over all of them), three frames each as desk.check counts them, on the staged document.
+ */
+function briefEstimate(
+  ctx: OperatorContext,
+  raw: unknown,
+  scope: BriefScope | null,
+): OperatorEstimate | null {
+  const b = record(raw);
+  const allCast = items(b.cast);
+  const cast = scope ? allCast.filter((c) => scope.cast.has(String(c.id))) : allCast;
+  const shots = items(b.shots).filter((s) => !scope || scope.shots.has(String(s.id)));
+  const props = items(b.elements).filter((e) => e.kind !== 'location');
+  const staged = scope ? props.filter((e) => scope.elements.has(String(e.id))) : props;
+  const flies = (e: Record<string, unknown>) => /kite|balloon/i.test(String(e.name ?? ''));
+  const kites = props.filter(flies).length;
+  const rate = Math.max(1, num(b.fps, fps(ctx.doc)));
+  let frames = 0;
+  let cameraKeyCount = 0;
+  // an update's checks: every shot of the brief it keeps (at most all of them), as desk.check's
+  let sampled = scope ? DESK_FRAMES_PER_SHOT * items(b.shots).length : 0;
+  for (const s of shots) {
+    const n = clampFrames(num(s.durationSec, DEFAULT_SHOT_SECONDS) * rate);
+    frames += n;
+    cameraKeyCount += cameraKeys(s.move ?? 'push_in', n);
+    sampled += solveFrames(s.move, n);
+  }
+  const keys =
+    cast.length * DESK_ACTOR_MAX_CHANNELS * DESK_POSE_KEYS +
+    allCast.length * BRIEF_ACTOR_KEYS_PER_SHOT * shots.length +
+    cameraKeyCount +
+    (shots.length ? kites * DESK_TETHER_CHANNELS * (frames + 1) : 0);
+  const fcurves =
+    cast.length * DESK_ACTOR_MAX_CHANNELS +
+    allCast.length * 3 +
+    shots.length * DESK_CAMERA_CHANNELS +
+    kites * DESK_TETHER_CHANNELS;
+  const set = scope ? 0 : DESK_SET_MAX_OBJECTS + BRIEF_LANDMARKS;
+  const objects =
+    cast.length * DESK_ACTOR_MAX_OBJECTS +
+    staged.length * STORE_MODEL_MAX_OBJECTS +
+    staged.filter(flies).length * DESK_TETHER_MAX_OBJECTS +
+    shots.length +
+    set;
+  return deskEstimate({
+    keys: newKeyframesWrites(keys, fcurves, BRIEF_LOWER),
+    faces: cast.length * DESK_ACTOR_MAX_FACES + staged.length * STORE_MODEL_MAX_FACES,
+    extra: frameSamplingBytes(ctx.doc, sampled + (shots.length ? kites * frames : 0)),
+    adds: {
+      objects,
+      datablocks: {
+        meshes: Math.max(0, objects - cast.length - shots.length),
+        armatures: cast.length,
+        cameras: shots.length,
+        lights: scope ? 0 : 1,
+        materials: DESK_MAX_MATERIALS * (cast.length + staged.length) + (scope ? 0 : BRIEF_LANDMARKS + 2),
+      },
+    },
+    lower: BRIEF_LOWER,
+  });
+}
 
 // ---------------------------------------------------------------- actors (CHARACTERS)
 

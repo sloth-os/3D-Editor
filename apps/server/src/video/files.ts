@@ -1,7 +1,7 @@
 /*
  * Serving the files of video exports over HTTP: their media types, strong ETags (from the SHA-256
- * every file records) and single byte ranges (players and rideo fetch MP4 clips with Range
- * requests; a request with several ranges gets the whole file, as RFC 9110 allows).
+ * every file records) and single byte ranges (video players fetch MP4 clips with Range requests; a
+ * request with several ranges gets the whole file, as RFC 9110 allows).
  */
 
 const TYPES: Readonly<Record<string, string>> = {

@@ -7,11 +7,10 @@ import { sharedRenderer, type Renderer } from './render';
 import { sharedRenderStore, type RenderStore } from './render/store';
 import { VideoExports } from './video';
 import { ModelStore } from './store';
-import { RideoBridge } from './rideo';
 
 /*
  * The services of the server, built once in app.ts and shared by the MCP tools (ToolContext) and
- * the REST routes (registerVideoExportRoutes, registerStoreRoutes, registerRideoRoutes).
+ * the REST routes (registerVideoExportRoutes, registerStoreRoutes).
  */
 
 export interface ServerServices {
@@ -25,8 +24,6 @@ export interface ServerServices {
   readonly exports: VideoExports;
   /** The model store. */
   readonly store: ModelStore;
-  /** The bridge to a rideo server. */
-  readonly rideo: RideoBridge;
 }
 
 /**
@@ -39,9 +36,9 @@ export interface ServiceContext {
   metrics: ServerMetrics;
   /** The loaded projects (open a project with `rooms.open(id)`). */
   rooms: RoomManager;
-  /** The other services (the renderer, the registry, the exports for the rideo bridge …). */
+  /** The other services (the renderer, the registry …). */
   services: ServerServices;
-  /** fetch for outbound requests (model providers, rideo); tests inject one. */
+  /** fetch for outbound requests (model providers); tests inject one. */
   fetch: typeof fetch;
 }
 
@@ -56,7 +53,7 @@ export interface ServerServicesOptions {
   renderer?: Renderer;
   /** Default: the process-wide render store. */
   renderStore?: RenderStore;
-  /** fetch of the model providers and the rideo bridge (default: the global fetch). */
+  /** fetch of the model providers (default: the global fetch). */
   fetch?: typeof fetch;
 }
 
@@ -64,7 +61,6 @@ class Services implements ServerServices {
   readonly renderStore: RenderStore;
   readonly exports: VideoExports;
   readonly store: ModelStore;
-  readonly rideo: RideoBridge;
   private registryInstance: OperatorRegistry | null;
 
   constructor(private readonly opts: ServerServicesOptions) {
@@ -80,7 +76,6 @@ class Services implements ServerServices {
     };
     this.exports = new VideoExports(ctx);
     this.store = new ModelStore(ctx);
-    this.rideo = new RideoBridge(ctx);
   }
 
   get renderer(): Renderer {
@@ -99,9 +94,9 @@ export function createServerServices(opts: ServerServicesOptions): ServerService
 
 /**
  * Stops the services (the app's preClose: before the projects are saved and closed): cancels
- * export jobs and their ffmpeg processes, model downloads and rideo requests. The renderer is the
- * process's (main.ts closes it).
+ * export jobs and their ffmpeg processes and model downloads. The renderer is the process's
+ * (main.ts closes it).
  */
 export async function closeServerServices(services: ServerServices): Promise<void> {
-  await Promise.allSettled([services.exports.close(), services.store.close(), services.rideo.close()]);
+  await Promise.allSettled([services.exports.close(), services.store.close()]);
 }

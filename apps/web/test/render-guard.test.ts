@@ -601,7 +601,7 @@ describe('the check of the first worker while it evaluates the scene', () => {
     try {
       const refused = startPathTrace(pool, doc, { width: 24, height: 16, frame: 1, samples: 1, memory });
       await expect(refused.result).rejects.toThrow(
-        /GB of which other path traced renders running in it hold \(about 69,192 triangles, 384 pixels\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'BevCube' would make 69,192 of these triangles/,
+        /GB of which other renders and exports in it hold \(about 69,192 triangles, 384 pixels\), and running out of memory would end the tab\. The Bevel modifier 'Bev' of 'BevCube' would make 69,192 of these triangles/,
       );
       expect(bevels.count()).toBe(0);
     } finally {

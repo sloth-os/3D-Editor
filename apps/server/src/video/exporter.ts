@@ -2,16 +2,40 @@ import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { DESK_PROPS, isActor, type SceneDoc } from '@3d-editor/core';
+import {
+  NO_POSE_ACTORS_WARNING,
+  ShotTracks,
+  buildManifest,
+  buildPalette,
+  contactSheetColumns,
+  contactTileSize,
+  downscaleRGBA,
+  isTileFrame,
+  maskToRGB,
+  paletteLut,
+  paletteRecord,
+  passBytes,
+  poseActorsOf,
+  renderInOrder,
+  resultBytes,
+  round6,
+  shotDeskOptions,
+  shotRenderFrames,
+  streamsFor,
+  stringLines,
+  tileLabel,
+  toRGBA,
+  type ManifestFile,
+  type SceneDoc,
+  type StreamSpec,
+} from '@3d-editor/core';
 import { ToolError } from '../mcp/agent';
 import type { Renderer } from '../render';
 import type { RenderLease, RenderRequest, RenderThread } from '../render/pool';
-import { stringLineWidth } from '../render/passes';
 import {
   INTERRUPTED_PREFIX,
   RenderOutOfMemoryError,
   isCancelled,
-  type DeskFrameOptions,
   type DeskShotInfo,
   type DocRef,
   type EncodedResult,
@@ -32,8 +56,6 @@ import {
   streamExtension,
   type StreamCodec,
 } from './ffmpeg';
-import { renderInOrder } from './frames';
-import { ShotTracks, buildManifest, type ManifestFile } from './manifest';
 import {
   exportMemory,
   exportNeeds,
@@ -47,19 +69,6 @@ import {
   type MemoryReader,
 } from './memory';
 import { qualityPreset, type VideoExportParams } from './params';
-import {
-  buildPalette,
-  contactTileSize,
-  downscaleRGBA,
-  maskToRGB,
-  paletteLut,
-  paletteRecord,
-  passBytes,
-  resultBytes,
-  streamsFor,
-  toRGBA,
-  type StreamSpec,
-} from './passes';
 import { planExport, sceneFrameAt, type ExportPlan, type PlannedShot } from './plan';
 import type { ExportFile, ExportProgress } from './index';
 
@@ -146,27 +155,8 @@ export interface ExportRunResult {
   plan: ExportPlan;
 }
 
-const linearToSrgb = (c: number): number => {
-  const v = Math.min(1, Math.max(0, c));
-  return v <= 0.0031308 ? v * 12.92 : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
-};
-
-/** The strings of the snapshot (desk_role 'string'), drawn as lines of at least 2 px. */
-export function stringLines(doc: SceneDoc, height: number): NonNullable<DeskFrameOptions['lines']> {
-  const width = stringLineWidth(height);
-  return doc
-    .listObjects()
-    .filter((o) => o.custom_props?.[DESK_PROPS.role] === 'string')
-    .map((o) => {
-      const mat = o.material_slots.map((id) => (id ? doc.getMaterial(id) : null)).find(Boolean);
-      const c = mat?.base_color ?? [0.85, 0.85, 0.85, 1];
-      return {
-        object: o.id,
-        width_px: width,
-        color: [linearToSrgb(c[0]), linearToSrgb(c[1]), linearToSrgb(c[2])] as [number, number, number],
-      };
-    });
-}
+/** The strings of the snapshot drawn as lines (core `stringLines`, shared with the browser export). */
+export { stringLines };
 
 /** SHA-256 of a file (hex). */
 export function sha256File(file: string): Promise<string> {
@@ -234,12 +224,8 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
   const palette = buildPalette(snapshot, subjects);
   const lut = paletteLut(palette);
   const objectPalette = paletteRecord(palette);
-  const poseActors = snapshot
-    .listObjects()
-    .filter((o) => isActor(snapshot, o.id))
-    .map((o) => o.id);
-  if (passes.includes('pose') && !poseActors.length)
-    warn("pose pass: the scene has no actors (desk_role 'actor'), so the pose images are black");
+  const poseActors = poseActorsOf(snapshot);
+  if (passes.includes('pose') && !poseActors.length) warn(NO_POSE_ACTORS_WARNING);
   const lines = stringLines(snapshot, height);
   const renderer = env.renderer;
   if (renderer.pool.mode === 'main-thread') throw mainThreadError();
@@ -321,8 +307,8 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
     ) => {
       for (const s of open) await s.proc.write(passBytes(img, s.spec.pass, maskRGB));
       tracks.add(sceneFrameAt(plan, shot, k), img.meta);
-      const middle = Math.floor(shot.outFrames / 2);
-      if ((outputs.posters && k === 0) || (outputs.contact_sheet && (k === 0 || k === middle))) {
+      const tileFrame = isTileFrame(shot, k);
+      if ((outputs.posters && k === 0) || (outputs.contact_sheet && tileFrame)) {
         const rgba = toRGBA(passBytes(img, primary.pass, maskRGB), primary.input, width, height);
         if (outputs.posters && k === 0) {
           const base = path.join(dir, shot.slug);
@@ -335,14 +321,14 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
           p.catch(() => undefined);
           pending.push(p);
         }
-        if (outputs.contact_sheet && (k === 0 || k === middle) && (k === 0 || middle > 0))
+        if (outputs.contact_sheet && tileFrame)
           tiles.push({
             frame: {
               width: tile.width,
               height: tile.height,
               data: downscaleRGBA(rgba, width, height, tile.width, tile.height),
             },
-            label: `${shot.index + 1}-${Math.round(sceneFrameAt(plan, shot, k))}`,
+            label: tileLabel(plan, shot, k),
           });
       }
       written++;
@@ -387,7 +373,7 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
               type: 'desk-shot',
               doc,
               options: {
-                frames: Array.from({ length: shot.renderFrames }, (_, i) => sceneFrameAt(plan, shot, i)),
+                frames: shotRenderFrames(plan, shot),
                 cameraId: shot.camera,
                 aspect: width / height,
               },
@@ -403,24 +389,20 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
             continue;
           }
           const measured = info!;
-          const desk: DeskFrameOptions = {
+          const desk = shotDeskOptions({
             look: params.look,
-            shadows: preset.shadows,
-            ao: preset.ao,
-            msaa: preset.msaa,
-            shadowFit: measured.shadowFit ?? undefined,
-            aoRadius: measured.aoRadius,
+            preset,
             passes,
-            depthRange: measured.depthRange,
+            info: measured,
             objectPalette,
-            subjects: shot.shot?.subjects ?? [],
+            shot,
             poseActors,
             lines,
-          };
+          });
           const base = k;
           // frames of render processes that died go to the other threads; when none is left the
           // run ends early (threadsLost) and the next lease brings new processes
-          const r = await renderInOrder<ImageResult>({
+          const r = await renderInOrder<ImageResult, RenderThread>({
             count: frames.length,
             threads: lease.threads,
             maxAhead: 2 * lease.threads.length,
@@ -554,8 +536,6 @@ export async function runExport(env: ExportEnvironment, input: ExportRunInput): 
     throw signal.aborted && !(err instanceof ToolError) ? cancelled() : err;
   }
 }
-
-const round6 = (v: number) => Math.round(v * 1e6) / 1e6;
 
 function cancelled(): Error {
   const e = new Error('export cancelled');
@@ -697,7 +677,6 @@ async function encodeContactSheet(
   signal: AbortSignal,
   deaths: Error[],
 ): Promise<Uint8Array> {
-  const pairs = Math.max(1, Math.round(Math.sqrt(tiles.length / 2)));
   /** Render processes the encoding took down. */
   let caused = 0;
   for (;;) {
@@ -710,7 +689,7 @@ async function encodeContactSheet(
         options: {
           format: 'CONTACT_SHEET',
           fps: plan.fps,
-          columns: Math.min(tiles.length, 2 * pairs),
+          columns: contactSheetColumns(tiles.length),
           labels: tiles.map((t) => t.label),
         },
       });

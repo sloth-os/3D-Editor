@@ -1,0 +1,533 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { setFlagsFromString } from 'node:v8';
+import { runInNewContext } from 'node:vm';
+import { gzipSync } from 'node:zlib';
+import { Gunzip } from 'fflate';
+import * as Y from 'yjs';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { SceneDoc, docHasUnitInstances, type SceneBrief } from '@3d-editor/core';
+import { MAX_STATE_BYTES } from '../src/embed/protocol';
+import { runStaging } from '../src/embed/staging-engine';
+import {
+  CONTAINER_VERSION,
+  MAX_HEADER_BYTES,
+  MAX_UPDATE_BYTES,
+  STATE_HEADER_KEYS,
+  STATE_MAGIC,
+  StateTooLarge,
+  StateUnreadable,
+  UNITS_CONTAINER_VERSION,
+  compressesStates,
+  decodeDeskState,
+  encodeDeskState,
+  newLineage,
+  readLineage,
+  readStateHeader,
+  restorePlan,
+  writeLineage,
+} from '../src/embed/state';
+import { KITE, library, withPins } from './desk-units-helpers';
+
+/*
+ * The desk state (embed/state.ts): the container round trip (gzipped and not), the same bytes for
+ * the same document (no time in the header, the gzip header's system bytes fixed), what does not
+ * read (another format, version, scene or container, a cut or corrupted payload, not a Yjs
+ * document, no staging of the scene), gzip read where the browser has no DecompressionStream, the
+ * limits both ways (64 MiB packed, 256 MiB unpacked) and a gzip bomb stopped while it unpacks, the
+ * lineage and the merge rule; container version 2 for a document with instances of library units
+ * (read here, refused by a desk from before units).
+ */
+
+const BRIEF = (): SceneBrief =>
+  structuredClone(
+    JSON.parse(readFileSync(resolve(__dirname, 'fixtures/desk-protocol/open.json'), 'utf8')).scene,
+  );
+const SCENE = BRIEF().id;
+
+/** A document staged from `brief` with `lineage` (as the staging worker stages it). */
+function stagedUpdate(lineage: string, brief = BRIEF()): Uint8Array {
+  const r = runStaging({
+    kind: 'stage',
+    update: Y.encodeStateAsUpdate(new Y.Doc()),
+    brief,
+    lineage,
+    generator: 'test',
+  });
+  if (!r.ok || r.kind !== 'stage') throw new Error(JSON.stringify(r));
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, r.diff);
+  return Y.encodeStateAsUpdate(doc);
+}
+
+let staged: Uint8Array;
+beforeAll(() => {
+  staged = stagedUpdate('lineage-a');
+});
+afterEach(() => {
+  vi.unstubAllGlobals();
+});
+
+const header = (over: Partial<{ sceneId: string; lineage: string; shots: number }> = {}) => ({
+  sceneId: SCENE,
+  lineage: 'lineage-a',
+  shots: 2,
+  deskVersion: 'test',
+  ...over,
+});
+
+const bytesOf = (s: { data: ArrayBuffer }) => new Uint8Array(s.data);
+const same = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** A container of version 1 around `payload` with `head` as its header (not checked). */
+function container(head: Record<string, unknown>, payload: Uint8Array, codec: 0 | 1) {
+  const h = new TextEncoder().encode(JSON.stringify(head));
+  const out = new Uint8Array(16 + h.length + payload.length);
+  out.set(STATE_MAGIC, 0);
+  out[8] = 1;
+  out[9] = codec;
+  new DataView(out.buffer).setUint32(12, h.length, true);
+  out.set(h, 16);
+  out.set(payload, 16 + h.length);
+  return { format: '3d-editor.desk-state' as const, version: 1 as const, data: out.buffer };
+}
+
+/** A gzip of `mib` MiB of zeros whose last deflate bytes are broken (an unpacker that gets there fails). */
+function bomb(mib: number): Uint8Array {
+  const b = new Uint8Array(gzipSync(Buffer.alloc(mib * 1024 * 1024), { level: 9 }));
+  for (let i = b.length - 24; i < b.length - 12; i++) b[i] ^= 0xa5;
+  return b;
+}
+
+/*
+ * Each test of the desk state takes 30 s, from its describe: writing and reading states (gzip, and
+ * the JS inflate where the browser has none) took up to 0.8 s under coverage, as CI runs the suites,
+ * and 3.5 s beside core's suite, past half of vitest's 5 s default. The gzip bomb's takes 60 s (its
+ * last argument).
+ */
+describe('the desk state', { timeout: 30_000 }, () => {
+  it('writes gzip where the browser has CompressionStream', () => {
+    expect(compressesStates()).toBe(true);
+  });
+
+  it.each([true, false])('round-trips a scene (compressed: %s)', async (compress) => {
+    const state = await encodeDeskState(staged, header(), { compress });
+    expect(state.format).toBe('3d-editor.desk-state');
+    expect(state.version).toBe(1);
+    const b = bytesOf(state);
+    expect([...b.subarray(0, 8)]).toEqual([...STATE_MAGIC]);
+    expect(b[9]).toBe(compress ? 1 : 0);
+    const read = readStateHeader(b);
+    expect(read.header).toEqual({ ...header(), updateBytes: staged.length });
+    // the header's keys in one order, and no time
+    const length = new DataView(b.buffer).getUint32(12, true);
+    const json = JSON.parse(new TextDecoder().decode(b.subarray(16, 16 + length))) as object;
+    expect(Object.keys(json)).toEqual([...STATE_HEADER_KEYS]);
+    const { header: h, update: back, lineage } = await decodeDeskState(state, SCENE);
+    expect(h.lineage).toBe('lineage-a');
+    expect(lineage).toBe('lineage-a');
+    expect(same(back, staged)).toBe(true);
+    const doc = SceneDoc.fromUpdate(back);
+    expect(readLineage(doc)).toBe('lineage-a');
+    // a view of the bytes (a host that kept a Uint8Array) reads the same
+    const view = await decodeDeskState({ ...state, data: new Uint8Array(state.data) }, SCENE);
+    expect(same(view.update, staged)).toBe(true);
+  });
+
+  it('gives the same bytes for the same document, whatever system gzips them', async () => {
+    const a = bytesOf(await encodeDeskState(staged, header()));
+    const b = bytesOf(await encodeDeskState(staged, header()));
+    expect(same(a, b)).toBe(true);
+    // the gzip header: no time, no level hint, system "unknown"
+    const at = 16 + new DataView(a.buffer).getUint32(12, true);
+    expect([...a.subarray(at, at + 10)]).toEqual([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 255]);
+    // a CompressionStream that stamps a time and its system (as zlib does on other systems) gives
+    // the same bytes
+    const Real = CompressionStream;
+    class Stamping {
+      readonly readable: ReadableStream<Uint8Array>;
+      readonly writable: WritableStream<BufferSource>;
+      constructor(format: CompressionFormat) {
+        const cs = new Real(format);
+        this.writable = cs.writable;
+        let first = true;
+        this.readable = cs.readable.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, c) {
+              if (first && chunk.length >= 10) {
+                chunk = chunk.slice();
+                chunk.set([0x78, 0x56, 0x34, 0x12, 2, 11], 4);
+              }
+              first = false;
+              c.enqueue(chunk);
+            },
+          }),
+        );
+      }
+    }
+    vi.stubGlobal('CompressionStream', Stamping);
+    const c = bytesOf(await encodeDeskState(staged, header()));
+    expect(same(a, c)).toBe(true);
+  });
+
+  it('reads a state written before the header lost its time (savedAt)', async () => {
+    const old = container(
+      {
+        sceneId: SCENE,
+        lineage: 'lineage-a',
+        shots: 2,
+        savedAt: '2026-11-14T10:00:00.000Z',
+        deskVersion: 'old',
+        updateBytes: staged.length,
+      },
+      staged,
+      0,
+    );
+    const { header: h, update } = await decodeDeskState(old, SCENE);
+    expect(h.deskVersion).toBe('old');
+    expect(same(update, staged)).toBe(true);
+  });
+
+  it('reads a gzipped state where the browser has no DecompressionStream, and writes its own uncompressed', async () => {
+    const gz = await encodeDeskState(staged, header());
+    expect(bytesOf(gz)[9]).toBe(1);
+    vi.stubGlobal('DecompressionStream', undefined);
+    vi.stubGlobal('CompressionStream', undefined);
+    expect(compressesStates()).toBe(false);
+    const { update } = await decodeDeskState(gz, SCENE);
+    expect(same(update, staged)).toBe(true);
+    const plain = await encodeDeskState(staged, header());
+    expect(bytesOf(plain)[9]).toBe(0);
+    expect(same((await decodeDeskState(plain, SCENE)).update, staged)).toBe(true);
+    // the JS unpacking checks the gzip trailer (CRC-32, size) and takes one member only
+    const b = bytesOf(gz);
+    const crc = b.slice();
+    crc[crc.length - 6] ^= 0xff;
+    await expect(decodeDeskState({ ...gz, data: crc.buffer }, SCENE)).rejects.toThrow(/does not unpack/);
+    const size = b.slice();
+    size[size.length - 2] ^= 0x01;
+    await expect(decodeDeskState({ ...gz, data: size.buffer }, SCENE)).rejects.toThrow(/does not unpack/);
+    const length = new DataView(b.buffer).getUint32(12, true);
+    const twice = container(
+      { ...header(), updateBytes: staged.length },
+      new Uint8Array([...b.subarray(16 + length), ...b.subarray(16 + length)]),
+      1,
+    );
+    await expect(decodeDeskState(twice, SCENE)).rejects.toBeInstanceOf(StateUnreadable);
+  });
+
+  it('does not read another format, version, scene or container', async () => {
+    const state = await encodeDeskState(staged, header());
+    const unreadable = (p: Promise<unknown>, what: RegExp) => expect(p).rejects.toThrow(what);
+    await unreadable(decodeDeskState({ ...state, format: 'other.state' }, SCENE), /format/);
+    await unreadable(decodeDeskState({ ...state, version: 2 }, SCENE), /version 2/);
+    await unreadable(decodeDeskState(state, 'clp_2'), new RegExp(`belongs to scene '${SCENE}', not 'clp_2'`));
+    const b = bytesOf(state).slice();
+    b[0] = 0;
+    await unreadable(decodeDeskState({ ...state, data: b.buffer }, SCENE), /not one this desk wrote/);
+    const v = bytesOf(state).slice();
+    v[8] = 9;
+    await unreadable(decodeDeskState({ ...state, data: v.buffer }, SCENE), /container is version 9/);
+    await expect(decodeDeskState({ ...state, version: 2 }, SCENE)).rejects.toBeInstanceOf(StateUnreadable);
+  });
+
+  it('does not read a cut, corrupted or foreign payload, or a document without a staging of the scene', async () => {
+    for (const compress of [true, false]) {
+      const state = await encodeDeskState(staged, header(), { compress });
+      const b = bytesOf(state);
+      const cut = b.slice(0, b.length - 5);
+      await expect(decodeDeskState({ ...state, data: cut.buffer }, SCENE)).rejects.toBeInstanceOf(
+        StateUnreadable,
+      );
+      // gzip's CRC catches any change; an uncompressed update has no checksum, so its structure is
+      // broken (the first bytes: how many clients, how many structs)
+      const bad = b.slice();
+      const at = 16 + new DataView(b.buffer).getUint32(12, true);
+      if (compress) for (let i = b.length - 20; i < b.length - 2; i++) bad[i] ^= 0x5a;
+      else bad.fill(0xff, at, at + 6);
+      await expect(decodeDeskState({ ...state, data: bad.buffer }, SCENE)).rejects.toBeInstanceOf(
+        StateUnreadable,
+      );
+    }
+    // a payload that is not a Yjs document
+    const junk = await encodeDeskState(new Uint8Array([200, 1, 2, 3, 4, 5]), header(), { compress: false });
+    await expect(decodeDeskState(junk, SCENE)).rejects.toThrow(/does not read/);
+    // a header without its lineage
+    const noLineage = await encodeDeskState(staged, header({ lineage: '' }), { compress: false });
+    await expect(decodeDeskState(noLineage, SCENE)).rejects.toThrow(/scene or lineage/);
+    // fewer bytes than the prefix
+    await expect(
+      decodeDeskState({ format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(3) }, SCENE),
+    ).rejects.toBeInstanceOf(StateUnreadable);
+    // a document of the scene's id that holds no staging, or the staging of another scene
+    const empty = await encodeDeskState(Y.encodeStateAsUpdate(new Y.Doc()), header());
+    await expect(decodeDeskState(empty, SCENE)).rejects.toThrow(/holds no staging of this scene/);
+    const other = { ...BRIEF(), id: 'clp_other0000000001' };
+    const foreign = await encodeDeskState(stagedUpdate('lineage-a', other), header());
+    await expect(decodeDeskState(foreign, SCENE)).rejects.toThrow(/holds no staging of this scene/);
+    // a header whose lineage is not the document's
+    const mismatch = await encodeDeskState(staged, header({ lineage: 'lineage-b' }));
+    await expect(decodeDeskState(mismatch, SCENE)).rejects.toThrow(/header does not match/);
+  });
+
+  it('keeps to 64 MiB packed and 256 MiB unpacked, both ways', async () => {
+    const big = new Uint8Array(MAX_STATE_BYTES);
+    const err = await encodeDeskState(big, header(), { compress: false }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(StateTooLarge);
+    expect((err as StateTooLarge).bytes).toBeGreaterThan(MAX_STATE_BYTES);
+    expect((err as Error).message).toMatch(/64 MiB/);
+    await expect(
+      decodeDeskState(
+        { format: '3d-editor.desk-state', version: 1, data: new ArrayBuffer(MAX_STATE_BYTES + 1) },
+        SCENE,
+      ),
+    ).rejects.toThrow(/over 64 MiB/);
+    // a document over 256 MiB is not written (the desk never writes what it would not read)
+    const huge = { length: MAX_UPDATE_BYTES + 1 } as Uint8Array;
+    const tooBig = await encodeDeskState(huge, header()).catch((e: unknown) => e);
+    expect(tooBig).toBeInstanceOf(StateTooLarge);
+    expect((tooBig as Error).message).toMatch(/256 MiB a desk state may hold/);
+    // a header that says more than 256 MiB is refused before anything is unpacked
+    const says = container({ ...header(), updateBytes: MAX_UPDATE_BYTES + 1 }, new Uint8Array(32), 1);
+    await expect(decodeDeskState(says, SCENE)).rejects.toThrow(/over the 256 MiB a state may hold/);
+    // a header over 64 KiB is not read, though it is JSON and the state otherwise a good one
+    const head = { ...header(), updateBytes: staged.length };
+    const fits = container({ ...head, pad: 'x'.repeat(MAX_HEADER_BYTES - 200) }, staged, 0);
+    expect((await decodeDeskState(fits, SCENE)).header.sceneId).toBe(SCENE);
+    const long = container({ ...head, pad: 'x'.repeat(MAX_HEADER_BYTES) }, staged, 0);
+    await expect(decodeDeskState(long, SCENE)).rejects.toThrow(/header is over 64 KiB/);
+  });
+
+  it('stops unpacking a gzip bomb once it passes what the header says', async () => {
+    // 64 MiB of zeros in about 64 KiB, its end broken: an unpacker that read it all would fail on
+    // the broken end ("does not unpack"); one that stops at the header's 1 MiB never gets there
+    const payload = bomb(64);
+    const state = container({ ...header(), updateBytes: 1024 * 1024 }, payload, 1);
+    const Real = DecompressionStream;
+    let unpacked = 0;
+    class Counting {
+      readonly readable: ReadableStream<Uint8Array>;
+      readonly writable: WritableStream<BufferSource>;
+      constructor(format: CompressionFormat) {
+        const ds = new Real(format);
+        this.writable = ds.writable;
+        this.readable = ds.readable.pipeThrough(
+          new TransformStream<Uint8Array, Uint8Array>({
+            transform(chunk, c) {
+              unpacked += chunk.length;
+              c.enqueue(chunk);
+            },
+          }),
+        );
+      }
+    }
+    vi.stubGlobal('DecompressionStream', Counting);
+    await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
+    expect(unpacked).toBeGreaterThan(1024 * 1024);
+    expect(unpacked).toBeLessThan(6 * 1024 * 1024);
+    // a DecompressionStream as the Compression Streams spec has it (and Chromium): each write
+    // unpacked and queued in full before the write settles (Node's waits for the reader): only
+    // small writes stop early (4 KiB, at most about 4 MiB queued; 16 KiB writes queued 16 MiB)
+    let queued = 0;
+    class WholeWrites {
+      readonly readable: ReadableStream<Uint8Array>;
+      readonly writable: WritableStream<BufferSource>;
+      constructor() {
+        let g: Gunzip;
+        const ts = new TransformStream<BufferSource, Uint8Array>({
+          start(c) {
+            g = new Gunzip((d) => {
+              queued += d.length;
+              c.enqueue(d);
+            });
+          },
+          transform(chunk) {
+            g.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk as ArrayBuffer));
+          },
+          flush() {
+            g.push(new Uint8Array(0), true);
+          },
+        });
+        this.readable = ts.readable;
+        this.writable = ts.writable;
+      }
+    }
+    vi.stubGlobal('DecompressionStream', WholeWrites);
+    await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
+    expect(queued).toBeGreaterThan(1024 * 1024);
+    expect(queued).toBeLessThan(6 * 1024 * 1024);
+    // the same with the JS unpacking (no DecompressionStream)
+    vi.stubGlobal('DecompressionStream', undefined);
+    await expect(decodeDeskState(state, SCENE)).rejects.toThrow(/unpacks to more than it says/);
+  });
+
+  it('holds the claimed bytes and one piece at most while a gzip bomb of its claim unpacks', async () => {
+    // The ArrayBuffer memory the page holds, measured after a full garbage collection (which frees
+    // dead buffers before it returns: no sweeping left to a background thread) whenever the
+    // unpacking makes a buffer of 1 MiB or more from script and after every 4 MiB it copies.
+    setFlagsFromString('--expose-gc');
+    setFlagsFromString('--no-concurrent-array-buffer-sweeping');
+    const gc = runInNewContext('gc') as () => void;
+    const settled = () => {
+      gc();
+      return process.memoryUsage().arrayBuffers;
+    };
+    // what the page holds before, once the buffers of the work before are gone (zlib lets go of
+    // the 48 MiB it packed only after its handle closes)
+    const before = async () => {
+      let last = -1;
+      for (let i = 0; i < 50; i++) {
+        await new Promise((r) => setTimeout(r, 10));
+        const now = settled();
+        if (now === last) return now;
+        last = now;
+      }
+      return last;
+    };
+    const MIB = 1024 * 1024;
+    const claim = 48 * MIB;
+    // 48 MiB of zeros in about 48 KiB, exactly what its header says
+    const state = container(
+      { ...header(), updateBytes: claim },
+      new Uint8Array(gzipSync(Buffer.alloc(claim), { level: 9 })),
+      1,
+    );
+    const peakOf = async (js: boolean) => {
+      const base = await before();
+      let peak = 0;
+      let samples = 0;
+      const sample = () => {
+        samples++;
+        peak = Math.max(peak, settled() - base);
+      };
+      const RealU8 = Uint8Array;
+      let copied = 0;
+      class Sampling extends RealU8 {
+        constructor(...args: unknown[]) {
+          super(...(args as []));
+          if (typeof args[0] === 'number' && args[0] >= MIB) sample();
+        }
+        override set(source: ArrayLike<number>, offset?: number) {
+          super.set(source, offset);
+          copied += source.length;
+          if (copied >= 4 * MIB) {
+            copied = 0;
+            sample();
+          }
+        }
+        static override [Symbol.hasInstance](v: unknown) {
+          return v instanceof RealU8;
+        }
+      }
+      if (js) vi.stubGlobal('DecompressionStream', undefined);
+      vi.stubGlobal('Uint8Array', Sampling);
+      let failure: unknown = null;
+      try {
+        await decodeDeskState(state, SCENE);
+      } catch (e) {
+        failure = e;
+      } finally {
+        vi.unstubAllGlobals();
+      }
+      // it unpacked in full (zeros are no staging of the scene)
+      expect(String(failure)).toMatch(/holds no staging of this scene/);
+      expect(samples).toBeGreaterThan(8);
+      return peak;
+    };
+    try {
+      // Measured: DecompressionStream (Node's, 16 KiB pieces) the claim and 0.03 MiB; fflate the
+      // claim and 12.04 MiB (a 4 MiB piece and its 8 MiB working buffer). Keeping every piece and
+      // putting them together after held twice the claim (+48 MiB on both).
+      const stream = await peakOf(false);
+      expect(stream).toBeGreaterThanOrEqual(claim);
+      expect(stream).toBeLessThan(claim + 2 * MIB);
+      const js = await peakOf(true);
+      expect(js).toBeGreaterThanOrEqual(claim);
+      expect(js).toBeLessThan(claim + 14 * MIB);
+    } finally {
+      setFlagsFromString('--concurrent-array-buffer-sweeping');
+    }
+  }, 60_000);
+
+  it('is described in docs/embedding.md as it reads and writes', () => {
+    const raw = readFileSync(resolve(__dirname, '../../../docs/embedding.md'), 'utf8');
+    const doc = raw.replace(/\s+/g, ' ');
+    // the container table's header row (in "The desk state": the unit file's table has one too): the
+    // keys state.ts writes, in its order, then the one earlier desks also wrote (it still reads)
+    const state = raw.slice(raw.indexOf('\n### The desk state\n'));
+    const row = state.split('\n').find((l) => l.startsWith('| header '))!;
+    const [written, earlier] = row.split(', in order');
+    expect([...written.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual([...STATE_HEADER_KEYS]);
+    expect([...earlier.matchAll(/`(\w+)`/g)].map((m) => m[1])).toEqual(['savedAt']);
+    expect(STATE_HEADER_KEYS).not.toContain('savedAt');
+    expect(doc).toContain(`UTF-8 JSON of at most ${MAX_HEADER_BYTES / 1024} KiB`);
+    expect(doc).toContain(`unpacked, at most ${MAX_UPDATE_BYTES / 1024 / 1024} MiB`);
+    expect(doc).toContain('An unchanged scene gives the same bytes.');
+    expect(doc).toContain("the gzip header's time is 0 and its system byte 255");
+    expect(doc).toContain('it unpacks gzip with a script (fflate)');
+    expect(doc).not.toContain('cannot read a gzipped one');
+  });
+
+  it('names a staging by its lineage', () => {
+    const a = newLineage();
+    expect(a).toMatch(/^[0-9a-f]{32}$/);
+    expect(newLineage()).not.toBe(a);
+    const doc = SceneDoc.create({ empty: true });
+    expect(readLineage(doc)).toBeNull();
+    doc.transact(() => writeLineage(doc, a));
+    expect(readLineage(doc)).toBe(a);
+  });
+
+  it('merges a state of the same staging, replaces with any other, else keeps or stages', () => {
+    const local = (lineage: string | null) => ({ staged: true, lineage });
+    expect(restorePlan({ lineage: 'a' }, local('a'))).toBe('merge');
+    expect(restorePlan({ lineage: 'a' }, local('b'))).toBe('replace');
+    expect(restorePlan({ lineage: 'a' }, local(null))).toBe('replace');
+    expect(restorePlan({ lineage: 'a' }, { staged: false, lineage: 'a' })).toBe('replace');
+    expect(restorePlan(null, local('a'))).toBe('local');
+    expect(restorePlan(null, { staged: false, lineage: null })).toBe('stage');
+  });
+});
+
+describe('the desk state of a scene with library units', () => {
+  it('is container version 2 exactly when the document holds instances of library units: this desk reads both, a desk from before units refuses it', async () => {
+    const lib = library();
+    const r = runStaging({
+      kind: 'stage',
+      update: Y.encodeStateAsUpdate(new Y.Doc()),
+      brief: withPins(BRIEF(), { elements: { [KITE]: lib.kite } }),
+      lineage: 'lineage-u',
+      generator: 'test',
+      units: { units: [{ ...lib.kite.pin, data: lib.kite.data.slice() }], problems: [] },
+    });
+    if (!r.ok || r.kind !== 'stage') throw new Error(JSON.stringify(r));
+    const ydoc = new Y.Doc();
+    Y.applyUpdate(ydoc, r.diff);
+    const update = Y.encodeStateAsUpdate(ydoc);
+    expect(docHasUnitInstances(SceneDoc.fromUpdate(update))).toBe(true);
+    for (const compress of [true, false]) {
+      const head = header({ lineage: 'lineage-u' });
+      const v2 = await encodeDeskState(update, head, { compress, units: true });
+      expect(bytesOf(v2)[8]).toBe(UNITS_CONTAINER_VERSION);
+      const read = await decodeDeskState(v2, SCENE);
+      expect(read.header.lineage).toBe('lineage-u');
+      expect(same(read.update, update)).toBe(true);
+      // a desk from before library units reads version 1 only: state_unreadable
+      expect(() => readStateHeader(bytesOf(v2), [CONTAINER_VERSION])).toThrow(StateUnreadable);
+      expect(() => readStateHeader(bytesOf(v2), [CONTAINER_VERSION])).toThrow(
+        /the desk state's container is version 2, this desk reads 1$/,
+      );
+      // the same document written as one without instances: version 1, the rest byte for byte
+      const v1 = await encodeDeskState(update, head, { compress });
+      expect(bytesOf(v1)[8]).toBe(CONTAINER_VERSION);
+      const differ = [...bytesOf(v1)].flatMap((b, i) => (b !== bytesOf(v2)[i] ? [i] : []));
+      expect(differ).toEqual([8]);
+    }
+    // a version neither desk wrote names both this one reads
+    const v3 = bytesOf(await encodeDeskState(staged, header())).slice();
+    v3[8] = 3;
+    await expect(
+      decodeDeskState({ format: '3d-editor.desk-state', version: 1, data: v3.buffer }, SCENE),
+    ).rejects.toThrow(/container is version 3, this desk reads 1 and 2/);
+  }, 60_000);
+});

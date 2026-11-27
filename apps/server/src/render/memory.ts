@@ -6,14 +6,13 @@ import {
   SAVE_BYTES_PER_IMAGE_BYTE,
   SAVE_BYTES_PER_KEPT_BYTE,
   SAVE_BYTES_PER_LAYER_BYTE,
+  RENDER_HEAP_BYTES_PER_TRIANGLE,
   decodedMeshBytes,
-  estimateModifier,
+  estimateRenderMemory,
+  estimateRenderTriangles,
   frameInputCacheBytes,
   isMeshMemoryError,
   layerBytes,
-  modifierRuns,
-  meshSize,
-  modifierContext,
   projectObjects,
   rigidBodyCacheBytes,
   rigidBodyCachesBytes,
@@ -28,7 +27,6 @@ import {
   type MeshLayout,
   type MeshMemoryCheck,
   type MeshMemoryRequest,
-  type MeshSize,
   type OperatorMemoryCheck,
   type OperatorMemoryRequest,
   type SceneDoc,
@@ -90,11 +88,10 @@ import { OUT_OF_MEMORY_PREFIX, RenderOutOfMemoryError } from './protocol';
  */
 
 /**
- * JavaScript heap a render takes per triangle of a mesh without modifiers, the decoded mesh
- * included: 307 bytes measured (a grid of 980,000 triangles, raster and path traced, 320×180),
- * rounded up.
+ * The heap a render takes, estimated without evaluating it: core's (export/memory.ts), which the
+ * guards here and the video exports use.
  */
-export const RENDER_HEAP_BYTES_PER_TRIANGLE = 320;
+export { RENDER_HEAP_BYTES_PER_TRIANGLE, estimateRenderMemory, estimateRenderTriangles };
 
 /** Least heap the guards keep free for the rest of the server (requests, rooms, other agents). */
 export const SERVER_HEAP_RESERVE_BYTES = 256 * 1024 * 1024;
@@ -119,58 +116,6 @@ const heapLimitBytes = (): number => v8.getHeapStatistics().heap_size_limit;
  */
 export function serverHeapReserve(limit: number = heapLimitBytes()): number {
   return Math.max(SERVER_HEAP_RESERVE_BYTES, Math.ceil(limit * SERVER_HEAP_RESERVE_SHARE));
-}
-
-const triangles = (s: MeshSize): number => Math.max(0, s.corners - 2 * s.faces);
-
-/**
- * Heap a render of `scene` takes, estimated without evaluating it: each mesh shown in renders
- * (its modifier stack counted once when objects share both) by its stored counts, the modifiers a
- * render runs (core `modifierRuns`: enabled for renders and not disabled by their type's rule) by
- * their estimates (core `estimateModifier`; a Bevel limited by angle by the
- * edges it bevels on the stored mesh when it comes first in the stack, else as if every edge were
- * sharp: core `modifierContext`), and the render of the result.
- */
-export function estimateRenderMemory(scene: SceneDoc): { triangles: number; bytes: number } {
-  const seen = new Set<string>();
-  let tris = 0;
-  let bytes = 0;
-  for (const o of scene.listObjects()) {
-    if (o.type !== 'MESH' || !o.data || o.hide_render) continue;
-    // the modifiers a render runs (show_render, and not disabled by their type's rule)
-    const mods = o.modifiers.filter((m) => modifierRuns(scene, m, true));
-    const key = `${o.data}|${JSON.stringify(mods.map((m) => [m.type, m.params]))}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    const counts = scene.meshCounts(o.data);
-    if (!counts) continue;
-    let size: MeshSize = counts;
-    // Array with FIT_LENGTH counts its copies from the mesh's size: decode it (the render will)
-    if (mods.some((m) => m.type === 'ARRAY' && m.params?.fit_type === 'FIT_LENGTH')) {
-      const mesh = scene.getMesh(o.data);
-      if (mesh) size = meshSize(mesh, true);
-    }
-    const base = triangles(size) * RENDER_HEAP_BYTES_PER_TRIANGLE;
-    let peaks = 0;
-    let first = true;
-    for (const m of mods) {
-      // a Bevel by angle: counted on the stored mesh when it comes first, else every edge
-      const e = estimateModifier(m, size, modifierContext(scene, o, m, first, true));
-      first = false;
-      peaks += e.bytes;
-      size = { ...e.result, extent: size.extent };
-    }
-    // the decoded mesh stays while the modifiers run; then their result is rendered
-    const result = mods.length ? triangles(size) * RENDER_HEAP_BYTES_PER_TRIANGLE : 0;
-    tris += triangles(size);
-    bytes += base + Math.max(peaks, result);
-  }
-  return { triangles: tris, bytes };
-}
-
-/** Triangles of the meshes a render of `scene` shows, after their modifiers (estimated). */
-export function estimateRenderTriangles(scene: SceneDoc): number {
-  return estimateRenderMemory(scene).triangles;
 }
 
 /**

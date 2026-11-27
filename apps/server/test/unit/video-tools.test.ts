@@ -119,7 +119,7 @@ describe('video export tools', { timeout: 30_000 }, () => {
     expect((await call('list_exports', {})).body.exports).toHaveLength(1);
   });
 
-  it("applies preset 'rideo' where the arguments leave a parameter out (the clips rideo_push sends)", async () => {
+  it("applies preset 'reference' where the arguments leave a parameter out (reference clips for a video model)", async () => {
     await connect();
     renderer.delayMs = 20;
     const paramsOf = async (args: Record<string, unknown>) => {
@@ -127,16 +127,19 @@ describe('video export tools', { timeout: 30_000 }, () => {
       expect(start.isError, start.text).toBe(false);
       return (await call('export_status', { export: start.body.export })).body.params;
     };
-    expect(await paramsOf({ preset: 'rideo' })).toMatchObject({
-      preset: 'rideo',
+    const reference = {
+      preset: 'reference',
       quality: 'draft',
       look: 'clay',
       passes: ['beauty', 'depth', 'pose'],
       outputs: { sequence: false, clips: true, posters: false, contact_sheet: false },
-    });
+    };
+    expect(await paramsOf({ preset: 'reference' })).toMatchObject(reference);
+    // 'rideo', the preset's former name, is still accepted and becomes 'reference'
+    expect(await paramsOf({ preset: 'rideo' })).toMatchObject(reference);
     // what the call gives wins, the defaults it leaves out are the preset's
     expect(
-      await paramsOf({ preset: 'rideo', quality: 'standard', look: 'material', passes: ['depth'] }),
+      await paramsOf({ preset: 'reference', quality: 'standard', look: 'material', passes: ['depth'] }),
     ).toMatchObject({ quality: 'standard', look: 'material', passes: ['depth'] });
     // without a preset, the defaults as before (every output: no outputs given)
     const plain = await paramsOf({});

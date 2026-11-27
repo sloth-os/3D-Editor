@@ -9,11 +9,14 @@ import { OperatorError } from '../../operators/context';
 import { DESK_PROPS } from '../props';
 import { getDeskSettings, getShots } from '../shots';
 import { DESK_SHAPE_PROP, DeskScene, isWater, toRideo, v3len, v3sub } from '../layout';
-import { GROUND_COLORS } from '../set';
+import { readBriefRecord } from '../brief/record';
+import { GROUND_COLORS, setUnitRoot } from '../set';
+import { UNIT_ROOT, deriveUnitId } from '../units/ids';
+import { readInstance, unitOf } from '../units/list';
 import { viewTarget } from '../moves';
 import { blueprintFor, posedBones, posesOf, requireBuiltKind } from '../characters/kinds';
 import { footprint, restSize, type PartsOf } from './footprint';
-import { RIDEO_PROPS, motionDigest, rideoHeightRatio, type RideoOffstage } from './import';
+import { RIDEO_PROPS, motionDigest, recordedMotion, rideoHeightRatio, type RideoOffstage } from './import';
 import { rideoPose } from './rules';
 import {
   RIDEO_BLOCKING_PALETTE,
@@ -37,14 +40,12 @@ import {
 } from './schema';
 
 /*
- * desk.export_rideo_blocking (spec §11 "Export"): the scene as a rideo SceneBlocking v1, validated by
- * rideo's schema (./schema.ts), so that rideo's camera view, blocking line and camera move derive from
- * the staging the desk renders (the agreement principle: the bridge writes it back before pushing
- * references).
+ * desk.export_rideo_blocking (spec §11 "Export"): the scene as a SceneBlocking v1 (./schema.ts), for
+ * agents that keep a scene's blocking as JSON: the staging the desk renders, in the format's terms.
  *
- * - Actors (those with a rideo character id, in cast order, at most 8): their opening marks are where
- *   the first enabled shot starts them; every shot has a mark for each of them at its start (rideo
- *   keeps those of the shot's cast) with the facing and the nearest of rideo's ten poses; toX/toZ is
+ * - Actors (those with a character id, in cast order, at most 16): their opening marks are where
+ *   the first enabled shot starts them; every shot has a mark for each of them at its start (the
+ *   format keeps those of the shot's cast) with the facing and the nearest of its ten poses; toX/toZ is
  *   where an actor ends the shot when it moved more than 0.3 m. A rider stands on its mount's mark.
  * - Cameras: where each shot's camera stands at its start, looking at the point of its view axis at
  *   its subjects' depth (rideo's target), its lens as a 36 mm wide sensor's; `end` where it is at the
@@ -52,10 +53,15 @@ import {
  * - Landmarks and props: their footprints (centre, width × depth × height, rotation) at the first
  *   shot's start; a prop's size is its largest extent; a held prop names its holder (heldBy).
  * - The set: its size and interior from the desk settings, its ground's name, the sun's azimuth and
- *   elevation as rideo measures them.
- * Shots are keyed by their rideo shot id (an imported shot's external.shot), else by their own id.
- * Their moves are returned beside the blocking (rideo's camera.move, which the push sets): a move
- * the blocking's end does not name (a tracking shot's end reads as a push in) stays the desk's.
+ *   elevation as rideo measures them. A library set (a unit instance with key 'set') is the set's
+ *   ground and pieces: its landmarks are not written (with a warning), also once it is made local
+ *   while the brief record says the slot holds a unit, so that importing the blocking again keeps the
+ *   set and adds no copies of its pieces; a linked set's ground name is the one staging wrote on its
+ *   root.
+ * Shots are keyed by their source's shot id (external.shot: a host's, or an imported clip's), else by
+ * their own id. Their moves are returned beside the blocking (a host keeps them as the shot's camera
+ * move): a move the blocking's end does not name (a tracking shot's end reads as a push in) stays the
+ * desk's.
  */
 
 /** How far (m) an actor must move during a shot for its mark to get toX/toZ. */
@@ -98,8 +104,24 @@ function hexOf(c: readonly number[]): string {
   return `#${byte(c[0] ?? 0)}${byte(c[1] ?? 0)}${byte(c[2] ?? 0)}`;
 }
 
+/**
+ * The root of the scene's library set: the instance with key 'set', or the root it keeps once made
+ * local (its id derived from the slot) while the brief record says the slot holds a unit, as a slot
+ * made local is still the scene's library set. Null: the set is the words'.
+ */
+function librarySetRoot(doc: SceneDoc): string | null {
+  const linked = setUnitRoot(doc);
+  if (linked) return linked;
+  const local = deriveUnitId('set', UNIT_ROOT);
+  return readBriefRecord(doc)?.setUnit?.staged === 'unit' && doc.getObject(local) ? local : null;
+}
+
 /** rideo's name of a ground colour (the first word of its table that names it), else 'ground'. */
 function groundName(doc: SceneDoc): string {
+  // a library set: the name staging wrote on its root
+  const setRoot = setUnitRoot(doc);
+  const unitGround = setRoot ? prop(doc.getObject(setRoot), RIDEO_PROPS.ground) : '';
+  if (unitGround) return unitGround.slice(0, 80);
   const ground = doc
     .listObjects()
     .find((o) => prop(o, DESK_PROPS.role) === 'set' && prop(o, DESK_PROPS.label) === 'ground');
@@ -277,14 +299,14 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   const keyOf = new Map<string, string>();
   const usedKeys = new Set<string>();
   for (const s of shots) {
-    let key = s.external?.source === 'rideo' && s.external.shot ? s.external.shot : s.id;
+    let key = s.external?.shot ? s.external.shot : s.id;
     if (usedKeys.has(key)) {
-      warnings.push(`shot '${s.name}' has the rideo shot id of an earlier shot: exported under its own id`);
+      warnings.push(`shot '${s.name}' has the source shot id of an earlier shot: exported under its own id`);
       key = s.id;
     }
-    if (!(s.external?.source === 'rideo' && s.external.shot))
+    if (!s.external?.shot)
       warnings.push(
-        `shot '${s.name}' has no rideo shot id: exported under its own id (rideo keeps only its clip's shots)`,
+        `shot '${s.name}' has no source shot id: exported under its own id (a host keeps only its own shots)`,
       );
     usedKeys.add(key);
     keyOf.set(s.id, key);
@@ -304,7 +326,7 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   for (const a of order) {
     const cid = prop(a, DESK_PROPS.characterId);
     if (!isRideoId(cid)) {
-      warnings.push(`actor '${a.name}' has no rideo character id: left out`);
+      warnings.push(`actor '${a.name}' has no character id: left out`);
       continue;
     }
     if (seenCharacters.has(cid)) {
@@ -312,7 +334,7 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
       continue;
     }
     if (exported.length >= RIDEO_MAX_ACTORS) {
-      warnings.push(`rideo blocks at most ${RIDEO_MAX_ACTORS} characters: '${a.name}' left out`);
+      warnings.push(`a blocking holds at most ${RIDEO_MAX_ACTORS} characters: '${a.name}' left out`);
       continue;
     }
     seenCharacters.add(cid);
@@ -326,7 +348,7 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   for (const a of offstage.actors) {
     if (seenCharacters.has(a.characterId)) continue;
     if (exported.length + offstageBack.length >= RIDEO_MAX_ACTORS) {
-      warnings.push(`rideo blocks at most ${RIDEO_MAX_ACTORS} characters: ${a.characterId} left out`);
+      warnings.push(`a blocking holds at most ${RIDEO_MAX_ACTORS} characters: ${a.characterId} left out`);
       continue;
     }
     seenCharacters.add(a.characterId);
@@ -391,7 +413,9 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
     }
     const camera = s.camera ? cameraOf(scene, s) : null;
     if (!camera) {
-      warnings.push(`shot '${s.name}' has no camera: left out of the blocking's shots (rideo solves one)`);
+      warnings.push(
+        `shot '${s.name}' has no camera: left out of the blocking's shots (an import solves one)`,
+      );
       continue;
     }
     const subjects = s.subjects
@@ -417,9 +441,23 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
   };
   const landmarks: RideoSceneBlocking['set']['landmarks'] = [];
   const landmarkIds = new Set<string>();
+  // a library set's pieces are the set's, linked or made local: a re-import keeps the set
+  const setRoot = librarySetRoot(doc);
+  const inSetUnit = (id: string) => {
+    const owner = unitOf(doc, id);
+    if (owner !== null && readInstance(doc, owner)?.kind === 'set') return true;
+    for (let p = scene.objects.get(id)?.parent ?? null; p; p = scene.objects.get(p)?.parent ?? null)
+      if (p === setRoot) return true;
+    return false;
+  };
+  let setPieces = 0;
   for (const l of objects.filter((x) => prop(x, DESK_PROPS.role) === 'landmark' && isRoot(x, 'landmark'))) {
+    if (inSetUnit(l.id)) {
+      setPieces++;
+      continue;
+    }
     if (landmarks.length >= RIDEO_MAX_LANDMARKS) {
-      warnings.push(`rideo's sets hold at most ${RIDEO_MAX_LANDMARKS} landmarks: '${l.name}' left out`);
+      warnings.push(`a blocking's set holds at most ${RIDEO_MAX_LANDMARKS} landmarks: '${l.name}' left out`);
       continue;
     }
     const f = footprint(doc, scene.frameState(frame0), parts, l.id);
@@ -453,6 +491,14 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
     });
   }
 
+  if (setPieces) {
+    const name =
+      (setRoot && (readInstance(doc, setRoot)?.name ?? doc.getObject(setRoot)?.name)) || 'library set';
+    warnings.push(
+      `the set is the library's '${name}': its ${setPieces} piece(s) are not written as landmarks (a re-import keeps the set)`,
+    );
+  }
+
   // ------------------------------------------------------------ props
   const strings = objects.filter((x) => typeof x.custom_props?.desk_string_to === 'string');
   const props: RideoSceneBlocking['props'] = [];
@@ -462,7 +508,7 @@ export function exportRideoBlocking(doc: SceneDoc, o: { now?: string } = {}): Ri
       prop(x, DESK_PROPS.role) === 'prop' && isRoot(x, 'prop') && x.custom_props?.desk_tail_of === undefined,
   )) {
     if (props.length >= RIDEO_MAX_PROPS) {
-      warnings.push(`rideo's blockings hold at most ${RIDEO_MAX_PROPS} props: '${p.name}' left out`);
+      warnings.push(`a blocking holds at most ${RIDEO_MAX_PROPS} props: '${p.name}' left out`);
       continue;
     }
     let holder: string | null = null;
@@ -541,14 +587,15 @@ function heightRatioOf(kind: string): number {
 
 /**
  * rideo's own blocked camera of a shot, as the import placed it (RIDEO_PROPS.camera), while the
- * camera is as the import left it (RIDEO_PROPS.motion); null once it was moved, keyed or solved again.
+ * camera is as the import left it (RIDEO_PROPS.motion's `all`); null once it was moved, keyed or
+ * solved again.
  */
 function importedCamera(doc: SceneDoc, s: ShotData): RideoBlockingShot['camera'] | null {
   const o = s.camera ? doc.getObject(s.camera) : null;
   const text = o?.custom_props?.[RIDEO_PROPS.camera];
-  const recorded = o?.custom_props?.[RIDEO_PROPS.motion];
-  if (!o || typeof text !== 'string' || typeof recorded !== 'string') return null;
-  if (s.external?.source !== 'rideo' || !s.external.shot) return null;
+  const recorded = recordedMotion(o).all;
+  if (!o || typeof text !== 'string' || recorded === null) return null;
+  if (!s.external?.shot) return null;
   if (motionDigest(doc, o.id) !== recorded) return null;
   try {
     const kept = JSON.parse(text) as { shot?: unknown; camera?: RideoBlockingShot['camera'] };

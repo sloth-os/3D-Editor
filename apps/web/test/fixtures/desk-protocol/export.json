@@ -1,0 +1,7 @@
+{
+  "type": "export",
+  "id": "exp-1",
+  "shots": ["sht_0123456789aaaa"],
+  "modes": ["camera", "pose"],
+  "still": true
+}

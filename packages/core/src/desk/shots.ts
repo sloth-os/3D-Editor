@@ -8,6 +8,7 @@ import {
   DESK_HEIGHTS,
   DESK_MOVES,
   DESK_SIDES,
+  SHOT_EXTERNAL_SOURCES,
 } from '../doc/types';
 import { defaultDeskSettings } from '../doc/defaults';
 import { docChangeToken } from '../doc/change-token';
@@ -55,7 +56,7 @@ export const DESK_ASPECT_MIN = 0.1;
 export const DESK_ASPECT_MAX = 10;
 /** Longest video-model take the clamp may name (seconds). */
 export const MAX_SHOT_SECONDS = 3600;
-/** Longest external reference string (rideo project, clip and shot ids). */
+/** Longest external reference string (the source's project, scene and shot ids). */
 const MAX_EXTERNAL_TEXT = 256;
 
 const ID_RE = /^[0-9A-Za-z]{16}$/;
@@ -120,10 +121,11 @@ function derivedId(seed: string, taken: ReadonlySet<string>): string {
 }
 
 function sanitizeExternal(v: unknown): ShotExternalRef | null {
-  if (!isRecord(v) || v.source !== 'rideo') return null;
+  const source = isRecord(v) ? oneOf(SHOT_EXTERNAL_SOURCES, v.source) : null;
+  if (!isRecord(v) || !source) return null;
   const index = isFiniteNumber(v.index) && v.index >= 0 ? Math.min(Math.round(v.index), 1_000_000) : null;
   return {
-    source: 'rideo',
+    source,
     project: text(v.project, MAX_EXTERNAL_TEXT),
     clip: text(v.clip, MAX_EXTERNAL_TEXT),
     shot: text(v.shot, MAX_EXTERNAL_TEXT),
@@ -216,8 +218,9 @@ function sanitizeShot(
  * read of the same data; setShots stores them); names are cut to 64 characters (empty: "Shot
  * <n>"), notes to 2000; enums that are not rideo's values become null; frames are integers
  * (frame_end ≥ frame_start), lens_mm is clamped to 8–800, pre_roll to 0–MAX_PRE_ROLL; continuity
- * defaults to 'cut'. With `doc`, a camera that is not a CAMERA object of it becomes null and
- * subjects and layout entries of objects it does not have are dropped.
+ * defaults to 'cut'; an external reference keeps a source of SHOT_EXTERNAL_SOURCES (else none).
+ * With `doc`, a camera that is not a CAMERA object of it becomes null and subjects and layout
+ * entries of objects it does not have are dropped.
  */
 export function sanitizeShots(raw: unknown, doc?: SceneDoc): ShotData[] {
   if (!Array.isArray(raw)) return [];

@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { Icon } from '../icons';
+import { isDeskRuntime } from '../../app/runtime';
+import { readStorage, writeStorage } from '../../app/safe-storage';
 
 function fmt(v: number, precision: number, unit?: string): string {
   if (!Number.isFinite(v)) return String(v);
@@ -546,9 +548,11 @@ export function Panel(p: {
   actions?: ComponentChildren;
   id?: string;
 }) {
-  const key = `3d-editor:panel:${p.id ?? p.title}`;
+  // whether it is open, kept in the browser: the desk keeps its own, apart from the editor's (they
+  // share storage where the desk is on the editor's site), as it does its panels' sizes
+  const key = `${isDeskRuntime() ? '3d-editor:desk:panel' : '3d-editor:panel'}:${p.id ?? p.title}`;
   const [open, setOpen] = useState(() => {
-    const s = localStorage.getItem(key);
+    const s = readStorage(key);
     return s === null ? p.defaultOpen !== false : s === '1';
   });
   return (
@@ -557,7 +561,7 @@ export function Panel(p: {
         class="panel-header"
         onClick={() => {
           setOpen(!open);
-          localStorage.setItem(key, open ? '0' : '1');
+          writeStorage(key, open ? '0' : '1');
         }}
       >
         <span class="chev">{open ? '▾' : '▸'}</span>

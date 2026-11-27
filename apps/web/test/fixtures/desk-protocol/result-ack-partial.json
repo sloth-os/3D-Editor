@@ -1,0 +1,13 @@
+{
+  "type": "result-ack",
+  "id": "desk-1",
+  "ok": false,
+  "message": "1 of 1 shots failed.",
+  "shots": [
+    {
+      "shotId": "sht_0123456789bbbb",
+      "ok": false,
+      "error": "The project is approved: unapprove it to change its references."
+    }
+  ]
+}

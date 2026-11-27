@@ -38,6 +38,7 @@ import {
   requireActor,
   restMatrices,
   shadeLinear,
+  type Blueprint,
 } from './rig';
 import { ACTOR_PALETTE, type ActorKind, type CreateActorOptions, type PoseLayer } from './types';
 
@@ -90,17 +91,9 @@ export function buildActor(
 
   const bp = blueprintFor(kind, height);
   const bones = boneData(bp.bones);
-  const rest = restMatrices(bones);
   const armId = doc.addArmature({ name, bones, display_type: 'STICK' });
   const arm = doc.getArmature(armId)!;
-  const base = hexToLinear(color);
-  const mats = [
-    doc.addMaterial({ name: `${name} Body`, base_color: base, roughness: 0.55 }),
-    doc.addMaterial({ name: `${name} Joints`, base_color: shadeLinear(base, 0.32), roughness: 0.5 }),
-    doc.addMaterial({ name: `${name} Face`, base_color: [0.88, 0.88, 0.84, 1], roughness: 0.35 }),
-  ];
-  if (bp.accent)
-    mats.push(doc.addMaterial({ name: `${name} Saddle`, base_color: [0.16, 0.07, 0.03, 1], roughness: 0.6 }));
+  const mats = actorMaterials(doc, name, color, bp);
   const props: Record<string, string | number | boolean> = {
     [DESK_PROPS.role]: 'actor',
     [DESK_PROPS.kind]: kind,
@@ -118,6 +111,39 @@ export function buildActor(
     pose: { bones: posedBones(kind, arm, bp, pose) },
   });
   const actorName = doc.getObject(actor)!.name;
+  const parts = buildActorParts(doc, actor, actorName, bp, mats);
+  return { actor, parts, name: actorName };
+}
+
+/**
+ * The materials of an actor's mannequin parts, named after the actor: body (its colour), joints (a
+ * shade of it), face, and a saddle when the blueprint has one (the order of the parts' slots).
+ */
+export function actorMaterials(doc: SceneDoc, name: string, color: string, bp: Blueprint): string[] {
+  const base = hexToLinear(color);
+  const mats = [
+    doc.addMaterial({ name: `${name} Body`, base_color: base, roughness: 0.55 }),
+    doc.addMaterial({ name: `${name} Joints`, base_color: shadeLinear(base, 0.32), roughness: 0.5 }),
+    doc.addMaterial({ name: `${name} Face`, base_color: [0.88, 0.88, 0.84, 1], roughness: 0.35 }),
+  ];
+  if (bp.accent)
+    mats.push(doc.addMaterial({ name: `${name} Saddle`, base_color: [0.16, 0.07, 0.03, 1], roughness: 0.6 }));
+  return mats;
+}
+
+/**
+ * An actor's mannequin parts: a mesh per blueprint part, BONE-parented to its bone of armature
+ * object `actor` (desk_actor = the armature), with the materials of actorMaterials. The bones are the
+ * blueprint's (the armature's must have them).
+ */
+export function buildActorParts(
+  doc: SceneDoc,
+  actor: string,
+  actorName: string,
+  bp: Blueprint,
+  mats: readonly string[],
+): string[] {
+  const rest = restMatrices(boneData(bp.bones));
   const parts: string[] = [];
   for (const part of bp.parts) {
     const r = rest.get(part.bone);
@@ -140,7 +166,7 @@ export function buildActor(
       }),
     );
   }
-  return { actor, parts, name: actorName };
+  return parts;
 }
 
 /** Pose channels keyed by a pose: every bone's rotation and the hips' location. */

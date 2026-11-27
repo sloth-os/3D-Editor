@@ -154,8 +154,15 @@ export const OPERATOR_GROUPS: readonly OperatorGroup[] = [
     name: 'Director',
     aliases: ['Desk', 'Shots'],
     description:
-      "The director's desk, previs for AI video: shots (a camera each, with framing, angle, height, lens, move, subjects and planned screen layout, solved like rideo's solver and kept on one side of the 180° line), continuity checks, the set (ground, sky and sun), actors, physics presets (drop, throw, push, bake), kites and balloons on strings, vehicles, and rideo's blocking in and out. export_video renders the shots as video files (export_status follows a job, cancel_export stops it, list_exports lists them); rideo_import and rideo_push exchange clips with a rideo server",
-    tools: ['export_video', 'export_status', 'cancel_export', 'list_exports', 'rideo_import', 'rideo_push'],
+      "The director's desk, previs for AI video: shots (a camera each, with framing, angle, height, lens, move, subjects and planned screen layout, solved from the plan and kept on one side of the 180° line), continuity checks, the set (ground, sky and sun), actors, physics presets (drop, throw, push, bake), kites and balloons on strings, vehicles, a host's scene brief staged and updated (desk.stage_brief, desk.update_from_brief, desk.shot_results) and SceneBlocking v1 in and out. desk_stage_brief and desk_shot_results do the brief's steps as tools; export_video renders the shots as video files ({preset: 'reference'}: a video model's reference clips; export_status follows a job, cancel_export stops it, list_exports lists them)",
+    tools: [
+      'desk_stage_brief',
+      'desk_shot_results',
+      'export_video',
+      'export_status',
+      'cancel_export',
+      'list_exports',
+    ],
     match: prefix('desk.'),
   },
   {

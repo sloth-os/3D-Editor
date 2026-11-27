@@ -392,9 +392,9 @@ describe('rideo export: scenes not made by the import', () => {
     const r = exportRideoBlocking(doc, { now: NOW });
     expect(Object.keys(r.blocking.shots)).toEqual([...DIALOGUE_SHOTS, shot.id]);
     expect(r.warnings).toContain(
-      "shot 'Insert' has no rideo shot id: exported under its own id (rideo keeps only its clip's shots)",
+      "shot 'Insert' has no source shot id: exported under its own id (a host keeps only its own shots)",
     );
-    expect(r.warnings).toContain("actor 'Extra' has no rideo character id: left out");
+    expect(r.warnings).toContain("actor 'Extra' has no character id: left out");
     expect(r.blocking.actors).toHaveLength(2);
   });
 

@@ -1,0 +1,9 @@
+{
+  "type": "unit-ack",
+  "id": "pub-2",
+  "ok": true,
+  "ref": "lib_0123456789mira",
+  "version": 3,
+  "linked": false,
+  "message": "Saved Mira v3. Not linked: the scene is open read-only."
+}

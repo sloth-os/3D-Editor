@@ -4,8 +4,9 @@ import { PLAIN, fieldNumber, newProject, outlinerNames } from './helpers';
 /*
  * The Asset Browser (bottom tab 'assets'): a search of the built-in models finds the chair, Add
  * puts it at the 3D cursor as one undo step, a card dragged onto the viewport with the mouse (the
- * browser's own drag and drop) lands where it is dropped, and the short list asks the server only
- * for the thumbnails of the cards in view and the next row.
+ * browser's own drag and drop) lands where it is dropped, and the short list makes only the
+ * thumbnails of the cards in view and the next row (in this browser's thumbnail workers: built-in
+ * models' thumbnails are never asked of the server; e2e/tests/asset-thumbnails.spec.ts has more).
  */
 
 /** Saves a screenshot when E2E_SCREENSHOT_DIR is set (visual checks outside CI). */
@@ -68,11 +69,12 @@ test.describe('Asset Browser', () => {
     await snap(page, 'assets-dropped');
   });
 
-  test('asks for the thumbnails of the cards in view and the next row only', async ({ page }) => {
-    const thumbnails = new Set<string>();
+  test('makes the thumbnails of the cards in view and the next row only, never asking the server', async ({
+    page,
+  }) => {
+    const asked: string[] = [];
     page.on('request', (r) => {
-      const m = /\/api\/store\/models\/([^/?]+)\/thumbnail/.exec(r.url());
-      if (m) thumbnails.add(decodeURIComponent(m[1]));
+      if (/\/api\/store\/models\/[^/?]+\/thumbnail/.test(r.url())) asked.push(r.url());
     });
     await newProject(page, PLAIN);
     await page.getByTestId('bottom-tab-assets').click();
@@ -87,13 +89,22 @@ test.describe('Asset Browser', () => {
       scrollHeight: el.scrollHeight,
     }));
     expect(scrollHeight).toBeGreaterThan(clientHeight * 3);
-    // what is in view and a box height beyond it: a few rows, not the whole page
-    await expect.poll(() => thumbnails.size).toBeGreaterThan(0);
+    // what is in view and a box height beyond it: a few rows asked for (rendering, or shown), not
+    // the whole page; the cards further down wait ('idle')
+    const thumbs = page.locator('[data-testid^="asset-thumb-box-"]');
+    const asking = () =>
+      thumbs.evaluateAll((els) => els.filter((e) => e.getAttribute('data-thumb-state') !== 'idle').length);
+    await expect.poll(asking).toBeGreaterThan(0);
+    await expect(thumbs.first()).toHaveAttribute('data-thumb-state', 'ready', { timeout: 30_000 });
     await page.waitForTimeout(1000);
-    const first = thumbnails.size;
+    const first = await asking();
     expect(first).toBeLessThan(24);
-    // scrolled to the end, the other cards ask for theirs
+    const last = page.getByTestId((await thumbs.nth(23).getAttribute('data-testid'))!);
+    await expect(last).toHaveAttribute('data-thumb-state', 'idle');
+    // scrolled to the end (which also brings the next page of models), the other cards get theirs
     await results.evaluate((el) => el.scrollTo(0, el.scrollHeight));
-    await expect.poll(() => thumbnails.size).toBeGreaterThan(first);
+    await expect(last).toHaveAttribute('data-thumb-state', 'ready', { timeout: 30_000 });
+    // made here, never asked of the server
+    expect(asked).toEqual([]);
   });
 });

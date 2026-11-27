@@ -3144,7 +3144,7 @@ describe('docs: round 13 (EDGE)', () => {
    */
   it('quote both forms of the RASTER refusal and give the heap of the page as an estimate', () => {
     const memory = web('render/memory.ts');
-    expect(memory).toContain("'the page and the path traced renders running in it are estimated to use'");
+    expect(memory).toContain("'the page and the renders and exports running in it are estimated to use'");
     expect(memory).toContain(": 'the page is estimated to use';");
     expect(memory).not.toMatch(/'the page uses'|running in it use'/);
     expect(memory).toContain(
@@ -3175,8 +3175,8 @@ describe('docs: round 13 (EDGE)', () => {
         '`browser render failed: Path tracing was not started: its render thread needs about … GB of JavaScript heap, more than the … GB the tab has left for it: …`',
       ),
     ).toContain(
-      'which is the share of the heap limit a render may fill less the heap the page (and the path traced ' +
-        'renders running in it) is estimated to use, from its scene with a quarter more',
+      'which is the share of the heap limit a render may fill less the heap the page (and the renders and ' +
+        'exports running in it) is estimated to use, from its scene with a quarter more',
     );
     expect(
       row(

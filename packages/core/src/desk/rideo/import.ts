@@ -1,4 +1,6 @@
-import type { Vec3 } from '../../math/types';
+import type { Mat4, Vec3 } from '../../math/types';
+import { compose4, determinant4, invert4, multiply4 } from '../../math/mat4';
+import { decomposeCompatible } from '../../generate/layout';
 import type { SceneDoc } from '../../doc/scene-doc';
 import type { DeskLayoutEntry, DeskMove, ObjectData, ShotData } from '../../doc/types';
 import { createCube, createCylinder, createPlane } from '../../mesh/primitives';
@@ -13,18 +15,38 @@ import { DESK_PROPS } from '../props';
 import { MAX_SHOT_SUBJECTS, getShots, newShotId, setDeskSettings, setShots } from '../shots';
 import { DESK_SHAPE_PROP, DeskScene, isWaterLabel, toEditor } from '../layout';
 import { setInWaterSpans, type FrameSpan } from '../water';
-import { buildSet } from '../set';
+import { buildSet, setGround } from '../set';
 import { addDeskCamera, applyCameraMove, lookEuler, prepareDeskCamera } from '../moves';
 import { cameraMoveOf, FRAMING_TABLE } from '../solver';
 import { fitShotToPlan, planFit } from '../plan';
 import { checkShots, type DeskIssue } from '../checks';
 import { applyPose, createActor, holdProp, isActor, mount, moveAlongPath } from '../characters';
+import { createFigureActor } from '../characters/figure';
+import type { UnitPayload } from '../units/format';
+import { insertUnit, type UnitPin } from '../units/insert';
+import { readInstance, unitOf } from '../units/list';
+import { UNIT_ROOT } from '../units/ids';
+import {
+  hangKept,
+  keptPlaces,
+  moversOf,
+  oldLook,
+  removeKeeping,
+  removeObjectTrees,
+  sameWorld,
+  type HeldBack,
+  type KeptPlaces,
+  type LaterWarning,
+} from '../units/remove';
+import { unitStatus } from '../units/status';
+import { updateUnit, withArticle } from '../units/update';
 import { ACTOR_PALETTE, type ActorKind } from '../characters/types';
 import { defaultActorHeight } from '../characters';
 import { deskTetherFly } from '../physics';
 import { measureActorKind } from '../../store/builtin/actors';
 import { docParts, footprint } from './footprint';
 import { KeyArchive, clearAnimation, hideSpans, replaceKeys, setKey, truncateMotion } from './keys';
+import { hiddenByScale } from '../hide';
 import {
   MOUNT_DISTANCE_M,
   PERSON_POSES,
@@ -43,6 +65,7 @@ import {
 } from './rules';
 import {
   RIDEO_BLOCKING_PALETTE,
+  RIDEO_MAX_ACTORS,
   RideoImportInputSchema,
   RideoSceneBlockingSchema,
   rideoLandmarkColor,
@@ -59,8 +82,11 @@ import {
 } from './schema';
 
 /*
- * desk.import_rideo_blocking (spec §11 "Import semantics"): a rideo clip's SceneBlocking as a scene,
- * its actors, props, landmarks and set, and a shot per rideo shot.
+ * desk.import_rideo_blocking (spec §11 "Import semantics"): a clip's SceneBlocking v1 (the blocking
+ * format rideo defined, ./schema.ts) as a scene, its actors, props, landmarks and set, and a shot per
+ * shot of the clip; also the staging engine of desk/brief stageBrief (source 'host'), which hands it a
+ * blocking of the set and props only (state 'missing': the cast placed from the planned layouts).
+ * "rideo" below is the format's: its coordinates, poses, landmarks and moves.
  *
  * Timeline. Shots in rideo's index order, each round(durationSec × fps) frames long, one after the
  * other; a cut where marks jump (someone stands elsewhere, a rider gets on or off) opens with a
@@ -96,7 +122,21 @@ import {
  * rideo no longer has are removed, shots rideo removed are disabled. A prop or landmark rideo still
  * describes the same way is kept with what was added to it (physics, materials, modifiers), else it is
  * built anew. The animation of imported actors and props is rebuilt from rideo's (keys added to them
- * by hand are lost).
+ * by hand are lost). What the person put on a piece that is built anew or goes (objects of their own
+ * below it, not its look) stays where it is in the world, hung from the piece built in its place, or
+ * from the set's ground for one that goes (hangOnGround), its keyed motion kept where it can be, and
+ * the warnings name it (units/remove.ts hangKept).
+ *
+ * Library units (code-level hooks, ImportUnits; the SceneBlocking JSON is unchanged): brief staging
+ * hands the import a prop unit per element and a figure unit per cast member it places (desk/brief),
+ * and the opening marks it planned clear of a set unit's pieces. A prop unit is put in as an instance
+ * (key 'el:<elementId>') at its spot, its base on the ground and its own size, and held or flown as a
+ * built-in prop is; an earlier instance of the same library item is kept and updated to the pinned
+ * version (its root id stays). A figure is put in as the cast member's actor (key 'cast:<castId>'),
+ * its kind, height and colour the figure's. Objects inside an instance are the unit's: an import never
+ * takes them for its own landmarks, props or actors (only an instance's root is), and a re-import
+ * without hooks keeps an imported prop that is an instance (with its look) and a figure actor of the
+ * same kind and height (with its colour).
  */
 
 /** Custom properties the import writes (besides DESK_PROPS). */
@@ -125,6 +165,8 @@ export const RIDEO_PROPS = {
   /**
    * A digest of what the import left an actor, prop, landmark or shot camera doing (motionDigest):
    * a re-import, which rebuilds them from rideo's blocking, says which were changed in the desk since.
+   * On a prop it is followed by a space and the digest of the keys on its own transform channels
+   * (ownKeysDigest): keys of the person's there are what the staging did not write (recordedMotion).
    */
   motion: 'desk_rideo_motion',
   /**
@@ -238,6 +280,50 @@ export interface RideoImportResult {
   warnings: string[];
 }
 
+/** A unit staging places through the import: its instance key, its pin and the decoded unit. */
+export interface StagedUnit {
+  /** The instance key (slotKey): 'el:<elementId>', 'cast:<castId>'. */
+  key: string;
+  pin: UnitPin;
+  /** The decoded unit (null: the slot's instance is kept as it is, only placed again). */
+  unit: UnitPayload | null;
+}
+
+/** A prop unit: its base (its root stands at z = −base) and the planning facts stamped on its root. */
+export interface StagedProp extends StagedUnit {
+  base: number;
+  /** The scene prop desk_unit_facts of its root (JSON), or null. */
+  facts: string | null;
+}
+
+/** A figure unit: the actor's kind, height and colour (the figure's). */
+export interface StagedFigure extends StagedUnit {
+  unit: UnitPayload;
+  kind: ActorKind;
+  heightM: number;
+  color: string;
+}
+
+/**
+ * Library units for the import (brief staging's; see the module comment): the opening marks to use
+ * instead of the planned layouts' (state 'missing'), and per prop and per cast member the unit that
+ * stages it (undefined: the built-in prop, the mannequin). `figureHeight`: the height of a member
+ * whose figure is pinned but not placed (not here, or refused), which the host gives as the
+ * figure's own: the desk's height of its kind (an animal's withers), used as it is rather than as
+ * rideo's height, so that the mannequin standing in has the figure's rig and its arrival is a look
+ * swap (undefined: rideo's height, as for any member). `failed`: a unit handed to the import that
+ * did not go in (by its key, with the error), which leaves nothing of it behind: its member stands
+ * as the mannequin of the figure's kind, height and colour, its element as the prop of the words
+ * (or the prop it had, kept as it is), and the rest of the import goes on.
+ */
+export interface ImportUnits {
+  marks?: ReadonlyMap<string, RideoBlockingMark>;
+  prop?(p: RideoBlockingProp): StagedProp | null | undefined;
+  figure?(characterId: string): StagedFigure | undefined;
+  figureHeight?(characterId: string): number | undefined;
+  failed?(key: string, err: unknown): void;
+}
+
 // ---------------------------------------------------------------- small helpers
 
 const rad = (deg: number) => (deg * Math.PI) / 180;
@@ -278,11 +364,38 @@ function subtree(doc: SceneDoc, id: string): string[] {
   return out;
 }
 
-/** Removes objects with everything below them. */
-function removeTrees(doc: SceneDoc, ids: readonly string[]): void {
-  const all = new Set<string>();
-  for (const id of ids) if (doc.getObject(id)) for (const x of subtree(doc, id)) all.add(x);
-  doc.removeObjects([...all]);
+/**
+ * Removes objects with everything below them; a library unit instance among them goes whole, with the
+ * datablocks its part table lists that nothing else uses (units/remove.ts: a unit placed in its slot
+ * again derives the same ids). `keep`: objects below them that stay, each with what is below it (see
+ * removeObjectTrees).
+ */
+export function removeTrees(doc: SceneDoc, ids: readonly string[], keep: readonly string[] = []): void {
+  removeObjectTrees(doc, ids, keep);
+}
+
+/**
+ * Hangs what stays of a piece that goes with nothing in its place (`kept`: a landmark or a prop the
+ * words drop, an actor or a shot's camera that goes, a flyer's old string; units/remove.ts
+ * removeKeeping) from the set's ground (`ground`, else the words' ground or a library set's root; the
+ * scene when there is none), where it was in the world, in the caller's transaction, and returns the
+ * warnings naming it ("'pond' goes; 'Lily' stays where it is, on the words' ground"). `held`:
+ * objects a later step of the caller may take out, whose warnings wait in `held.later`
+ * (units/remove.ts KeptWords' `unnamed`).
+ */
+export function hangOnGround(
+  doc: SceneDoc,
+  kept: KeptPlaces,
+  gone: string,
+  ground: string | null = setGround(doc),
+  held: HeldBack = {},
+): string[] {
+  const on = !ground
+    ? 'the scene'
+    : readInstance(doc, ground)
+      ? "the library set's root"
+      : "the words' ground";
+  return hangKept(doc, ground, kept, { of: gone, on, gone, unnamed: held.unnamed, later: held.later });
 }
 
 const prop = (o: ObjectData | null | undefined, key: string): string => {
@@ -300,6 +413,9 @@ function importedBy(
   const out = new Map<string, ObjectData>();
   for (const o of doc.listObjects()) {
     if (prop(o, DESK_PROPS.role) !== role) continue;
+    // a part of a library unit instance is the unit's, not the import's (its root may be the import's)
+    const owner = unitOf(doc, o.id);
+    if (owner !== null && owner !== o.id) continue;
     const k = key(o);
     if (!k) continue;
     const from = prop(o, RIDEO_PROPS.clip);
@@ -341,26 +457,29 @@ function digestOf(text: string): string {
 /**
  * A digest of what an object does (RIDEO_PROPS.motion): the placement, constraints, pose and
  * animation (its own curves and its data's) of it and of everything parented below it, and a
- * camera's lens. Equal digests: nothing of it was changed.
+ * camera's lens. Equal digests: nothing of it was changed. `hang` false leaves out where `root`
+ * hangs (its parent) and the channel values a hang with Keep Transform rewrites to keep it where it
+ * is (cameraOwnDigest).
  */
-export function motionDigest(doc: SceneDoc, root: string): string {
+export function motionDigest(doc: SceneDoc, root: string, o: { hang?: boolean } = {}): string {
   const parts: unknown[] = [];
   for (const id of subtree(doc, root)) {
-    const o = doc.getObject(id);
-    if (!o) continue;
-    const curves = [...doc.listFCurves(id), ...(o.data ? doc.listFCurves(o.data) : [])]
+    const ob = doc.getObject(id);
+    if (!ob) continue;
+    const curves = [...doc.listFCurves(id), ...(ob.data ? doc.listFCurves(ob.data) : [])]
       .map((fc) => [fcurveKey(fc), fc.keyframes, fc.extrapolation, fc.mute, fc.modifiers ?? null] as const)
       .sort((x, y) => (x[0] < y[0] ? -1 : x[0] > y[0] ? 1 : 0));
-    const camera = o.type === 'CAMERA' && o.data ? doc.getCamera(o.data) : null;
+    const camera = ob.type === 'CAMERA' && ob.data ? doc.getCamera(ob.data) : null;
+    const placed = o.hang !== false || id !== root;
     parts.push([
       id,
-      o.parent,
-      o.parent_bone,
-      o.location,
-      o.rotation_euler,
-      o.scale,
-      o.constraints,
-      o.pose ?? null,
+      placed ? ob.parent : null,
+      placed ? ob.parent_bone : null,
+      placed ? ob.location : null,
+      placed ? ob.rotation_euler : null,
+      placed ? ob.scale : null,
+      ob.constraints,
+      ob.pose ?? null,
       curves,
       camera,
     ]);
@@ -368,15 +487,122 @@ export function motionDigest(doc: SceneDoc, root: string): string {
   return digestOf(JSON.stringify(parts));
 }
 
+/**
+ * A digest of what the person may set on shot camera `id` besides where it hangs: motionDigest with
+ * its parent and the channel values a hang with Keep Transform rewrites left out, so its keys and its
+ * data's (lens, focus), its constraints and camera settings and what hangs below it. RIDEO_PROPS.motion
+ * records it after a camera's motion (recordedMotion's `own`): a camera hung from another object
+ * since whose `own` is as recorded was only hung there, not set by hand (cameraOwnAsStaged).
+ */
+export function cameraOwnDigest(doc: SceneDoc, id: string): string {
+  return motionDigest(doc, id, { hang: false });
+}
+
+/** The transform channels of an object that a hold, a flight or a hide key writes (and the person may key). */
+const OWN_CHANNELS: ReadonlySet<string> = new Set(['location', 'rotation_euler', 'scale']);
+
+/** A number as ownKeysDigest reads it: to 1e-6, so that a channel read back from a matrix keeps its ulps out. */
+function digestNumber(v: number): number {
+  const r = Math.round(v * 1e6) / 1e6;
+  return Object.is(r, -0) ? 0 : r;
+}
+
+/**
+ * A digest of the keys and drivers on object `id`'s own transform channels (location, rotation,
+ * scale; frames and values to 1e-6): on a prop, what the staging keyed there (its hold, its flight,
+ * its hiding) and any key the person added since. RIDEO_PROPS.motion records it after a prop's
+ * motion; recordedMotion's `own`.
+ */
+export function ownKeysDigest(doc: SceneDoc, id: string): string {
+  const curves = doc
+    .listFCurves(id)
+    .filter((fc) => fc.target_type === 'object' && OWN_CHANNELS.has(fc.path))
+    .map(
+      (fc) =>
+        [
+          fc.path,
+          fc.index,
+          fc.keyframes.map((k) => [
+            digestNumber(k.frame),
+            digestNumber(k.value),
+            k.interpolation,
+            k.easing ?? null,
+          ]),
+          fc.extrapolation,
+          fc.mute,
+          fc.modifiers ?? null,
+        ] as const,
+    )
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
+  const drivers = doc
+    .listDrivers(id)
+    .filter((d) => d.target_type === 'object' && OWN_CHANNELS.has(d.path))
+    .map((d) => [d.path, d.index, d.expression, d.variables, d.mute] as const)
+    .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] - b[1]));
+  return digestOf(JSON.stringify([curves, drivers]));
+}
+
+/**
+ * What RIDEO_PROPS.motion records of an object: `all`, the digest of what it did (motionDigest), and
+ * `own`, on a prop the digest of the keys on its own transform channels (ownKeysDigest), on a camera
+ * that of what was set on it besides where it hangs (cameraOwnDigest); null for a part not recorded
+ * (`own` of a staging recorded before props, or cameras, had it).
+ */
+export function recordedMotion(o: ObjectData | null | undefined): { all: string | null; own: string | null } {
+  const [all, own] = prop(o, RIDEO_PROPS.motion).split(' ');
+  return { all: all || null, own: own || null };
+}
+
+/**
+ * Records on object `id` what the staging left it doing (RIDEO_PROPS.motion): `all` its motion
+ * digest, `own` (on a prop) the digest of its own transform channels' keys, (on a camera) the digest
+ * of what was set on it besides where it hangs; a part not asked for keeps what was recorded before.
+ */
+export function recordMotionOf(
+  doc: SceneDoc,
+  id: string,
+  parts: { all: boolean; own: boolean } = { all: true, own: true },
+): void {
+  const o = doc.getObject(id);
+  const kind = prop(o, DESK_PROPS.role) === 'prop' ? 'prop' : o?.type === 'CAMERA' ? 'camera' : null;
+  if (!o || !(parts.all || (parts.own && kind))) return;
+  const was = recordedMotion(o);
+  const all = parts.all ? motionDigest(doc, id) : was.all;
+  const own = !kind
+    ? null
+    : !parts.own
+      ? was.own
+      : kind === 'prop'
+        ? ownKeysDigest(doc, id)
+        : cameraOwnDigest(doc, id);
+  const value = [all ?? '', ...(own ? [own] : [])].join(' ');
+  doc.updateObject(id, { custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: value } });
+}
+
+/**
+ * Whether the keys on prop `id`'s own transform channels are those the staging left there
+ * (recordedMotion's `own`): false when the person keyed it since (their keys move it too). A prop
+ * recorded without them counts as left so.
+ */
+export function ownKeysAsStaged(doc: SceneDoc, id: string): boolean {
+  const own = recordedMotion(doc.getObject(id)).own;
+  return own === null || own === ownKeysDigest(doc, id);
+}
+
+/**
+ * Whether shot camera `id` is as the staging left it but for where it hangs (recordedMotion's `own`:
+ * cameraOwnDigest): false once the person keyed or set it by hand (its keys or its lens's, its
+ * settings, constraints or what hangs below it), and for a camera recorded without it (staged before
+ * cameras had it: then a hang cannot be told from what the person set on it).
+ */
+export function cameraOwnAsStaged(doc: SceneDoc, id: string): boolean {
+  const own = recordedMotion(doc.getObject(id)).own;
+  return own !== null && own === cameraOwnDigest(doc, id);
+}
+
 /** Records on each of `ids` what the import left it doing (RIDEO_PROPS.motion). */
 function recordMotion(doc: SceneDoc, ids: Iterable<string>): void {
-  for (const id of new Set(ids)) {
-    const o = doc.getObject(id);
-    if (o)
-      doc.updateObject(id, {
-        custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: motionDigest(doc, id) },
-      });
-  }
+  for (const id of new Set(ids)) recordMotionOf(doc, id);
 }
 
 /** Removes the hold and ride constraints the import put on objects (and their influence curves). */
@@ -466,7 +692,7 @@ export function parseRideoBlocking(raw: unknown): RideoSceneBlocking {
   const r = RideoSceneBlockingSchema.safeParse(withDate);
   if (!r.success)
     throw new OperatorError(
-      `blocking is not a rideo SceneBlocking v1: ${r.error.issues
+      `blocking is not a SceneBlocking v1: ${r.error.issues
         .slice(0, 5)
         .map((i) => `${i.path.join('.') || '(root)'}: ${i.message}`)
         .join('; ')}`,
@@ -483,11 +709,12 @@ export function importRideoBlocking(
   ctx: OperatorContext,
   raw: unknown,
   solve: ShotSolver,
+  units: ImportUnits = {},
 ): RideoImportResult {
   const parsed = RideoImportInputSchema.safeParse(raw);
   if (!parsed.success)
     throw new OperatorError(
-      `rideo import: ${parsed.error.issues
+      `blocking import: ${parsed.error.issues
         .slice(0, 5)
         .map((i) => `${i.path.join('.')}: ${i.message}`)
         .join('; ')}`,
@@ -499,7 +726,9 @@ export function importRideoBlocking(
   const doc = ctx.doc;
   const warnings: string[] = [];
   const clip = input.clip ?? null;
-  if (!input.shots.length) throw new OperatorError('rideo import: the clip has no shots', 'INVALID_PARAMS');
+  const source = input.source;
+  if (!input.shots.length)
+    throw new OperatorError('blocking import: the clip has no shots', 'INVALID_PARAMS');
 
   // ------------------------------------------------------------ settings
   const scene = doc.getScene();
@@ -516,7 +745,7 @@ export function importRideoBlocking(
       const m = /^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)$/.exec(ar.trim());
       if (m && Math.abs(Number(m[1]) / Number(m[2]) - aspect) > 0.02)
         warnings.push(
-          `rideo's aspect ratio ${ar} differs from its resolution ${width}×${height}: the desk follows the resolution, as rideo's blocking does`,
+          `the settings' aspect ratio ${ar} differs from their resolution ${width}×${height}: the desk follows the resolution, as a SceneBlocking does`,
         );
     }
   }
@@ -557,18 +786,24 @@ export function importRideoBlocking(
   // opening marks: the blocking's (missing state: placed from the shots' planned layouts)
   const opening = new Map<string, RideoBlockingMark>();
   if (missing) {
-    for (const [id, mark] of layoutMarks(ordered, cast)) opening.set(id, mark);
-    warnings.push(
-      "rideo has no blocking for this clip (state 'missing'): the cast stands where the shots' planned layouts put them and every camera is solved",
-    );
+    for (const [id, mark] of units.marks ?? openingMarks(ordered, cast))
+      if (cast.includes(id)) opening.set(id, mark);
+    // a brief never has positions: saying so would be noise there
+    if (source === 'rideo')
+      warnings.push(
+        "the clip has no blocking (state 'missing'): the cast stands where the shots' planned layouts put them and every camera is solved",
+      );
   } else if (input.state === 'incomplete')
-    warnings.push("rideo's blocking of this clip is incomplete: its draft (completed by rideo) is imported");
+    warnings.push("the clip's blocking is incomplete: its draft (completed by its source) is imported");
   cast.forEach((id, i) => {
     if (opening.has(id)) return;
     const a = blockActor.get(id);
+    const at = a
+      ? { x: a.x, z: a.z }
+      : freeRowSpot(opening.values(), (i - (cast.length - 1) / 2) * LAYOUT_SPACING_M);
     opening.set(id, {
-      x: a?.x ?? (i - (cast.length - 1) / 2) * 1.2,
-      z: a?.z ?? 0,
+      x: at.x,
+      z: at.z,
       facingDeg: a?.facingDeg ?? 0,
       pose: a?.pose ?? 'stand',
       toX: null,
@@ -690,34 +925,47 @@ export function importRideoBlocking(
   const oldProps = update ? importedBy(doc, 'prop', (o) => prop(o, RIDEO_PROPS.id), clip) : new Map();
   const oldLandmarks = update ? importedBy(doc, 'landmark', (o) => prop(o, RIDEO_PROPS.id), clip) : new Map();
   const oldShots = getShots(doc);
+  // what each shot's camera hangs from before any piece is built anew (a camera on the old piece
+  // hangs from the new one then): what the warnings name as what the person hung it from
+  const hungBefore = cameraParents(doc);
   const removed: string[] = [];
   // what was changed in the desk since the last import (keys, poses, holds, mounts, flights, a
   // camera solved again): the import rebuilds them from rideo's blocking, so their changes are lost
+  const changedSince = new Set<string>();
+  // the earlier props the person keyed by hand (keys the staging did not write on their own transform
+  // channels), read before anything changes: what followed one does not follow the prop built in its
+  // place, whose staging moves it without those keys
+  const byHand = new Set<string>();
   if (update) {
     const changed: string[] = [];
     const seen = new Set<string>();
     const check = (o: ObjectData | undefined, label: string) => {
       if (!o || seen.has(o.id)) return;
       seen.add(o.id);
-      const recorded = prop(doc.getObject(o.id), RIDEO_PROPS.motion);
-      if (recorded && motionDigest(doc, o.id) !== recorded) changed.push(label);
+      const recorded = recordedMotion(doc.getObject(o.id)).all;
+      if (recorded && motionDigest(doc, o.id) !== recorded) {
+        changed.push(label);
+        changedSince.add(o.id);
+      }
     };
+    for (const o of oldProps.values() as Iterable<ObjectData>)
+      if (!ownKeysAsStaged(doc, o.id)) byHand.add(o.id);
     for (const o of oldActors.values()) check(o, `'${o.name}'`);
     for (const o of oldProps.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
     for (const o of oldLandmarks.values()) check(o as ObjectData, `'${(o as ObjectData).name}'`);
     for (const sh of oldShots)
       if (
         sh.camera &&
-        sh.external?.source === 'rideo' &&
+        sh.external?.source === source &&
         (!clip || !sh.external.clip || sh.external.clip === clip)
       )
         check(doc.getObject(sh.camera) ?? undefined, `the camera of shot '${sh.name}'`);
     if (changed.length)
       warnings.push(
         `${changed.join(', ')} ${changed.length > 1 ? 'were' : 'was'} changed in the desk since the last import ` +
-          "(keys, poses, holds, mounts, flights or a camera): this import rebuilt them from rideo's blocking, so " +
-          "those changes are gone. Stage them again, or before importing again write the desk's blocking to " +
-          'rideo (rideo_push writes it), so that the clip carries them',
+          "(keys, poses, holds, mounts, flights or a camera): this import rebuilt them from the clip's blocking, " +
+          "so those changes are gone. Stage them again, or before importing again export the desk's blocking " +
+          '(desk.export_rideo_blocking) and import that, so that the clip carries them',
       );
   }
 
@@ -732,6 +980,8 @@ export function importRideoBlocking(
     sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
     sky: !set.interior,
   });
+  // what the person put on the set built before stays, on the new one
+  warnings.push(...built.warnings);
   const groundObj = doc.getObject(built.ground);
   if (groundObj) {
     const kept = { ...groundObj.custom_props };
@@ -766,13 +1016,23 @@ export function importRideoBlocking(
   for (const l of blocking.set.landmarks) {
     const old = oldLandmarks.get(l.id) as ObjectData | undefined;
     if (old) keptLandmarks.add(l.id);
-    const made = buildLandmark(doc, l, elements.get(l.elementId ?? '')?.name ?? null, castNames, stamp, old);
+    const { warnings: kept, ...made } = buildLandmark(
+      doc,
+      l,
+      elements.get(l.elementId ?? '')?.name ?? null,
+      castNames,
+      stamp,
+      old,
+    );
+    for (const w of kept ?? []) warnings.push(`${made.name}: ${w}`);
     landmarkOut.push({ ...made, rideo_id: l.id, element_id: l.elementId, label: l.label });
   }
+  // a landmark rideo no longer has goes, but for what the person put on it, which stays on the ground
   for (const [rid, o] of oldLandmarks)
     if (!keptLandmarks.has(rid) && doc.getObject((o as ObjectData).id)) {
-      removed.push((o as ObjectData).name);
-      removeTrees(doc, [(o as ObjectData).id]);
+      const { id, name } = o as ObjectData;
+      removed.push(name);
+      warnings.push(...hangOnGround(doc, removeKeeping(doc, [id]), `'${name}'`, built.ground));
     }
 
   // ------------------------------------------------------------ actors
@@ -783,24 +1043,66 @@ export function importRideoBlocking(
     const b = blockActor.get(id);
     const c = characters.get(id);
     const humanoid = isHumanoid(kind);
+    // a library figure: its own height and colour; one pinned but not placed: the figure's height
+    const figure = units.figure?.(id);
+    const pinned = figure ? undefined : units.figureHeight?.(id);
     // people: rideo's height (the draft's, from the identity); animals: theirs when rideo has one,
     // their mannequin's top in rideo, made the withers the desk sizes an animal by
     let h = b?.heightM ?? c?.heightM ?? null;
     if (!humanoid && (h === null || Math.abs(h - 1.7) < 1e-6)) h = c?.heightM ?? null;
-    const heightM = h && h > 0 ? h / rideoHeightRatio(kind) : defaultActorHeight(kind);
-    const color = (b?.color ?? ACTOR_PALETTE[i % ACTOR_PALETTE.length]).toLowerCase();
+    const heightM = figure
+      ? figure.heightM
+      : pinned !== undefined
+        ? pinned
+        : h && h > 0
+          ? h / rideoHeightRatio(kind)
+          : defaultActorHeight(kind);
+    const color = figure ? figure.color : (b?.color ?? ACTOR_PALETTE[i % ACTOR_PALETTE.length]).toLowerCase();
     const first = markOf(ordered[0].id, id);
     const old = oldActors.get(id);
     let actorId: string | null = null;
     let created = false;
+    // what the person put on an actor built anew stays, on the new one (the import keys it on its marks)
+    let rebuilt: KeptPlaces | null = null;
     if (old) {
       const sameKind = prop(old, DESK_PROPS.kind) === kind;
       const oldH = Number(old.custom_props?.[DESK_PROPS.heightM]);
-      if (sameKind && Number.isFinite(oldH) && Math.abs(oldH - heightM) < 0.005 && isActor(doc, old.id)) {
+      const inst = readInstance(doc, old.id);
+      // a figure is kept only as that very version
+      const sameFigure = figure
+        ? !!inst && inst.ref === figure.pin.ref && inst.version === figure.pin.version
+        : true;
+      if (
+        sameKind &&
+        sameFigure &&
+        Number.isFinite(oldH) &&
+        Math.abs(oldH - heightM) < 0.005 &&
+        isActor(doc, old.id)
+      ) {
         actorId = old.id;
         resetActor(doc, old.id, nameOf(id), color);
       } else {
-        removeTrees(doc, [old.id]);
+        rebuilt = removeKeeping(doc, [old.id]);
+      }
+    }
+    if (!actorId && figure) {
+      try {
+        const r = createFigureActor(doc, figure.unit, {
+          pin: figure.pin,
+          key: figure.key,
+          name: nameOf(id),
+          location: floor(first.x, first.z),
+          facing_deg: first.facingDeg,
+          pose: editorPose(first.pose, kind),
+          character_id: id,
+        });
+        for (const w of r.warnings) warnings.push(`${nameOf(id)}: ${w}`);
+        actorId = r.actor;
+        created = true;
+      } catch (err) {
+        // the figure does not go in (nothing of it is left): the mannequin of its kind, height and
+        // colour stands in, which the figure restyles in place once it goes in
+        units.failed?.(figure.key, err);
       }
     }
     if (!actorId) {
@@ -827,6 +1129,13 @@ export function importRideoBlocking(
         [DESK_PROPS.characterId]: id,
       }),
     });
+    if (rebuilt)
+      for (const w of hangKept(doc, actorId, rebuilt, {
+        of: 'the actor it replaces',
+        on: 'the new actor',
+        restaged: true,
+      }))
+        warnings.push(`${nameOf(id)}: ${w}`);
     actors.set(id, {
       characterId: id,
       name: doc.getObject(actorId)!.name,
@@ -847,10 +1156,11 @@ export function importRideoBlocking(
       created,
     });
   }
+  // an actor rideo no longer stages goes, but for what the person put on it, which stays on the ground
   for (const [cid, o] of oldActors)
     if (!actors.has(cid) && doc.getObject(o.id)) {
       removed.push(o.name);
-      removeTrees(doc, [o.id]);
+      warnings.push(...hangOnGround(doc, removeKeeping(doc, [o.id]), `'${o.name}'`, built.ground));
     }
 
   // ------------------------------------------------------------ props
@@ -871,10 +1181,26 @@ export function importRideoBlocking(
     const elementName = elements.get(p.elementId ?? '')?.name ?? '';
     const flies = p.heldBy ? flyerKind(`${p.label} ${elementName}`) : null;
     if (old) {
-      for (const x of tetherPartsOf(doc, old.id)) removeTrees(doc, [x]);
+      warnings.push(...dropTether(doc, old.id, built.ground));
       keptProps.add(p.id);
     }
-    const made = buildProp(doc, p, elementName, castNames, stamp, flies, old);
+    const unit = units.prop?.(p);
+    // the holds below hold or fly it while its holder is in a shot (every cast member is), else hide it
+    const move = propMove(p, flies, !!p.heldBy && cast.includes(p.heldBy));
+    const made = buildProp(
+      doc,
+      p,
+      elementName,
+      castNames,
+      stamp,
+      flies,
+      move,
+      old,
+      unit,
+      !!old && byHand.has(old.id),
+    );
+    if (unit && made.failed !== undefined) units.failed?.(unit.key, made.failed);
+    for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
     props.set(p.id, { ...made, plan: p, flies });
     // rideo's holder, for the export to write back while the desk has no hold of theirs
     const rest = { ...doc.getObject(made.root)!.custom_props };
@@ -896,11 +1222,14 @@ export function importRideoBlocking(
       created: made.created,
     });
   }
+  // a prop rideo no longer has goes with its string, but for what the person put on them, which
+  // stays on the ground
   for (const [rid, o] of oldProps)
     if (!keptProps.has(rid) && doc.getObject((o as ObjectData).id)) {
-      removed.push((o as ObjectData).name);
-      for (const x of tetherPartsOf(doc, (o as ObjectData).id)) removeTrees(doc, [x]);
-      removeTrees(doc, [(o as ObjectData).id]);
+      const { id, name } = o as ObjectData;
+      removed.push(name);
+      const gone = removeKeeping(doc, [id, ...tetherPartsOf(doc, id)]);
+      warnings.push(...hangOnGround(doc, gone, `'${name}'`, built.ground));
     }
 
   // ------------------------------------------------------------ timeline
@@ -945,7 +1274,7 @@ export function importRideoBlocking(
   if (update)
     for (const s of oldShots)
       if (
-        s.external?.source === 'rideo' &&
+        s.external?.source === source &&
         s.external.shot &&
         (!clip || !s.external.clip || s.external.clip === clip)
       )
@@ -990,7 +1319,7 @@ export function importRideoBlocking(
       continuity: p.input.continuity,
       pre_roll: p.preRoll,
       external: {
-        source: 'rideo',
+        source,
         project: input.project ?? null,
         clip,
         shot: p.input.id,
@@ -1003,8 +1332,7 @@ export function importRideoBlocking(
   const disabled: RideoImportResult['disabled_shots'] = [];
   for (const s of oldShots) {
     if (importedIds.has(s.id)) continue;
-    const fromClip =
-      s.external?.source === 'rideo' && (!clip || !s.external.clip || s.external.clip === clip);
+    const fromClip = s.external?.source === source && (!clip || !s.external.clip || s.external.clip === clip);
     if (update && fromClip && s.enabled) {
       disabled.push({ id: s.id, name: s.name, rideo_shot: s.external?.shot ?? null });
       shotsOut.push({ ...s, enabled: false });
@@ -1111,7 +1439,12 @@ export function importRideoBlocking(
       toSolve.push(p.id);
       continue;
     }
-    placeCamera(doc, s, p);
+    placeCamera(
+      doc,
+      s,
+      p,
+      cameraSpace(doc, s, warnings, changedSince.has(s.camera!), hungBefore.get(s.camera!)),
+    );
   }
   const from = new Map<string, 'blocking' | 'solved' | 'refit'>();
   const agrees = new Map<string, boolean>();
@@ -1139,7 +1472,7 @@ export function importRideoBlocking(
       from.set(p.id, 'refit');
       agrees.set(p.id, true);
       warnings.push(
-        `${p.name}: rideo's camera disagreed with the shot's planned layout; refitted (${fit.spec.angle})`,
+        `${p.name}: the blocked camera disagreed with the shot's planned layout; refitted (${fit.spec.angle})`,
       );
     } else {
       agrees.set(p.id, false);
@@ -1172,11 +1505,11 @@ export function importRideoBlocking(
   }
   if (boards.length)
     warnings.push(
-      `${boards.length} shot board(s) were drawn in rideo before this staging (${boards
+      `${boards.length} shot board(s) were drawn before this staging (${boards
         .map((b) => b.shot)
         .join(
           ', ',
-        )}): redraw them from the desk's camera views, or push those shots' references in 'camera' mode`,
+        )}): redraw them from the desk's camera views, or send those shots' references in 'camera' mode`,
     );
 
   // the cameras placed as rideo blocked them keep rideo's placement, for the export to give back
@@ -1222,17 +1555,21 @@ export function importRideoBlocking(
 
 // ---------------------------------------------------------------- the missing state
 
+/** How far apart (m) the planned sides put the cast, and the rows behind each other on a side. */
+export const LAYOUT_SPACING_M = 1.2;
+
 /**
- * Opening marks of a clip rideo has not blocked: each character on the side of the frame the first
- * shot that plans it puts it (left −1.2 m, centre 0, right +1.2 m, front to back in order), facing
- * the way it is planned to face a front camera; the others in a row, as rideo's emptyBlocking.
+ * Opening marks of a clip without blocking: each character on the side of the frame the first shot
+ * that plans it puts it (left −1.2 m, centre 0, right +1.2 m, front to back in order), facing the way
+ * it is planned to face a front camera. The others have none here: the import stands them in a row
+ * (as rideo's emptyBlocking).
  */
-function layoutMarks(
-  shots: readonly RideoShotInput[],
+export function layoutMarks(
+  shots: readonly Pick<RideoShotInput, 'layout'>[],
   cast: readonly string[],
 ): Map<string, RideoBlockingMark> {
   const out = new Map<string, RideoBlockingMark>();
-  const sideX = { left: -1.2, centre: 0, right: 1.2 } as const;
+  const sideX = { left: -LAYOUT_SPACING_M, centre: 0, right: LAYOUT_SPACING_M } as const;
   const facingDeg = { camera: 0, away: 180, left: 270, right: 90 } as const;
   const used = new Map<string, number>();
   for (const s of shots)
@@ -1242,7 +1579,7 @@ function layoutMarks(
       used.set(e.side, n + 1);
       out.set(e.characterId, {
         x: sideX[e.side],
-        z: -n * 1.2,
+        z: -n * LAYOUT_SPACING_M,
         facingDeg: facingDeg[e.facing],
         pose: 'stand',
         toX: null,
@@ -1252,18 +1589,55 @@ function layoutMarks(
   return out;
 }
 
+/**
+ * Opening marks of a clip without blocking, for every character of `cast` (in cast order): where the
+ * shots' planned layouts put them (layoutMarks), the others on free spots of the front row.
+ */
+export function openingMarks(
+  shots: readonly Pick<RideoShotInput, 'layout'>[],
+  cast: readonly string[],
+): Map<string, RideoBlockingMark> {
+  const out = layoutMarks(shots, cast);
+  cast.forEach((id, i) => {
+    if (out.has(id)) return;
+    const at = freeRowSpot(out.values(), (i - (cast.length - 1) / 2) * LAYOUT_SPACING_M);
+    out.set(id, { x: at.x, z: at.z, facingDeg: 0, pose: 'stand', toX: null, toZ: null });
+  });
+  return out;
+}
+
+/**
+ * A spot on the front row (z = 0) for a character without a mark: x `preferred`, else the nearest
+ * spot 1.2 m steps away (right first) that no mark taken holds (rideo's OVERLAP_M: two figures closer
+ * than 0.35 m stand in the same place).
+ */
+export function freeRowSpot(taken: Iterable<RideoBlockingMark>, preferred: number): { x: number; z: number } {
+  const marks = [...taken];
+  const free = (x: number) => marks.every((m) => Math.hypot(m.x - x, m.z) >= LAYOUT_SPACING_M / 2);
+  for (let k = 0; k <= 2 * RIDEO_MAX_ACTORS + marks.length; k++) {
+    const step = Math.ceil(k / 2) * (k % 2 ? 1 : -1);
+    const x = preferred + step * LAYOUT_SPACING_M;
+    if (free(x)) return { x, z: 0 };
+  }
+  return { x: preferred, z: 0 };
+}
+
 // ---------------------------------------------------------------- moves
 
 /**
  * The move a shot is keyed with and rideo prompts: its camera.move, else (rideo sets it so when the
  * blocking is saved) the move its blocked camera's end amounts to, else its planned movement's.
  */
-function shotMove(s: RideoShotInput, camera: RideoBlockingCamera | null, warnings: string[]): DeskMove {
+export function shotMove(
+  s: RideoShotInput,
+  camera: RideoBlockingCamera | null,
+  warnings: string[],
+): DeskMove {
   if (s.camera.move) {
     const said = camera?.end ? cameraMoveOf(placementOf(camera), placementOf(camera.end)) : null;
     if (said && said !== s.camera.move)
       warnings.push(
-        `shot ${s.index + 1}: rideo's camera move is ${s.camera.move} but its blocked camera's end is a ${said}: ${s.camera.move} is keyed (the export writes its end back)`,
+        `shot ${s.index + 1}: its camera move is ${s.camera.move} but its blocked camera's end is a ${said}: ${s.camera.move} is keyed (the export writes its end back)`,
       );
     return s.camera.move;
   }
@@ -1283,7 +1657,7 @@ function shotMove(s: RideoShotInput, camera: RideoBlockingCamera | null, warning
     if (Math.abs(side) > 1e-3) return side > 0 ? 'pan_right' : 'pan_left';
   }
   if (s.camera.movement === 'pan' && !panDirectionSaid(shotText(s)))
-    warnings.push(`shot ${s.index + 1}: rideo plans a pan without a direction; keyed as ${move}`);
+    warnings.push(`shot ${s.index + 1}: its movement is a pan without a direction; keyed as ${move}`);
   return move;
 }
 
@@ -1306,12 +1680,205 @@ function clearCameraAnimation(doc: SceneDoc, cameraId: string): void {
     for (const fc of doc.listFCurves(data)) if (fc.target_type === 'camera') doc.removeFCurve(fcurveKey(fc));
 }
 
+/** Whether matrix `m` turns and scales alike along every axis: no skew, no uneven scale, no mirror. */
+function evenAxes(m: Readonly<Mat4>): boolean {
+  const axis = (k: number): Vec3 => [m[k * 4], m[k * 4 + 1], m[k * 4 + 2]];
+  const [x, y, z] = [axis(0), axis(1), axis(2)];
+  const len = [x, y, z].map((v) => Math.hypot(v[0], v[1], v[2]));
+  const s = len[0];
+  if (!(s > 1e-9) || len.some((l) => Math.abs(l - s) > 1e-9 * s)) return false;
+  const dot = (a: Vec3, b: Vec3) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  if ([dot(x, y), dot(x, z), dot(y, z)].some((d) => Math.abs(d) > 1e-9 * s * s)) return false;
+  return determinant4(m) > 0;
+}
+
+/** What a shot's camera hung from before an import or an update built anything anew (cameraParents). */
+export interface HungFrom {
+  /** The object's id then. */
+  id: string;
+  /** Its name then. */
+  name: string;
+}
+
+/**
+ * What each shot's camera hangs from, by camera (cameras on nothing left out): read before an import
+ * or an update builds a piece anew, which hangs a camera that hung from the old piece from the new
+ * one (units/remove.ts hangKept), so that a warning names the object the person hung it from.
+ */
+export function cameraParents(doc: SceneDoc): Map<string, HungFrom> {
+  const out = new Map<string, HungFrom>();
+  for (const s of getShots(doc)) {
+    const cam = s.camera ? doc.getObject(s.camera) : null;
+    const parent = cam?.parent ? doc.getObject(cam.parent) : null;
+    if (cam && parent) out.set(cam.id, { id: parent.id, name: parent.name });
+  }
+  return out;
+}
+
+/**
+ * Where what the camera of `shot` hangs from (its parent, through what is above that) stands in the
+ * world at each frame of the shot, from its first (null: the camera hangs from nothing): read before
+ * a brief update builds or stages anything anew, to tell (sameMotion) whether that still moves in the
+ * shot as it did.
+ */
+export function hungMotion(doc: SceneDoc, shot: ShotData): Mat4[] | null {
+  const cam = shot.camera ? doc.getObject(shot.camera) : null;
+  if (!cam?.parent) return null;
+  const out: Mat4[] = [];
+  for (let f = shot.frame_start; f <= shot.frame_end; f++) out.push(new FrameState(doc, f).parent(cam.id));
+  return out;
+}
+
+/**
+ * Whether two hungMotion readings of a shot agree (sameWorld, to rounding) at each frame from the
+ * shot's first over the frames both hold: a shot made longer or shorter, or moved by a ripple, keeps
+ * the motion of what its camera hangs from when those frames do.
+ */
+export function sameMotion(a: readonly Mat4[], b: readonly Mat4[]): boolean {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (!sameWorld(b[i], a[i])) return false;
+  return true;
+}
+
+/**
+ * How a warning names `now`, what a shot's camera hangs from: as the person hung it (`was`, read
+ * before anything was built anew), and what was built in its place ("'kite' (built anew as
+ * 'balloon')") or what it was renamed ("'Mira' (now 'Mira Jones')").
+ */
+export function hungFromName(doc: SceneDoc, now: ObjectData, was: HungFrom | undefined): string {
+  if (!was || (was.id === now.id && was.name === now.name)) return `'${now.name}'`;
+  if (was.id === now.id) return `'${was.name}' (now '${now.name}')`;
+  if (doc.getObject(was.id)) return `'${now.name}'`;
+  return was.name === now.name ? `'${was.name}' (built anew)` : `'${was.name}' (built anew as '${now.name}')`;
+}
+
+/** Why a shot's camera does not stay on what it hangs from (cameraHold), as a warning says it. */
+const UNSTEADY = {
+  moves: 'moves during the shot',
+  uneven: 'is scaled unevenly or mirrored',
+  hidden: 'is hidden by its scale in the shot',
+} as const;
+
+/**
+ * Whether the camera of `shot` can stay on what it hangs from through the shot (null: it hangs from
+ * nothing): `space` is that object's world matrix at the shot's first frame, and `why` (null: it can
+ * stay) why it cannot. It moves in the shot (it is not where it is at the first frame at every frame
+ * of the shot: keys in its space would hold the camera at the keys only); it is hidden by its scale
+ * there (hide.ts hiddenByScale: a camera on it stands where its squashed space puts it, far off where
+ * it is shown); or it turns and scales the camera unevenly (scaled unevenly, skewed or mirrored:
+ * evenAxes), which bends the camera.
+ */
+function cameraHold(
+  doc: SceneDoc,
+  shot: ShotData,
+): { parent: ObjectData; space: Mat4; why: keyof typeof UNSTEADY | null } | null {
+  const cam = shot.camera!;
+  const o = doc.getObject(cam);
+  const parent = o?.parent ? doc.getObject(o.parent) : null;
+  if (!o || !parent) return null;
+  const space = new FrameState(doc, shot.frame_start).parent(cam);
+  let still = true;
+  // nothing above it keyed, driven, constrained or simulated: it stands still at every frame
+  if (moversOf(doc, cam).length)
+    for (let f = shot.frame_start + 1; f <= shot.frame_end && still; f++)
+      still = sameWorld(new FrameState(doc, f).parent(cam), space);
+  const why = !still ? 'moves' : hiddenByScale(space) ? 'hidden' : !evenAxes(space) ? 'uneven' : null;
+  return { parent, space, why };
+}
+
+/**
+ * Takes the camera of `shot` off what it hangs from, where it stands in the world at the shot's first
+ * frame (where it stands at rest when its parent squashes it there, flat or to a point: a hidden
+ * actor), at scale 1: the stretch an uneven parent gave its world matrix goes with the parent.
+ */
+function takeCameraOff(doc: SceneDoc, shot: ShotData): void {
+  const cam = shot.camera!;
+  const world = new FrameState(doc, shot.frame_start).world(cam);
+  const placed =
+    world &&
+    world.every(Number.isFinite) &&
+    !hiddenByScale(world) &&
+    [0, 1, 2].every((k) => Math.hypot(world[k * 4], world[k * 4 + 1], world[k * 4 + 2]) > 1e-9);
+  doc.setParent(cam, null, true, placed ? { world, parentWorld: null } : undefined);
+  doc.updateObject(cam, { scale: [1, 1, 1] });
+}
+
+/**
+ * The world matrix a shot's blocked camera is placed through: its parent's (null: it hangs from
+ * nothing). A camera the person hung from another object (a rig) stays on it while that object
+ * stands still through the shot, scaled evenly, not mirrored and shown (cameraHold): the blocking's
+ * placement, turned into the parent's space (as CameraKeys.pose turns a solved one), then holds at
+ * every frame. Hung from something that moves in the shot (a kite, an actor), keys in its space would
+ * hold that placement at the keys only, an uneven parent bends the camera and a hidden one squashes
+ * it: such a camera is taken off its parent (takeCameraOff), and `warnings` says so, naming what the
+ * person hung it from (`was`: hungFromName). One kept on its parent that the re-import names as
+ * changed since the last import (`named`: hung from it since) is said to stay on it, as that warning
+ * says those changes are gone.
+ */
+function cameraSpace(
+  doc: SceneDoc,
+  shot: ShotData,
+  warnings: string[],
+  named: boolean,
+  was: HungFrom | undefined,
+): Mat4 | null {
+  const hold = cameraHold(doc, shot);
+  if (!hold) return null;
+  const from = hungFromName(doc, hold.parent, was);
+  if (!hold.why) {
+    if (named)
+      warnings.push(
+        `${shot.name}: its camera stays hung from ${from}, which stands still in the shot; ` +
+          "the import placed it in its space where the clip's blocking has it",
+      );
+    return hold.space;
+  }
+  takeCameraOff(doc, shot);
+  warnings.push(
+    `${shot.name}: its camera hung from ${from}, which ${UNSTEADY[hold.why]}; ` +
+      `the import took it off '${hold.parent.name}' to place it where the clip's blocking has it`,
+  );
+  return null;
+}
+
+/**
+ * A brief update's rule for the camera of `shot`, a camera it solves (update.ts): kept on what it
+ * hangs from while that stands still through the shot, scaled evenly, not mirrored and shown
+ * (cameraHold; a solve keys it in that space, as CameraKeys.pose does); else taken off it
+ * (takeCameraOff) for the caller to solve again, and `warnings` says so, naming what the person hung
+ * it from (`was`, read before the update built anything anew: hungFromName) and why, and the other
+ * shots that use the camera (`also`, their names: the caller solves it again for them too).
+ * `moving`: taken off only when what it hangs from moves in the shot (the update solves it because
+ * that now moves otherwise than it did). Returns whether it was taken off.
+ */
+export function updateCameraHold(
+  doc: SceneDoc,
+  shot: ShotData,
+  was: HungFrom | undefined,
+  warnings: string[],
+  o: { moving?: boolean; also?: readonly string[] } = {},
+): boolean {
+  const hold = cameraHold(doc, shot);
+  if (!hold?.why || (o.moving && hold.why !== 'moves')) return false;
+  const from = hungFromName(doc, hold.parent, was);
+  takeCameraOff(doc, shot);
+  const also = o.also ?? [];
+  const others = also.length > 1 ? `${also.slice(0, -1).join(', ')} and ${also[also.length - 1]}` : also[0];
+  warnings.push(
+    `${shot.name}: its camera hung from ${from}, which ${UNSTEADY[hold.why]}; ` +
+      `the update took it off '${hold.parent.name}' and solved it again` +
+      (also.length ? `, also for ${others}, which ${also.length > 1 ? 'use' : 'uses'} the same camera` : ''),
+  );
+  return true;
+}
+
 /**
  * Poses a shot's camera as rideo blocked it (position, target, lens) and keys its move: the blocked
  * end itself when it is the shot's move (an orbit along its arc; see endIsMove), else the shot's move
- * from the blocked start; a locked-off shot holds its pose.
+ * from the blocked start; a locked-off shot holds its pose. `space`: the parent's world matrix the
+ * camera hangs from (cameraSpace), still through the shot; its channels are the placement in it.
  */
-function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan): void {
+function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan, space: Mat4 | null): void {
   const cam = shot.camera!;
   const c = p.camera!;
   const data = doc.getObject(cam)?.data;
@@ -1327,10 +1894,11 @@ function placeCamera(doc: SceneDoc, shot: ShotData, p: ShotPlan): void {
     ],
     o.rotation_euler,
   );
-  doc.updateObject(cam, { location: start.position, rotation_euler: rotation });
+  const placed = inSpace(space, start.position, rotation, o.rotation_euler);
+  doc.updateObject(cam, { location: placed.location, rotation_euler: placed.rotation });
   const move = shot.move;
   if (end && endIsMove(move, start, end)) {
-    keyPlacedMove(doc, cam, start, end, shot.frame_start, shot.frame_end);
+    keyPlacedMove(doc, cam, start, end, shot.frame_start, shot.frame_end, rotation, space);
     return;
   }
   if (move && move !== 'locked_off')
@@ -1382,9 +1950,30 @@ function endIsMove(
 }
 
 /**
+ * The channels that stand an object hung from world matrix `space` (null: from nothing) at `position`
+ * turned by world Euler `euler`: local = inverse(space) × world, its rotation the Euler closest to
+ * `prev` (as CameraKeys.pose keys a camera through its parent).
+ */
+function inSpace(
+  space: Mat4 | null,
+  position: Vec3,
+  euler: Vec3,
+  prev: Readonly<Vec3>,
+): { location: Vec3; rotation: Vec3 } {
+  if (!space) return { location: position, rotation: euler };
+  const d = decomposeCompatible(
+    multiply4(invert4(space), compose4(position, euler, [1, 1, 1])),
+    prev,
+    [1, 1, 1],
+  );
+  return d ? { location: d.location, rotation: d.rotation } : { location: position, rotation: euler };
+}
+
+/**
  * Keys a camera from `start` to `end` over [f0, f1]: along the arc around the target when the target
  * stays and the distance to it does (an orbit), else straight; eased (smoothstep), at most 12 keys,
- * each looking at the target where it is then.
+ * each looking at the target where it is then. `euler`: the world rotation at `start`; `space`: the
+ * world matrix the camera hangs from (inSpace), which the keys are turned into.
  */
 function keyPlacedMove(
   doc: SceneDoc,
@@ -1393,6 +1982,8 @@ function keyPlacedMove(
   end: { position: Vec3; target: Vec3 },
   f0: number,
   f1: number,
+  euler: Vec3,
+  space: Mat4 | null,
 ): void {
   const len = (v: Vec3) => Math.hypot(v[0], v[1], v[2]);
   const sub = (a: Vec3, b: Vec3): Vec3 => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
@@ -1414,7 +2005,8 @@ function keyPlacedMove(
     Math.abs(da) > rad(5);
   const frames = Math.max(1, f1 - f0);
   const n = Math.min(12, Math.max(arc ? 8 : 2, Math.ceil(frames / 8) + 1));
-  let rot = doc.getObject(cam)!.rotation_euler as Vec3;
+  let rot = euler;
+  let local = doc.getObject(cam)!.rotation_euler as Vec3;
   const loc: number[][] = [[], [], []];
   const eul: number[][] = [[], [], []];
   const at: number[] = [];
@@ -1433,10 +2025,12 @@ function keyPlacedMove(
       ];
     } else pos = lerp(start.position, end.position, s);
     rot = lookEuler(sub(target, pos), rot);
+    const placed = inSpace(space, pos, rot, local);
+    local = placed.rotation;
     at.push(f0 + Math.round(u * frames * 1000) / 1000);
     for (let i = 0; i < 3; i++) {
-      loc[i].push(pos[i]);
-      eul[i].push(rot[i]);
+      loc[i].push(placed.location[i]);
+      eul[i].push(placed.rotation[i]);
     }
   }
   for (let i = 0; i < 3; i++) {
@@ -1526,8 +2120,19 @@ function rideSpans(plans: readonly ShotPlan[]): { rider: string; mount: string; 
   return out.sort((a, b) => a.from - b.from);
 }
 
+/** What the span helpers read of a shot: its key frame, its end, its cast and words, its blocked camera. */
+export interface SpanShot {
+  keyFrame: number;
+  frameEnd: number;
+  camera: RideoBlockingCamera | null;
+  input: Pick<RideoShotInput, 'characterIds' | 'description' | 'action'>;
+}
+
 /** Consecutive shots (by plan index) whose cast includes `characterId`. */
-function holderSpans(plans: readonly ShotPlan[], characterId: string): { from: number; to: number }[] {
+export function holderSpans(
+  plans: readonly Pick<SpanShot, 'input'>[],
+  characterId: string,
+): { from: number; to: number }[] {
   const out: { from: number; to: number }[] = [];
   plans.forEach((p, i) => {
     if (!p.input.characterIds.includes(characterId)) return;
@@ -1539,9 +2144,9 @@ function holderSpans(plans: readonly ShotPlan[], characterId: string): { from: n
 }
 
 /** The frame spans a held prop is hidden in: before its first holder span, between spans, after the last. */
-function hiddenSpans(
+export function hiddenSpans(
   spans: readonly { from: number; to: number }[],
-  plans: readonly ShotPlan[],
+  plans: readonly Pick<SpanShot, 'keyFrame'>[],
   timelineStart: number,
 ): { from: number; to: number | null }[] {
   if (!spans.length) return [{ from: timelineStart, to: null }];
@@ -1565,7 +2170,9 @@ function resetActor(doc: SceneDoc, id: string, name: string, color: string): voi
   removeAttachments(doc, id);
   const o = doc.getObject(id)!;
   if (o.name !== name) doc.rename('objects', id, name);
-  doc.updateObject(id, { custom_props: { ...o.custom_props, [DESK_PROPS.color]: color } });
+  // a library figure's colour is the figure's (the unit's): it stays
+  if (readInstance(doc, id)?.kind !== 'figure')
+    doc.updateObject(id, { custom_props: { ...o.custom_props, [DESK_PROPS.color]: color } });
   applyPose(doc, id, 'stand');
 }
 
@@ -1666,38 +2273,363 @@ function animateActors(
 
 // ---------------------------------------------------------------- props
 
+/** Whether `o` is a string or tail desk.tether_fly made for a flyer (see tetherPartsOf). */
+export function isTetherPart(o: ObjectData): boolean {
+  return (
+    typeof o.custom_props?.desk_string_to === 'string' || typeof o.custom_props?.desk_tail_of === 'string'
+  );
+}
+
 /** The string and tail objects desk.tether_fly made for a flyer. */
-function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
+export function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
   return doc
     .listObjects()
     .filter((o) => o.custom_props?.desk_string_to === flyer || o.custom_props?.desk_tail_of === flyer)
     .map((o) => o.id);
 }
 
-/** Whether an earlier import's object was built as `build` says, to be kept; one built otherwise is removed. */
+/**
+ * Takes out the string and tail desk.tether_fly made for flyer `flyer` (a flight flown again makes
+ * new ones), but for what the person put on them, which stays on the ground (hangOnGround). Returns
+ * the warnings naming it; those naming `held.unnamed` objects (another flight's string or tail the
+ * person hung on them) wait in `held.later`.
+ */
+export function dropTether(
+  doc: SceneDoc,
+  flyer: string,
+  ground?: string | null,
+  held: HeldBack = {},
+): string[] {
+  const parts = tetherPartsOf(doc, flyer);
+  if (!parts.length) return [];
+  const gone = `'${doc.getObject(parts[0])?.name ?? parts[0]}'`;
+  return hangOnGround(doc, removeKeeping(doc, parts), gone, ground, held);
+}
+
+/** Whether an earlier import's object (in the scene) was built as `build` says, to be kept; one built otherwise is built anew. */
 function keepable(doc: SceneDoc, old: ObjectData | undefined, build: string): old is ObjectData {
   if (!old || !doc.getObject(old.id)) return false;
   if (prop(doc.getObject(old.id), RIDEO_PROPS.build) === build) return true;
-  removeTrees(doc, [old.id]);
-  return false;
+  // a library unit instance is kept with its look (only unit actions change it)
+  return !!readInstance(doc, old.id);
 }
+
+/** The library item and version an imported prop was built from ('unit:<ref>@<version>' recipes), else null. */
+function unitBuildOf(doc: SceneDoc, id: string): { ref: string; version: number } | null {
+  try {
+    const b = JSON.parse(prop(doc.getObject(id), RIDEO_PROPS.build)) as unknown;
+    const m = Array.isArray(b) && typeof b[1] === 'string' ? /^unit:(.+)@(\d+)$/.exec(b[1]) : null;
+    return m ? { ref: m[1], version: Number(m[2]) } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Points the shots' subjects and layouts that name object `from` at `to`. */
+function remapShotRefs(doc: SceneDoc, from: string, to: string): void {
+  const shots = getShots(doc);
+  if (!shots.some((s) => s.subjects.includes(from) || s.layout.some((e) => e.subject === from))) return;
+  setShots(
+    doc,
+    shots.map((s) => ({
+      ...s,
+      subjects: s.subjects.map((id) => (id === from ? to : id)),
+      layout: s.layout.map((e) => (e.subject === from ? { ...e, subject: to } : e)),
+    })),
+  );
+}
+
+/**
+ * How the staging moves a prop whose element has a holder (rideo's heldBy): in the holder's hand
+ * ('held'), on a string from it ('flown': a kite or a balloon), or out of sight while the holder is
+ * in no shot ('hidden').
+ */
+export interface PropMove {
+  /** The holder's character id. */
+  by: string;
+  how: 'held' | 'flown' | 'hidden';
+  /**
+   * The person keyed the prop too (its own transform channels carry keys the staging did not write,
+   * ownKeysAsStaged): those keys move it beside its holder, and go with it.
+   */
+  byHand?: boolean;
+}
+
+/**
+ * How the staging moves prop `p` (null: not at all, it has no holder): its holder holds it, or flies
+ * it as `flies` says, while the holder is in a shot (`inShot`); it is hidden otherwise.
+ */
+export function propMove(
+  p: Pick<RideoBlockingProp, 'heldBy'>,
+  flies: 'kite' | 'balloon' | null,
+  inShot: boolean,
+): PropMove | null {
+  if (!p.heldBy) return null;
+  return { by: p.heldBy, how: !inShot ? 'hidden' : flies ? 'flown' : 'held' };
+}
+
+/** The tether flights a flyer records (desk.tether_fly: "lo:hi[hs][@anchor[/bone]]" entries). */
+const FLIGHTS = 'desk_tether_flights';
+
+/**
+ * How the staging moved an earlier prop (see PropMove), read before it goes: by the holder it records
+ * (RIDEO_PROPS.heldBy), flown when it carries a flight, held when it carries a hold, else hidden;
+ * null when it records no holder (the staging left it where it stands). `byHand`: the person keyed
+ * it too (read before the update or import changed anything: ownKeysAsStaged).
+ */
+function movedBy(doc: SceneDoc, id: string, byHand: boolean): PropMove | null {
+  const o = doc.getObject(id);
+  const by = prop(o, RIDEO_PROPS.heldBy);
+  if (!o || !by) return null;
+  const how: PropMove['how'] = prop(o, FLIGHTS).trim()
+    ? 'flown'
+    : (o.constraints ?? []).some((c) => !c.mute && c.type === 'CHILD_OF' && c.name.startsWith('Hold '))
+      ? 'held'
+      : 'hidden';
+  return byHand ? { by, how, byHand } : { by, how };
+}
+
+/**
+ * Whether the staging moves a prop built anew as it moved the one it takes the place of (KeptWords'
+ * `restaged`): held, or flown, again by the same holder, or hidden again, and the old one carried no
+ * keys of the person's (their keys moved it too, and go with it). What was on the old one then
+ * follows the new one; otherwise what moved it with the old one is named (a flight or a hold lost
+ * with the holder, keys the person gave the old prop).
+ */
+const movesAlike = (was: PropMove | null, now: PropMove | null): boolean =>
+  !!was && !!now && !was.byHand && was.by === now.by && was.how === now.how;
+
+/**
+ * A prop staged from a library unit (see buildProp): the instance with key `unit.key`, its root at the
+ * prop's spot with its base on the ground and the unit's own size. An earlier root of the same library
+ * item (an instance, or one made local) is kept, updated to the pin's version, cleared of its
+ * animation and of the import's holds; another earlier root is swapped for the unit (the unit's root
+ * takes its id when their types agree, else shots that named it name the new root). A version whose
+ * root is another type of object than the instance's (an empty in one version, a mesh in the next),
+ * which no update turns into the other, takes the instance's place as another item's unit does, with
+ * a warning. What the person put on the prop a unit takes the place of (objects of their own below
+ * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`), and
+ * follows the root's motion where the staging moves it (`move`) as it moved that prop (movesAlike;
+ * `byHand`: the person keyed that prop too, see buildProp). `held.unnamed`: what of that the caller
+ * may take out after (see buildProp), which the insert keeps like the rest and names in a warning
+ * that waits in `held.later`, or in none without it.
+ */
+function buildUnitProp(
+  doc: SceneDoc,
+  p: RideoBlockingProp,
+  label: string,
+  props: Record<string, string | number | boolean>,
+  flies: 'kite' | 'balloon' | null,
+  move: PropMove | null,
+  old: ObjectData | undefined,
+  unit: StagedProp,
+  byHand: boolean,
+  held: { unnamed: Iterable<string>; later?: LaterWarning[] },
+): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings: string[] } {
+  const model = `unit:${unit.pin.ref}@${unit.pin.version}`;
+  const build = JSON.stringify(['prop', model, label, flies]);
+  const own = stampFacts({ ...props, [RIDEO_PROPS.build]: build }, unit.facts);
+  const at: Vec3 = [p.x, -p.z, -unit.base];
+  const cur = old && doc.getObject(old.id) ? old : undefined;
+  const inst = cur ? readInstance(doc, cur.id) : null;
+  const sameItem = cur && (inst ? inst.ref === unit.pin.ref : unitBuildOf(doc, cur.id)?.ref === unit.pin.ref);
+  const unitRoot = unit.unit?.body.blocks.objects?.['@root'];
+  const curType = cur ? doc.getObject(cur.id)?.type : undefined;
+  // the instance's own item at another version: updated in place, unless its root is another type of
+  // object than the instance's, which no update turns into the other: it then takes the instance's
+  // place, in the insert's transaction, as another item's unit does
+  const next =
+    inst && sameItem && unit.unit && (inst.version !== unit.pin.version || inst.sha256 !== unit.pin.sha256)
+      ? unit.unit
+      : null;
+  const retyped = next !== null && unitRoot !== undefined && unitRoot.type !== curType;
+  // the scene's root as its version wrote it (then its type is the version's own), or edited here
+  const rootEdited =
+    retyped && cur
+      ? unitStatus(doc, cur.id).edited.some((p) => p.kind === 'objects' && p.src === UNIT_ROOT)
+      : false;
+  const curName = cur ? doc.getObject(cur.id)?.name : undefined;
+  let root: string;
+  let created = false;
+  const warnings: string[] = [];
+  if (cur && sameItem && !retyped) {
+    root = cur.id;
+    if (next) updateUnit(doc, root, next, unit.pin);
+    clearAnimation(doc, root);
+    removeAttachments(doc, root);
+  } else {
+    if (!unit.unit) throw new OperatorError(`the library unit of '${label}' is not here to place`, 'FAILED');
+    const swap = cur && !inst && unitRoot && curType === unitRoot.type ? cur.id : undefined;
+    // the prop it takes the place of goes in the insert's own transaction (a unit that does not go
+    // in leaves it as it is), but for what the person put on it, which the root placed at the
+    // prop's spot takes over where it is
+    const r = insertUnit(doc, unit.unit, {
+      ...unit.pin,
+      key: unit.key,
+      name: label,
+      location: at,
+      rotation_euler: [0, 0, 0],
+      ...(swap ? { replace: swap } : {}),
+      ...(cur && !swap
+        ? {
+            remove: [cur.id],
+            keep: oldLook(doc, cur.id).kept,
+            restaged: movesAlike(movedBy(doc, cur.id, byHand), move),
+          }
+        : {}),
+      rootProps: own,
+      unnamed: held.unnamed,
+      later: held.later,
+    });
+    root = r.root;
+    // what the person put on the prop the unit replaces stays, named here
+    warnings.push(...r.warnings);
+    if (retyped && inst) {
+      // v1's own root type is the scene's only while the scene left its root as v1 wrote it
+      const was = rootEdited
+        ? `the scene's '${curName}' (v${inst.version}'s root, edited here) ${withArticle(curType)}`
+        : `v${inst.version}'s ${withArticle(curType)}`;
+      warnings.push(
+        `v${unit.pin.version}'s root is ${withArticle(unitRoot?.type)} and ${was}, so v${unit.pin.version} replaces v${inst.version}, edits and all, instead of updating it`,
+      );
+    }
+    if (cur && !swap) remapShotRefs(doc, cur.id, root);
+    created = !swap;
+  }
+  const o = doc.getObject(root)!;
+  doc.updateObject(root, {
+    location: at,
+    rotation_euler: [0, 0, 0],
+    custom_props: { ...o.custom_props, ...own },
+  });
+  const s = doc.getObject(root)!.scale;
+  return { root, baseScale: [s[0], s[1], s[2]], model, created, warnings };
+}
+
+/** `props` with the planning facts a unit's root keeps (desk_unit_facts), when there are any. */
+const stampFacts = (
+  props: Record<string, string | number | boolean>,
+  facts: string | null,
+): Record<string, string | number | boolean> => (facts ? { ...props, desk_unit_facts: facts } : props);
 
 /**
  * Adds a prop: the built-in model its element or label names, fitted to `size`, else a cube of edge
  * `size`; an earlier import's prop built the same way is kept (with what was added to it since),
  * cleared of its animation and of the import's holds, which the import keys anew, and put back on
- * its mark.
+ * its mark. With `unit`, the library prop (buildUnitProp); one that does not go in (its update or
+ * insert throws before writing anything) leaves the prop the element had as it was and is staged as
+ * without a unit (the words' prop, or that prop kept): `failed` holds the error. `unit` null: the
+ * library prop the element had goes for the words' prop, and what the person put on it (objects of
+ * their own below it, not its parts) stays, hung from the words' prop where it is in the world; the
+ * warnings name it (units/remove.ts hangKept). So does what the person put on an earlier prop built
+ * otherwise (the words describe it anew), which goes for the prop built in its place; the shots that
+ * named it name the new one. `move`: how the staging moves the prop once it is built (its hold or
+ * flight comes after); what was on the prop it replaces follows the new one's motion where it moves
+ * it as it moved that one (movesAlike), and is named as no longer following that one's otherwise.
+ * `byHand`: the person keyed `old` by hand (keys the staging did not write on its own transform
+ * channels, read by the caller before anything changed: ownKeysAsStaged); those keys go with it, so
+ * what was on it is named whatever moves the new prop. `fallback` false: a unit that does not go in
+ * throws its error instead, the scene as it was (an update whose words give no reason to stage the
+ * prop again leaves it as the desk has it). `unnamed`: objects below `old` that the caller takes
+ * out right after a unit went in, its own warning naming what goes (the string and tail of the
+ * flight before, which an update acting for the prop's slot alone takes out only once its unit is
+ * in: dropTether); the unit's insert keeps them like the rest but names them in no warning.
+ * `held`: objects a later step of the caller may take out (the desk's strings and tails, which an
+ * update takes out once its props are staged); what the person put on the prop that goes is hung
+ * like the rest, and the warnings naming them (and `unnamed`) wait in `held.later`, in the same
+ * words (units/remove.ts KeptWords' `unnamed`).
  */
-function buildProp(
+export function buildProp(
   doc: SceneDoc,
   p: RideoBlockingProp,
   elementName: string,
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   flies: 'kite' | 'balloon' | null,
+  move: PropMove | null,
   old?: ObjectData,
-): { root: string; baseScale: Vec3; model: string | null; created: boolean } {
+  unit?: StagedProp | null,
+  byHand = false,
+  fallback = true,
+  unnamed: readonly string[] = [],
+  held: HeldBack = {},
+): {
+  root: string;
+  baseScale: Vec3;
+  model: string | null;
+  created: boolean;
+  warnings?: string[];
+  failed?: unknown;
+} {
   const label = p.label || elementName || p.id;
+  if (unit)
+    try {
+      // held: the insert's warnings naming them wait, only once it went in
+      const later: LaterWarning[] = [];
+      const quiet = held.later
+        ? { unnamed: new Set([...unnamed, ...(held.unnamed ?? [])]), later }
+        : { unnamed };
+      const made = buildUnitProp(
+        doc,
+        p,
+        label,
+        stamp({
+          [DESK_PROPS.role]: 'prop',
+          [DESK_PROPS.label]: label,
+          [RIDEO_PROPS.id]: p.id,
+          [DESK_PROPS.color]: p.color,
+          ...(p.elementId ? { [DESK_PROPS.elementId]: p.elementId } : {}),
+        }),
+        flies,
+        move,
+        old,
+        unit,
+        byHand,
+        quiet,
+      );
+      held.later?.push(...later);
+      return made;
+    } catch (err) {
+      if (!fallback) throw err;
+      return {
+        ...buildProp(
+          doc,
+          p,
+          elementName,
+          castNames,
+          stamp,
+          flies,
+          move,
+          old,
+          undefined,
+          byHand,
+          true,
+          [],
+          held,
+        ),
+        failed: err,
+      };
+    }
+  // null: the element has no unit (any more): an instance of one goes, for the words' prop (the
+  // shots that named it name the new prop), but for what the person put on it (objects of their own
+  // below it, not its parts), which the words' prop takes over where it is
+  let replaced: string | null = null;
+  let kept: KeptPlaces | null = null;
+  // how the staging moved the prop that goes (what is on it follows the new one only when it moves alike)
+  let was: PropMove | null = null;
+  let of = 'the library prop';
+  if (
+    unit === null &&
+    old &&
+    doc.getObject(old.id) &&
+    (readInstance(doc, old.id) || unitBuildOf(doc, old.id))
+  ) {
+    replaced = old.id;
+    was = movedBy(doc, old.id, byHand);
+    kept = keptPlaces(doc, readInstance(doc, old.id) ? oldLook(doc, old.id).kept : [], [old.id]);
+    removeTrees(doc, [old.id], kept.ids);
+    old = undefined;
+  }
   const queries = flies === 'kite' ? ['kite'] : flies === 'balloon' ? ['balloon'] : [elementName, p.label];
   const found = modelFor(queries.filter(Boolean), { exclude: castNames });
   const build = JSON.stringify([
@@ -1718,18 +2650,34 @@ function buildProp(
   });
   const at = floor(p.x, p.z);
   const model = found?.entry.id ?? null;
+  const prior = old && doc.getObject(old.id) ? old.id : null;
+  if (prior && !keepable(doc, old, build)) {
+    // built otherwise now: the prop goes for the one built in its place, but for what the person put
+    // on it (objects of their own below it, not its look), which the new prop takes over where it is
+    replaced = prior;
+    was = movedBy(doc, prior, byHand);
+    kept = removeKeeping(doc, [prior]);
+    of = 'the prop it replaces';
+    old = undefined;
+  }
   let root: string;
   let created = true;
   if (keepable(doc, old, build)) {
     root = old.id;
     created = false;
-    for (const id of subtree(doc, root)) clearAnimation(doc, id);
+    const inst = readInstance(doc, root);
+    // the import's own keys (holds, flights, hiding) are on the prop and its look (a model's tail): a
+    // library unit's parts carry none; what the person put on the prop keeps its own
+    for (const id of inst ? [root] : [root, ...oldLook(doc, root).look]) clearAnimation(doc, id);
     removeAttachments(doc, root);
     const o = doc.getObject(root)!;
     doc.updateObject(root, {
-      location: at,
+      // a library prop stands on its base (its root's height is kept)
+      location: inst ? [at[0], at[1], o.location[2]] : at,
       rotation_euler: [0, 0, 0],
-      custom_props: { ...o.custom_props, ...props },
+      custom_props: inst
+        ? { ...o.custom_props, ...props, [RIDEO_PROPS.build]: prop(o, RIDEO_PROPS.build) || build }
+        : { ...o.custom_props, ...props },
     });
   } else if (found) {
     const entry: CatalogEntry = found.entry;
@@ -1755,23 +2703,47 @@ function buildProp(
       custom_props: props,
     });
   }
+  // what stays follows the new prop, and is named as no longer following the old one's motion unless
+  // the staging moves the new one alike (held or flown again by the same holder, or hidden again)
+  const warnings = kept
+    ? hangKept(doc, root, kept, {
+        of,
+        on: "the words' prop",
+        restaged: movesAlike(was, move),
+        unnamed: held.unnamed,
+        later: held.later,
+      })
+    : [];
+  if (replaced) remapShotRefs(doc, replaced, root);
   const s = doc.getObject(root)!.scale;
-  return { root, baseScale: [s[0], s[1], s[2]], model, created };
+  return { root, baseScale: [s[0], s[1], s[2]], model, created, ...(warnings.length ? { warnings } : {}) };
 }
 
 /**
  * Adds a landmark: water as a flat plane, else a primitive, or the built-in model its label names
  * (its footprint centred on the mark); an earlier import's landmark built the same way is kept (with
- * what was added to it since) and put on its mark.
+ * what was added to it since) and put on its mark. One built otherwise goes for the one built in its
+ * place, but for what the person put on it (objects of their own below it, not its look), which the
+ * new landmark takes over where it is in the world; `warnings` names it (units/remove.ts hangKept).
+ * `held`: objects a later step of the caller may take out, whose warnings wait in `held.later`, in
+ * the same words (KeptWords' `unnamed`).
  */
-function buildLandmark(
+export function buildLandmark(
   doc: SceneDoc,
   l: RideoBlockingLandmark,
   elementName: string | null,
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   old?: ObjectData,
-): { id: string; name: string; shape: string; model: string | null; created: boolean } {
+  held: HeldBack = {},
+): {
+  id: string;
+  name: string;
+  shape: string;
+  model: string | null;
+  created: boolean;
+  warnings?: string[];
+} {
   const label = l.label || elementName || l.id;
   const water = l.shape === 'water';
   const shape = water ? 'water' : l.shape;
@@ -1810,6 +2782,9 @@ function buildLandmark(
   });
   const at = floor(l.x, l.z);
   const rotation: Vec3 = [0, 0, rad(l.rotationDeg)];
+  const prior = old && doc.getObject(old.id) ? old.id : null;
+  const kept = prior && !keepable(doc, old, build) ? removeKeeping(doc, [prior]) : null;
+  if (kept) old = undefined;
   let id: string;
   let created = true;
   if (keepable(doc, old, build)) {
@@ -1857,7 +2832,15 @@ function buildLandmark(
     if (f) location = [o.location[0] + at[0] - f.x, o.location[1] + at[1] + f.z, o.location[2]];
   }
   doc.updateObject(id, { location, custom_props: { ...o.custom_props, ...props } });
-  return { id, name: o.name, shape, model, created };
+  const warnings = kept
+    ? hangKept(doc, id, kept, {
+        of: 'the landmark it replaces',
+        on: 'the new landmark',
+        unnamed: held.unnamed,
+        later: held.later,
+      })
+    : [];
+  return { id, name: o.name, shape, model, created, ...(warnings.length ? { warnings } : {}) };
 }
 
 /**
@@ -1921,14 +2904,14 @@ function markCastInWater(
  * of those shots' camera (turned a little, so the string is seen), a kite is already up unless the
  * shot's text says it is launched.
  */
-function flyProp(
+export function flyProp(
   doc: SceneDoc,
   root: string,
-  holder: ActorPlan,
+  holder: Pick<ActorPlan, 'id' | 'kind'>,
   kind: 'kite' | 'balloon',
   spans: readonly { from: number; to: number }[],
-  plans: readonly ShotPlan[],
-  p: RideoBlockingProp,
+  plans: readonly SpanShot[],
+  p: Pick<RideoBlockingProp, 'id' | 'size'>,
 ): { frame_start: number; frame_end: number; string: string | null; tail: string[]; warnings: string[] } {
   const first = plans[spans[0].from];
   const last = plans[spans[spans.length - 1].to];

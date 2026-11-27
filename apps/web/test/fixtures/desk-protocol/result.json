@@ -1,0 +1,57 @@
+{
+  "type": "result",
+  "id": "exp-1",
+  "sceneId": "clp_0123456789abcdef",
+  "fps": 24,
+  "width": 1280,
+  "height": 720,
+  "shots": [
+    {
+      "shotId": "sht_0123456789aaaa",
+      "frames": 72,
+      "durationSec": 3,
+      "references": {
+        "camera": "sht_0123456789aaaa.camera.mp4",
+        "pose": "sht_0123456789aaaa.pose.mp4"
+      },
+      "still": "sht_0123456789aaaa.still.png",
+      "camera": {
+        "lensMm": 24,
+        "move": "tracking_follow"
+      },
+      "line": "Mira is left of frame, facing right; Pip is right of frame in the background, facing left.",
+      "moves": "Mira runs from left of frame to the centre.",
+      "planAgrees": true,
+      "issues": [
+        {
+          "code": "screen_direction",
+          "severity": "warning",
+          "message": "Mira runs left to right here and right to left in the next cut."
+        }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "name": "sht_0123456789aaaa.camera.mp4",
+      "mime": "video/mp4",
+      "data": {
+        "$bytes": "AAAAHGZ0eXBpc29t"
+      }
+    },
+    {
+      "name": "sht_0123456789aaaa.pose.mp4",
+      "mime": "video/mp4",
+      "data": {
+        "$bytes": "AAAAHGZ0eXBpc29t"
+      }
+    },
+    {
+      "name": "sht_0123456789aaaa.still.png",
+      "mime": "image/png",
+      "data": {
+        "$bytes": "iVBORw0KGgo="
+      }
+    }
+  ]
+}

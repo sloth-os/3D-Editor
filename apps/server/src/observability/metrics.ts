@@ -392,7 +392,6 @@ export class ServerMetrics {
   readonly storeSearches: CounterMetric<'provider' | 'status'>;
   readonly storeDownloads: CounterMetric<'provider' | 'status'>;
   readonly storeDownloadBytes: CounterMetric;
-  readonly rideoRequests: CounterMetric<'op' | 'status'>;
   readonly client: ClientMetrics;
   private readonly mirrored: Mirrorable[];
 
@@ -486,10 +485,6 @@ export class ServerMetrics {
       'store_download_bytes_total',
       'Bytes the model store downloaded',
     );
-    this.rideoRequests = new CounterMetric(r, 'rideo_requests_total', 'Requests to the rideo server', [
-      'op',
-      'status',
-    ]);
     this.client = new ClientMetrics(r);
     this.mirrored = [
       this.syncConnections,
@@ -511,7 +506,6 @@ export class ServerMetrics {
       this.storeSearches,
       this.storeDownloads,
       this.storeDownloadBytes,
-      this.rideoRequests,
     ];
   }
 

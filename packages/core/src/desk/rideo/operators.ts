@@ -13,7 +13,7 @@ import {
 /*
  * The executes of desk.import_rideo_blocking and desk.export_rideo_blocking (registered with their
  * schemas in operators/desk-shots.ts): the operator's snake_case parameters as the import's input
- * (rideo's own field names, ./schema.ts), and the warnings of both reported.
+ * (the SceneBlocking format's own field names, ./schema.ts), and the warnings of both reported.
  */
 
 /** desk.import_rideo_blocking's parameters (its zod schema's output). */
@@ -125,6 +125,7 @@ export function importInputOf(p: ImportRideoParams): { input: RideoImportInput; 
     clip: p.clip ?? null,
     preRollFrames: p.pre_roll_frames,
     update: p.update,
+    source: 'rideo',
   };
   return { input, warnings };
 }

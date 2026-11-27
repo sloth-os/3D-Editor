@@ -195,7 +195,47 @@ function handle(map: Record<string, Handler>, key: string, e: KeyboardEvent): bo
  */
 export const TYPING_PAUSE_MS = 1500;
 
-export function installKeymap(): () => void {
+/**
+ * Keys of the editor whose browser default acts on the page itself: Save Page As (Ctrl/Cmd+S) and
+ * the file chooser whose file the tab opens in place of the page (Ctrl/Cmd+O). A page that ignores
+ * them (the embeddable desk: it has no Save or Open) still keeps them from the browser, wherever the
+ * focus is, and on a layout without Latin letters too (keptCombo()).
+ */
+export const KEPT_FROM_BROWSER: ReadonlySet<string> = new Set(['Ctrl+S', 'Ctrl+O']);
+
+/**
+ * The combination a key press is to the browser's own shortcuts (combo() names it by the letter the
+ * layout types). A layout whose key types no Latin letter (Cyrillic, Greek, Hebrew, ...) leaves the
+ * browser the key's letter on a US keyboard: Ctrl+Ы is Ctrl+S to it, so it saves the page. A key
+ * that types a Latin letter is that letter's shortcut (Dvorak's Ctrl+R on the O key reloads).
+ */
+function keptCombo(e: KeyboardEvent): string {
+  const letter = /^Key([A-Z])$/.exec(e.code);
+  if (!letter || !(e.ctrlKey || e.metaKey) || e.altKey || /^[a-z]$/i.test(e.key)) return combo(e);
+  return ['Ctrl', ...(e.shiftKey ? ['Shift'] : []), letter[1]].join('+');
+}
+
+/**
+ * Installs the window-level keymap. `ignore`: key combinations (as combo() names them, e.g.
+ * 'Ctrl+N', 'F3') the page leaves alone: the embeddable desk ignores the keys that open chrome it
+ * hides (embed/guards.ts DESK_IGNORED_KEYS). The browser keeps what it does with them, except for
+ * those of KEPT_FROM_BROWSER, which do nothing at all. `blocked`: while it says so, no key acts, as
+ * while one of the editor's own windows is open (`dialog`): the embeddable desk blocks the keymap
+ * while a modal window of its own is open (embed/DeskApp.tsx deskModals), so Space and Enter press
+ * the window's focused button and Ctrl+Z or the arrows change nothing behind it. The editor passes
+ * none.
+ */
+export function installKeymap(
+  opts: { ignore?: ReadonlySet<string>; blocked?: () => boolean } = {},
+): () => void {
+  // in the capture phase, before any field: fields stop many of the keys typed into them, and the
+  // listener below leaves keys typed into a field alone, so it would not keep a Ctrl+S typed into one
+  const kept = [...KEPT_FROM_BROWSER].filter((k) => opts.ignore?.has(k));
+  const onKept = (e: KeyboardEvent) => {
+    // a keydown without a key (browsers' autofill sends some to the field it fills) is none of them
+    if (typeof e.key !== 'string' || typeof e.code !== 'string') return;
+    if (kept.includes(keptCombo(e))) e.preventDefault();
+  };
   // The field keys are being typed into, while the typing goes on. When it is taken away under the
   // person's fingers (an agent made another object active, ran another operation, removed what it
   // edits, or reordered the list it is in: Chromium takes the focus from a field that moves), the keys
@@ -257,8 +297,9 @@ export function installKeymap(): () => void {
     }
     // other keys do nothing while a popup menu or the search is open
     if (paletteOpen.value || popupMenu.value) return;
-    if (dialog.value) return;
+    if (dialog.value || opts.blocked?.()) return;
     const key = combo(e);
+    if (opts.ignore?.has(key)) return;
     if (handle(GLOBAL, key, e)) {
       e.preventDefault();
       return;
@@ -290,10 +331,12 @@ export function installKeymap(): () => void {
     }
     if (handle(VIEWPORT_COMMON, key, e)) e.preventDefault();
   };
+  if (kept.length) window.addEventListener('keydown', onKept, true);
   window.addEventListener('keydown', onTyped, true);
   window.addEventListener('pointerdown', onPointer, true);
   window.addEventListener('keydown', onKey);
   return () => {
+    if (kept.length) window.removeEventListener('keydown', onKept, true);
     window.removeEventListener('keydown', onTyped, true);
     window.removeEventListener('pointerdown', onPointer, true);
     window.removeEventListener('keydown', onKey);

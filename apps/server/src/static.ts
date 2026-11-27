@@ -3,6 +3,7 @@ import path from 'node:path';
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import fastifyStatic from '@fastify/static';
 import { pathnameOf } from './auth';
+import { DEFAULT_DESK_EMBED, deskHeadersFor, isDeskPagePath, type DeskEmbedSettings } from './desk-embed';
 
 /** Path prefixes that belong to the server API and never fall back to the SPA. */
 export const RESERVED_PREFIXES = [
@@ -33,9 +34,15 @@ export function cacheControlFor(relativePath: string): string {
 
 /**
  * Serves the PWA from `publicDir` with SPA fallback (unknown GET routes outside the API get
- * index.html). Returns false when there is nothing to serve (API-only mode).
+ * index.html). The embeddable desk (desk.html, also at /desk) and the built assets get the desk's
+ * headers (desk-embed.ts: COEP, CORP, CSP frame-ancestors; never X-Frame-Options). Returns false
+ * when there is nothing to serve (API-only mode).
  */
-export async function registerStatic(app: FastifyInstance, publicDir: string | null): Promise<boolean> {
+export async function registerStatic(
+  app: FastifyInstance,
+  publicDir: string | null,
+  desk: DeskEmbedSettings = DEFAULT_DESK_EMBED,
+): Promise<boolean> {
   const hasIndex = !!publicDir && existsSync(path.join(publicDir, 'index.html'));
   const notFound = (reply: FastifyReply, url: string) =>
     reply.code(404).send({ error: `not found: ${pathnameOf(url)}` });
@@ -56,13 +63,17 @@ export async function registerStatic(app: FastifyInstance, publicDir: string | n
     setHeaders(reply, file) {
       const rel = path.relative(root, file).split(path.sep).join('/');
       reply.header('cache-control', cacheControlFor(rel));
+      reply.headers(deskHeadersFor(rel, desk));
     },
   });
+  const hasDesk = existsSync(path.join(root, 'desk.html'));
   app.setNotFoundHandler((request, reply) => {
     const pathname = pathnameOf(request.url);
     const isPage = request.method === 'GET' || request.method === 'HEAD';
     if (!isPage || isReservedPath(pathname) || pathname.startsWith('/assets/'))
       return notFound(reply, request.url);
+    // the desk's clean URL (/desk): the desk page, never the editor's index.html
+    if (isDeskPagePath(pathname)) return hasDesk ? reply.sendFile('desk.html') : notFound(reply, request.url);
     return reply.header('cache-control', 'no-cache').sendFile('index.html');
   });
   return true;

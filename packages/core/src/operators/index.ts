@@ -22,6 +22,7 @@ import { registerLightCameraOperators } from './light-camera';
 import { registerDeskShotOperators } from './desk-shots';
 import { registerDeskActorOperators } from './desk-actors';
 import { registerDeskMotionOperators } from './desk-motion';
+import { registerDeskBriefOperators } from './desk-brief';
 import { registerStoreOperators } from './store';
 
 export * from './context';
@@ -58,6 +59,7 @@ export function createOperatorRegistry(): OperatorRegistry {
   registerDeskShotOperators(reg);
   registerDeskActorOperators(reg);
   registerDeskMotionOperators(reg);
+  registerDeskBriefOperators(reg);
   registerStoreOperators(reg);
   return reg;
 }

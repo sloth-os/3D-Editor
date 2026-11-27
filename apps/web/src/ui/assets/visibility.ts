@@ -1,13 +1,16 @@
 /*
- * Lazy loading in the Asset Browser: one IntersectionObserver per results list tells each card when
- * it comes near the visible part of the list (its thumbnail is fetched then: only the cards on
- * screen ask the server for one), and tells the end of the list when it shows (the next page is
- * fetched). Without IntersectionObserver everything counts as visible at once.
+ * Lazy loading in the Asset Browser: an IntersectionObserver per results list (and per distance)
+ * tells each card when it comes near the visible part of the list, and tells the end of the list
+ * when it shows (the next page is fetched). A card's server thumbnail is fetched once it comes near;
+ * a built-in model's thumbnail, made in this browser, is followed both ways: asked for when the
+ * card comes near, let go when it leaves (a thumbnail still waiting then leaves the queue).
+ * Without IntersectionObserver everything counts as visible at once.
  */
 
 export class VisibilityWatcher {
   private readonly io: IntersectionObserver | null;
   private readonly callbacks = new Map<Element, () => void>();
+  private readonly followers = new Map<Element, (near: boolean) => void>();
 
   /**
    * @param root the scrolling element (null: the page's viewport)
@@ -23,6 +26,7 @@ export class VisibilityWatcher {
 
   private onEntries(entries: IntersectionObserverEntry[]): void {
     for (const e of entries) {
+      this.followers.get(e.target)?.(e.isIntersecting);
       if (!e.isIntersecting) continue;
       const cb = this.callbacks.get(e.target);
       if (!cb) continue;
@@ -45,14 +49,34 @@ export class VisibilityWatcher {
     return () => this.unwatch(el);
   }
 
+  /**
+   * Tells `onChange` whether `el` is near the root each time that changes, first when the observer
+   * first sees it (at once and for good without IntersectionObserver: near). Returns the function
+   * that stops following.
+   */
+  follow(el: Element, onChange: (near: boolean) => void): () => void {
+    if (!this.io) {
+      onChange(true);
+      return () => undefined;
+    }
+    this.followers.set(el, onChange);
+    this.io.observe(el);
+    return () => {
+      if (this.followers.get(el) !== onChange) return;
+      this.followers.delete(el);
+      if (!this.callbacks.has(el)) this.io?.unobserve(el);
+    };
+  }
+
   private unwatch(el: Element): void {
     if (!this.callbacks.delete(el)) return;
-    this.io?.unobserve(el);
+    if (!this.followers.has(el)) this.io?.unobserve(el);
   }
 
   /** Stops watching everything. */
   disconnect(): void {
     this.callbacks.clear();
+    this.followers.clear();
     this.io?.disconnect();
   }
 }

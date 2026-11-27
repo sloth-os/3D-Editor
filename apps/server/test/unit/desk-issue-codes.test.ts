@@ -12,12 +12,12 @@ import { DESK_CHECK_ERRORS, MCP_INSTRUCTIONS } from '../../src/mcp/instructions'
 
 /*
  * desk.check's issue codes where the server's texts name them: the errors the MCP instructions tell
- * agents to fix are core's (DESK_ISSUE_SEVERITY), as are the lists of docs/mcp.md,
- * docs/rideo.md and docs/agent-guide.md, and the kite and water codes are among them with the
- * severity core gives them. docs/video-export.md's troubleshooting names those codes and the
- * severity of subject_revealed. Every code of core, under the severity core gives it: in the
- * desk.check operator's description, in docs/director-desk.md's table of checks, and in words in
- * docs/features.md's Continuity checks row.
+ * agents to fix are core's (DESK_ISSUE_SEVERITY), as are the lists of docs/mcp.md, of
+ * docs/director-desk.md's brief staging and of docs/agent-guide.md, and the kite and water codes
+ * are among them with the severity core gives them. docs/video-export.md's troubleshooting names
+ * those codes and the severity of subject_revealed. Every code of core, under the severity core
+ * gives it: in the desk.check operator's description, in docs/director-desk.md's table of checks,
+ * and in words in docs/features.md's Continuity checks row.
  */
 
 /** A doc without its fenced code blocks. */
@@ -112,7 +112,7 @@ describe("desk.check's issue codes in the server's texts", () => {
     );
   });
 
-  it('docs/mcp.md and docs/rideo.md list the errors of core', () => {
+  it("docs/mcp.md and docs/director-desk.md's brief staging list the errors of core", () => {
     const mcp = flat(doc('mcp.md'));
     const list = /The errors `desk\.check` reports are (.+?): fix them before exporting the shots\./.exec(
       mcp,
@@ -122,9 +122,11 @@ describe("desk.check's issue codes in the server's texts", () => {
     expect(/A kite is flown with .*?fly it again\./.exec(mcp)?.[0]).toBe(
       "A kite is flown with `desk.tether_fly` after its anchor actor's moves, poses and mounts, since its string starts where the hand is then; `tether_detached` reports a string left behind, so fly it again.",
     );
-    const rideo = /Fix the check's errors \(([^)]+)\) and `plan_mismatch`/.exec(flat(doc('rideo.md')));
-    expect(rideo).not.toBeNull();
-    expect(spans(rideo![1])).toEqual(errors);
+    const brief = /Fix the check's errors \(([^)]+)\) and `plan_mismatch` before a host's references/.exec(
+      flat(doc('director-desk.md')),
+    );
+    expect(brief).not.toBeNull();
+    expect(spans(brief![1])).toEqual(errors);
   });
 
   it("docs/agent-guide.md's director workflow lists the errors of core, and only warnings as warnings", () => {
@@ -176,7 +178,7 @@ describe("desk.check's issue codes in the server's texts", () => {
       .split('\n')
       .find((line) => line.startsWith('| Continuity checks '));
     expect(row).toBeDefined();
-    const list = /`desk\.check`: (.+?); rideo's blocking sentence per shot/.exec(cells(row!)[2]);
+    const list = /`desk\.check`: (.+?); the blocking sentence per shot/.exec(cells(row!)[2]);
     expect(list).not.toBeNull();
     expect(list![1].split(', ')).toEqual(DESK_ISSUE_CODES.map((code) => FEATURE_WORDS[code]));
   });

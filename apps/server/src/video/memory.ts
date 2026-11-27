@@ -1,12 +1,15 @@
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
-import { estimateRenderBufferBytes, type SceneDoc, type ScreenLine } from '@3d-editor/core';
-import { deskAovs } from '../render/desk';
-import { estimateRenderMemory } from '../render/memory';
-import type { PassName } from '../render/protocol';
+import {
+  exportRenderEstimate,
+  resultBytes,
+  type PassName,
+  type QualityPreset,
+  type SceneDoc,
+  type StreamSpec,
+  type VideoExportParams,
+} from '@3d-editor/core';
 import { x264Threads } from './ffmpeg';
-import type { QualityPreset, VideoExportParams } from './params';
-import { resultBytes, type StreamSpec } from './passes';
 
 /*
  * Memory of a video export (SPEC §9). Before its first frame, an export estimates what one of its
@@ -177,12 +180,9 @@ export function readMachineMemory(deps: MemoryReadDeps = systemDeps): MachineMem
     : machine;
 }
 
-/** A string stand-in for `estimateRenderBufferBytes` (it reads only whether there are lines). */
-const SOME_LINE: ScreenLine[] = [{ a: [0, 0, 0], b: [0, 0, 0], width_px: 2, color: [1, 1, 1] }];
-
 /** The parts of the estimated memory of one render process of an export (bytes). */
 export interface RenderProcessEstimate {
-  /** The snapshot's scene in the JavaScript heap (render/memory.ts `estimateRenderMemory`). */
+  /** The snapshot's scene in the JavaScript heap (core `estimateRenderMemory`). */
   scene: number;
   /** The renderer's working buffers and returned image (core `estimateRenderBufferBytes`). */
   buffers: number;
@@ -212,28 +212,8 @@ export function renderProcessBytes(
     resultBytes: number;
   },
 ): RenderProcessEstimate {
-  const set = new Set(o.passes);
-  const beauty = set.has('beauty');
-  const aovs = deskAovs(set, o.strings);
-  // as renderDeskFrame: no rasterizing without the beauty image or a per-pixel pass
-  const buffers =
-    beauty || aovs.length
-      ? estimateRenderBufferBytes(
-          {
-            width: o.width,
-            height: o.height,
-            samples: o.preset.samples,
-            look: o.look,
-            shadows: beauty && o.preset.shadows,
-            ao: beauty && o.preset.ao,
-            aovs,
-            lines: beauty && o.strings ? SOME_LINE : undefined,
-          },
-          snapshot,
-        )
-      : 0;
-  const scene = estimateRenderMemory(snapshot).bytes;
-  const frame = 2 * o.resultBytes;
+  // core's estimate (the browser export plans its render workers with it too)
+  const { scene, buffers, frame } = exportRenderEstimate(snapshot, o);
   return { scene, buffers, frame, total: scene + buffers + frame + RENDER_PROCESS_SLACK_BYTES };
 }
 
