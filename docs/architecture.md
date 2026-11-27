@@ -1073,34 +1073,36 @@ does not solve, also while still as staged; but an update records anew the camer
 brief's shots that it solves or that is still as staged, `own` digest included, so a later update
 can take such a camera for one only hung. Any other camera keeps its hang as `hangKept` leaves it;
 one set by hand is never solved: its keys change only as the ripple changes every curve's keys
-(`timeline.ts`), as `retimeCameraRange` fits its move to a new length of its shot, for one hung
-straight from a piece that goes or is built anew as `keepMotion` rewrites the keys of anything the
-person put on such a piece (`hangKept`), and, for one that shares its camera data with another
-shot's camera, as the update solves that camera or fits its move (the lens and focus keys are the
-shared data's); a warning says to check its framing when what it hangs from was built anew, staged
-again or no longer moves as it did. Both warnings name the camera's parent as `hungFromName` does,
-against what the person hung it from (`cameraParents`, read before any piece is built anew): the
-same object by its name, or `'Mira' (now 'Mira Jones')` when renamed; another object alone while an
-object with the old one's id is still in the scene; otherwise `'kite' (built anew as 'balloon')`.
-The warning that the camera is kept as set by hand names the parent alone also when it was there
-before the update (the set's ground, or the root of a look or instance whose part went). An update
-replaces the parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep
-resolving; it keeps parts edited or deleted in the scene, adds new parts at ids of the instance's
-generation (or of the next free one) and removes dropped untouched ones that nothing staying uses (a
-record that stays refers to it, such as another object, a camera's focus or a part the update keeps,
-or a key, driver, shot or the scene camera names it; then it stays with what it uses), and treats
-the unit's drivers the same way by their own table: a driver the new version drops together with the
-part it drives goes with that part, or stays on it when the part stays, and what it reads stays too.
-`unitStatus` names the parts and the drivers the scene edited or deleted. Extraction carries an
-instance's generation in its link plan, so linking the saved unit (adoption) keeps it; Make local
-drops it with the other `unit_*` props. What an update writes is stamped as written: a reference to
-a part that is not in the scene is cut, and the part still reads as left as it was. Linking a saved
-set (adoption) stamps the scene's set root, also one made local before: the root a new set would
-take is that one. A unit's driver writes only the unit's own datablocks (it may read the world or
-the scene), and drivers count toward the 20,000 records. Scene-owned fields (names, the collection
-and rigid body of every object, the root's placement, pose and constraints, the scene's `desk_*`
-props) never count as edits, and a unit holds no rigid body: a drop preset that makes a library
-set's ground the floor edits nothing of the set. Measured on the sample brief:
+(`timeline.ts`), as `retimeCameraRange` fits its move to a new length of its shot and, for one hung
+straight from a piece that goes or is built anew, as `keepMotion` rewrites the keys of anything the
+person put on such a piece (`hangKept`); a warning says to check its framing when what it hangs from
+was built anew, staged again or no longer moves as it did. Camera data that a camera set by hand
+shares with another shot's camera changes as the update solves that camera or fits its move: the
+lens and focus distance, keyed or as plain values (`CameraKeys`), and the depth of field and sensor
+settings (`applyCameraMove`, `prepareDeskCamera`). Both warnings name the camera's parent as
+`hungFromName` does, against what the person hung it from (`cameraParents`, read before any piece is
+built anew): the same object by its name, or `'Mira' (now 'Mira Jones')` when renamed; another
+object alone while an object with the old one's id is still in the scene; otherwise
+`'kite' (built anew as 'balloon')`, or `'Set Ground' (built anew)` when what was built has the old
+name. The warning that the camera is kept as set by hand also names another object alone when that
+object was there before the update (the set's ground, or the root of a look or instance whose part
+went). An update replaces the parts the scene left untouched in place, ids kept, so shots, holds and
+F-curves keep resolving; it keeps parts edited or deleted in the scene, adds new parts at ids of the
+instance's generation (or of the next free one) and removes dropped untouched ones that nothing
+staying uses (a record that stays refers to it, such as another object, a camera's focus or a part
+the update keeps, or a key, driver, shot or the scene camera names it; then it stays with what it
+uses), and treats the unit's drivers the same way by their own table: a driver the new version drops
+together with the part it drives goes with that part, or stays on it when the part stays, and what
+it reads stays too. `unitStatus` names the parts and the drivers the scene edited or deleted.
+Extraction carries an instance's generation in its link plan, so linking the saved unit (adoption)
+keeps it; Make local drops it with the other `unit_*` props. What an update writes is stamped as
+written: a reference to a part that is not in the scene is cut, and the part still reads as left as
+it was. Linking a saved set (adoption) stamps the scene's set root, also one made local before: the
+root a new set would take is that one. A unit's driver writes only the unit's own datablocks (it may
+read the world or the scene), and drivers count toward the 20,000 records. Scene-owned fields
+(names, the collection and rigid body of every object, the root's placement, pose and constraints,
+the scene's `desk_*` props) never count as edits, and a unit holds no rigid body: a drop preset that
+makes a library set's ground the floor edits nothing of the set. Measured on the sample brief:
 
 | Unit                            | File      | Body      | Objects |
 | ------------------------------- | --------- | --------- | ------- |

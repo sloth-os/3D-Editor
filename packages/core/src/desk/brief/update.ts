@@ -128,12 +128,13 @@ import {
  *   camera solved again;
  * - a camera set by hand in the desk is never solved again: the update keeps it, and its keys
  *   change only as the ripple changes every curve's keys (timeline.ts), as a new length of its shot
- *   fits its move (moves.ts retimeCameraRange), for one hung straight from a piece that goes or is
- *   built anew as the keyed motion of what the person put on such a piece is kept, below
- *   (units/remove.ts keepMotion), and, for one that shares its camera data with another shot's
- *   camera, as the update solves that camera or fits its move (the lens and focus keys are the
- *   shared data's); it warns (one hung from or under another object also when what it hangs from
- *   was built anew, staged again or no longer moves in the shot as it did);
+ *   fits its move (moves.ts retimeCameraRange) and, for one hung straight from a piece that goes or
+ *   is built anew, as the keyed motion of what the person put on such a piece is kept, below
+ *   (units/remove.ts keepMotion); camera data it shares with another shot's camera changes as the
+ *   update solves that camera or fits its move (lens and focus distance, keyed or plain, depth of
+ *   field and sensor: moves.ts CameraKeys, applyCameraMove, prepareDeskCamera); it warns (one hung
+ *   from or under another object also when what it hangs from was built anew, staged again or no
+ *   longer moves in the shot as it did);
  * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
  *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
  *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
@@ -779,8 +780,10 @@ export function updateFromBriefIn(
   }
   // the set is staged: what stays of the cameras and actors that went hangs from its ground
   for (const d of dropped) warnings.push(...hangOnGround(doc, d.kept, d.gone, setGround(doc)));
-  // the cameras still as staged see the new set: solved again (one set by hand is kept)
-  if (setAction !== 'none')
+  // the cameras still as staged see the new set: solved again (one set by hand is kept). A library
+  // set that did not go in left the set as it was (slotFailed made its action 'none'): no camera
+  // sees a new set then
+  if ((setSlot?.action ?? 'none') !== 'none')
     for (const d of hostShots(doc, sceneId).values()) {
       if (!d.camera || solve.has(d.id)) continue;
       if (staged.get(d.camera) === false)
@@ -880,32 +883,32 @@ export function updateFromBriefIn(
   }
 
   // ------------------------------------------------------------ cameras, motion records, checks
-  // a shot's camera hung from (or under) another object is taken off it only when this update solves
-  // it: solveShotCameras keys it in that object's space, between whose keys it would drift if that
-  // moves (rideo/import.ts updateCameraHold, which takes it off one that moves in the shot, is scaled
-  // unevenly or is hidden there; on one that stands still, evenly scaled, it stays and the solve keys
-  // it in its space). One it takes off is solved again for every shot that uses it, the brief's or
-  // the desk's own (a later one skips it here, as it no longer hangs), as their keys on it were in
-  // that object's space too: none of them keeps a warning that it is kept as set by hand, and the
-  // warning that it was taken off names them. The update solves one whose shot it solves (a camera
-  // still as staged), and one the person only hung (not set by hand: cameraOwnAsStaged) from or
-  // under a piece it built anew or staged again that now moves in the shot otherwise than it did: it
-  // would ride a motion no one framed (taken off only when what it hangs from moves in the shot),
-  // also when its shot's cast, camera plan or frame size changed or a library set was placed,
-  // replaced, updated or taken out, which kept it as set by hand above: it is not kept then, and
-  // the warning that it was taken off and solved names it, not one that it is set by hand (those
-  // go: notKept). Any other keeps its hang as the kept-objects rules (hangKept) left it, on the
-  // piece built in place of what it hung from. Those rules name the camera, or the object of the
-  // person's it hangs under, solved or not, when it no longer follows the animation of what went
-  // (what took the piece's place does not move alike, as when another holder now flies the prop).
-  // One the person set by hand, or one recorded without an own part (an older desk's record:
-  // cameraOwnAsStaged is false), is not solved here: kept with its keys as the ripple, the fit to a
-  // new length of its shot (resizeShot) and those rules (keepMotion) left them and, for one that
-  // shares its camera data with another shot's camera, as the update solves that camera or fits its
-  // move (the lens and focus keys are the shared data's), with a warning when what it hangs from
-  // was built anew, staged again or moves otherwise (one recorded so that is still as staged is
-  // solved below for a shot of it the update solves, which went into solve above, and recorded
-  // anew)
+  // a shot's camera hung from (or under) another object is taken off it only when this update
+  // solves it: solveShotCameras keys it in that object's space, between whose keys it would drift
+  // if that moves (rideo/import.ts updateCameraHold, which takes it off one that moves in the shot,
+  // is scaled unevenly or is hidden there; on one that stands still, evenly scaled, it stays and
+  // the solve keys it in its space). One it takes off is solved again for every shot that uses it,
+  // the brief's or the desk's own (a later one skips it here, as it no longer hangs), as their keys
+  // on it were in that object's space too: none of them keeps a warning that it is kept as set by
+  // hand, and the warning that it was taken off names them. The update solves one whose shot it
+  // solves (a camera still as staged), and one the person only hung (not set by hand:
+  // cameraOwnAsStaged) from or under a piece it built anew or staged again that now moves in the
+  // shot otherwise than it did: it would ride a motion no one framed (taken off only when what it
+  // hangs from moves in the shot), also when its shot's cast, camera plan or frame size changed or
+  // a library set was placed, replaced, updated or taken out, which kept it as set by hand above:
+  // it is not kept then, and the warning that it was taken off and solved names it, not one that it
+  // is set by hand (those go: notKept). Any other keeps its hang as the kept-objects rules
+  // (hangKept) left it, on the piece built in place of what it hung from. Those rules name the
+  // camera, or the object of the person's it hangs under, solved or not, when it no longer follows
+  // the animation of what went (what took the piece's place does not move alike, as when another
+  // holder now flies the prop). One the person set by hand, or one recorded without an own part (an
+  // older desk's record: cameraOwnAsStaged is false), is not solved here: kept with its keys as the
+  // ripple, the fit to a new length of its shot (resizeShot) and those rules (keepMotion) left
+  // them, with a warning when what it hangs from was built anew, staged again or moves otherwise;
+  // camera data it shares with another shot's camera changes as the update solves that camera or
+  // fits its move. One recorded so that is still as staged is solved below for each shot of it the
+  // update solves, which went into solve above or, when this loop takes the camera off for one of
+  // them, here, and is recorded anew
   const notKept = new Set<number>();
   for (const s of desk.values()) {
     const cam = s.camera ? doc.getObject(s.camera) : null;

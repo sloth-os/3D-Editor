@@ -390,6 +390,9 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       );
       // and a shot the brief lengthens, which the update applies all the same
       b.shots[0].durationSec += 1;
+      // and a camera the person set by hand (keyed): a slot that does not go in changes no set, so
+      // no camera is solved for one, nor warned of one
+      keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
       const words = doc
         .listObjects()
         .filter((o) => prop(o, 'desk_role') === 'set' || prop(o, 'desk_role') === 'landmark')
@@ -401,6 +404,9 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       expect(() => (r = updateFromBrief(doc, b, { units: source(L.set, L.kite, L.mira) }))).not.toThrow();
       expect(r!.units).toEqual([expect.objectContaining({ slot: key, staged: 'words', why: 'unavailable' })]);
       expect(getShots(doc)[0].frame_end - getShots(doc)[0].frame_start + 1).toBe(frames + b.fps);
+      // the lengthened shot only fits its move: no camera is solved, and none is warned of a set
+      expect(r!.solved).toEqual([]);
+      expect(r!.warnings.join('\n')).not.toMatch(/the set changed/);
       expect(listUnits(doc)).toEqual([]);
       // what the slot held stays as it was: the words' set, the kite and Mira's mannequin
       if (kind === 'set') for (const id of words) expect(doc.has('objects', id)).toBe(true);

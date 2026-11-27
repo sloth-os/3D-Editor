@@ -587,13 +587,13 @@ and no other shot's keys are cut:
   size changed;
 - a camera set by hand in the desk is never solved again: the update keeps it, and its keys change
   only as a ripple changes every curve's keys (below), as a new length of its shot fits its move
-  (above), for one hung straight from a piece the update builds anew or takes out as the keys of
-  what the person put on such a piece change (below), and, for one that shares its camera data with
-  another shot's camera, as the update solves that camera or fits its move (the lens and focus keys
-  are the shared data's); it warns when its shot's cast, camera plan or frame size changes or a
-  library set is placed, replaced, updated or taken out, and, for one hung from or under another
-  object, when what it hangs from was built anew or staged again or no longer moves in the shot as
-  it did:
+  (above) and, for one hung straight from a piece the update builds anew or takes out, as the keys
+  of what the person put on such a piece change (below); camera data it shares with another shot's
+  camera changes as the update solves that camera or fits its move (the lens and focus distance,
+  keyed or as plain values, and the depth of field and sensor settings); it warns when its shot's
+  cast, camera plan or frame size changes or a library set is placed, replaced, updated or taken
+  out, and, for one hung from or under another object, when what it hangs from was built anew or
+  staged again or no longer moves in the shot as it did:
   `Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite' (built anew as 'Red balloon'), no longer moves as it did, so check its framing (solve it again with desk.shot_solve)`;
 - a shot's camera the person only hung from, or under, another object (its keys and its lens's, its
   settings, constraints and what hangs below it as staging left them: a hang only sets its parent
