@@ -881,7 +881,7 @@ describe('a shot camera the person hung from a prop that a later brief builds an
     const doc = stagedDoc();
     const cam = firstShot(doc).camera!;
     const second = shotOf(doc, 'sht_0123456789bbbb');
-    // the second shot, and a cutaway of the desk's own after it, shoot with the first shot's camera
+    // the second shot, and two cutaways of the desk's own after it, shoot with the first shot's camera
     const cutaway: ShotData = {
       ...second,
       id: newShotId(),
@@ -893,8 +893,19 @@ describe('a shot camera the person hung from a prop that a later brief builds an
       layout: [],
       external: null,
     };
-    setShots(doc, [...getShots(doc).map((s) => (s.id === second.id ? { ...s, camera: cam } : s)), cutaway]);
-    doc.updateScene({ frame_end: cutaway.frame_end });
+    const cutaway2: ShotData = {
+      ...cutaway,
+      id: newShotId(),
+      name: 'Cutaway 2',
+      frame_start: cutaway.frame_end + 1,
+      frame_end: cutaway.frame_end + 24,
+    };
+    setShots(doc, [
+      ...getShots(doc).map((s) => (s.id === second.id ? { ...s, camera: cam } : s)),
+      cutaway,
+      cutaway2,
+    ]);
+    doc.updateScene({ frame_end: cutaway2.frame_end });
     // hung from a dolly of the person's at the scene's root, recorded as staged there, as a rideo
     // re-import leaves a camera it placed in its parent's space
     let dolly = '';
@@ -931,10 +942,10 @@ describe('a shot camera the person hung from a prop that a later brief builds an
     const r = update(doc, b);
     expect(doc.getObject(cam)!.parent).toBeNull();
     expect(doc.getObject(cam)!.scale).toEqual([1, 1, 1]);
-    // the report lists the brief's shots it solved; the cutaway is solved too, and named
+    // the report lists the brief's shots it solved; the cutaways are solved too, and named
     expect(r.solved).toEqual(['sht_0123456789aaaa', 'sht_0123456789bbbb']);
     expect(cameraWarnings(doc, cam, r.warnings)).toEqual([
-      "Shot 1: its camera hung from 'Dolly', which is scaled unevenly or mirrored; the update took it off 'Dolly' and solved it again, also for Shot 2 and Cutaway, which use the same camera",
+      "Shot 1: its camera hung from 'Dolly', which is scaled unevenly or mirrored; the update took it off 'Dolly' and solved it again, also for Shot 2, Cutaway and Cutaway 2, which use the same camera",
     ]);
     // each shot is where a solve puts it: solving them all again moves none of them
     const solved = paths(doc);
