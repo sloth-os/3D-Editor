@@ -594,17 +594,18 @@ and no other shot's keys are cut:
   settings, constraints and what hangs below it as staging left them: a hang only sets its parent
   and where it stands) keeps its hang unless the update solves it. The update solves it when what it
   hangs from, or what is above that, is a piece the update built anew or staged again that now moves
-  in the shot, and otherwise than it did: left there it would ride a motion no one framed. It is
-  solved so also when its shot's cast, camera plan or frame size changes or the set changes, and
-  then the warning that it is kept as set by hand (above) does not name it: the one below, that the
-  update took it off and solved it again, does. When it is not solved, such a change makes it count
-  as set by hand (kept, with the warning above). A camera the update solves (that one, or a hung
-  one still as staged in a shot it solves, as a rideo re-import leaves a camera it placed in its
-  parent's space) stays on what it hangs from while that stands still through the shot, scaled
-  evenly, not mirrored and shown (the solve keys it in that space); off one that moves in the shot,
-  is scaled unevenly, skewed or mirrored, or is hidden by its scale there, it is taken off, at scale
-  1, where it stands at the shot's first frame, and solved again, and a warning names what the
-  person hung it from and why:
+  in the shot, and otherwise than it did, and what the desk recorded of it tells that it was only
+  hung (a record an older desk made cannot tell, nor can a missing one): left there it would ride a
+  motion no one framed. It is solved so also when its shot's cast, camera plan or frame size changes
+  or the set changes, and then the warning that it is kept as set by hand (above) does not name it:
+  the one below, that the update took it off and solved it again, does. When it is not solved, such
+  a change makes it count as set by hand (kept, with the warning above). A camera the update solves
+  (that one, or a hung one still as staged in a shot it solves, as a rideo re-import leaves a camera
+  it placed in its parent's space) stays on what it hangs from while that stands still through the
+  shot, scaled evenly, not mirrored and shown (the solve keys it in that space); off one that moves
+  in the shot, is scaled unevenly, skewed or mirrored, or is hidden by its scale there, it is taken
+  off, at scale 1, where it stands at the shot's first frame, and solved again, and a warning names
+  what the person hung it from and why:
   `Shot 1: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again`.
   One taken off that other shots use too (the brief's or the desk's own) is solved again for each
   of them, as their keys on it were in the space of what it hung from as well: none of them keeps
