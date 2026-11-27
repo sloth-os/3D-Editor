@@ -104,8 +104,13 @@ export interface BriefDiff {
   resized: boolean;
   /** The set as planned changed (rebuilt). */
   set: boolean;
-  /** Elements staged as props that are new or are staged again, and the staged props the brief no longer plans. */
-  props: { restage: Set<string>; removed: Set<string> };
+  /**
+   * Elements staged as props that are new or are staged again, and the staged props the brief no
+   * longer plans. `bySlot`: those of `restage` staged again only as their library prop's slot acts
+   * (the words give no reason to): staged again once their unit goes in, left as the desk has them
+   * when it does not (one removed in the desk is staged from the words then: updateFromBrief).
+   */
+  props: { restage: Set<string>; removed: Set<string>; bySlot: Set<string> };
   /**
    * Cast members staged before whose words change what an update does: a new name (the actor is
    * renamed), a kind or a height other than the staged actor's (kept, with a warning).
@@ -257,7 +262,7 @@ export function diffBrief(
 ): BriefDiff {
   const staged = r && r.sceneId === b.id ? r : null;
   const shots = new Map<string, ShotDiff>();
-  const none = { restage: new Set<string>(), removed: new Set<string>() };
+  const none = { restage: new Set<string>(), removed: new Set<string>(), bySlot: new Set<string>() };
   // the brief staged, as it was: nothing differs (unless a library unit the record waits for is
   // here, to place or to refuse)
   if (staged && staged.hash === briefHash(b) && !units?.all.some((s) => acts(s) || refusesPin(s))) {
@@ -405,8 +410,14 @@ export function diffBrief(
     )
       restage.add(eid);
   }
-  // an element whose library prop an update places, updates, replaces or removes is staged again
-  for (const [eid, slot] of units?.elements ?? []) if (acts(slot) && planned.has(eid)) restage.add(eid);
+  // an element whose library prop an update places, updates, replaces or removes is staged again;
+  // one staged again for that alone is staged again only once its unit goes in (bySlot)
+  const bySlot = new Set<string>();
+  for (const [eid, slot] of units?.elements ?? [])
+    if (acts(slot) && planned.has(eid) && !restage.has(eid)) {
+      restage.add(eid);
+      bySlot.add(eid);
+    }
   const removedProps = new Set(
     [...stagedBy(doc, 'prop', b.id, (o) => o.custom_props?.[DESK_PROPS.elementId]).keys()].filter(
       (eid) => !planned.has(eid),
@@ -440,7 +451,7 @@ export function diffBrief(
     fps,
     resized,
     set,
-    props: { restage, removed: removedProps },
+    props: { restage, removed: removedProps, bySlot },
     castWords,
     plan: p,
     units,

@@ -1020,7 +1020,16 @@ objects in its own transaction, and a staging or an update puts each slot in on 
 does not go in (the scene in its way, a body that does not read) leaves its slot as it was or staged
 from the words, with its reason in the record, and the other slots, the shots and the rest of an
 update go on; one the scene was in the way of is pending `unavailable`, tried again at the next open
-or update. A prop's version whose root is another type of object than the instance's (a set's root
+or update. A library set that does not go in changes no set for the shots' cameras, and the record
+keeps the set digest of the set the scene has, not the plan's (so a later brief is told from that
+set); its report row names the set's root only while a set instance stands there or the set was
+made local. A library prop that does not go in, in an update that stages the prop again only for
+its slot (`BriefDiff.props.bySlot`: the words give no reason to), leaves the prop as the desk has it,
+keys, hold or flight and string (buildProp's `fallback` false); in one whose words stage it again,
+or for a prop the desk removed, the prop is staged as without the unit. A library set slot that
+goes in changes the set for an update's cameras only when it places, replaces or takes out a set,
+or its version changes a part (`updateUnit`'s report: not one with the same content, or whose
+changes all fall on parts edited in the scene, which are kept). A prop's version whose root is another type of object than the instance's (a set's root
 is always an empty, a figure's an armature) is no update in place: it takes the instance's place in
 the insert's transaction, as another item does; an instance the scene changed so that no version
 fits it (its root's type changed by other means) leaves the slot pending `unavailable`. What the
@@ -1078,8 +1087,11 @@ straight from a piece that goes or is built anew, as `keepMotion` rewrites the k
 person put on such a piece (`hangKept`); a warning says to check its framing when what it hangs from
 was built anew, staged again or no longer moves as it did. Camera data that a camera set by hand
 shares with another shot's camera changes as the update solves that camera or fits its move: the
-lens and focus distance, keyed or as plain values (`CameraKeys`), and the depth of field and sensor
-settings (`applyCameraMove`, `prepareDeskCamera`). Both warnings name the camera's parent as
+lens, keyed or as a plain value (`CameraKeys`), the focus distance's keys and the depth of field
+(`applyCameraMove`). The update solves that camera only while the shared data is as staged (an edit
+of it makes that camera count as set by hand too), and the data's other settings, its sensor among
+them, stay as they are. The warning that an update took a camera off and solved it again
+(`updateCameraHold`) and the one that it kept a camera set by hand both name its parent as
 `hungFromName` does, against what the person hung it from (`cameraParents`, read before any piece is
 built anew): the same object by its name, or `'Mira' (now 'Mira Jones')` when renamed; another
 object alone while an object with the old one's id is still in the scene; otherwise

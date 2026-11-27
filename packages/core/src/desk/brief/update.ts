@@ -131,10 +131,12 @@ import {
  *   fits its move (moves.ts retimeCameraRange) and, for one hung straight from a piece that goes or
  *   is built anew, as the keyed motion of what the person put on such a piece is kept, below
  *   (units/remove.ts keepMotion); camera data it shares with another shot's camera changes as the
- *   update solves that camera or fits its move (lens and focus distance, keyed or plain, depth of
- *   field and sensor: moves.ts CameraKeys, applyCameraMove, prepareDeskCamera); it warns (one hung
- *   from or under another object also when what it hangs from was built anew, staged again or no
- *   longer moves in the shot as it did);
+ *   update solves that camera or fits its move (the lens, keyed or as a plain value, the focus
+ *   distance's keys and the depth of field: moves.ts CameraKeys, applyCameraMove; the update solves
+ *   that camera only while the shared data is as staged, as an edit of it makes that camera count
+ *   as set by hand too, and the data's other settings, its sensor among them, stay as they are); it
+ *   warns (one hung from or under another object also when what it hangs from was built anew,
+ *   staged again or no longer moves in the shot as it did);
  * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
  *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
  *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
@@ -181,15 +183,25 @@ import {
  * Library pins (brief/units.ts; `units`, the units the desk holds) act per slot:
  * - the set: a unit placed takes the place of the words' set (its ground, walls and landmarks go) and
  *   is lit; a new version updates the instance (its root and the parts not edited here keep their
- *   ids); another item replaces it; no pin brings the words' set back; the cameras still as staged
- *   are solved again (one set by hand is kept, with a warning);
+ *   ids); another item replaces it; no pin brings the words' set back. The cameras still as staged
+ *   are solved again (one set by hand is kept, with a warning) when the slot changed the scene's
+ *   set: a set placed, replaced or taken out, or a version that changes a part of it (not one with
+ *   the same content, or whose changes all fall on parts edited here, which are kept). A set that
+ *   does not go in leaves the scene's set, and the set the record keeps of it, as they were (a later
+ *   brief is told from the set the scene has); its report row names the set's root only while a
+ *   set instance stands there or the set was made local (an object of the person's at that id is
+ *   not the set);
  * - a figure restyles its member's actor in place (same armature, keys, holds, shots) when its kind
  *   and height are the actor's; a member the update adds stands as the figure; no pin brings back the
  *   mannequin of the actor's kind and height (another kind or height is refused and the actor kept:
  *   rebuilding it is left to staging the brief in a new project);
  * - a prop unit replaces the element's prop, or updates it to a new version of the same item (its
  *   root id stays; a version whose root is another type of object than the instance's replaces it,
- *   as another item does), held or flown again; no pin brings back the words' prop;
+ *   as another item does), held or flown again; no pin brings back the words' prop. One that does
+ *   not go in leaves the prop the desk has as it is (its keys, its hold or flight and its string,
+ *   with what hangs on it) when the brief gives no other reason to stage the prop again; otherwise,
+ *   or when the desk removed the prop, the prop is staged as without the unit (the version placed
+ *   before, or the words' prop), as its slot's warning says;
  * - a unit not held changes nothing (the words, or the version placed, stay), a slot made local stays
  *   local, a refused pin is not tried again; the record says what each slot holds;
  * - a unit saved to the host's library from a slot whose answer the desk did not take in (library.ts
@@ -346,9 +358,10 @@ export function updateFromBriefIn(
   const actors = stagedActors(doc, sceneId);
   const props = stagedBy(doc, 'prop', sceneId, (o) => o.custom_props?.[DESK_PROPS.elementId]);
   const staged = new Map<string, boolean>();
-  // whether each shot's camera is as the staging left it but for where the person hung it (its keys,
-  // lens and settings: cameraOwnAsStaged), read before a ripple or a kept hang moves its keys: one
-  // the person only hung from another object was not set by hand
+  // whether each shot's camera is as the staging left it but for where the person hung it (its keys
+  // and its lens's, its settings, constraints and what hangs below it: cameraOwnAsStaged), read
+  // before a ripple or a kept hang moves its keys: one the person only hung from another object was
+  // not set by hand
   const ownCamera = new Map<string, boolean>();
   for (const s of hostShots(doc, sceneId).values())
     if (s.camera) {
@@ -731,13 +744,19 @@ export function updateFromBriefIn(
   // ------------------------------------------------------------ the set
   const setSlot = units.set;
   const setAction = setSlot?.action ?? 'none';
+  // whether the library set's slot changed the scene's set: a set placed, replaced or taken out, or a
+  // version that changes a part of it (not one with the same content, or whose changes all fall on
+  // parts edited here, which are kept); a set that does not go in changes nothing
+  let setChanged = false;
   if (setSlot && (setAction === 'place' || setAction === 'replace' || setAction === 'update')) {
     // a set that does not go in (its update or insert throws before writing anything) leaves the
     // slot as it was, saying why; the rest of the update goes on
     try {
+      let parts = true;
       if (setAction === 'update') {
         const root = setSlot.inst!.root;
         const rep = updateUnit(doc, root, setSlot.payload!, setSlot.pin!);
+        parts = rep.updated.length + rep.added.length + rep.removed.length > 0;
         warnings.push(...rep.warnings.map((w) => `the library set: ${w}`));
         const info = setSlot.held!.info as SetPlanInfo;
         const o = doc.getObject(root)!;
@@ -759,12 +778,14 @@ export function updateFromBriefIn(
       }
       warnings.push(...relightSet(doc, blocking));
       done.add(setSlot.key);
+      setChanged = parts;
     } catch (err) {
       warnings.push(...slotFailed(setSlot, err, done));
     }
   } else if (setSlot && setAction === 'remove') {
     // the words' set comes back; what the person put on the library set (objects of their own below
     // it, not its parts) stays, hung from the words' ground where it is in the world
+    setChanged = true;
     const kept = removeKeeping(doc, [setSlot.inst!.root]);
     const staged = restageSet(doc, blocking, brief, castNames, stamp, sceneId);
     warnings.push(
@@ -781,9 +802,9 @@ export function updateFromBriefIn(
   // the set is staged: what stays of the cameras and actors that went hangs from its ground
   for (const d of dropped) warnings.push(...hangOnGround(doc, d.kept, d.gone, setGround(doc)));
   // the cameras still as staged see the new set: solved again (one set by hand is kept). A library
-  // set that did not go in left the set as it was (slotFailed made its action 'none'): no camera
-  // sees a new set then
-  if ((setSlot?.action ?? 'none') !== 'none')
+  // set that did not go in (slotFailed made its action 'none'), or a version that changes none of
+  // its parts, left the set as it was: no camera sees a new set then
+  if (setChanged)
     for (const d of hostShots(doc, sceneId).values()) {
       if (!d.camera || solve.has(d.id)) continue;
       if (staged.get(d.camera) === false)
@@ -813,27 +834,43 @@ export function updateFromBriefIn(
     const holder = plan.holders.get(eid) ?? null;
     const flies = holder ? flyerKind(`${p.label} ${e.name}`) : null;
     // a prop the brief did not change stays as the desk has it (also one removed in the desk), but a
-    // flight over shots staged again flies again
-    const restage =
-      diff.props.restage.has(eid) ||
+    // flight over shots staged again flies again. The words' own reasons to stage it again (its
+    // element or holder, a flight over shots staged again) are told from its library prop's slot
+    // acting alone (bySlot), which stages it again only once its unit goes in
+    const words =
+      (diff.props.restage.has(eid) && !diff.props.bySlot.has(eid)) ||
       (flies !== null &&
         holderRuns(shotsAfter, holder)
           .flat()
           .some((id) => place.has(id)));
-    if (!restage) continue;
-    if (old) warnings.push(...dropTether(doc, old.id));
+    if (!words && !diff.props.bySlot.has(eid)) continue;
     const current = old && doc.getObject(old.id) ? old : undefined;
     const slot = units.elements.get(eid);
     // the element's library prop: placed, updated or replaced; kept (another version not held, made
-    // local); none any more (the words' prop again); one that does not go in leaves the prop as it
-    // was (or the words' prop), its slot saying why
+    // local); none any more (the words' prop again). One that does not go in is staged as without it
+    // (buildProp: the version placed before, or the words' prop) when the words stage the prop again
+    // or the desk has no prop for it (removed there), as its slot's warning says; for its slot alone
+    // it leaves the prop the desk has as it is (its keys, its hold or flight and its string)
     const unit = slot?.action === 'remove' ? null : propHook(doc, slot, current?.id ?? null);
+    const alone = !words && !!unit?.unit && !!current;
+    // the string and tail of the flight before go (a flight flown again makes new ones): for the
+    // slot alone once its unit went in
+    if (old && !alone) warnings.push(...dropTether(doc, old.id));
     if (unit?.unit) done.add(unit.key);
     // stageHeld below holds or flies it while its holder has an actor in a shot, else hides it
     const holderActor = p.heldBy ? actors.get(p.heldBy) : undefined;
     const move = propMove(p, flies, !!holderActor && holderSpans(cut, p.heldBy!).length > 0);
     const byHand = !!current && ownStaged.get(current.id) === false;
-    const made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand);
+    let made: ReturnType<typeof buildProp>;
+    try {
+      made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand, !alone);
+    } catch (err) {
+      // a unit for the slot alone that does not go in (it throws before writing anything)
+      if (!alone || !slot) throw err;
+      warnings.push(...slotFailed(slot, err, done));
+      continue;
+    }
+    if (old && alone) warnings.push(...dropTether(doc, old.id));
     restagedProps.add(made.root);
     if (slot && made.failed !== undefined) warnings.push(...slotFailed(slot, made.failed, done));
     for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
@@ -987,7 +1024,7 @@ export function updateFromBriefIn(
       actorName: actorNames.get(cid),
     });
   }
-  const next = recordOf(
+  const planned = recordOf(
     brief,
     desk,
     kinds,
@@ -997,10 +1034,15 @@ export function updateFromBriefIn(
     removedKept,
     recordPinsOf(units, done),
   );
+  // a library set that did not go in left the scene's set as it was: the record keeps that set's
+  // digest (the plan's is of a set never built), so that a later brief is told from the set the
+  // scene has
+  const setFailed = setSlot !== null && setAction !== 'none' && setSlot.action === 'none';
+  const next = setFailed ? { ...planned, set: record.set } : planned;
   writeBriefRecord(doc, next);
   const objectOf = (s: SlotUnit): string | null =>
     'set' in s.slot
-      ? (setUnitRoot(doc) ?? (doc.getObject(SET_ROOT_ID()) ? SET_ROOT_ID() : null))
+      ? (setUnitRoot(doc) ?? (s.local && doc.getObject(SET_ROOT_ID()) ? SET_ROOT_ID() : null))
       : 'castId' in s.slot
         ? actorId(s.slot.castId)
         : (props.get(s.slot.elementId)?.id ?? null);

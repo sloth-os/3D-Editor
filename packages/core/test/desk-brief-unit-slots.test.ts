@@ -400,9 +400,16 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       const mira = actorOf(doc, MIRA).id;
       const look = doc.listObjects().filter((o) => prop(o, 'desk_actor') === mira).length;
       const frames = getShots(doc)[0].frame_end - getShots(doc)[0].frame_start + 1;
+      const set = readBriefRecord(doc)!.set;
       let r: StageBriefReport | null = null;
       expect(() => (r = updateFromBrief(doc, b, { units: source(L.set, L.kite, L.mira) }))).not.toThrow();
       expect(r!.units).toEqual([expect.objectContaining({ slot: key, staged: 'words', why: 'unavailable' })]);
+      // a set that did not go in: its row names no object (the one in the way is not the set's
+      // root), and the record keeps the set the scene has
+      if (kind === 'set') {
+        expect(r!.units[0]!.object).toBeNull();
+        expect(readBriefRecord(doc)!.set).toBe(set);
+      }
       expect(getShots(doc)[0].frame_end - getShots(doc)[0].frame_start + 1).toBe(frames + b.fps);
       // the lengthened shot only fits its move: no camera is solved, and none is warned of a set
       expect(r!.solved).toEqual([]);
@@ -426,6 +433,132 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       expect(pinned).toMatchObject({ staged: 'pending', why: 'unavailable' });
     },
   );
+
+  it.each(['keyed by hand', 'only hung'] as const)(
+    'Update shots: a library prop pinned with no other change to it that does not go in leaves the prop as the desk has it (a camera %s under it)',
+    (how) => {
+      const L = library();
+      const { doc } = staged(openBrief());
+      const kite = propOf(doc, KITE).id;
+      blockAll(doc, `el:${KITE}`, objectPart(L.units.kite));
+      // the person edits one key of the kite's flight and hangs shot 2's camera under the kite
+      const z = doc.listFCurves(kite).find((f) => f.path === 'location' && f.index === 2)!;
+      doc.transact(() =>
+        doc.setFCurve({
+          ...z,
+          keyframes: z.keyframes.map((k, i) => (i === 10 ? { ...k, value: k.value + 3 } : k)),
+        }),
+      );
+      const cam = getShots(doc)[1].camera!;
+      doc.setParent(cam, kite, true);
+      if (how === 'keyed by hand') keyed(doc, cam, 'location', 0, [0, 0.5, 1]);
+      const strings = doc
+        .listObjects()
+        .filter((o) => o.custom_props?.desk_string_to === kite)
+        .map((o) => o.id);
+      expect(strings).not.toEqual([]);
+      const curves = JSON.stringify(doc.listFCurves(kite));
+      // the brief pins the kite, and rewords a shot (an update without the pin acts as well)
+      const b = withPins(openBrief(), { el: { [KITE]: L.kite } });
+      b.shots[1].description = 'Close-up: Mira looks up at the red kite, smiling.';
+      const r = updateFromBrief(doc, b, { units: source(L.kite) });
+      expect(rowsOf(r)).toEqual([`el:${KITE} words unavailable`]);
+      expect(r.warnings.join('\n')).toMatch(
+        /Red kite's library prop .* could not be used this time .*: the prop from the words stands in/,
+      );
+      // the kite is as the desk had it: its keys (the person's edit with them), its string, and the
+      // camera on it, neither taken off nor warned of
+      expect(propOf(doc, KITE).id).toBe(kite);
+      expect(JSON.stringify(doc.listFCurves(kite))).toBe(curves);
+      expect(
+        doc
+          .listObjects()
+          .filter((o) => o.custom_props?.desk_string_to === kite)
+          .map((o) => o.id),
+      ).toEqual(strings);
+      expect(doc.getObject(cam)!.parent).toBe(kite);
+      expect(r.solved).toEqual([]);
+      expect(r.warnings.filter((w) => /set by hand|took it off/.test(w))).toEqual([]);
+      expect(readBriefRecord(doc)!.elements.find((e) => e.id === KITE)!.unit).toMatchObject({
+        staged: 'pending',
+        why: 'unavailable',
+      });
+    },
+  );
+
+  it.each(['the words change it too', 'the desk removed it'] as const)(
+    'Update shots: a library prop that does not go in is staged from the words when %s',
+    (how) => {
+      const L = library();
+      const { doc } = staged(openBrief());
+      const kite = propOf(doc, KITE).id;
+      blockAll(doc, `el:${KITE}`, objectPart(L.units.kite));
+      const z = doc.listFCurves(kite).find((f) => f.path === 'location' && f.index === 2)!;
+      const edit = z.keyframes[10].value + 3;
+      doc.transact(() =>
+        doc.setFCurve({ ...z, keyframes: z.keyframes.map((k, i) => (i === 10 ? { ...k, value: edit } : k)) }),
+      );
+      const b = withPins(openBrief(), { el: { [KITE]: L.kite } });
+      if (how === 'the words change it too') {
+        const e = b.elements.find((x) => x.id === KITE)!;
+        e.description = `${e.description} It has a long blue tail.`;
+      } else doc.removeObjects([kite]);
+      const r = updateFromBrief(doc, b, { units: source(L.kite) });
+      expect(rowsOf(r)).toEqual([`el:${KITE} words unavailable`]);
+      expect(r.warnings.join('\n')).toMatch(
+        /Red kite's library prop .* could not be used this time .*: the prop from the words stands in/,
+      );
+      // the words' kite stands in, its flight keyed anew (the person's edit gone with the old keys)
+      const now = propOf(doc, KITE).id;
+      expect(readInstance(doc, now)).toBeNull();
+      const after = doc.listFCurves(now).find((f) => f.path === 'location' && f.index === 2)!;
+      expect(after.keyframes[10]?.value).not.toBe(edit);
+    },
+  );
+
+  it("Update shots: a library set that does not go in leaves the record's set as the scene has it, so a brief that then drops the pin changes nothing", () => {
+    const L = library();
+    const { doc } = staged(openBrief());
+    const groundOf = () =>
+      doc.listObjects().find((o) => prop(o, 'desk_role') === 'set' && prop(o, 'desk_label') === 'ground')?.id;
+    const ground = groundOf()!;
+    // a camera the person hung from the words' ground and keyed
+    const cam = getShots(doc)[1].camera!;
+    doc.setParent(cam, ground, true);
+    keyed(doc, cam, 'location', 0, [0, 0.5, 1]);
+    doc.addObject({ type: 'EMPTY', name: 'Squatter' }, deriveUnitId('set', UNIT_ROOT));
+    const set = readBriefRecord(doc)!.set;
+    const r = updateFromBrief(doc, withPins(openBrief(), { set: L.set }), { units: source(L.set) });
+    expect(rowsOf(r)).toEqual(['set words unavailable']);
+    expect(readBriefRecord(doc)!.set).toBe(set);
+    expect(r.warnings.filter((w) => /set by hand|took it off|the set changed/.test(w))).toEqual([]);
+    // the brief drops the pin: it plans the words' set the scene has, so nothing is built again
+    const u = update(doc, openBrief());
+    expect(u.changes).toBeNull();
+    expect(groundOf()).toBe(ground);
+    expect(doc.getObject(cam)!.parent).toBe(ground);
+    expect(u.r.warnings.filter((w) => /set by hand|took it off/.test(w))).toEqual([]);
+  });
+
+  it('Update shots: another library set that does not go in leaves the set, the record and the cameras as they were', () => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    const other = lib('lib_0123456789othr', 1, L.set.given.data);
+    // the instance's part moved out from under its root keeps its id; every later generation's id
+    // is held by an object of the person's, so the other set has no id to take for that part
+    const src = objectPart(L.units.set);
+    doc.setParent(derivePartId('set', src, 0), null, true);
+    for (let g = 1; g <= MAX_UNIT_GENERATION; g++)
+      doc.addObject({ type: 'EMPTY', name: `In the way ${g}` }, derivePartId('set', src, g));
+    keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
+    const set = readBriefRecord(doc)!.set;
+    const r = updateFromBrief(doc, withPins(openBrief(), { set: other }), { units: source(other) });
+    expect(rowsOf(r)).toEqual(['set words unavailable']);
+    expect(readInstance(doc, deriveUnitId('set', UNIT_ROOT))!.ref).toBe(L.set.pin.ref);
+    expect(readBriefRecord(doc)!.set).toBe(set);
+    expect(r.solved).toEqual([]);
+    expect(r.warnings.join('\n')).not.toMatch(/the set changed/);
+  });
 
   it('Update shots: a member it adds whose figure does not go in stands as a mannequin of its height', () => {
     const L = library();
@@ -872,9 +1005,16 @@ describe("a later version whose root is another type of object than the instance
     const b2 = withPins(openBrief(), { set: v2 });
     // no operator turns an empty into another type: a scene written by other means
     doc.transact(() => doc.updateObject(root, { type: 'MESH' }));
+    // and a camera the person set by hand (keyed): a set that does not go in changes nothing, so no
+    // camera is solved for it, none is warned of it, and the record keeps the set the scene has
+    keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
+    const set = readBriefRecord(doc)!.set;
     let r: StageBriefReport | null = null;
     expect(() => (r = updateFromBrief(doc, b2, { units: source(v2) }))).not.toThrow();
     expect(rowsOf(r!)).toEqual(['set words unavailable']);
+    expect(r!.solved).toEqual([]);
+    expect(r!.warnings.join('\n')).not.toMatch(/the set changed/);
+    expect(readBriefRecord(doc)!.set).toBe(set);
     // v1 stays, as the record says, and v2 is not refused: the next open or update tries it again
     expect(readInstance(doc, root)).toMatchObject({ version: 1 });
     expect(readBriefRecord(doc)!.setUnit).toMatchObject({ version: 1, staged: 'unit' });
@@ -1141,5 +1281,65 @@ describe('what the person put on a library set stays when the brief links anothe
     // it keeps its place at rest, but the new root does not bob: said so
     FRAMES.forEach((f) => sameWorld(new FrameState(doc, f).world(duck)!, at));
     expect(u.r.warnings).toContain("the library set: 'Duck' no longer follows the animation of 'pond'");
+  });
+});
+
+describe("a later version of the library set that changes none of the set's parts", () => {
+  const SET_ROOT = () => deriveUnitId('set', UNIT_ROOT);
+  /** An object part of the library set, and a version 2 of the set that moves it 1 m along x. */
+  const moving = () => {
+    const L = library();
+    const src = Object.keys(L.units.set.body.blocks.objects!).find((s) => s !== UNIT_ROOT)!;
+    const edited = editedUnit(L.units.set, (body) => {
+      const at = body.blocks.objects![src].location as number[];
+      body.blocks.objects![src].location = [at[0] + 1, at[1], at[2]];
+    });
+    return { src, v2: lib(L.set.pin.ref, 2, encodeUnit(edited.body, headerInput(edited.header))) };
+  };
+
+  it.each([
+    'the same file again',
+    'a new name only',
+    'a change to a part the person edited in the desk',
+  ] as const)("Update shots: a version 2 that is %s is no set change for the shots' cameras", (how) => {
+    const L = library();
+    const { doc } = staged(withPins(openBrief(), { set: L.set }), source(L.set));
+    let v2: Lib;
+    if (how === 'the same file again') v2 = lib(L.set.pin.ref, 2, L.set.given.data);
+    else if (how === 'a new name only')
+      v2 = lib(
+        L.set.pin.ref,
+        2,
+        encodeUnit(L.units.set.body, { ...headerInput(L.units.set.header), name: 'Meadow in summer' }),
+      );
+    else {
+      const m = moving();
+      v2 = m.v2;
+      // the person moved that part in the desk: the update keeps their edit of it
+      const id = readInstance(doc, SET_ROOT())!.parts.get(`objects:${m.src}`)!.id;
+      const at = doc.getObject(id)!.location;
+      doc.transact(() => doc.updateObject(id, { location: [at[0], at[1] + 2, at[2]] }));
+    }
+    // a camera set by hand (keyed): it would be warned of a set change, and the others solved
+    keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
+    const { r } = update(doc, withPins(openBrief(), { set: v2 }), source(v2));
+    expect(rowsOf(r)).toEqual(['set unit']);
+    expect(readInstance(doc, SET_ROOT())!.version).toBe(2);
+    expect(r.solved).toEqual([]);
+    expect(r.warnings.join('\n')).not.toMatch(/the set changed/);
+  });
+
+  it('Update shots: a version 2 that moves a part of the set solves the cameras still as staged and keeps the one set by hand', () => {
+    const L = library();
+    const b = withPins(openBrief(), { set: L.set });
+    const { doc } = staged(b, source(L.set));
+    const { v2 } = moving();
+    keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
+    const { r } = update(doc, withPins(openBrief(), { set: v2 }), source(v2));
+    expect(rowsOf(r)).toEqual(['set unit']);
+    expect(r.solved).toEqual(b.shots.filter((_, i) => i !== 1).map((s) => s.id));
+    expect(r.warnings).toContain(
+      'Shot 2: its camera was set by hand in the desk and is kept; the set changed, so check its framing (solve it again with desk.shot_solve)',
+    );
   });
 });

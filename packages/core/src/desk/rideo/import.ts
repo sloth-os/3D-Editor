@@ -2505,7 +2505,9 @@ const stampFacts = (
  * it as it moved that one (movesAlike), and is named as no longer following that one's otherwise.
  * `byHand`: the person keyed `old` by hand (keys the staging did not write on its own transform
  * channels, read by the caller before anything changed: ownKeysAsStaged); those keys go with it, so
- * what was on it is named whatever moves the new prop.
+ * what was on it is named whatever moves the new prop. `fallback` false: a unit that does not go in
+ * throws its error instead, the scene as it was (an update whose words give no reason to stage the
+ * prop again leaves it as the desk has it).
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2518,6 +2520,7 @@ export function buildProp(
   old?: ObjectData,
   unit?: StagedProp | null,
   byHand = false,
+  fallback = true,
 ): {
   root: string;
   baseScale: Vec3;
@@ -2547,6 +2550,7 @@ export function buildProp(
         byHand,
       );
     } catch (err) {
+      if (!fallback) throw err;
       return {
         ...buildProp(doc, p, elementName, castNames, stamp, flies, move, old, undefined, byHand),
         failed: err,
