@@ -585,17 +585,21 @@ and no other shot's keys are cut:
 - a recast shot shows its new cast and hides the rest, and is solved again, as is a shot whose
   camera plan changed (framing, movement, lens, move, layout, continuity) and every shot when the
   size changed;
-- a camera set by hand in the desk is never solved again: the update keeps it and its keys (fitted
-  only to a new length of its shot, as above) and warns when its shot's cast, camera plan or frame
-  size changes or the set changes, and, for one hung from or under another object, when what it
-  hangs from was built anew or staged again or no longer moves in the shot as it did:
+- a camera set by hand in the desk is never solved again: the update keeps it, and its keys change
+  only as a ripple changes every curve's keys (below), as a new length of its shot fits its move
+  (above) and, for one hung straight from a piece the update builds anew or takes out, as the keys
+  of what the person put on such a piece change (below); it warns when its shot's cast, camera plan
+  or frame size changes or the set changes, and, for one hung from or under another object, when
+  what it hangs from was built anew or staged again or no longer moves in the shot as it did:
   `Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite' (built anew as 'Red balloon'), no longer moves as it did, so check its framing (solve it again with desk.shot_solve)`;
 - a shot's camera the person only hung from, or under, another object (its keys and its lens's, its
   settings, constraints and what hangs below it as staging left them: a hang only sets its parent
   and where it stands) keeps its hang unless the update solves it. The update solves it when what it
   hangs from, or what is above that, is a piece the update built anew or staged again that now moves
   in the shot, and otherwise than it did, and what the desk recorded of it tells that it was only
-  hung (a record an older desk made cannot tell, nor can a missing one): left there it would ride a
+  hung (a record an older desk made cannot tell, nor can a missing one: such a camera is kept as one
+  set by hand, above, unless it is still as staged in a shot the update solves, and an update
+  records one still as staged anew, so that a later update can tell): left there it would ride a
   motion no one framed. It is solved so also when its shot's cast, camera plan or frame size changes
   or the set changes, and then the warning that it is kept as set by hand (above) does not name it:
   the one below, that the update took it off and solved it again, does. When it is not solved, such

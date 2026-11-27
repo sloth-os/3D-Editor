@@ -1066,29 +1066,38 @@ is built anew and after, compared from the shot's first frame by `sameMotion`), 
 only when what it hangs from moves in the shot. To tell one only hung, beside a camera's motion
 digest its motion record keeps an `own` one (`cameraOwnDigest`: the digest without its hang, that is
 its parent and the channel values a hang with Keep Transform rewrites, so of its keys, its data's,
-its constraints and what hangs below it), which a hang leaves as recorded (`cameraOwnAsStaged`; a
-camera recorded without it counts as set by hand). Any other camera keeps its hang as `hangKept`
-leaves it; one set by hand is never solved: it keeps its keys (fitted only to a new length of its
-shot), and a warning says to check its framing when what it hangs from was built anew, staged again
-or no longer moves as it did. The warnings name what the person hung it from (`cameraParents`, read
-before any piece is built anew: `'kite' (built anew as 'balloon')`). An update replaces the
-parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep resolving; it
-keeps parts edited or deleted in the scene, adds new parts at ids of the instance's generation (or
-of the next free one) and removes dropped untouched ones that nothing staying uses (a record that
-stays refers to it, such as another object, a camera's focus or a part the update keeps, or a key,
-driver, shot or the scene camera names it; then it stays with what it uses), and treats the unit's
-drivers the same way by their own table: a driver the new version drops together with the part it
-drives goes with that part, or stays on it when the part stays, and what it reads stays too.
-`unitStatus` names the parts and the drivers the scene edited or deleted. Extraction carries an
-instance's generation in its link plan, so linking the saved unit (adoption) keeps it; Make local
-drops it with the other `unit_*` props. What an update writes is stamped as written: a reference to
-a part that is not in the scene is cut, and the part still reads as left as it was. Linking a saved
-set (adoption) stamps the scene's set root, also one made local before: the root a new set would
-take is that one. A unit's driver writes only the unit's own datablocks (it may read the world or
-the scene), and drivers count toward the 20,000 records. Scene-owned fields (names, the collection
-and rigid body of every object, the root's placement, pose and constraints, the scene's `desk_*`
-props) never count as edits, and a unit holds no rigid body: a drop preset that makes a library
-set's ground the floor edits nothing of the set. Measured on the sample brief:
+its constraints and what hangs below it), which a hang leaves as recorded (`cameraOwnAsStaged`). A
+camera recorded without it, as older desks recorded, is never taken for one only hung: it is solved
+only as one still as staged in a shot the update solves, and is otherwise kept as one set by hand
+(below), also while still as staged; but an update records anew the camera of each of the brief's
+shots that it solves or that is still as staged, `own` digest included, so a later update can take
+such a camera for one only hung. Any other camera keeps its hang as `hangKept` leaves it; one set
+by hand is never solved: its keys change only as the ripple changes every curve's keys
+(`timeline.ts`), as `retimeCameraRange` fits its move to a new length of its shot and, for one hung
+straight from a piece that goes or is built anew, as `keepMotion` rewrites the keys of anything the
+person put on such a piece (`hangKept`), and a warning says to check its framing when what it hangs
+from was built anew, staged again or no longer moves as it did. The warnings name what the person
+hung it from and the piece built in its place or its new name (`cameraParents`, read before any
+piece is built anew: `'kite' (built anew as 'balloon')`), or, when it now hangs from an object that
+was there before the update (the set's ground, or the root of a look or instance whose part went),
+that object. An update replaces the parts the scene left untouched in place, ids kept, so shots,
+holds and F-curves keep resolving; it keeps parts edited or deleted in the scene, adds new parts at
+ids of the instance's generation (or of the next free one) and removes dropped untouched ones that
+nothing staying uses (a record that stays refers to it, such as another object, a camera's focus or
+a part the update keeps, or a key, driver, shot or the scene camera names it; then it stays with
+what it uses), and treats the unit's drivers the same way by their own table: a driver the new
+version drops together with the part it drives goes with that part, or stays on it when the part
+stays, and what it reads stays too. `unitStatus` names the parts and the drivers the scene edited or
+deleted. Extraction carries an instance's generation in its link plan, so linking the saved unit
+(adoption) keeps it; Make local drops it with the other `unit_*` props. What an update writes is
+stamped as written: a reference to a part that is not in the scene is cut, and the part still reads
+as left as it was. Linking a saved set (adoption) stamps the scene's set root, also one made local
+before: the root a new set would take is that one. A unit's driver writes only the unit's own
+datablocks (it may read the world or the scene), and drivers count toward the 20,000 records.
+Scene-owned fields (names, the collection and rigid body of every object, the root's placement, pose
+and constraints, the scene's `desk_*` props) never count as edits, and a unit holds no rigid body: a
+drop preset that makes a library set's ground the floor edits nothing of the set. Measured on the
+sample brief:
 
 | Unit                            | File      | Body      | Objects |
 | ------------------------------- | --------- | --------- | ------- |

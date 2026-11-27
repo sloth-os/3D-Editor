@@ -126,9 +126,12 @@ import {
  * - a shot whose camera plan changed (framing, movement, lens, move, layout, continuity; a lens or move
  *   the host gives back as staged is no change), or every shot when the render size changed, has its
  *   camera solved again;
- * - a camera set by hand in the desk is never solved again: the update keeps it and its keys (fitted
- *   only to a new length of its shot) and warns (one hung from or under another object also when
- *   what it hangs from was built anew, staged again or no longer moves in the shot as it did);
+ * - a camera set by hand in the desk is never solved again: the update keeps it, and its keys
+ *   change only as the ripple changes every curve's keys (timeline.ts), as a new length of its shot
+ *   fits its move (moves.ts retimeCameraRange) and, for one hung straight from a piece that goes or
+ *   is built anew, as the keyed motion of what the person put on such a piece is kept, below
+ *   (units/remove.ts keepMotion); it warns (one hung from or under another object also when what it
+ *   hangs from was built anew, staged again or no longer moves in the shot as it did);
  * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
  *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
  *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
@@ -890,8 +893,12 @@ export function updateFromBriefIn(
   // rules (hangKept) left it, on the piece built in place of what it hung from. Those rules name the
   // camera, or the object of the person's it hangs under, solved or not, when it no longer follows
   // the animation of what went (what took the piece's place does not move alike, as when another
-  // holder now flies the prop). One the person set by hand is never solved: kept with its keys, with
-  // a warning when what it hangs from was built anew, staged again or moves otherwise
+  // holder now flies the prop). One the person set by hand, or one recorded without an own part (an
+  // older desk's record: cameraOwnAsStaged is false), is not solved here: kept with its keys as the
+  // ripple, the fit to a new length of its shot (resizeShot) and those rules (keepMotion) left
+  // them, with a warning when what it hangs from was built anew, staged again or moves otherwise
+  // (one recorded so that is still as staged is solved above for a shot of it the update solves,
+  // and recorded anew below)
   const notKept = new Set<number>();
   for (const s of desk.values()) {
     const cam = s.camera ? doc.getObject(s.camera) : null;
@@ -943,8 +950,10 @@ export function updateFromBriefIn(
       fit_plan: true,
       keep_lens: false,
     });
-  // a camera the person only hung keeps its own record as the staging's (a ripple or its kept hang
-  // may have moved its keys); one they set by hand stays theirs
+  // the camera of a brief's shot the update solved, or one still as staged, is recorded anew, own
+  // part included (an older desk's record gains it, so a later update can tell a hang); one the
+  // person only hung keeps its own record as the staging's (a ripple or its kept hang may have
+  // moved its keys); one they set by hand stays theirs
   for (const s of desk.values())
     if (s.camera && (solve.has(s.id) || staged.get(s.camera) === true)) recordMotion(doc, s.camera);
     else if (s.camera && ownCamera.get(s.camera) === true)
