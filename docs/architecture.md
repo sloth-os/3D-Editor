@@ -1003,101 +1003,104 @@ SHA-256, the body digest, the kind, the key, the name, `unit_parts` (each source
 target's source id, path and index, with its stamp) and, for an instance whose parts took ids of a
 later generation (below), `unit_gen`. glTF node extras and `get_object` give the two tables as how
 many entries they hold (`unit_parts_count`, `unit_drivers_count`, about 56 bytes a part saved).
-Insertion derives every id from the instance key and the source id (`deriveUnitId`), so two
-replicas inserting the same unit agree. Taking an instance out removes all of it (`remove.ts`): its
-objects and the datablocks its part table lists that nothing left in the scene uses, so a unit
-placed in the slot again finds its ids free. A datablock at a derived id that nothing uses counts as
-free and goes in the insert's transaction. A part the scene still uses keeps its id when its
-instance goes (the person gave its material to an object of their own, or moved one of its objects
-out from under it), so a slot's ids come in generations (`derivePartId`): generation 0 is
-`deriveUnitId(key, sourceId)`, generation n hashes the key as `<key>#<n>`, which no key can be, and
-an insert takes the first of the 65 generations (0 to 64) whose ids are all free and keeps it in
-`unit_gen`. The root's id is the same in every generation, so shots, holds and the set's root keep
-finding it; only an object of the scene's own at the root's id, or a part whose ids are taken in
-every generation, refuses the insert (`UNIT_ID_TAKEN`). The choice depends on the document alone,
-so replicas agree. An insert that takes the place of what was there (a library set over the words'
-set, a prop's new look) removes the old objects in its own transaction, and a staging or an update
-puts each slot in on its own: a unit that does not go in (the scene in its way, a body that does
-not read) leaves its slot as it was or staged from the words, with its reason in the record, and
-the other slots, the shots and the rest of an update go on; one the scene was in the way of is
-pending `unavailable`, tried again at the next open or update. A prop's version whose root is
-another type of object than the instance's (a set's root is always an empty, a figure's an armature)
-is no update in place: it takes the instance's place in the insert's transaction, as another item
-does; an instance the scene changed so that no version fits it (its root's type changed by other
-means) leaves the slot pending `unavailable`. What the person put on a set or a prop whose look goes
-(objects of their own below its root or its parts, not its look: remove.ts `oldLook`), for another
-item, a version of another type, a library set in place of the words' set, or the words' set or prop
-back when the pin is dropped, stays in the same transaction (insertUnit's `keep`, removeObjectTrees'
-`keep`): `hangKept` hangs it from what takes the look's place (the new root, the words' ground or
-prop) where it is in the world, or leaves it where it was, under its parent of the moment, when the
-new root's uneven scale would change it there, and a warning names it. Its keys are in its parent's
-space: where the new parent is the old one moved and scaled along its axes, `keepMotion` rewrites its
-location and scale keys so that it moves as it did; otherwise (a keyed turn under a root scaled
-unevenly, keys under a modifier that changes values, a driven channel) they stay as they are and the
-warning says that its keyed motion now follows the new root. Places are read at rest
-(`restWorld`: an object hung from a bone sits at the bone's tail in the armature's rest position,
-which `SceneDoc.worldMatrix` leaves out), with what moved each one on its own above it (`moversOf`:
-keys, drivers, constraints, an active rigid body, or the pose of the bones it hung from); one whose
-mover went and that nothing above it moves alike now is named as no longer following it, unless the
-staging moves what takes the piece's place as it moved the piece (`restaged`: a prop held or flown
-again as the old one was, by the same holder, which the import reads from the holder the old prop
-records and the flight or holds it carries before it goes, and from the plan for the new one, when
-the old prop's own transform channels carry no keys of the person's: its motion record
-(`RIDEO_PROPS.motion`) keeps a digest of the keys the staging wrote there (`ownKeysDigest`), read
-before an update's ripple shifts them; an actor built anew on its marks). One that followed a bone
-through the pieces that went (a hat on a mannequin's head part) hangs from the same bone of the new
-root when the root is that armature or takes its place. One skewed by an uneven scale above it,
-which no parent holds, keeps its origin and is named as changing shape. The same steps keep what the
-person put on what staging and updates build anew or take out without a library unit (`keptPlaces`,
-then `hangKept`): a words' prop or landmark built anew or dropped, the words' ground, walls and sun
-built again (`buildSet` and `lightSet`, which name nothing when a piece comes back with its name and
-place), a cast member's actor or a shot's camera an update drops, a kite's string flown again, an
-actor a rideo re-import builds anew, and an old look's parts when a figure or the mannequin takes
-their place (insertUnit's `replace`, `restyleActor`); what goes with nothing in its place hangs from
-the set's ground, or from the scene when there is none. A shot's camera hung from (or under) such a
-piece is held on a re-import as a blocked camera is (rideo/import.ts `cameraHold`): it stays on what
-it hangs from while that stands still through the shot, scaled evenly, not mirrored and shown;
-otherwise it is taken off it, at scale 1, where it stands at the shot's first frame, and placed
-where the clip's blocking has it. An update holds so only a camera it solves, and solves it again
-(`updateCameraHold`): one still as staged in a shot it solves (a re-import records one it placed in
-its parent's space so), and one the person only hung from or under a piece the update built anew or
-staged again that now moves in the shot otherwise than it did (`hungMotion`, read before any piece
-is built anew and after, compared from the shot's first frame by `sameMotion`), which it takes off
-only when what it hangs from moves in the shot. To tell one only hung, beside a camera's motion
-digest its motion record keeps an `own` one (`cameraOwnDigest`: the digest without its hang, that is
-its parent and the channel values a hang with Keep Transform rewrites, so of its keys, its data's,
-its constraints and what hangs below it), which a hang leaves as recorded (`cameraOwnAsStaged`). A
-camera recorded without it, as older desks recorded, is never taken for one only hung: it is solved
-only as one still as staged in a shot the update solves, and is otherwise kept as one set by hand
-(below), also while still as staged; but an update records anew the camera of each of the brief's
-shots that it solves or that is still as staged, `own` digest included, so a later update can take
-such a camera for one only hung. Any other camera keeps its hang as `hangKept` leaves it; one set
-by hand is never solved: its keys change only as the ripple changes every curve's keys
-(`timeline.ts`), as `retimeCameraRange` fits its move to a new length of its shot and, for one hung
-straight from a piece that goes or is built anew, as `keepMotion` rewrites the keys of anything the
-person put on such a piece (`hangKept`), and a warning says to check its framing when what it hangs
-from was built anew, staged again or no longer moves as it did. The warnings name what the person
-hung it from and the piece built in its place or its new name (`cameraParents`, read before any
-piece is built anew: `'kite' (built anew as 'balloon')`), or, when it now hangs from an object that
-was there before the update (the set's ground, or the root of a look or instance whose part went),
-that object. An update replaces the parts the scene left untouched in place, ids kept, so shots,
-holds and F-curves keep resolving; it keeps parts edited or deleted in the scene, adds new parts at
-ids of the instance's generation (or of the next free one) and removes dropped untouched ones that
-nothing staying uses (a record that stays refers to it, such as another object, a camera's focus or
-a part the update keeps, or a key, driver, shot or the scene camera names it; then it stays with
-what it uses), and treats the unit's drivers the same way by their own table: a driver the new
-version drops together with the part it drives goes with that part, or stays on it when the part
-stays, and what it reads stays too. `unitStatus` names the parts and the drivers the scene edited or
-deleted. Extraction carries an instance's generation in its link plan, so linking the saved unit
-(adoption) keeps it; Make local drops it with the other `unit_*` props. What an update writes is
-stamped as written: a reference to a part that is not in the scene is cut, and the part still reads
-as left as it was. Linking a saved set (adoption) stamps the scene's set root, also one made local
-before: the root a new set would take is that one. A unit's driver writes only the unit's own
-datablocks (it may read the world or the scene), and drivers count toward the 20,000 records.
-Scene-owned fields (names, the collection and rigid body of every object, the root's placement, pose
-and constraints, the scene's `desk_*` props) never count as edits, and a unit holds no rigid body: a
-drop preset that makes a library set's ground the floor edits nothing of the set. Measured on the
-sample brief:
+Insertion derives every id from the instance key and the source id (`deriveUnitId`), so two replicas
+inserting the same unit agree. Taking an instance out removes all of it (`remove.ts`): its objects
+and the datablocks its part table lists that nothing left in the scene uses, so a unit placed in the
+slot again finds its ids free. A datablock at a derived id that nothing uses counts as free and goes
+in the insert's transaction. A part the scene still uses keeps its id when its instance goes (the
+person gave its material to an object of their own, or moved one of its objects out from under it),
+so a slot's ids come in generations (`derivePartId`): generation 0 is `deriveUnitId(key, sourceId)`,
+generation n hashes the key as `<key>#<n>`, which no key can be, and an insert takes the first of
+the 65 generations (0 to 64) whose ids are all free and keeps it in `unit_gen`. The root's id is the
+same in every generation, so shots, holds and the set's root keep finding it; only an object of the
+scene's own at the root's id, or a part whose ids are taken in every generation, refuses the insert
+(`UNIT_ID_TAKEN`). The choice depends on the document alone, so replicas agree. An insert that takes
+the place of what was there (a library set over the words' set, a prop's new look) removes the old
+objects in its own transaction, and a staging or an update puts each slot in on its own: a unit that
+does not go in (the scene in its way, a body that does not read) leaves its slot as it was or staged
+from the words, with its reason in the record, and the other slots, the shots and the rest of an
+update go on; one the scene was in the way of is pending `unavailable`, tried again at the next open
+or update. A prop's version whose root is another type of object than the instance's (a set's root
+is always an empty, a figure's an armature) is no update in place: it takes the instance's place in
+the insert's transaction, as another item does; an instance the scene changed so that no version
+fits it (its root's type changed by other means) leaves the slot pending `unavailable`. What the
+person put on a set or a prop whose look goes (objects of their own below its root or its parts, not
+its look: remove.ts `oldLook`), for another item, a version of another type, a library set in place
+of the words' set, or the words' set or prop back when the pin is dropped, stays in the same
+transaction (insertUnit's `keep`, removeObjectTrees' `keep`): `hangKept` hangs it from what takes
+the look's place (the new root, the words' ground or prop) where it is in the world, or leaves it
+where it was, under its parent of the moment, when the new root's uneven scale would change it
+there, and a warning names it. Its keys are in its parent's space: where the new parent is the old
+one moved and scaled along its axes, `keepMotion` rewrites its location and scale keys so that it
+moves as it did; otherwise (a keyed turn under a root scaled unevenly, keys under a modifier that
+changes values, a driven channel) they stay as they are and the warning says that its keyed motion
+now follows the new root. Places are read at rest (`restWorld`: an object hung from a bone sits at
+the bone's tail in the armature's rest position, which `SceneDoc.worldMatrix` leaves out), with what
+moved each one on its own above it (`moversOf`: keys, drivers, constraints, an active rigid body, or
+the pose of the bones it hung from); one whose mover went and that nothing above it moves alike now
+is named as no longer following it, unless the staging moves what takes the piece's place as it
+moved the piece (`restaged`: a prop held or flown again as the old one was, by the same holder,
+which the import reads from the holder the old prop records and the flight or holds it carries
+before it goes, and from the plan for the new one, when the old prop's own transform channels carry
+no keys of the person's: its motion record (`RIDEO_PROPS.motion`) keeps a digest of the keys the
+staging wrote there (`ownKeysDigest`), read before an update's ripple shifts them; an actor built
+anew on its marks). One that followed a bone through the pieces that went (a hat on a mannequin's
+head part) hangs from the same bone of the new root when the root is that armature or takes its
+place. One skewed by an uneven scale above it, which no parent holds, keeps its origin and is named
+as changing shape. The same steps keep what the person put on what staging and updates build anew or
+take out without a library unit (`keptPlaces`, then `hangKept`): a words' prop or landmark built
+anew or dropped, the words' ground, walls and sun built again (`buildSet` and `lightSet`, which name
+nothing when a piece comes back with its name and place), a cast member's actor or a shot's camera
+an update drops, a kite's string flown again, an actor a rideo re-import builds anew, and an old
+look's parts when a figure or the mannequin takes their place (insertUnit's `replace`,
+`restyleActor`); what goes with nothing in its place hangs from the set's ground, or from the scene
+when there is none. A shot's camera hung from (or under) such a piece is held on a re-import as a
+blocked camera is (rideo/import.ts `cameraHold`): it stays on what it hangs from while that stands
+still through the shot, scaled evenly, not mirrored and shown; otherwise it is taken off it, at
+scale 1, where it stands at the shot's first frame, and placed where the clip's blocking has it. An
+update holds so only a camera it solves, and solves it again (`updateCameraHold`): one still as
+staged in a shot it solves (a re-import records one it placed in its parent's space so), and one the
+person only hung from or under a piece the update built anew or staged again that now moves in the
+shot otherwise than it did (`hungMotion`, read before any piece is built anew and after, compared
+from the shot's first frame by `sameMotion`), which it takes off only when what it hangs from moves
+in the shot. To tell one only hung, beside a camera's motion digest its motion record keeps an `own`
+one (`cameraOwnDigest`: the digest without its hang, that is its parent and the channel values a
+hang with Keep Transform rewrites, so of its keys, its data's, its constraints and what hangs below
+it), which a hang leaves as recorded (`cameraOwnAsStaged`). A camera recorded without it, as older
+desks recorded, is never taken for one only hung: it is solved only as one still as staged in a shot
+the update solves, and is otherwise kept as one set by hand (below) for each shot of it the update
+does not solve, also while still as staged; but an update records anew the camera of each of the
+brief's shots that it solves or that is still as staged, `own` digest included, so a later update
+can take such a camera for one only hung. Any other camera keeps its hang as `hangKept` leaves it;
+one set by hand is never solved: its keys change only as the ripple changes every curve's keys
+(`timeline.ts`), as `retimeCameraRange` fits its move to a new length of its shot, for one hung
+straight from a piece that goes or is built anew as `keepMotion` rewrites the keys of anything the
+person put on such a piece (`hangKept`), and, for one that shares its camera data with another
+shot's camera, as the update solves that camera or fits its move (the lens and focus keys are the
+shared data's); a warning says to check its framing when what it hangs from was built anew, staged
+again or no longer moves as it did. Both warnings name the camera's parent as `hungFromName` does,
+against what the person hung it from (`cameraParents`, read before any piece is built anew): the
+same object by its name, or `'Mira' (now 'Mira Jones')` when renamed; another object alone while an
+object with the old one's id is still in the scene; otherwise `'kite' (built anew as 'balloon')`.
+The warning that the camera is kept as set by hand names the parent alone also when it was there
+before the update (the set's ground, or the root of a look or instance whose part went). An update
+replaces the parts the scene left untouched in place, ids kept, so shots, holds and F-curves keep
+resolving; it keeps parts edited or deleted in the scene, adds new parts at ids of the instance's
+generation (or of the next free one) and removes dropped untouched ones that nothing staying uses (a
+record that stays refers to it, such as another object, a camera's focus or a part the update keeps,
+or a key, driver, shot or the scene camera names it; then it stays with what it uses), and treats
+the unit's drivers the same way by their own table: a driver the new version drops together with the
+part it drives goes with that part, or stays on it when the part stays, and what it reads stays too.
+`unitStatus` names the parts and the drivers the scene edited or deleted. Extraction carries an
+instance's generation in its link plan, so linking the saved unit (adoption) keeps it; Make local
+drops it with the other `unit_*` props. What an update writes is stamped as written: a reference to
+a part that is not in the scene is cut, and the part still reads as left as it was. Linking a saved
+set (adoption) stamps the scene's set root, also one made local before: the root a new set would
+take is that one. A unit's driver writes only the unit's own datablocks (it may read the world or
+the scene), and drivers count toward the 20,000 records. Scene-owned fields (names, the collection
+and rigid body of every object, the root's placement, pose and constraints, the scene's `desk_*`
+props) never count as edits, and a unit holds no rigid body: a drop preset that makes a library
+set's ground the floor edits nothing of the set. Measured on the sample brief:
 
 | Unit                            | File      | Body      | Objects |
 | ------------------------------- | --------- | --------- | ------- |

@@ -128,25 +128,28 @@ import {
  *   camera solved again;
  * - a camera set by hand in the desk is never solved again: the update keeps it, and its keys
  *   change only as the ripple changes every curve's keys (timeline.ts), as a new length of its shot
- *   fits its move (moves.ts retimeCameraRange) and, for one hung straight from a piece that goes or
- *   is built anew, as the keyed motion of what the person put on such a piece is kept, below
- *   (units/remove.ts keepMotion); it warns (one hung from or under another object also when what it
- *   hangs from was built anew, staged again or no longer moves in the shot as it did);
+ *   fits its move (moves.ts retimeCameraRange), for one hung straight from a piece that goes or is
+ *   built anew as the keyed motion of what the person put on such a piece is kept, below
+ *   (units/remove.ts keepMotion), and, for one that shares its camera data with another shot's
+ *   camera, as the update solves that camera or fits its move (the lens and focus keys are the
+ *   shared data's); it warns (one hung from or under another object also when what it hangs from
+ *   was built anew, staged again or no longer moves in the shot as it did);
  * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
  *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
  *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
  *   the shot otherwise than it did. One only hung counts as set by hand when its shot's cast, camera
- *   plan or frame size, or the set, changes (kept, with that warning), unless the update solves it
- *   so: then it is not kept, and the warning that it is set by hand does not name it (the one that it
- *   was taken off and solved again does). A camera it solves stays on what it hangs from while that
- *   stands still through the shot, scaled evenly, not mirrored and shown; off one that moves in the
- *   shot, is scaled unevenly or is hidden by its scale there (one only hung: off one that moves), it
- *   is taken off and solved again, for every shot that uses it (the brief's or the desk's own: none
- *   keeps a set-by-hand warning for it), with a warning naming what the person hung it from and the
- *   other shots that use it (rideo/import.ts updateCameraHold). Solved or not, the camera, or the
- *   object of the person's it hangs under, is also named as no longer following the animation of
- *   what went when what takes its place does not move alike, as when another holder now flies the
- *   prop (the kept-objects rule below: units/remove.ts hangKept);
+ *   plan or frame size changes or a library set is placed, replaced, updated or taken out (kept,
+ *   with that warning), unless the update solves it so: then it is not kept, and the warning that
+ *   it is set by hand does not name it (the one that it was taken off and solved again does). A
+ *   camera it solves stays on what it hangs from while that stands still through the shot, scaled
+ *   evenly, not mirrored and shown; off one that moves in the shot, is scaled unevenly or is hidden
+ *   by its scale there (one only hung: off one that moves), it is taken off and solved again, for
+ *   every shot that uses it (the brief's or the desk's own: none keeps a set-by-hand warning for
+ *   it), with a warning naming what the person hung it from and the other shots that use it
+ *   (rideo/import.ts updateCameraHold). Solved or not, the camera, or the object of the person's it
+ *   hangs under, is also named as no longer following the animation of what went when what takes
+ *   its place does not move alike, as when another holder now flies the prop (the kept-objects rule
+ *   below: units/remove.ts hangKept);
  * - cast members the brief no longer stages go; new ones stand on a free mark, shown in their shots
  *   (an actor removed in the desk is staged again only for a shot the update stages or recasts); a
  *   member the brief renames is renamed, unless the desk renamed it (it keeps the desk's name, with a
@@ -363,9 +366,10 @@ export function updateFromBriefIn(
   // hangs from the new one then): what the warnings name as what the person hung it from
   const hungBefore = cameraParents(doc);
   // the warnings that keep a shot's camera as set by hand (where in `warnings`, by desk shot): its
-  // shot's cast, camera plan or frame size, or the set, changed, or (the camera loop below) what it
-  // hangs from was built anew, staged again or moves otherwise. One the camera loop takes off and
-  // solves after all is not kept, and those warnings go, for every shot that uses it
+  // shot's cast, camera plan or frame size changed or a library set was placed, replaced, updated
+  // or taken out, or (the camera loop below) what it hangs from was built anew, staged again or
+  // moves otherwise. One the camera loop takes off and solves after all is not kept, and those
+  // warnings go, for every shot that uses it
   const keptByHand = new Map<string, number[]>();
   const keepByHand = (shot: string, warning: string) =>
     keptByHand.set(shot, [...(keptByHand.get(shot) ?? []), warnings.push(warning) - 1]);
@@ -887,18 +891,21 @@ export function updateFromBriefIn(
   // still as staged), and one the person only hung (not set by hand: cameraOwnAsStaged) from or
   // under a piece it built anew or staged again that now moves in the shot otherwise than it did: it
   // would ride a motion no one framed (taken off only when what it hangs from moves in the shot),
-  // also when its shot's cast, camera plan or frame size, or the set, changed, which kept it as set
-  // by hand above: it is not kept then, and the warning that it was taken off and solved names it,
-  // not one that it is set by hand (those go: notKept). Any other keeps its hang as the kept-objects
-  // rules (hangKept) left it, on the piece built in place of what it hung from. Those rules name the
-  // camera, or the object of the person's it hangs under, solved or not, when it no longer follows
-  // the animation of what went (what took the piece's place does not move alike, as when another
-  // holder now flies the prop). One the person set by hand, or one recorded without an own part (an
-  // older desk's record: cameraOwnAsStaged is false), is not solved here: kept with its keys as the
-  // ripple, the fit to a new length of its shot (resizeShot) and those rules (keepMotion) left
-  // them, with a warning when what it hangs from was built anew, staged again or moves otherwise
-  // (one recorded so that is still as staged is solved above for a shot of it the update solves,
-  // and recorded anew below)
+  // also when its shot's cast, camera plan or frame size changed or a library set was placed,
+  // replaced, updated or taken out, which kept it as set by hand above: it is not kept then, and
+  // the warning that it was taken off and solved names it, not one that it is set by hand (those
+  // go: notKept). Any other keeps its hang as the kept-objects rules (hangKept) left it, on the
+  // piece built in place of what it hung from. Those rules name the camera, or the object of the
+  // person's it hangs under, solved or not, when it no longer follows the animation of what went
+  // (what took the piece's place does not move alike, as when another holder now flies the prop).
+  // One the person set by hand, or one recorded without an own part (an older desk's record:
+  // cameraOwnAsStaged is false), is not solved here: kept with its keys as the ripple, the fit to a
+  // new length of its shot (resizeShot) and those rules (keepMotion) left them and, for one that
+  // shares its camera data with another shot's camera, as the update solves that camera or fits its
+  // move (the lens and focus keys are the shared data's), with a warning when what it hangs from
+  // was built anew, staged again or moves otherwise (one recorded so that is still as staged is
+  // solved below for a shot of it the update solves, which went into solve above, and recorded
+  // anew)
   const notKept = new Set<number>();
   for (const s of desk.values()) {
     const cam = s.camera ? doc.getObject(s.camera) : null;
