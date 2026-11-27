@@ -15,7 +15,7 @@ import {
 import { BRIEF_RECORD_KEY } from '../src/desk/brief/record';
 import { docContext } from '../src/desk/brief/stage';
 import { sha256Hex } from '../src/desk/container';
-import { recordMotionOf } from '../src/desk/rideo/import';
+import { RIDEO_PROPS, cameraOwnAsStaged, motionDigest, recordMotionOf } from '../src/desk/rideo/import';
 import { getShots, newShotId, setShots } from '../src/desk/shots';
 import { readInstance } from '../src/desk/units';
 import { restParentWorld, restWorld } from '../src/desk/units/remove';
@@ -874,6 +874,57 @@ describe('a shot camera the person hung from a prop that a later brief builds an
       expect(doc.listFCurves(cam), what).toEqual(hung.keys);
       expect(getShots(doc), what).toEqual(hung.shots);
       paths(doc).forEach((p, i) => expect(largestGap(p, hung.paths[i]), `${what}: ${both[i]}`).toBe(0));
+    }
+  });
+
+  it('that another shot uses too, recorded where it hangs with no own part as an older desk recorded cameras, is taken off and solved again for both shots when one is framed anew, whichever comes first in the cut, and neither keeps a set-by-hand warning', () => {
+    const both = ['sht_0123456789aaaa', 'sht_0123456789bbbb'];
+    /** The kite described anew as a red balloon Mira flies, the second shot framed anew. */
+    const next = () => {
+      const b = retyped(openBrief(), { balloonWords: true });
+      b.shots[1].framing = 'medium';
+      return b;
+    };
+    // the first shot first in the cut, as staged: its pass meets the camera, which it does not
+    // solve, before the second shot's pass takes it off; then the second shot first, whose pass
+    // takes it off before the first shot's
+    for (const cut of [both, [both[1], both[0]]]) {
+      const what = `${cut[0] === both[0] ? 'Shot 1' : 'Shot 2'} first in the cut`;
+      const doc = stagedDoc();
+      const cam = firstShot(doc).camera!;
+      // the second shot shoots with the first shot's camera, the two in the cut in `cut`'s order
+      const shots = getShots(doc).map((s) => (s.external?.shot === both[1] ? { ...s, camera: cam } : s));
+      const slots = shots.flatMap((s, i) => (both.includes(s.external?.shot ?? '') ? [i] : []));
+      const byHost = (host: string) => shots.find((s) => s.external?.shot === host)!;
+      setShots(
+        doc,
+        shots.map((s, i) => (slots.includes(i) ? byHost(cut[slots.indexOf(i)]) : s)),
+      );
+      hangCamera(doc, propOf(doc, KITE).id, 'first');
+      // recorded as staged where it hangs, as a desk before cameras had an own part recorded it: what
+      // it does and nothing more, which cannot tell the hang from what the person set on it
+      const o = doc.getObject(cam)!;
+      doc.updateObject(cam, {
+        custom_props: { ...o.custom_props, [RIDEO_PROPS.motion]: motionDigest(doc, cam) },
+      });
+      expect(cameraOwnAsStaged(doc, cam), what).toBe(false);
+      const hung = { cam: doc.getObject(cam), keys: doc.listFCurves(cam), shots: getShots(doc) };
+      const undo = undoOf(doc);
+      const r = update(doc, next());
+      // the second shot, framed anew, is solved: the balloon Mira flies moves in it otherwise than
+      // the kite did, so the camera comes off it and is solved again for both shots, and neither
+      // keeps the warning that it was set by hand and is kept
+      expect(doc.getObject(cam)!.parent, what).toBeNull();
+      expect(r.solved, what).toEqual(cut);
+      expect(cameraWarnings(doc, cam, r.warnings), what).toEqual([
+        "Shot 2: its camera hung from 'Red kite' (built anew as 'Red balloon'), which moves during the shot; the update took it off 'Red balloon' and solved it again, also for Shot 1, which uses the same camera",
+      ]);
+      expect(r.warnings.join('\n'), what).not.toMatch(/set by hand/);
+      // one undo step puts the hang back as it was
+      undo.undo();
+      expect(doc.getObject(cam), what).toEqual(hung.cam);
+      expect(doc.listFCurves(cam), what).toEqual(hung.keys);
+      expect(getShots(doc), what).toEqual(hung.shots);
     }
   });
 

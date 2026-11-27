@@ -359,10 +359,10 @@ export function updateFromBriefIn(
   // what each shot's camera hangs from before any piece is built anew (a camera on the old piece
   // hangs from the new one then): what the warnings name as what the person hung it from
   const hungBefore = cameraParents(doc);
-  // the warnings that keep a shot's camera as set by hand because the shot's cast, camera plan or
-  // frame size, or the set, changed (where in `warnings`, by desk shot): one the person only hung
-  // that the camera loop below solves after all is not kept, and those warnings go, for every shot
-  // that uses it
+  // the warnings that keep a shot's camera as set by hand (where in `warnings`, by desk shot): its
+  // shot's cast, camera plan or frame size, or the set, changed, or (the camera loop below) what it
+  // hangs from was built anew, staged again or moves otherwise. One the camera loop takes off and
+  // solves after all is not kept, and those warnings go, for every shot that uses it
   const keptByHand = new Map<string, number[]>();
   const keepByHand = (shot: string, warning: string) =>
     keptByHand.set(shot, [...(keptByHand.get(shot) ?? []), warnings.push(warning) - 1]);
@@ -925,7 +925,10 @@ export function updateFromBriefIn(
       if (restaged && moved) tookOff(updateCameraHold(doc, s, was, warnings, { moving: true, also }));
     } else if (restaged || moved) {
       const from = was.id === parent.id || builtNow ? hungFromName(doc, parent, was) : `'${parent.name}'`;
-      warnings.push(
+      // (as kept by hand: the pass of another shot that uses the camera and takes it off after all
+      // drops it)
+      keepByHand(
+        s.id,
         `${s.name}: its camera was set by hand in the desk and is kept; what it hangs from, ${from}, ${
           moved ? 'no longer moves as it did' : 'was staged anew'
         }, so check its framing (solve it again with desk.shot_solve)`,
