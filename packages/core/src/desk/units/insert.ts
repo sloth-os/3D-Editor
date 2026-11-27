@@ -17,6 +17,7 @@ import {
   keptPlaces,
   type KeptPlaces,
   keptWarning,
+  namedWhenKept,
   oldLook,
   unusedData,
 } from './remove';
@@ -108,6 +109,13 @@ export interface InsertUnitOptions extends UnitPin {
    * motion (remove.ts KeptWords' `restaged`).
    */
   restaged?: boolean;
+  /**
+   * Objects that stay below what `replace` or `remove` takes the place of, like the rest, but that
+   * the caller takes out right after the insert, its own warning naming what goes: the warnings
+   * here do not name them (the string and tail of a flight flown again: rideo/import.ts
+   * dropTether).
+   */
+  unnamed?: readonly string[];
 }
 
 export interface InsertUnitResult {
@@ -250,6 +258,9 @@ export function writeUnitRecords(
     );
   });
   const places = keptPlaces(doc, hung, o.remove ?? []);
+  // what the caller takes out right after the insert (its own warning names what goes): it stays
+  // here like the rest, unnamed
+  const unnamed = new Set(o.unnamed ?? []);
 
   let old: UnitRecord | null = null;
   let doomed: string[] = [];
@@ -271,7 +282,10 @@ export function writeUnitRecords(
     const look = oldLook(doc, o.replace);
     doomed = look.look.filter((id) => !removing.has(id));
     kept = new Set(look.kept);
-    named = look.named;
+    named = look.kept.flatMap((id) => {
+      const k = doc.getObject(id);
+      return k && namedWhenKept(k) && !unnamed.has(id) ? [k.name] : [];
+    });
     const going = new Set(doomed);
     belowLook = keptPlaces(
       doc,
@@ -430,6 +444,7 @@ export function writeUnitRecords(
         of: replacedLook(kind),
         on: `the library ${kind}'s root`,
         restaged: o.restaged,
+        unnamed,
       }),
     );
     // what was below a part of the old look moved up as the part went: hung from the root (from the
@@ -440,6 +455,7 @@ export function writeUnitRecords(
           of: replacedLook(kind),
           on: `the library ${kind}'s root`,
           listed: true,
+          unnamed,
         }),
       );
   });

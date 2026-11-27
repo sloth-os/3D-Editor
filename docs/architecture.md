@@ -1032,14 +1032,14 @@ stages anew), or for a prop the desk removed, the prop is staged as without the 
 slot that goes in changes the set for an update's cameras only when it places, replaces or takes
 out a set, or its version changes a part or a driver (`updateUnit`'s report, which names the parts
 and the drivers it wrote or removed: not one with the same content, or whose changes all fall on
-parts and drivers edited in the scene, which are kept). A prop's version whose root is another type
-of object than the instance's (a set's root is always an empty, a figure's an armature) is no update
-in place: it takes the instance's place in
-the insert's transaction, as another item does; an instance the scene changed so that no version
+parts and drivers edited or deleted in the scene, which stay as the scene has them, or on drivers
+of parts deleted there, which drove nothing: a version that drops one removes it unnamed). A prop's
+version whose root is another type of object than the instance's (a set's root is always an empty,
+a figure's an armature) is no update in place: it takes the instance's place in the insert's
+transaction, as another item does; an instance the scene changed so that no version
 fits it (its root's type changed by other means) leaves the slot pending `unavailable`. What the
 person put on a set or a prop whose look goes (objects of their own below its root or its parts, not
-its look nor the desk's own string or tail of a flight hung there: remove.ts `oldLook`), for another
-item, a version of another type, a library set in place
+its look: remove.ts `oldLook`), for another item, a version of another type, a library set in place
 of the words' set, or the words' set or prop back when the pin is dropped, stays in the same
 transaction (insertUnit's `keep`, removeObjectTrees' `keep`): `hangKept` hangs it from what takes
 the look's place (the new root, the words' ground or prop) where it is in the world, or leaves it
@@ -1061,7 +1061,11 @@ staging wrote there (`ownKeysDigest`), read before an update's ripple shifts the
 anew on its marks). One that followed a bone through the pieces that went (a hat on a mannequin's
 head part) hangs from the same bone of the new root when the root is that armature or takes its
 place. One skewed by an uneven scale above it, which no parent holds, keeps its origin and is named
-as changing shape. The same steps keep what the person put on what staging and updates build anew or
+as changing shape. A flight's string or tail of the desk's own hung there stays and is named like
+the rest, unless the update takes it out right after: for a prop's slot acting alone, which flies
+the new prop on a string of its own, insertUnit's and `hangKept`'s `unnamed` leave it out of these
+warnings, and `dropTether` takes it out, naming what the person hung on it. The same steps keep
+what the person put on what staging and updates build anew or
 take out without a library unit (`keptPlaces`, then `hangKept`): a words' prop or landmark built
 anew or dropped, the words' ground, walls and sun built again (`buildSet` and `lightSet`, which name
 nothing when a piece comes back with its name and place), a cast member's actor or a shot's camera

@@ -497,10 +497,46 @@ describe("a unit's drivers in an instance", () => {
     const r = insertUnit(doc, v1, { ...pin(1, SHA1), key: `el:${KITE}` });
     const id = r.ids[`objects:${tail2}`];
     expect(doc.listDrivers(id)).toHaveLength(1);
+    const key = fcurveKey(doc.listDrivers(id)[0]);
     const rep = updateUnit(doc, r.root, v2, pin(2, SHA2));
     expect(rep.removed.map((p) => p.id)).toContain(id);
     expect(doc.getObject(id)).toBeFalsy();
     expect(doc.listDrivers()).toEqual([]);
+    // the driver that went with its part is named as removed: it turned a part the scene had
+    expect(rep.drivers).toEqual({ added: [], updated: [], removed: [key] });
+  });
+
+  it('a driver the next version drops from what the scene deleted goes, unnamed: it drove nothing', () => {
+    // a set whose point lamp's light has its energy set by a unit driver
+    const src = stagedDoc();
+    const light = src.addLight({ type: 'POINT', name: 'LampLight', energy: 800 });
+    src.addObject({ type: 'LIGHT', name: 'Lamp', data: light, location: [3, 4, 3] });
+    src.setDriver({
+      target_type: 'light',
+      target_id: light,
+      path: 'energy',
+      index: 0,
+      expression: '1000',
+      variables: [],
+      mute: false,
+    });
+    const v1 = unitFrom(src, { kind: 'set', name: 'Meadow' }).unit;
+    src.destroy();
+    const v2 = editedUnit(v1, (b) => {
+      b.drivers = [];
+    });
+    const doc = SceneDoc.create({ empty: true });
+    const r = insertUnit(doc, v1, { ...pin(1, SHA1), key: 'set', rootProps: { desk_role: 'set' } });
+    const lamp = r.ids[`objects:${srcNamed(v1.body, 'Lamp')}`];
+    const data = r.ids[`lights:${srcNamed(v1.body, 'LampLight', 'lights')}`];
+    expect(doc.listDrivers(data)).toHaveLength(1);
+    // the person deletes the lamp: its light goes with it, and the light's driver is left behind
+    doc.removeObjects([lamp]);
+    expect(doc.has('lights', data)).toBe(false);
+    expect(doc.listDrivers(data)).toHaveLength(1);
+    const rep = updateUnit(doc, r.root, v2, pin(2, SHA2));
+    expect(doc.listDrivers()).toEqual([]);
+    expect(rep.drivers).toEqual({ added: [], updated: [], removed: [] });
   });
 
   describe('a part the next version drops that the scene keeps keeps the driver the unit gave it', () => {

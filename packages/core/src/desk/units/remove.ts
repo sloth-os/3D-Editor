@@ -191,10 +191,7 @@ export interface OldLook {
   look: string[];
   /** The tops of what stays below the object: what the person put there, cameras, other actors. */
   kept: string[];
-  /**
-   * The names of the kept objects that are not cameras, actors or a flight's string or tail (the
-   * desk's own, which the caller takes out), for a warning.
-   */
+  /** The names of the kept objects that are not cameras or actors, for a warning. */
   named: string[];
 }
 
@@ -230,19 +227,12 @@ export function oldLook(doc: SceneDoc, root: string): OldLook {
         continue;
       }
       kept.push(child);
-      if (namedWhenKept(o) && !tetherPart(o)) named.push(o.name);
+      if (namedWhenKept(o)) named.push(o.name);
     }
   };
   walk(root);
   return { look: [...look], kept, named };
 }
-
-/**
- * The string or tail desk.tether_fly made for a flight: the desk's own, not the person's, which a
- * flight flown again makes anew (the caller takes the old ones out: rideo/import.ts dropTether).
- */
-const tetherPart = (o: ObjectData): boolean =>
-  o.custom_props?.desk_string_to !== undefined || o.custom_props?.desk_tail_of !== undefined;
 
 /** Whether the warnings name an object that stays when a new look comes (cameras and actors are not named). */
 export const namedWhenKept = (o: ObjectData): boolean =>
@@ -478,6 +468,12 @@ export interface KeptWords {
    * piece built again as it was). Only what changes for it (where it hangs, its motion) is named.
    */
   listed?: boolean;
+  /**
+   * Objects of `kept` hung like the rest but named in no warning: the caller takes them out right
+   * after, and its own warning names what goes (the string and tail of a flight flown again, which
+   * rideo/import.ts dropTether takes out naming what the person put on them).
+   */
+  unnamed?: ReadonlySet<string>;
 }
 
 /** "'A' is …" / "'A' and 'B' are …": `one` or `many` after the names. */
@@ -488,19 +484,20 @@ const namesWith = (names: readonly string[], one: string, many: string): string 
  * Hangs the objects of `kept` (left where taking out what was above them put them) from `root` (null:
  * the scene) where they were in the world at rest, in the caller's transaction, and returns the
  * warnings naming them (cameras and actors are not named: namedWhenKept; `listed`: the caller names
- * them). One that followed a bone through the pieces that went (KeptPlaces' `bones`: a hat on a
- * mannequin's head) hangs from that bone of the root when the root is the armature it was or takes
- * its place and still has the bone, and so follows it as before. One that the root's scale would
- * change there (a root scaled unevenly shears an object turned under it, which no channels hold) goes
- * back under its parent of the moment, where it was in the world, and a warning says so; one already
- * sheared (turned below a piece scaled unevenly that went), which neither parent holds as it is, hangs
- * from the root with its origin where it was, and a warning says it changes shape. The keyed motion
- * of each stays where it was when its change of parent allows it (keepMotion); a warning names one
- * whose keyed motion now follows its new parent instead, and one that followed the animation of an
- * object that went above it (moversOf: its parent or a part above it keyed, driven, constrained,
- * simulated or posed by keys) and that nothing above it now moves alike (see KeptWords' `restaged`):
- * it keeps its place at rest, but no longer moves with it. Cameras and actors are named in those two
- * (what the shots show changes).
+ * them; `unnamed`: the caller takes them out right after). One that followed a bone through the
+ * pieces that went (KeptPlaces' `bones`: a hat on a mannequin's head) hangs from that bone of the
+ * root when the root is the armature it was or takes its place and still has the bone, and so
+ * follows it as before. One that the root's scale would change there (a root scaled unevenly shears
+ * an object turned under it, which no channels hold) goes back under its parent of the moment,
+ * where it was in the world, and a warning says so; one already sheared (turned below a piece
+ * scaled unevenly that went), which neither parent holds as it is, hangs from the root with its
+ * origin where it was, and a warning says it changes shape. The keyed motion of each stays where it
+ * was when its change of parent allows it (keepMotion); a warning names one whose keyed motion now
+ * follows its new parent instead, and one that followed the animation of an object that went above
+ * it (moversOf: its parent or a part above it keyed, driven, constrained, simulated or posed by
+ * keys) and that nothing above it now moves alike (see KeptWords' `restaged`): it keeps its place
+ * at rest, but no longer moves with it. Cameras and actors are named in those two (what the shots
+ * show changes).
  */
 export function hangKept(doc: SceneDoc, root: string | null, kept: KeptPlaces, words: KeptWords): string[] {
   const named: string[] = [];
@@ -522,6 +519,8 @@ export function hangKept(doc: SceneDoc, root: string | null, kept: KeptPlaces, w
   for (const id of kept.ids) {
     const o = doc.getObject(id);
     if (!o || (root && doc.isAncestor(id, root))) continue;
+    // hung like the rest, but named in no warning (the caller takes it out right after)
+    const quiet = words.unnamed?.has(id) ?? false;
     const world = kept.worlds.get(id)!;
     const was = o.parent;
     let parent: string | null = root;
@@ -536,16 +535,17 @@ export function hangKept(doc: SceneDoc, root: string | null, kept: KeptPlaces, w
       doc.setParent(id, was, true, { world, parentWorld: was ? restWorld(doc, was) : null });
       if (sameWorld(restWorld(doc, id), world)) {
         parent = was;
-        stayed.push(o.name);
+        if (!quiet) stayed.push(o.name);
       } else {
         // skewed in the world (turned below a piece scaled unevenly), which neither parent holds as it
         // is: it hangs from the root where its channels come closest (its origin where it was)
         doc.setParent(id, root, true, { world, parentWorld: rootWorld });
-        unskewed.push(o.name);
+        if (!quiet) unskewed.push(o.name);
       }
     }
     const from = kept.parentWorlds.get(id) ?? null;
     const motion = keepMotion(doc, id, world, from, restParentWorld(doc, doc.getObject(id)!));
+    if (quiet) continue;
     if (motion === 'changed') moved.set(parent, [...(moved.get(parent) ?? []), o.name]);
     const gone = lostMover(
       kept.movers.get(id) ?? [],

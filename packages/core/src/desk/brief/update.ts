@@ -163,9 +163,9 @@ import {
  *   still the desk's own); one whose kind or height the brief changes stays the actor staged, with a
  *   warning;
  * - props whose element went go, new ones are placed, and a held prop whose holder or holder's shots
- *   changed, or whose holder the update stages anew (an actor removed in the desk, staged again for
- *   a shot the brief recasts or the update stages again), is held (or flown) again; the set is
- *   rebuilt when its plan changed;
+ *   changed, or one the desk still has whose holder the update stages anew (an actor removed in the
+ *   desk, staged again for a shot the brief recasts or the update stages again), is held (or flown)
+ *   again; the set is rebuilt when its plan changed;
  * - what the person put on a piece that goes or is built anew (objects of their own below a shot's
  *   camera, an actor, a prop, a landmark, the ground, a wall or the sun: not the piece's own look)
  *   stays where it is in the world, hung from the piece built in its place, or from the set's ground
@@ -190,8 +190,9 @@ import {
  *   ids); another item replaces it; no pin brings the words' set back. The cameras still as staged
  *   are solved again (one set by hand is kept, with a warning) when the slot changed the scene's
  *   set: a set placed, replaced or taken out, or a version that changes a part or a driver of it
- *   (not one with the same content, or whose changes all fall on parts and drivers edited here,
- *   which are kept). A set that does not go in leaves the scene's set, and the set the record keeps
+ *   (not one with the same content, or whose changes all fall on parts and drivers edited or
+ *   deleted here, which stay as the scene has them, or on drivers of parts deleted here, which
+ *   drove nothing). A set that does not go in leaves the scene's set, and the set the record keeps
  *   of it, as they were, as does an update that does not act on the set (a later brief is told from
  *   the set the scene has); its report row names the set's root only while a set instance stands
  *   there or the set was made local (an object of the person's at that id is not the set);
@@ -749,10 +750,10 @@ export function updateFromBriefIn(
   // ------------------------------------------------------------ the set
   const setSlot = units.set;
   const setAction = setSlot?.action ?? 'none';
-  // whether the library set's slot changed the scene's set: a set placed, replaced or taken out, or a
-  // version that changes a part or a driver of it (not one with the same content, or whose changes
-  // all fall on parts and drivers edited here, which are kept); a set that does not go in changes
-  // nothing
+  // whether the library set's slot changed the scene's set: a set placed, replaced or taken out, or
+  // a version that changes a part or a driver of it (not one with the same content, or whose
+  // changes all fall on parts and drivers edited or deleted here, or on drivers of parts deleted
+  // here, which drove nothing); a set that does not go in changes nothing
   let setChanged = false;
   if (setSlot && (setAction === 'place' || setAction === 'replace' || setAction === 'update')) {
     // a set that does not go in (its update or insert throws before writing anything) leaves the
@@ -842,15 +843,15 @@ export function updateFromBriefIn(
     const old = props.get(eid);
     const holder = plan.holders.get(eid) ?? null;
     const flies = holder ? flyerKind(`${p.label} ${e.name}`) : null;
-    // a prop the brief did not change stays as the desk has it (also one removed in the desk), but a
-    // flight over shots staged again flies again, and one whose holder this update stages anew (its
-    // actor removed in the desk, its shot recast or staged again) is held or flown by the new actor,
-    // not by the one that went. The words' own reasons to stage it again (its element or holder, a
-    // flight over shots staged again, a holder staged anew) are told from its library prop's slot
-    // acting alone (bySlot), which stages it again only once its unit goes in
+    // a prop the brief did not change stays as the desk has it (also one removed in the desk), but
+    // a flight over shots staged again flies again, and one the desk still has whose holder this
+    // update stages anew (its actor removed in the desk, its shot recast or staged again) is held
+    // or flown by the new actor, not by the one that went. The words' reasons to stage it again
+    // (its element or holder, a flight over shots staged again, a holder staged anew) are told from
+    // its library prop's slot acting alone (bySlot), which stages it again only once its unit is in
     const words =
       (diff.props.restage.has(eid) && !diff.props.bySlot.has(eid)) ||
-      (holder !== null && created.has(holder)) ||
+      (holder !== null && created.has(holder) && !!old && !!doc.getObject(old.id)) ||
       (flies !== null &&
         holderRuns(shotsAfter, holder)
           .flat()
@@ -873,9 +874,12 @@ export function updateFromBriefIn(
     const holderActor = p.heldBy ? actors.get(p.heldBy) : undefined;
     const move = propMove(p, flies, !!holderActor && holderSpans(cut, p.heldBy!).length > 0);
     const byHand = !!current && ownStaged.get(current.id) === false;
+    // for the slot alone the flight's string and tail are taken out below once the unit went in:
+    // the insert keeps them like the rest without naming them
+    const tether = old && alone ? tetherPartsOf(doc, old.id) : [];
     let made: ReturnType<typeof buildProp>;
     try {
-      made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand, !alone);
+      made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand, !alone, tether);
     } catch (err) {
       // a unit for the slot alone that does not go in (it throws before writing anything)
       if (!alone || !slot) throw err;

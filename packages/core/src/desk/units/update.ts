@@ -57,7 +57,8 @@ import { cloneJson } from '../../util/json';
  * part, or stays with it when the scene still uses the part (the scene's then, as the part is), and
  * what it reads stays with it. The report names the drivers the update wrote or removed (`drivers`),
  * as it names the parts it added, updated or removed: a version that changes only a driver changes
- * the scene all the same.
+ * the scene all the same. A dropped driver left on what the scene deleted (the light of a lamp the
+ * person deleted keeps its data's drivers) drove nothing: it goes unnamed.
  *
  * The same content (an equal body digest) changes no part: only the provenance moves (noop).
  */
@@ -77,7 +78,8 @@ export interface UnitUpdateReport {
   kept: (UnitPartRef & { reason: UnitKeptReason })[];
   /**
    * The unit's drivers the update wrote or removed in the scene, by their scene keys (fcurveKey): a
-   * driver the scene edited or deleted, or one the new version gives as it was, is not among them.
+   * driver the scene edited or deleted, one the new version gives as it was, or one it removes from
+   * what the scene deleted (which drove nothing), is not among them.
    */
   drivers: { added: string[]; updated: string[]; removed: string[] };
   warnings: string[];
@@ -381,12 +383,16 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     for (const d of drops)
       if (going.has(dataKey(d.kind, d.id))) report.removed.push(refOf(d.pk));
       else report.kept.push({ ...refOf(d.pk), reason: 'dropped-but-used' });
-    // a driver dropped with its part goes with it; one whose part stays is the scene's, as the part is
-    for (const d of withPart)
-      if (going.has(partOf(d)) || !doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id)) {
+    // a driver dropped with its part goes with it; one whose part stays is the scene's, as the part
+    // is. One left on what the scene deleted (a lamp's light, its object deleted here) drove
+    // nothing: it goes, unnamed, so a version that only drops it changes nothing the shots see
+    for (const d of withPart) {
+      const live = doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id);
+      if (going.has(partOf(d)) || !live) {
         doc.removeDriver(fcurveKey(d));
-        report.drivers.removed.push(fcurveKey(d));
+        if (live) report.drivers.removed.push(fcurveKey(d));
       }
+    }
     const objects = gone.filter((d) => d.kind === 'objects').map((d) => d.id);
     if (objects.length) doc.removeObjects(objects);
     for (const d of gone) {

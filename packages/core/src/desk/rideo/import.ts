@@ -2392,7 +2392,9 @@ const movesAlike = (was: PropMove | null, now: PropMove | null): boolean =>
  * a warning. What the person put on the prop a unit takes the place of (objects of their own below
  * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`), and
  * follows the root's motion where the staging moves it (`move`) as it moved that prop (movesAlike;
- * `byHand`: the person keyed that prop too, see buildProp).
+ * `byHand`: the person keyed that prop too, see buildProp). `unnamed`: what of that the caller
+ * takes out right after (see buildProp), which the insert keeps like the rest but names in no
+ * warning.
  */
 function buildUnitProp(
   doc: SceneDoc,
@@ -2404,6 +2406,7 @@ function buildUnitProp(
   old: ObjectData | undefined,
   unit: StagedProp,
   byHand: boolean,
+  unnamed: readonly string[],
 ): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings: string[] } {
   const model = `unit:${unit.pin.ref}@${unit.pin.version}`;
   const build = JSON.stringify(['prop', model, label, flies]);
@@ -2457,6 +2460,7 @@ function buildUnitProp(
           }
         : {}),
       rootProps: own,
+      unnamed,
     });
     root = r.root;
     // what the person put on the prop the unit replaces stays, named here
@@ -2507,7 +2511,10 @@ const stampFacts = (
  * channels, read by the caller before anything changed: ownKeysAsStaged); those keys go with it, so
  * what was on it is named whatever moves the new prop. `fallback` false: a unit that does not go in
  * throws its error instead, the scene as it was (an update whose words give no reason to stage the
- * prop again leaves it as the desk has it).
+ * prop again leaves it as the desk has it). `unnamed`: objects below `old` that the caller takes
+ * out right after a unit went in, its own warning naming what goes (the string and tail of the
+ * flight before, which an update acting for the prop's slot alone takes out only once its unit is
+ * in: dropTether); the unit's insert keeps them like the rest but names them in no warning.
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2521,6 +2528,7 @@ export function buildProp(
   unit?: StagedProp | null,
   byHand = false,
   fallback = true,
+  unnamed: readonly string[] = [],
 ): {
   root: string;
   baseScale: Vec3;
@@ -2548,6 +2556,7 @@ export function buildProp(
         old,
         unit,
         byHand,
+        unnamed,
       );
     } catch (err) {
       if (!fallback) throw err;

@@ -97,6 +97,22 @@ function library(): Library {
   return made;
 }
 
+/**
+ * Version `version` of the kite, its root an EMPTY or a MESH (wearing one of the kite's meshes),
+ * scaled by `scale` when given.
+ */
+function kiteRooted(type: 'EMPTY' | 'MESH', version: number, scale?: [number, number, number]): Lib {
+  const L = library();
+  const unit = editedUnit(L.units.kite, (body) => {
+    const root = body.blocks.objects![UNIT_ROOT];
+    root.type = type;
+    if (type === 'EMPTY') delete root.data;
+    else root.data = Object.keys(body.blocks.meshes!).sort()[0];
+    if (scale) root.scale = scale;
+  });
+  return lib(L.kite.pin.ref, version, encodeUnit(unit.body, headerInput(unit.header)));
+}
+
 /** `b` with pins set (a Lib) or removed (null) on the set, cast members and elements. */
 function withPins(
   b: SceneBrief,
@@ -672,24 +688,69 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
     },
   );
 
-  it("Update shots: a library prop that takes the place of a kite the person hung the string under names none of the desk's own string as kept", () => {
-    const L = library();
-    const { doc } = staged(openBrief());
-    const kite = propOf(doc, KITE).id;
-    const string = doc.listObjects().find((o) => o.custom_props?.desk_string_to === kite)!;
-    doc.setParent(string.id, kite, true);
-    const bead = doc.addObject({ type: 'EMPTY', name: 'Bead' });
-    doc.setParent(bead, string.id, true);
-    const { r } = update(doc, withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite));
-    expect(rowsOf(r)).toEqual([`el:${KITE} unit`]);
-    expect(r.warnings.filter((w) => /keeps/.test(w))).toEqual([]);
-    expect(r.warnings).toContain(`'${string.name}' goes; 'Bead' stays where it is, on the words' ground`);
-    // the kite flies on a string of its own again, and the bead stays
-    const now = propOf(doc, KITE).id;
-    expect(doc.listObjects().filter((o) => o.custom_props?.desk_string_to === now)).toHaveLength(1);
-    expect(doc.has('objects', string.id)).toBe(false);
-    expect(doc.has('objects', bead)).toBe(true);
+  it('Update shots: a prop the desk removed stays removed when its holder, whose actor the desk removed too, is staged anew', () => {
+    const { doc } = staged(withBasket());
+    const before = actorOf(doc, MIRA).id;
+    run(doc, 'object.delete', { objects: [before, propOf(doc, BASKET).id] });
+    const b = withBasket();
+    b.shots[1].castIds = [MIRA, PIP];
+    update(doc, b);
+    expect(actorOf(doc, MIRA).id).not.toBe(before);
+    // the brief did not change the basket: it stays as the desk has it, removed
+    expect(() => propOf(doc, BASKET)).toThrow();
   });
+
+  it.each([
+    'a library prop whose root is the type of the words',
+    'a library prop whose root is another type than the words',
+    "a later version whose root is another type than the library prop's",
+  ] as const)(
+    "Update shots: %s, in the place of a kite the person hung the string under, names none of the desk's own string as kept",
+    (how) => {
+      const L = library();
+      const later = how.startsWith('a later');
+      const { doc } = later
+        ? staged(withPins(openBrief(), { el: { [KITE]: L.kite } }), source(L.kite))
+        : staged(openBrief());
+      const kite = propOf(doc, KITE).id;
+      expect(doc.getObject(kite)!.type).toBe('EMPTY');
+      const string = doc.listObjects().find((o) => o.custom_props?.desk_string_to === kite)!;
+      doc.setParent(string.id, kite, true);
+      const bead = doc.addObject({ type: 'EMPTY', name: 'Bead' });
+      doc.setParent(bead, string.id, true);
+      const unit = how.endsWith('the type of the words') ? L.kite : kiteRooted('MESH', later ? 2 : 1);
+      const { r } = update(doc, withPins(openBrief(), { el: { [KITE]: unit } }), source(unit));
+      expect(rowsOf(r)).toEqual([`el:${KITE} unit`]);
+      expect(propOf(doc, KITE).type).toBe(unit === L.kite ? 'EMPTY' : 'MESH');
+      expect(r.warnings.filter((w) => /keeps/.test(w))).toEqual([]);
+      expect(r.warnings).toContain(`'${string.name}' goes; 'Bead' stays where it is, on the words' ground`);
+      // the kite flies on a string of its own again, and the bead stays
+      const now = propOf(doc, KITE).id;
+      expect(doc.listObjects().filter((o) => o.custom_props?.desk_string_to === now)).toHaveLength(1);
+      expect(doc.has('objects', string.id)).toBe(false);
+      expect(doc.has('objects', bead)).toBe(true);
+    },
+  );
+
+  it.each(['pins a library figure for Mira', 'then drops the pin (the mannequin back)'] as const)(
+    "Update shots: the desk's own string the person hung under Mira is named as kept when the update %s",
+    (how) => {
+      const L = library();
+      const { doc } = staged(openBrief());
+      const kite = propOf(doc, KITE).id;
+      const string = doc.listObjects().find((o) => o.custom_props?.desk_string_to === kite)!;
+      doc.setParent(string.id, actorOf(doc, MIRA).id, true);
+      let { r } = update(doc, withPins(openBrief(), { cast: { [MIRA]: L.mira } }), source(L.mira));
+      expect(readInstance(doc, actorOf(doc, MIRA).id)).not.toBeNull();
+      if (how !== 'pins a library figure for Mira') {
+        ({ r } = update(doc, openBrief()));
+        expect(readInstance(doc, actorOf(doc, MIRA).id)).toBeNull();
+      }
+      // a new look for Mira does not take the string out: it stays under her, and is named
+      expect(r.warnings).toContainEqual(expect.stringContaining(`keeps '${string.name}'`));
+      expect(doc.getObject(string.id)?.parent).toBe(actorOf(doc, MIRA).id);
+    },
+  );
 
   it('Update shots: a member it adds whose figure does not go in stands as a mannequin of its height', () => {
     const L = library();
@@ -740,21 +801,6 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
 
 describe("a later version whose root is another type of object than the instance's", () => {
   const key = `el:${KITE}`;
-  /**
-   * Version `version` of the kite, its root an EMPTY or a MESH (wearing one of the kite's meshes),
-   * scaled by `scale` when given.
-   */
-  function kiteRooted(type: 'EMPTY' | 'MESH', version: number, scale?: [number, number, number]): Lib {
-    const L = library();
-    const unit = editedUnit(L.units.kite, (body) => {
-      const root = body.blocks.objects![UNIT_ROOT];
-      root.type = type;
-      if (type === 'EMPTY') delete root.data;
-      else root.data = Object.keys(body.blocks.meshes!).sort()[0];
-      if (scale) root.scale = scale;
-    });
-    return lib(L.kite.pin.ref, version, encodeUnit(unit.body, headerInput(unit.header)));
-  }
   /** A cube of the person's under `parent`, at local `location` and `rotation`. */
   function mine(doc: SceneDoc, name: string, parent: string, location: Vec3, rotation: Vec3): string {
     let id = '';
@@ -1474,9 +1520,13 @@ describe("a later version of the library set that changes none of the set's part
     );
   });
 
-  it.each(['changes a driver of it', 'drops a driver of it'] as const)(
+  it.each([
+    ['adds a driver to it', null, '0.25'],
+    ['changes a driver of it', '0.25', '0.5'],
+    ['drops a driver of it', '0.25', null],
+  ] as const)(
     "Update shots: a version 2 that only %s changes the scene's set: the cameras still as staged are solved, the one set by hand kept",
-    (how) => {
+    (_how, before, after) => {
       const L = library();
       const src = Object.keys(L.units.set.body.blocks.objects!).find((s) => s !== UNIT_ROOT)!;
       /** The library set with a part of it turned by a driver (`expression`; null: none). */
@@ -1497,14 +1547,14 @@ describe("a later version of the library set that changes none of the set's part
                   },
                 ];
         });
-      const u1 = driven('0.25');
-      const u2 = driven(how === 'changes a driver of it' ? '0.5' : null);
+      const u1 = driven(before);
+      const u2 = driven(after);
       const v1 = lib('lib_0123456789drvn', 1, encodeUnit(u1.body, headerInput(u1.header)));
       const v2 = lib('lib_0123456789drvn', 2, encodeUnit(u2.body, headerInput(u2.header)));
       const b = withPins(openBrief(), { set: v1 });
       const { doc } = staged(b, source(v1));
       const part = readInstance(doc, SET_ROOT())!.parts.get(`objects:${src}`)!.id;
-      expect(doc.listDrivers(part).map((d) => d.expression)).toEqual(['0.25']);
+      expect(doc.listDrivers(part).map((d) => d.expression)).toEqual(before === null ? [] : [before]);
       const record = JSON.stringify(doc.getObject(part));
       keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
       const { r } = update(doc, withPins(openBrief(), { set: v2 }), source(v2));
@@ -1512,15 +1562,54 @@ describe("a later version of the library set that changes none of the set's part
       expect(readInstance(doc, SET_ROOT())!.version).toBe(2);
       // no part's record changed, but the driver that turns the part did
       expect(JSON.stringify(doc.getObject(part))).toBe(record);
-      expect(doc.listDrivers(part).map((d) => d.expression)).toEqual(
-        how === 'changes a driver of it' ? ['0.5'] : [],
-      );
+      expect(doc.listDrivers(part).map((d) => d.expression)).toEqual(after === null ? [] : [after]);
       expect(r.solved).toEqual(b.shots.filter((_, i) => i !== 1).map((s) => s.id));
       expect(r.warnings).toContain(
         'Shot 2: its camera was set by hand in the desk and is kept; the set changed, so check its framing (solve it again with desk.shot_solve)',
       );
     },
   );
+
+  it("Update shots: a version 2 that only drops a driver left on what the person deleted is no set change for the shots' cameras", () => {
+    // a set whose point lamp's light has its energy set by a unit driver
+    const s = stagedDoc();
+    const light = s.addLight({ type: 'POINT', name: 'LampLight', energy: 800 });
+    s.addObject({ type: 'LIGHT', name: 'Lamp', data: light, location: [3, 4, 3] });
+    s.setDriver({
+      target_type: 'light',
+      target_id: light,
+      path: 'energy',
+      index: 0,
+      expression: '1000',
+      variables: [],
+      mute: false,
+    });
+    const u1 = unitFrom(s, { kind: 'set', name: 'Meadow' }).unit;
+    s.destroy();
+    const u2 = editedUnit(u1, (body) => {
+      body.drivers = [];
+    });
+    const v1 = lib('lib_0123456789lamp', 1, encodeUnit(u1.body, headerInput(u1.header)));
+    const v2 = lib('lib_0123456789lamp', 2, encodeUnit(u2.body, headerInput(u2.header)));
+    const { doc } = staged(withPins(openBrief(), { set: v1 }), source(v1));
+    const srcOf = (kind: 'objects' | 'lights', name: string) =>
+      Object.entries(u1.body.blocks[kind]!).find(([, o]) => o.name === name)![0];
+    const parts = readInstance(doc, SET_ROOT())!.parts;
+    const lamp = parts.get(`objects:${srcOf('objects', 'Lamp')}`)!.id;
+    const data = parts.get(`lights:${srcOf('lights', 'LampLight')}`)!.id;
+    // the person deletes the lamp: its light goes with it, and the light's driver is left behind
+    run(doc, 'object.delete', { objects: [lamp] });
+    expect(doc.has('lights', data)).toBe(false);
+    expect(doc.listDrivers(data)).toHaveLength(1);
+    keyed(doc, getShots(doc)[1].camera!, 'location', 0, [0, 0.5, 1]);
+    const { r } = update(doc, withPins(openBrief(), { set: v2 }), source(v2));
+    expect(rowsOf(r)).toEqual(['set unit']);
+    expect(readInstance(doc, SET_ROOT())!.version).toBe(2);
+    expect(doc.listDrivers(data)).toEqual([]);
+    // the driver drove nothing the shots see: no camera is solved, and none is warned of a set change
+    expect(r.solved).toEqual([]);
+    expect(r.warnings.join('\n')).not.toMatch(/the set changed/);
+  });
 
   it.each(['another item linked to the slot', 'the pin dropped'] as const)(
     "Update shots: %s changes the scene's set: the cameras still as staged are solved, the one set by hand kept",
