@@ -1136,6 +1136,85 @@ describe('a shot camera the person hung that a later brief does not solve', () =
       expect(cameraWarnings(doc, cam, r.warnings), what).toEqual([]);
     }
   });
+
+  it('that another shot uses too keeps every warning of both shots that it is set by hand, in order: on a balloon that stands still, or keyed by hand under one that flies', () => {
+    // the meadow as a library set, which an update places in the words' set's stead
+    const src = stagedDoc();
+    const meadow = lib('lib_0123456789mead', 1, unitFrom(src, { kind: 'set', name: 'Meadow' }).ex.data);
+    src.destroy();
+    const kept = (shot: string, why: string) =>
+      `${shot}: its camera was set by hand in the desk and is kept; ${why}, so check its framing (solve it again with desk.shot_solve)`;
+    const size = (b: SceneBrief) => {
+      b.width = 1920;
+      b.height = 1080;
+    };
+    const moved = "what it hangs from, 'Red kite' (built anew as 'Red balloon'), no longer moves as it did";
+    const cases: {
+      what: string;
+      keyed: boolean;
+      flies: boolean;
+      change: (b: SceneBrief) => void;
+      units?: UnitSource;
+      warnings: string[];
+    }[] = [
+      {
+        what: 'a balloon no one holds, the frame size',
+        keyed: false,
+        flies: false,
+        change: size,
+        warnings: [kept('Shot 1', 'its frame size changed'), kept('Shot 2', 'its frame size changed')],
+      },
+      {
+        what: 'a balloon no one holds, the set',
+        keyed: false,
+        flies: false,
+        change: (b) => (b.set.unit = meadow.pin),
+        units: unitSourceOf([meadow.given]),
+        warnings: [kept('Shot 1', 'the set changed'), kept('Shot 2', 'the set changed')],
+      },
+      {
+        what: 'keyed by hand, a balloon Mira flies, the frame size',
+        keyed: true,
+        flies: true,
+        change: size,
+        warnings: [
+          kept('Shot 1', 'its frame size changed'),
+          kept('Shot 2', 'its frame size changed'),
+          kept('Shot 1', moved),
+          kept('Shot 2', moved),
+        ],
+      },
+    ];
+    for (const { what, keyed, flies, change, units, warnings } of cases) {
+      const doc = stagedDoc();
+      const cam = firstShot(doc).camera!;
+      // the second shot shoots with the first shot's camera, hung from the kite where it stands at the
+      // first shot's first frame
+      setShots(
+        doc,
+        getShots(doc).map((s) => (s.external?.shot === 'sht_0123456789bbbb' ? { ...s, camera: cam } : s)),
+      );
+      hangCamera(doc, propOf(doc, KITE).id, 'first');
+      if (keyed) {
+        // the person keys it half a metre aside ten frames into the first shot
+        const f = firstShot(doc).frame_start + 10;
+        keyMore(doc, cam, 'location', 0, [[f, new FrameState(doc, f).local(cam)[12] + 0.5]]);
+      }
+      const keys = JSON.stringify(doc.listFCurves(cam));
+      const next = retyped(openBrief(), { balloonWords: flies });
+      change(next);
+      const r = update(doc, next, units);
+      // no shot's pass takes it off: it stays on the balloon built in the kite's place with its keys,
+      // solved for neither shot, and each shot keeps the warnings that it is set by hand
+      expect(doc.getObject(doc.getObject(cam)!.parent!)?.name, what).toBe('Red balloon');
+      expect(JSON.stringify(doc.listFCurves(cam)), what).toBe(keys);
+      expect(r.solved, what).toEqual([]);
+      expect(
+        r.warnings.filter((w) => w.includes('set by hand')),
+        what,
+      ).toEqual(warnings);
+    }
+  });
 });
 
 describe('a shot camera the person keyed by hand', () => {
