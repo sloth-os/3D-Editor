@@ -815,6 +815,9 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
     doc.setParent(cup, propOf(doc, BLANKET).id, true);
   }
   const CUP_SAID = "Picnic blanket: keeps 'Cup', which is not part of the prop it replaces";
+  /** What the props step says of the cup when the blanket's library prop takes the blanket's place. */
+  const CUP_SAID_UNIT =
+    "Picnic blanket: keeps 'Cup', which is not part of the look the library prop replaces";
   /** `said` are the last warnings of `r`, written once the props are staged: after `cupSaid`. */
   function saidAfterProps(r: StageBriefReport, said: readonly string[], cupSaid = CUP_SAID): void {
     expect(r.warnings.slice(-said.length)).toEqual(said);
@@ -1059,12 +1062,12 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
   };
   /**
    * Pieces an update builds anew or takes out, keeping what the person put on them, with the kite's
-   * string hung on them: the brief staged first and its units, the piece, the brief that changes it,
-   * where the string's bead stays when the props take the string out, and what the update says of
-   * the string when it keeps it.
+   * string hung on them: the brief staged first, the units the scene's files hold (the update's hold
+   * the meadow and the kite as well), the piece, the brief that changes it, where the string's bead
+   * stays when the props take the string out, and what the update says of the string when it keeps it.
    */
   const KEEPS = {
-    "the library set placed over an interior set (its 'Set Sun' lit anew)": {
+    "an outdoor library set placed over an interior set (its 'Set Sun' goes, the sky lights it)": {
       first: (_: Library) => indoors(withBlanket()),
       units: (_: Library): Lib[] => [],
       piece: (doc: SceneDoc) => named(doc, 'Set Sun'),
@@ -1073,6 +1076,23 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       kept: (s: string) => [
         `the set: keeps '${s}', which is not part of the set built before`,
         `the set: '${s}' is animated: its keyed motion now follows 'Meadow'`,
+      ],
+      cup: CUP_SAID,
+    },
+    // the same name in the same place is no change, so this sun moves: another time of day
+    "an interior library set placed over an interior set at dusk (its 'Set Sun' built anew)": {
+      first: (_: Library) => indoors(withBlanket()),
+      units: (L: Library): Lib[] => [L.room],
+      piece: (doc: SceneDoc) => named(doc, 'Set Sun'),
+      next: (L: Library) => {
+        const b = withPins(indoors(withBlanket()), { set: L.room });
+        b.set.timeOfDay = 'dusk';
+        return b;
+      },
+      on: "the library set's root",
+      kept: (s: string) => [
+        `the set: keeps '${s}', which is not part of the set built before`,
+        `the set: '${s}' is animated: its keyed motion now follows 'Set Sun'`,
       ],
       cup: CUP_SAID,
     },
@@ -1143,7 +1163,7 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       kept: (s: string) => [
         `Picnic blanket: keeps '${s}', which is not part of the look the library prop replaces`,
       ],
-      cup: "Picnic blanket: keeps 'Cup', which is not part of the look the library prop replaces",
+      cup: CUP_SAID_UNIT,
     },
   } as const;
   /** The update of KEEPS[how] staged on a scene of its own, the string and the cup hung there. */
@@ -1239,6 +1259,78 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
     },
   );
 
+  it.each([
+    'flies the kite again in a third shot',
+    'pins the kite (its slot acting alone)',
+    'keeps the kite as it was',
+  ] as const)(
+    "Update shots: the desk's own string the person hung on a prop whose slot acts alone (its library prop placed, its words as they were) is named only when it stays, after the props, when the update %s",
+    (how) => {
+      const L = library();
+      const { doc } = staged(withBlanket());
+      const string = hangString(doc, propOf(doc, BLANKET).id);
+      cupOnBlanket(doc);
+      const pinned = withPins(withBlanket(), { el: { [BLANKET]: L.blanket } });
+      const keeps = how === 'keeps the kite as it was';
+      const { r } = update(doc, keeps ? pinned : STRING_OUT[how](pinned), source(L.blanket, L.kite));
+      expect(rowsOf(r)).toContain(`el:${BLANKET} unit`);
+      expect(readInstance(doc, propOf(doc, BLANKET).id)).not.toBeNull();
+      expect(doc.has('objects', string.id)).toBe(keeps);
+      if (!keeps) {
+        expect(aboutString(r, string.name)).toEqual(
+          goneSaid(string.name, `'${string.name}'`, "the words' ground"),
+        );
+        expect(r.warnings).toContain(CUP_SAID_UNIT);
+        return;
+      }
+      const said = [
+        `Picnic blanket: keeps '${string.name}', which is not part of the look the library prop replaces`,
+      ];
+      expect(aboutString(r, string.name)).toEqual(said);
+      saidAfterProps(r, said, CUP_SAID_UNIT);
+    },
+  );
+
+  it.each(['flies the balloon again', 'keeps the balloon as it was'] as const)(
+    "Update shots: the balloon's string the person hung under the kite is named only when it stays, after the props, when the kite's library prop is placed alone and the update %s",
+    (how) => {
+      const L = library();
+      // the blanket after both flyers: the props step builds it anew, naming the cup, after the kite
+      const brief = () => {
+        const b = withBalloon(openBrief());
+        return withBlanket(b, b.elements.length);
+      };
+      const { doc } = staged(brief());
+      const string = doc
+        .listObjects()
+        .find((o) => o.custom_props?.desk_string_to === propOf(doc, BALLOON).id)!;
+      doc.setParent(string.id, propOf(doc, KITE).id, true);
+      const bead = doc.addObject({ type: 'EMPTY', name: 'Bead' });
+      doc.setParent(bead, string.id, true);
+      cupOnBlanket(doc);
+      // the kite's pin changes and its words do not: its slot acts alone
+      const b = blanketAnew(withPins(brief(), { el: { [KITE]: L.kite } }));
+      const again = how === 'flies the balloon again';
+      if (again) b.elements.find((e) => e.id === BALLOON)!.description = 'A blue helium balloon on a string.';
+      const { r } = update(doc, b, source(L.kite));
+      expect(rowsOf(r)).toContain(`el:${KITE} unit`);
+      expect(doc.has('objects', string.id)).toBe(!again);
+      if (again) {
+        // the kite's library prop kept the balloon's string, which the balloon's flight then took out
+        expect(aboutString(r, string.name)).toEqual(
+          goneSaid(string.name, `'${string.name}'`, "the words' ground"),
+        );
+        expect(r.warnings).toContain(CUP_SAID);
+        return;
+      }
+      const said = [
+        `Red kite: keeps '${string.name}', which is not part of the look the library prop replaces`,
+      ];
+      expect(aboutString(r, string.name)).toEqual(said);
+      saidAfterProps(r, said);
+    },
+  );
+
   it.each(['flies the kite again in a third shot', 'keeps the kite as it was'] as const)(
     "Update shots: the words' blanket built anew in place of a library prop that does not go in names the desk's own string the person hung on the blanket only when it stays, after the props, when the update %s",
     (how) => {
@@ -1277,6 +1369,27 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
       saidAfterProps(r, said, k.cup);
     },
   );
+
+  it("Update shots: an interior library set placed over an interior set at the same time of day builds 'Set Sun' anew where it was, and names nothing of the desk's own string the person hung on it", () => {
+    const L = library();
+    const { doc } = staged(indoors(withBlanket()), source(L.room));
+    const sun = named(doc, 'Set Sun');
+    const string = hangString(doc, sun);
+    const at = doc.worldMatrix(string.id);
+    const { r } = update(
+      doc,
+      withPins(indoors(withBlanket()), { set: L.room }),
+      source(L.room, L.set, L.kite),
+    );
+    expect(rowsOf(r)).toContain('set unit');
+    const lamp = named(doc, 'Set Sun');
+    expect(lamp).not.toBe(sun);
+    expect(doc.has('objects', sun)).toBe(false);
+    // the same name in the same place at rest: no change for what hangs from it (hangOnSet `same`)
+    expect(doc.getObject(string.id)?.parent).toBe(lamp);
+    doc.worldMatrix(string.id).forEach((v, i) => expect(v, `entry ${i}`).toBeCloseTo(at[i], 9));
+    expect(aboutString(r, string.name)).toEqual([]);
+  });
 
   it('Update shots: a member it adds whose figure does not go in stands as a mannequin of its height', () => {
     const L = library();
