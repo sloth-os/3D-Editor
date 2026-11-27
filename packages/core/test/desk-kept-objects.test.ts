@@ -18,7 +18,14 @@ import { sha256Hex } from '../src/desk/container';
 import { RIDEO_PROPS, cameraOwnAsStaged, motionDigest, recordMotionOf } from '../src/desk/rideo/import';
 import { getShots, newShotId, setShots } from '../src/desk/shots';
 import { readInstance } from '../src/desk/units';
-import { restParentWorld, restWorld } from '../src/desk/units/remove';
+import {
+  hangKept,
+  laterWarnings,
+  removeKeeping,
+  restParentWorld,
+  restWorld,
+  type LaterWarning,
+} from '../src/desk/units/remove';
 import { FrameState } from '../src/eval/frame-state';
 import { insertKeyframe } from '../src/anim/fcurve';
 import { identity4, invert4, multiply4 } from '../src/math/mat4';
@@ -1594,5 +1601,100 @@ describe('what the person put on what a rideo re-import builds anew or drops sta
         "balloon: 'Ribbon' no longer follows the animation of 'kite'",
       ]),
     );
+  });
+});
+
+describe('the warnings naming what stays, held back for objects a later step may take out', () => {
+  /**
+   * What stays when the pieces 'Even' (keyed to rise) and 'Uneven' (scaled unevenly) go, hung from
+   * 'Root' (scaled unevenly), names every kind of thing: kept objects; 'Turned', whose turn the
+   * root's scale would shear, staying where it was; 'Skewed', sheared below 'Uneven', changing
+   * shape; 'Spun', whose keyed turn now follows the root; and what followed 'Even' and no longer
+   * does.
+   */
+  function scene(): { doc: SceneDoc; ids: Record<string, string> } {
+    const doc = SceneDoc.create({ empty: true });
+    const ids: Record<string, string> = {};
+    doc.transact(() => {
+      ids.Root = doc.addObject({ type: 'EMPTY', name: 'Root', scale: [1, 2, 1] });
+      ids.Even = doc.addObject({ type: 'EMPTY', name: 'Even', location: [1, 0, 0] });
+      ids.Uneven = doc.addObject({ type: 'EMPTY', name: 'Uneven', location: [-1, 0, 0], scale: [1, 1, 3] });
+    });
+    ids.Plain = mine(doc, 'Plain', ids.Even, [0, 0, 0.5]);
+    ids.Turned = mine(doc, 'Turned', ids.Even, [0, 0.5, 0], [0, 0, Math.PI / 4]);
+    ids.Spun = mine(doc, 'Spun', ids.Even, [0.5, 0, 0]);
+    ids.Skewed = mine(doc, 'Skewed', ids.Uneven, [0, 0, 0.2], [Math.PI / 6, 0, 0]);
+    keyed(doc, ids.Even, 'location', 2, [0, 0.5, 1]);
+    keyed(doc, ids.Spun, 'rotation_euler', 2, [0, 0.5, 1]);
+    return { doc, ids };
+  }
+  const words = { of: 'the pieces that went', on: "'Root'" };
+  /** Hangs what stays of 'Even' and 'Uneven' from 'Root', holding back the warnings naming `quiet`. */
+  function hang(quiet: readonly string[], later?: LaterWarning[]) {
+    const { doc, ids } = scene();
+    const kept = removeKeeping(doc, [ids.Even, ids.Uneven]);
+    const unnamed = new Set(quiet.map((n) => ids[n]));
+    const now = hangKept(doc, ids.Root, kept, { ...words, unnamed, later });
+    return { doc, ids, now };
+  }
+  const LOUD = [
+    "keeps 'Plain', 'Spun', 'Turned' and 'Skewed', which are not part of the pieces that went",
+    "'Turned' stays where it was, not on 'Root': its scale would change it there",
+    "'Skewed' changes shape on 'Root': the uneven scale of what it hung from skewed it, and no channels keep that skew there",
+    "'Spun' is animated: its keyed motion now follows 'Root'",
+    "'Plain', 'Spun' and 'Turned' no longer follow the animation of 'Even'",
+  ];
+
+  it('names every kind of thing that stays when none is held back', () => {
+    expect(hang([]).now).toEqual(LOUD);
+  });
+
+  it('held back, writes them later word for word while they are there, the objects hung as when named at once', () => {
+    const loud = hang([]);
+    const later: LaterWarning[] = [];
+    const held = hang(['Plain', 'Spun', 'Turned', 'Skewed'], later);
+    expect(held.now).toEqual([]);
+    expect(laterWarnings(held.doc, later)).toEqual(LOUD);
+    for (const name of ['Plain', 'Spun', 'Turned', 'Skewed']) {
+      expect(held.doc.getObject(held.ids[name])!.parent, name).toBe(
+        loud.doc.getObject(loud.ids[name])!.parent === loud.ids.Root ? held.ids.Root : null,
+      );
+      sameWorld(restWorld(held.doc, held.ids[name]), restWorld(loud.doc, loud.ids[name]));
+      const motion = worldsAt(loud.doc, loud.ids[name]);
+      worldsAt(held.doc, held.ids[name]).forEach((m, i) => sameWorld(m, motion[i]));
+    }
+  });
+
+  it('writes the rest at once, and the held ones later naming only those still there', () => {
+    const later: LaterWarning[] = [];
+    const { doc, ids, now } = hang(['Spun', 'Turned'], later);
+    expect(now).toEqual([
+      "keeps 'Plain' and 'Skewed', which are not part of the pieces that went",
+      "'Skewed' changes shape on 'Root': the uneven scale of what it hung from skewed it, and no channels keep that skew there",
+      "'Plain' no longer follows the animation of 'Even'",
+    ]);
+    expect(laterWarnings(doc, later)).toEqual([
+      "keeps 'Spun' and 'Turned', which are not part of the pieces that went",
+      "'Turned' stays where it was, not on 'Root': its scale would change it there",
+      "'Spun' is animated: its keyed motion now follows 'Root'",
+      "'Spun' and 'Turned' no longer follow the animation of 'Even'",
+    ]);
+    // a later step takes 'Turned' out: no warning names it, and one that named only it goes
+    doc.transact(() => doc.removeObjects([ids.Turned]));
+    expect(laterWarnings(doc, later)).toEqual([
+      "keeps 'Spun', which is not part of the pieces that went",
+      "'Spun' is animated: its keyed motion now follows 'Root'",
+      "'Spun' no longer follows the animation of 'Even'",
+    ]);
+    doc.transact(() => doc.removeObjects([ids.Spun]));
+    expect(laterWarnings(doc, later)).toEqual([]);
+  });
+
+  it('with nowhere to hold them, names none of the objects held back (the caller takes them out right after)', () => {
+    expect(hang(['Spun', 'Turned']).now).toEqual([
+      "keeps 'Plain' and 'Skewed', which are not part of the pieces that went",
+      "'Skewed' changes shape on 'Root': the uneven scale of what it hung from skewed it, and no channels keep that skew there",
+      "'Plain' no longer follows the animation of 'Even'",
+    ]);
   });
 });

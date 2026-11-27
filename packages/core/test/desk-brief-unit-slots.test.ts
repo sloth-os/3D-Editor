@@ -746,9 +746,251 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
         ({ r } = update(doc, openBrief()));
         expect(readInstance(doc, actorOf(doc, MIRA).id)).toBeNull();
       }
-      // a new look for Mira does not take the string out: it stays under her, and is named
-      expect(r.warnings).toContainEqual(expect.stringContaining(`keeps '${string.name}'`));
+      // a new look for Mira does not take the string out: it stays under her, and is named (once the
+      // props are staged, under her name)
+      const of =
+        how === 'pins a library figure for Mira'
+          ? 'the look the library figure replaces'
+          : "the library figure's look";
+      expect(r.warnings.filter((w) => w.includes(`'${string.name}'`))).toEqual([
+        `Mira: keeps '${string.name}', which is not part of ${of}`,
+      ]);
       expect(doc.getObject(string.id)?.parent).toBe(actorOf(doc, MIRA).id);
+    },
+  );
+
+  /** The kite's own string in `doc`, which the person hangs under `parent` with a bead of theirs on it. */
+  function hangString(doc: SceneDoc, parent: string): { name: string; id: string; bead: string } {
+    const kite = propOf(doc, KITE).id;
+    const string = doc.listObjects().find((o) => o.custom_props?.desk_string_to === kite)!;
+    doc.setParent(string.id, parent, true);
+    const bead = doc.addObject({ type: 'EMPTY', name: 'Bead' });
+    doc.setParent(bead, string.id, true);
+    return { name: string.name, id: string.id, bead };
+  }
+  /** `b` with the kite worded anew: the update stages it again, flown on a new string. */
+  const reworded = (b: SceneBrief): SceneBrief => {
+    const e = b.elements.find((x) => x.id === KITE)!;
+    e.description = `${e.description} It has a long blue tail.`;
+    return b;
+  };
+  /** The ways one update takes the kite's string out, each with what the person had on it said to stay. */
+  const STRING_OUT = {
+    'pins the kite (its slot acting alone)': (b: SceneBrief) =>
+      withPins(b, { el: { [KITE]: library().kite } }),
+    'flies the kite again in a third shot': (b: SceneBrief) => {
+      b.shots.push({
+        ...b.shots[0],
+        id: 'sht_0123456789cccc',
+        index: 2,
+        durationSec: 2,
+        description: 'Wide: Mira flies the kite over the meadow.',
+        action: 'Mira flies the kite.',
+        castIds: [MIRA],
+        layout: [],
+      });
+      return b;
+    },
+    'drops the kite': (b: SceneBrief) => {
+      b.elements = b.elements.filter((e) => e.id !== KITE);
+      for (const s of b.shots) s.elementIds = (s.elementIds ?? []).filter((x) => x !== KITE);
+      return b;
+    },
+  } as const;
+  /** The warnings naming the string or the bead. */
+  const aboutString = (r: StageBriefReport, name: string) =>
+    r.warnings.filter((w) => w.includes(`'${name}'`) || w.includes("'Bead'"));
+  /**
+   * What one update that takes the string out says of it: the bead's warnings only, as when nothing
+   * kept the string.
+   */
+  const goneSaid = (name: string, gone: string, on: string) => [
+    `${gone} goes; 'Bead' stays where it is, on ${on}`,
+    `'Bead' no longer follows the animation of '${name}'`,
+  ];
+
+  it.each(
+    (['a library figure for Mira', 'the mannequin back for Mira'] as const).flatMap((look) =>
+      (Object.keys(STRING_OUT) as (keyof typeof STRING_OUT)[]).map((out) => [look, out] as const),
+    ),
+  )(
+    "Update shots: the desk's own string the person hung under Mira is not named as kept by %s when the same update %s",
+    (look, out) => {
+      const L = library();
+      const mannequin = look === 'the mannequin back for Mira';
+      const { doc } = mannequin
+        ? staged(withPins(openBrief(), { cast: { [MIRA]: L.mira } }), source(L.mira))
+        : staged(openBrief());
+      const kiteName = propOf(doc, KITE).name;
+      const string = hangString(doc, actorOf(doc, MIRA).id);
+      const b = STRING_OUT[out](
+        mannequin ? openBrief() : withPins(openBrief(), { cast: { [MIRA]: L.mira } }),
+      );
+      const { r } = update(doc, b, source(L.mira, L.kite));
+      expect(readInstance(doc, actorOf(doc, MIRA).id) === null).toBe(mannequin);
+      expect(doc.has('objects', string.id)).toBe(false);
+      const gone = out === 'drops the kite' ? `'${kiteName}'` : `'${string.name}'`;
+      expect(aboutString(r, string.name)).toEqual(goneSaid(string.name, gone, "the words' ground"));
+      expect(prop(doc.getObject(doc.getObject(string.bead)!.parent!), 'desk_label')).toBe('ground');
+    },
+  );
+
+  it("Update shots: a tail of the desk's flight the person hung under Mira is not named as kept by her new look when the same update flies the kite again", () => {
+    const L = library();
+    const { doc } = staged(openBrief());
+    const kite = propOf(doc, KITE).id;
+    // the tail desk.tether_fly makes for a flyer without one of its own, tied to the kite
+    let tail = '';
+    doc.transact(() => {
+      tail = doc.addObject({
+        type: 'EMPTY',
+        name: 'Ribbon tail',
+        parent: actorOf(doc, MIRA).id,
+        custom_props: { desk_role: 'prop', desk_tail_of: kite },
+      });
+    });
+    const b = STRING_OUT['flies the kite again in a third shot'](
+      withPins(openBrief(), { cast: { [MIRA]: L.mira } }),
+    );
+    const { r } = update(doc, b, source(L.mira));
+    expect(readInstance(doc, actorOf(doc, MIRA).id)).not.toBeNull();
+    expect(doc.has('objects', tail)).toBe(false);
+    expect(r.warnings.filter((w) => w.includes('Ribbon tail'))).toEqual([]);
+  });
+
+  it.each([
+    'places the library set while the kite is worded anew',
+    "places the library set while the kite's library prop is pinned (its slot acting alone)",
+    "drops the library set's pin while the kite is worded anew",
+  ] as const)(
+    "Update shots: the desk's own string the person hung on the set is not named as kept when the update %s",
+    (how) => {
+      const L = library();
+      const unpin = how.startsWith('drops');
+      const { doc } = unpin
+        ? staged(withPins(openBrief(), { set: L.set }), source(L.set))
+        : staged(openBrief());
+      const ground = doc.listObjects().find((o) => prop(o, 'desk_label') === 'ground');
+      const string = hangString(doc, unpin ? deriveUnitId('set', UNIT_ROOT) : ground!.id);
+      const b = unpin
+        ? reworded(openBrief())
+        : how.includes('pinned')
+          ? withPins(openBrief(), { set: L.set, el: { [KITE]: L.kite } })
+          : reworded(withPins(openBrief(), { set: L.set }));
+      const { r } = update(doc, b, source(L.set, L.kite));
+      expect(doc.has('objects', string.id)).toBe(false);
+      expect(r.warnings.filter((w) => w.includes(`keeps '${string.name}'`))).toEqual([]);
+      expect(r.warnings).toContain(
+        `'${string.name}' goes; 'Bead' stays where it is, on ${unpin ? "the words' ground" : "the library set's root"}`,
+      );
+    },
+  );
+
+  it.each(['places the library set', "drops the library set's pin"] as const)(
+    "Update shots: the desk's own string the person hung on the set is named as kept, after the props, when the update only %s",
+    (how) => {
+      const L = library();
+      const unpin = how.startsWith('drops');
+      const { doc } = unpin
+        ? staged(withPins(openBrief(), { set: L.set }), source(L.set))
+        : staged(openBrief());
+      const ground = doc.listObjects().find((o) => prop(o, 'desk_label') === 'ground');
+      const string = hangString(doc, unpin ? deriveUnitId('set', UNIT_ROOT) : ground!.id);
+      const { r } = update(doc, unpin ? openBrief() : withPins(openBrief(), { set: L.set }), source(L.set));
+      expect(doc.has('objects', string.id)).toBe(true);
+      expect(aboutString(r, string.name)).toEqual([
+        unpin
+          ? `the set: keeps '${string.name}', which is not part of the library set`
+          : `the library set: keeps '${string.name}', which is not part of the set the library set replaces`,
+      ]);
+    },
+  );
+
+  /**
+   * Pieces an update takes out, with the kite's string hung on them: the brief staged first, the
+   * piece, and the brief that takes it out.
+   */
+  const GOES = {
+    'Mira leaves the cast': {
+      first: openBrief,
+      piece: (doc: SceneDoc) => actorOf(doc, MIRA).id,
+      next: () => {
+        const b = openBrief();
+        b.cast = b.cast.filter((c) => c.id !== MIRA);
+        for (const s of b.shots) {
+          s.castIds = s.castIds.filter((c) => c !== MIRA);
+          s.layout = s.layout.filter((l) => l.castId !== MIRA);
+        }
+        return b;
+      },
+    },
+    "the basket's element goes": {
+      first: () => withBasket(),
+      piece: (doc: SceneDoc) => propOf(doc, BASKET).id,
+      next: openBrief,
+    },
+    'the words drop the pond': {
+      first: openBrief,
+      piece: (doc: SceneDoc) => doc.listObjects().find((o) => prop(o, 'desk_role') === 'landmark')!.id,
+      next: () => {
+        const b = openBrief();
+        b.set.description = 'A wide green meadow on a breezy afternoon, an oak tree behind.';
+        return b;
+      },
+    },
+    'the second shot goes with its camera': {
+      first: openBrief,
+      piece: (doc: SceneDoc) => getShots(doc).find((s) => s.external?.shot === 'sht_0123456789bbbb')!.camera!,
+      next: () => {
+        const b = openBrief();
+        b.shots = b.shots.filter((s) => s.id !== 'sht_0123456789bbbb');
+        return b;
+      },
+    },
+  } as const;
+
+  it.each([
+    ['Mira leaves the cast', 'the kite has no holder any more'],
+    ["the basket's element goes", 'the kite is worded anew'],
+    ['the words drop the pond', 'the kite is worded anew'],
+    ['the second shot goes with its camera', 'the kite is flown again over the shots left'],
+  ] as const)(
+    "Update shots: the desk's own string on a piece that goes is not named as staying on the ground when %s and %s",
+    (how, why) => {
+      const g = GOES[how];
+      const { doc } = staged(g.first());
+      const string = hangString(doc, g.piece(doc));
+      const b = g.next();
+      const { r } = update(doc, why === 'the kite is worded anew' ? reworded(b) : b);
+      expect(doc.has('objects', string.id)).toBe(false);
+      expect(aboutString(r, string.name)).toEqual(
+        goneSaid(string.name, `'${string.name}'`, "the words' ground"),
+      );
+    },
+  );
+
+  it.each([
+    ["the basket's element goes", (s: string) => `'${s}' no longer follows the animation of 'Picnic basket'`],
+    [
+      'the words drop the pond',
+      (s: string) => `'${s}' is animated: its keyed motion now follows the words' ground`,
+    ],
+  ] as const)(
+    "Update shots: the desk's own string on a piece that goes is named as staying on the ground, after the props, when %s and the kite stays as it was",
+    (how, more) => {
+      const g = GOES[how];
+      const { doc } = staged(g.first());
+      const gone = doc.getObject(g.piece(doc))!.name;
+      const string = hangString(doc, g.piece(doc));
+      const { r } = update(doc, g.next());
+      expect(doc.has('objects', string.id)).toBe(true);
+      const said = [
+        `'${gone}' goes; '${string.name}' stays where it is, on the words' ground`,
+        more(string.name),
+      ];
+      expect(aboutString(r, string.name)).toEqual(said);
+      // written once the props are staged: after every warning of the props
+      expect(r.warnings.slice(-said.length)).toEqual(said);
     },
   );
 

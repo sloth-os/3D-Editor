@@ -9,7 +9,7 @@ import { isActor } from '../characters';
 import { DESK_PROPS } from '../props';
 import { RIDEO_PROPS, importRideoBlocking, type StagedFigure, type StagedProp } from '../rideo/import';
 import { insertUnit } from '../units/insert';
-import { oldLook } from '../units/remove';
+import { oldLook, type LaterWarning } from '../units/remove';
 import { setUnitRoot } from '../set';
 import { planBrief, shotCast } from './plan';
 import {
@@ -298,14 +298,16 @@ export function stagedCast(brief: SceneBrief): Set<string> {
  * library set before), taken out in the same transaction once it is sure to go in (insertUnit's
  * `remove`): a set that does not go in throws and leaves them as they are. What the person put on
  * what goes (objects of their own below it, not its look: remove.ts oldLook) stays, hung from the
- * set's root where it is in the world (insertUnit's `keep`), and the warnings name it. Returns the
- * set's root and the warnings.
+ * set's root where it is in the world (insertUnit's `keep`), and the warnings name it; those naming
+ * `held.unnamed` (what a later step of the update may take out) wait in `held.later` (insertUnit's
+ * `unnamed` and `later`). Returns the set's root and the warnings.
  */
 export function insertSetUnit(
   doc: SceneDoc,
   sceneId: string,
   s: SlotUnit,
   remove: readonly string[] = [],
+  held: { unnamed?: Iterable<string>; later?: LaterWarning[] } = {},
 ): { root: string; warnings: string[] } {
   const info = s.held!.info as SetPlanInfo;
   const keep = remove.flatMap((id) => (doc.has('objects', id) ? oldLook(doc, id).kept : []));
@@ -314,6 +316,8 @@ export function insertSetUnit(
     key: s.key,
     name: info.name,
     ...(remove.length ? { remove, keep } : {}),
+    unnamed: held.unnamed,
+    later: held.later,
     rootProps: {
       [DESK_PROPS.role]: 'set',
       [RIDEO_PROPS.clip]: sceneId,

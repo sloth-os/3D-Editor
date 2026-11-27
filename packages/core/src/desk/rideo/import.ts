@@ -35,6 +35,7 @@ import {
   removeObjectTrees,
   sameWorld,
   type KeptPlaces,
+  type LaterWarning,
 } from '../units/remove';
 import { unitStatus } from '../units/status';
 import { updateUnit, withArticle } from '../units/update';
@@ -377,20 +378,23 @@ export function removeTrees(doc: SceneDoc, ids: readonly string[], keep: readonl
  * words drop, an actor or a shot's camera that goes, a flyer's old string; units/remove.ts
  * removeKeeping) from the set's ground (`ground`, else the words' ground or a library set's root; the
  * scene when there is none), where it was in the world, in the caller's transaction, and returns the
- * warnings naming it ("'pond' goes; 'Lily' stays where it is, on the words' ground").
+ * warnings naming it ("'pond' goes; 'Lily' stays where it is, on the words' ground"). `held`:
+ * objects a later step of the caller may take out, whose warnings wait in `held.later`
+ * (units/remove.ts KeptWords' `unnamed`).
  */
 export function hangOnGround(
   doc: SceneDoc,
   kept: KeptPlaces,
   gone: string,
   ground: string | null = setGround(doc),
+  held: { unnamed?: ReadonlySet<string>; later?: LaterWarning[] } = {},
 ): string[] {
   const on = !ground
     ? 'the scene'
     : readInstance(doc, ground)
       ? "the library set's root"
       : "the words' ground";
-  return hangKept(doc, ground, kept, { of: gone, on, gone });
+  return hangKept(doc, ground, kept, { of: gone, on, gone, unnamed: held.unnamed, later: held.later });
 }
 
 const prop = (o: ObjectData | null | undefined, key: string): string => {
@@ -2267,6 +2271,13 @@ function animateActors(
 }
 
 // ---------------------------------------------------------------- props
+
+/** Whether `o` is a string or tail desk.tether_fly made for a flyer (see tetherPartsOf). */
+export function isTetherPart(o: ObjectData): boolean {
+  return (
+    typeof o.custom_props?.desk_string_to === 'string' || typeof o.custom_props?.desk_tail_of === 'string'
+  );
+}
 
 /** The string and tail objects desk.tether_fly made for a flyer. */
 export function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {

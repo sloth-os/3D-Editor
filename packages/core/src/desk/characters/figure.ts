@@ -12,6 +12,8 @@ import {
   instanceData,
   keptPlaces,
   keptWarning,
+  type LaterWarning,
+  namedWhenKept,
   oldLook,
   unusedData,
 } from '../units/remove';
@@ -129,12 +131,15 @@ export type ActorLook = { figure: UnitPayload; pin: UnitPin; key: string } | { m
  * figure whose kind and height are the actor's (INVALID_PARAMS otherwise), or back to the mannequin
  * of the actor's kind and height in `color` (a figure instance is made local first). The armature
  * object, its id, keys, holds and rides stay, and so does what the person put on the actor (only
- * the old look goes; the warnings name what stays). Returns the actor's parts and warnings.
+ * the old look goes; the warnings name what stays). `held`: objects the caller may take out after
+ * (the string and tail of a flight a later step of a brief update flies again), whose warnings wait
+ * in `held.later` (units/remove.ts KeptWords' `unnamed`). Returns the actor's parts and warnings.
  */
 export function restyleActor(
   doc: SceneDoc,
   actorId: string,
   look: ActorLook,
+  held: { unnamed?: Iterable<string>; later?: LaterWarning[] } = {},
 ): { parts: string[]; warnings: string[] } {
   const meta = requireActor(doc, actorId);
   const warnings: string[] = [];
@@ -150,7 +155,13 @@ export function restyleActor(
         warnings.push(...updateUnit(doc, actorId, look.figure, look.pin).warnings);
       else
         warnings.push(
-          ...insertUnit(doc, look.figure, { ...look.pin, key: look.key, replace: actorId }).warnings,
+          ...insertUnit(doc, look.figure, {
+            ...look.pin,
+            key: look.key,
+            replace: actorId,
+            unnamed: held.unnamed,
+            later: held.later,
+          }).warnings,
         );
     } else {
       // only the old look goes (the figure's parts and datablocks, read before Make local clears
@@ -171,7 +182,21 @@ export function restyleActor(
       doc.removeObjects(old.look);
       deleteData(doc, unusedData(doc, data));
       const of = figure ? "the library figure's look" : 'its old look';
-      if (old.named.length) warnings.push(keptWarning(old.named, of));
+      // what stays on the actor, named now, or once the caller knows it is still there (`held`)
+      const quiet = new Set(held.unnamed ?? []);
+      const now: string[] = [];
+      const waiting = { ids: [] as string[], names: [] as string[] };
+      for (const id of old.kept) {
+        const k = doc.getObject(id);
+        if (!k || !namedWhenKept(k)) continue;
+        if (!quiet.has(id)) now.push(k.name);
+        else {
+          waiting.ids.push(id);
+          waiting.names.push(k.name);
+        }
+      }
+      if (now.length) warnings.push(keptWarning(now, of));
+      if (waiting.ids.length && held.later) held.later.push({ ...waiting, say: (n) => keptWarning(n, of) });
       const kind = meta.kind as ActorKind;
       const bp = blueprintFor(kind, meta.height);
       const color = look.mannequin.color.toLowerCase();
@@ -180,7 +205,15 @@ export function restyleActor(
       doc.updateObject(actorId, { custom_props: { ...o.custom_props, [DESK_PROPS.color]: color } });
       // it hangs from the actor where it was at rest, from the bone the part hung from (so it follows
       // it as before)
-      warnings.push(...hangKept(doc, actorId, below, { of, on: `'${meta.name}'`, listed: true }));
+      warnings.push(
+        ...hangKept(doc, actorId, below, {
+          of,
+          on: `'${meta.name}'`,
+          listed: true,
+          unnamed: quiet,
+          later: held.later,
+        }),
+      );
     }
     refreshAttached(doc, actorId);
   });

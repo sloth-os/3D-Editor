@@ -1061,10 +1061,17 @@ staging wrote there (`ownKeysDigest`), read before an update's ripple shifts the
 anew on its marks). One that followed a bone through the pieces that went (a hat on a mannequin's
 head part) hangs from the same bone of the new root when the root is that armature or takes its
 place. One skewed by an uneven scale above it, which no parent holds, keeps its origin and is named
-as changing shape. A flight's string or tail of the desk's own hung there stays and is named like
-the rest, unless the update takes it out right after: for a prop's slot acting alone, which flies
-the new prop on a string of its own, insertUnit's and `hangKept`'s `unnamed` leave it out of these
-warnings, and `dropTether` takes it out, naming what the person hung on it. The same steps keep
+as changing shape. A flight's string or tail of the desk's own (rideo/import.ts `tetherPartsOf`)
+hung there stays like the rest. A brief update takes out the string and tail of a flight it flies
+again only when it stages the props (`dropTether`, naming what the person hung on them), after the
+steps that keep what the person put on what goes or takes a new look: those steps (an actor's new
+look, the library set placed or taken out, a cast member's actor or a shot's camera that goes, a
+prop whose element goes, a landmark the words drop) hold back the warnings naming a string or tail
+(insertUnit's and `hangKept`'s `unnamed` and `later`) and write them once the props are staged, in
+the same words, naming only the ones still there (`laterWarnings`). The insert of a prop's slot
+acting alone, which takes its own flight's string and tail out right after, names none of them.
+A piece the words build anew in its place (a prop or a landmark described anew, the set's ground
+or walls built again) still names, at once, one hung on it. The same steps keep
 what the person put on what staging and updates build anew or
 take out without a library unit (`keptPlaces`, then `hangKept`): a words' prop or landmark built
 anew or dropped, the words' ground, walls and sun built again (`buildSet` and `lightSet`, which name

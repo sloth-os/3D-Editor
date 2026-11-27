@@ -645,8 +645,12 @@ and no other shot's keys are cut:
   hung from the piece built in its place, or from the set's ground when nothing takes its place,
   where it was in the world at rest (from a bone's tail for one hung from a bone), and the warnings
   name it (`'pond' goes; 'Duck' stays where it is, on the words' ground`); nothing is named for a
-  piece built again as it was. Its keyed motion is kept where the change of parent is a move and a
-  scale along the parent's axes, and otherwise a warning says that it now follows the new parent.
+  piece built again as it was. A kite's own string or tail the person hung on what goes, or on an
+  actor or a library set that takes a new look, is named once the props are staged, and only when
+  it is still there: the update takes out the string and tail of a flight it flies again (a piece
+  the words build anew in its place names one hung on it at once). Its keyed motion is kept where
+  the change of parent is a move and a scale along the parent's axes, and otherwise a warning says
+  that it now follows the new parent.
   One that followed the animation of what went (its keys, drivers, constraints, physics or the
   bones it hung from: an actor's walk, a camera's move, a kite's flight) keeps its place at rest
   and is named as no longer following it (`'Hat' no longer follows the animation of 'Pip'`),
@@ -666,8 +670,10 @@ and no other shot's keys are cut:
   and no pin brings the words' set back; what the person put on the set that goes stays, on the set
   that takes its place, and the warnings name it; when the slot changes the scene's set (a version
   with the same content, or whose changes all fall on parts and drivers edited or deleted in the
-  desk or on drivers of parts deleted there, changes nothing the shots see), the cameras still as
-  staged are then solved again (one set by hand is kept, with a warning). A figure restyles its
+  desk or on drivers of parts deleted there, changes no part or driver of the set), the cameras
+  still as staged are then solved again (one set by hand is kept, with a warning). Every version
+  that goes in lights the set again, also one that changes none of it: the sky's sun is set again,
+  or the 'Set Sun' lamp built anew, which undoes light edits made in the desk. A figure restyles its
   member's actor in place (the same armature, keys, holds and shots) when its kind and height
   (within 5 mm) are the actor's; another
   kind or height is refused and the actor kept (stage the brief in a new project to rebuild it), and

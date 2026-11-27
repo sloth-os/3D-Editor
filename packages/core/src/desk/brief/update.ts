@@ -15,7 +15,7 @@ import { addDeskCamera, prepareDeskCamera, retimeCameraRange } from '../moves';
 import { DESK_PROPS } from '../props';
 import { buildSet, lightSet, setGround, setUnitRoot } from '../set';
 import { unitOf } from '../units/list';
-import { hangKept, removeKeeping, type KeptPlaces } from '../units/remove';
+import { hangKept, laterWarnings, removeKeeping, type KeptPlaces, type LaterWarning } from '../units/remove';
 import { updateUnit } from '../units/update';
 import { FRAMING_TABLE } from '../solver';
 import { MAX_SHOT_SUBJECTS, getDeskSettings, getShots, newShotId, setDeskSettings, setShots } from '../shots';
@@ -34,6 +34,7 @@ import {
   holderSpans,
   hungFromName,
   hungMotion,
+  isTetherPart,
   motionDigest,
   ownKeysAsStaged,
   parseRideoBlocking,
@@ -171,7 +172,10 @@ import {
  *   stays where it is in the world, hung from the piece built in its place, or from the set's ground
  *   once the set is staged (a piece that goes with nothing in its place), its keyed motion kept where
  *   it can be, and the warnings name it, also when it no longer follows the animation of what went
- *   (units/remove.ts hangKept);
+ *   (units/remove.ts hangKept). Those naming a flight's own string or tail, kept by a step before
+ *   the props (what goes, an actor's new look, the library set placed or taken out), wait until the
+ *   props are staged and name only the ones still there: the props take out the string and tail of
+ *   a flight flown again;
  * - notes the desk did not edit follow the brief's words; shot names that are the desk's own
  *   ('Shot 3') follow the brief's order;
  * - riders are not seated by an update: a shot it stages, or whose words or cast change, that says
@@ -425,6 +429,18 @@ export function updateFromBriefIn(
     setDeskSettings(doc, { aspect: brief.width / brief.height });
   }
 
+  // the strings and tails of flights (rideo/import.ts tetherPartsOf): the props below take out
+  // those of a flight flown again, so the steps before them that keep one (the person hung it on a
+  // piece that goes or takes a new look) hold back the warnings naming it, written after the props
+  // for the ones still there, each with the prefix its step gives its warnings
+  const tethers = new Set(doc.listObjects().flatMap((o) => (isTetherPart(o) ? [o.id] : [])));
+  const heldBack: { prefix: string; later: LaterWarning[] }[] = [];
+  const holdBack = (prefix: string): { unnamed: ReadonlySet<string>; later: LaterWarning[] } => {
+    const later: LaterWarning[] = [];
+    heldBack.push({ prefix, later });
+    return { unnamed: tethers, later };
+  };
+
   // ------------------------------------------------------------ shots the brief no longer has
   const inBrief = new Set(brief.shots.map((s) => s.id));
   const gone = [...deskBefore].filter(([host]) => !inBrief.has(host)).map(([, s]) => s);
@@ -543,13 +559,17 @@ export function updateFromBriefIn(
     if (!actor || created.has(cid) || slot.action === 'none') continue;
     const name = castById.get(cid)?.name ?? actor.name;
     try {
+      // a look that does not go in writes nothing (restyleActor throws first), held back or not
+      const held = { unnamed: tethers, later: [] as LaterWarning[] };
       if (slot.action === 'remove') {
         const color = ACTOR_PALETTE[Math.max(0, plan.order.indexOf(cid)) % ACTOR_PALETTE.length];
-        const r = restyleActor(doc, actor.id, { mannequin: { color } });
+        const r = restyleActor(doc, actor.id, { mannequin: { color } }, held);
         warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
+        heldBack.push({ prefix: `${name}: `, later: held.later });
       } else if (slot.payload) {
-        const r = restyleActor(doc, actor.id, { figure: slot.payload, pin: slot.pin!, key: slot.key });
+        const r = restyleActor(doc, actor.id, { figure: slot.payload, pin: slot.pin!, key: slot.key }, held);
         warnings.push(...r.warnings.map((w) => `${name}: ${w}`));
+        heldBack.push({ prefix: `${name}: `, later: held.later });
         done.add(slot.key);
       }
     } catch (err) {
@@ -780,11 +800,16 @@ export function updateFromBriefIn(
       } else {
         // the words' set (or the library set before) goes, in the insert's own transaction: the
         // library set is the place; what the person put on what goes stays, on the set's root
-        const placed = insertSetUnit(doc, sceneId, setSlot, [
-          ...(setAction === 'replace' ? [setSlot.inst!.root] : []),
-          ...wordSet(doc, sceneId),
-        ]);
+        const held = { unnamed: tethers, later: [] as LaterWarning[] };
+        const placed = insertSetUnit(
+          doc,
+          sceneId,
+          setSlot,
+          [...(setAction === 'replace' ? [setSlot.inst!.root] : []), ...wordSet(doc, sceneId)],
+          held,
+        );
         warnings.push(...placed.warnings.map((w) => `the library set: ${w}`));
+        heldBack.push({ prefix: 'the library set: ', later: held.later });
       }
       warnings.push(...relightSet(doc, blocking));
       done.add(setSlot.key);
@@ -797,20 +822,22 @@ export function updateFromBriefIn(
     // it, not its parts) stays, hung from the words' ground where it is in the world
     setChanged = true;
     const kept = removeKeeping(doc, [setSlot.inst!.root]);
-    const staged = restageSet(doc, blocking, brief, castNames, stamp, sceneId);
+    const staged = restageSet(doc, blocking, brief, castNames, stamp, sceneId, holdBack(''));
     warnings.push(
       ...staged.warnings,
-      ...hangKept(doc, staged.ground, kept, { of: 'the library set', on: "the words' ground" }).map(
-        (w) => `the set: ${w}`,
-      ),
+      ...hangKept(doc, staged.ground, kept, {
+        of: 'the library set',
+        on: "the words' ground",
+        ...holdBack('the set: '),
+      }).map((w) => `the set: ${w}`),
     );
   } else if (diff.set) {
     // a library set (or one made local) is relit; the words' set is built again
     if (plan.set.unit) warnings.push(...relightSet(doc, blocking));
-    else warnings.push(...restageSet(doc, blocking, brief, castNames, stamp, sceneId).warnings);
+    else warnings.push(...restageSet(doc, blocking, brief, castNames, stamp, sceneId, holdBack('')).warnings);
   }
   // the set is staged: what stays of the cameras and actors that went hangs from its ground
-  for (const d of dropped) warnings.push(...hangOnGround(doc, d.kept, d.gone, setGround(doc)));
+  for (const d of dropped) warnings.push(...hangOnGround(doc, d.kept, d.gone, setGround(doc), holdBack('')));
   // the cameras still as staged see the new set: solved again (one set by hand is kept). A library
   // set that did not go in (slotFailed made its action 'none'), or a version that changes none of
   // its parts and drivers, left the set as it was: no camera sees a new set then
@@ -833,7 +860,8 @@ export function updateFromBriefIn(
     if (!plannedProps.has(eid)) {
       if (doc.getObject(o.id)) {
         const kept = removeKeeping(doc, [o.id, ...tetherPartsOf(doc, o.id)]);
-        warnings.push(...hangOnGround(doc, kept, `'${doc.getObject(o.id)?.name ?? o.name}'`));
+        const gone = `'${doc.getObject(o.id)?.name ?? o.name}'`;
+        warnings.push(...hangOnGround(doc, kept, gone, setGround(doc), holdBack('')));
       }
       props.delete(eid);
     }
@@ -899,6 +927,9 @@ export function updateFromBriefIn(
     if (p.heldBy)
       stageHeld(doc, made.root, made.baseScale, p, flies, actors.get(p.heldBy) ?? null, cut, warnings);
   }
+  // the props are staged: the warnings held back above name the strings and tails still there
+  for (const { prefix, later } of heldBack)
+    warnings.push(...laterWarnings(doc, later).map((w) => prefix + w));
   // an insert shot frames its props: subjects of new or replanned inserts may name props made just now
   if (solve.size)
     setShots(
@@ -1253,7 +1284,8 @@ function stageHeld(
  * Rebuilds the set as planned: ground, sky or sun, walls, and the landmarks (the water). What the
  * person put on a piece built anew stays on the new one, and on the ground when its landmark goes.
  * Returns the ground (a library set's root while the scene holds one) and the warnings naming what
- * stays.
+ * stays; those naming `held.unnamed` objects on a landmark that goes wait in `held.later`
+ * (rideo/import.ts hangOnGround).
  */
 function restageSet(
   doc: SceneDoc,
@@ -1262,6 +1294,7 @@ function restageSet(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   sceneId: string,
+  held: { unnamed?: ReadonlySet<string>; later?: LaterWarning[] } = {},
 ): { ground: string; warnings: string[] } {
   const set = blocking.set;
   const built = buildSet(doc, {
@@ -1297,7 +1330,7 @@ function restageSet(
   // a landmark the words drop goes, but for what the person put on it, which stays on the ground
   for (const [rid, o] of old)
     if (!kept.has(rid) && doc.getObject(o.id))
-      warnings.push(...hangOnGround(doc, removeKeeping(doc, [o.id]), `'${o.name}'`, built.ground));
+      warnings.push(...hangOnGround(doc, removeKeeping(doc, [o.id]), `'${o.name}'`, built.ground, held));
   return { ground: built.ground, warnings };
 }
 

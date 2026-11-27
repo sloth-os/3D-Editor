@@ -17,6 +17,7 @@ import {
   keptPlaces,
   type KeptPlaces,
   keptWarning,
+  type LaterWarning,
   namedWhenKept,
   oldLook,
   unusedData,
@@ -111,11 +112,14 @@ export interface InsertUnitOptions extends UnitPin {
   restaged?: boolean;
   /**
    * Objects that stay below what `replace` or `remove` takes the place of, like the rest, but that
-   * the caller takes out right after the insert, its own warning naming what goes: the warnings
-   * here do not name them (the string and tail of a flight flown again: rideo/import.ts
-   * dropTether).
+   * the caller may take out after the insert, its own warning naming what goes (the string and tail
+   * of a flight flown again: rideo/import.ts dropTether): the warnings naming them go to `later`,
+   * for the caller to write once it knows which are still there (remove.ts laterWarnings); with no
+   * `later` none names them (the caller takes them out right after).
    */
-  unnamed?: readonly string[];
+  unnamed?: Iterable<string>;
+  /** Where the warnings naming `unnamed` objects wait (remove.ts LaterWarning). */
+  later?: LaterWarning[];
 }
 
 export interface InsertUnitResult {
@@ -258,14 +262,16 @@ export function writeUnitRecords(
     );
   });
   const places = keptPlaces(doc, hung, o.remove ?? []);
-  // what the caller takes out right after the insert (its own warning names what goes): it stays
-  // here like the rest, unnamed
+  // what the caller may take out after the insert (its own warning names what goes): it stays here
+  // like the rest, and the warnings naming it wait in `o.later`
   const unnamed = new Set(o.unnamed ?? []);
 
   let old: UnitRecord | null = null;
   let doomed: string[] = [];
   let kept = new Set<string>();
-  let named: string[] = [];
+  const named: string[] = [];
+  // the objects of `named`'s warning that are `unnamed`: their names wait (o.later)
+  const held = { ids: [] as string[], names: [] as string[] };
   // what stays below a part of the old look (a hat on a mannequin's head), read before the part goes
   let belowLook: KeptPlaces | null = null;
   if (o.replace) {
@@ -282,10 +288,15 @@ export function writeUnitRecords(
     const look = oldLook(doc, o.replace);
     doomed = look.look.filter((id) => !removing.has(id));
     kept = new Set(look.kept);
-    named = look.kept.flatMap((id) => {
+    for (const id of look.kept) {
       const k = doc.getObject(id);
-      return k && namedWhenKept(k) && !unnamed.has(id) ? [k.name] : [];
-    });
+      if (!k || !namedWhenKept(k)) continue;
+      if (!unnamed.has(id)) named.push(k.name);
+      else {
+        held.ids.push(id);
+        held.names.push(k.name);
+      }
+    }
     const going = new Set(doomed);
     belowLook = keptPlaces(
       doc,
@@ -438,6 +449,7 @@ export function writeUnitRecords(
       });
     }
     if (named.length) warnings.push(keptWarning(named, replacedLook(kind)));
+    if (held.ids.length && o.later) o.later.push({ ...held, say: (n) => keptWarning(n, replacedLook(kind)) });
     if (bones && o.replace) warnings.push(...missingBones(doc, o.replace, bones, kept));
     warnings.push(
       ...hangKept(doc, rootId, places, {
@@ -445,6 +457,7 @@ export function writeUnitRecords(
         on: `the library ${kind}'s root`,
         restaged: o.restaged,
         unnamed,
+        later: o.later,
       }),
     );
     // what was below a part of the old look moved up as the part went: hung from the root (from the
@@ -456,6 +469,7 @@ export function writeUnitRecords(
           on: `the library ${kind}'s root`,
           listed: true,
           unnamed,
+          later: o.later,
         }),
       );
   });

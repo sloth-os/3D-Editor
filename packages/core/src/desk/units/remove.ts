@@ -191,8 +191,6 @@ export interface OldLook {
   look: string[];
   /** The tops of what stays below the object: what the person put there, cameras, other actors. */
   kept: string[];
-  /** The names of the kept objects that are not cameras or actors, for a warning. */
-  named: string[];
 }
 
 /**
@@ -216,7 +214,6 @@ export function oldLook(doc: SceneDoc, root: string): OldLook {
         : typeof o.custom_props?.[STORE_PART_PROP] === 'string';
   const index = doc.childrenIndex();
   const kept: string[] = [];
-  const named: string[] = [];
   const walk = (id: string) => {
     for (const child of index.get(id) ?? []) {
       const o = doc.getObject(child);
@@ -227,11 +224,10 @@ export function oldLook(doc: SceneDoc, root: string): OldLook {
         continue;
       }
       kept.push(child);
-      if (namedWhenKept(o)) named.push(o.name);
     }
   };
   walk(root);
-  return { look: [...look], kept, named };
+  return { look: [...look], kept };
 }
 
 /** Whether the warnings name an object that stays when a new look comes (cameras and actors are not named). */
@@ -469,11 +465,38 @@ export interface KeptWords {
    */
   listed?: boolean;
   /**
-   * Objects of `kept` hung like the rest but named in no warning: the caller takes them out right
-   * after, and its own warning names what goes (the string and tail of a flight flown again, which
-   * rideo/import.ts dropTether takes out naming what the person put on them).
+   * Objects of `kept` hung like the rest whose warnings wait: the caller may take them out after, its
+   * own warning naming what goes (the string and tail of a flight, which rideo/import.ts dropTether
+   * takes out naming what the person put on them). Their warnings go to `later`, for the caller to
+   * write once it knows which are still there (laterWarnings); with no `later` none names them (the
+   * caller takes them out right after).
    */
   unnamed?: ReadonlySet<string>;
+  /** Where the warnings naming `unnamed` objects wait (see LaterWarning). */
+  later?: LaterWarning[];
+}
+
+/**
+ * A warning a step holds back (KeptWords' `later`): it names objects that a later step of the same
+ * update may still take out, and is written once the update knows which of them are still there
+ * (laterWarnings).
+ */
+export interface LaterWarning {
+  /** The objects it names, and their names in the same order. */
+  ids: string[];
+  names: string[];
+  /** The warning naming `names`, or the ones of them still there. */
+  say: (names: readonly string[]) => string;
+}
+
+/** The warnings of `later` that still name an object in the scene, naming only those. */
+export function laterWarnings(doc: SceneDoc, later: readonly LaterWarning[]): string[] {
+  const out: string[] = [];
+  for (const w of later) {
+    const names = w.names.filter((_, i) => doc.has('objects', w.ids[i]));
+    if (names.length) out.push(w.say(names));
+  }
+  return out;
 }
 
 /** "'A' is …" / "'A' and 'B' are …": `one` or `many` after the names. */
@@ -500,13 +523,21 @@ const namesWith = (names: readonly string[], one: string, many: string): string 
  * show changes).
  */
 export function hangKept(doc: SceneDoc, root: string | null, kept: KeptPlaces, words: KeptWords): string[] {
-  const named: string[] = [];
-  const stayed: string[] = [];
-  const unskewed: string[] = [];
+  // what each warning names: the objects named now, and the `unnamed` ones, whose warning waits
+  type Named = { now: { ids: string[]; names: string[] }; held: { ids: string[]; names: string[] } };
+  const group = (): Named => ({ now: { ids: [], names: [] }, held: { ids: [], names: [] } });
+  const add = (g: Named, quiet: boolean, o: ObjectData) => {
+    const to = quiet ? g.held : g.now;
+    to.ids.push(o.id);
+    to.names.push(o.name);
+  };
+  const named = group();
+  const stayed = group();
+  const unskewed = group();
   // the objects whose keyed motion now follows their new parent, by that parent (null: none)
-  const moved = new Map<string | null, string[]>();
+  const moved = new Map<string | null, Named>();
   // the objects that no longer follow the animation of an object above them, by its name
-  const lost = new Map<string, string[]>();
+  const lost = new Map<string, Named>();
   const rootObj = root ? doc.getObject(root) : null;
   const rootWorld = root ? restWorld(doc, root) : null;
   // the bone of the root an object follows through the pieces that went, when the root has it
@@ -519,7 +550,7 @@ export function hangKept(doc: SceneDoc, root: string | null, kept: KeptPlaces, w
   for (const id of kept.ids) {
     const o = doc.getObject(id);
     if (!o || (root && doc.isAncestor(id, root))) continue;
-    // hung like the rest, but named in no warning (the caller takes it out right after)
+    // hung like the rest, but the warnings naming it wait (the caller may take it out after)
     const quiet = words.unnamed?.has(id) ?? false;
     const world = kept.worlds.get(id)!;
     const was = o.parent;
@@ -535,55 +566,79 @@ export function hangKept(doc: SceneDoc, root: string | null, kept: KeptPlaces, w
       doc.setParent(id, was, true, { world, parentWorld: was ? restWorld(doc, was) : null });
       if (sameWorld(restWorld(doc, id), world)) {
         parent = was;
-        if (!quiet) stayed.push(o.name);
+        add(stayed, quiet, o);
       } else {
         // skewed in the world (turned below a piece scaled unevenly), which neither parent holds as it
         // is: it hangs from the root where its channels come closest (its origin where it was)
         doc.setParent(id, root, true, { world, parentWorld: rootWorld });
-        if (!quiet) unskewed.push(o.name);
+        add(unskewed, quiet, o);
       }
     }
     const from = kept.parentWorlds.get(id) ?? null;
     const motion = keepMotion(doc, id, world, from, restParentWorld(doc, doc.getObject(id)!));
-    if (quiet) continue;
-    if (motion === 'changed') moved.set(parent, [...(moved.get(parent) ?? []), o.name]);
+    if (motion === 'changed') {
+      const g = moved.get(parent) ?? group();
+      moved.set(parent, g);
+      add(g, quiet, o);
+    }
     const gone = lostMover(
       kept.movers.get(id) ?? [],
       moversOf(doc, id),
       words.restaged ? kept.tops : null,
       onBone,
     );
-    if (gone) lost.set(gone.name, [...(lost.get(gone.name) ?? []), o.name]);
-    if (namedWhenKept(o)) named.push(o.name);
+    if (gone) {
+      const g = lost.get(gone.name) ?? group();
+      lost.set(gone.name, g);
+      add(g, quiet, o);
+    }
+    if (namedWhenKept(o)) add(named, quiet, o);
   }
-  const out: string[] = [];
-  if (named.length && !words.listed)
-    out.push(
-      words.gone
-        ? `${words.gone} goes; ${namesWith(named, 'stays where it is', 'stay where they are')}${root ? `, on ${words.on}` : ''}`
-        : keptWarning(named, words.of),
-    );
-  if (stayed.length)
-    out.push(
-      namesWith(stayed, 'stays where it was', 'stay where they were') +
-        `, not on ${words.on}: its scale would change ${stayed.length > 1 ? 'them' : 'it'} there`,
-    );
-  if (unskewed.length) {
-    const many = unskewed.length > 1;
-    out.push(
-      namesWith(unskewed, 'changes shape', 'change shape') +
-        ` on ${words.on}: the uneven scale of what ${many ? 'they' : 'it'} hung from skewed ${many ? 'them' : 'it'}, and no channels keep that skew there`,
-    );
-  }
-  for (const [parent, names] of moved) {
+  // each warning, as the names it lists: written now for the objects named now, and held back in
+  // `later` for the `unnamed` ones
+  const says: [Named, (names: readonly string[]) => string][] = [];
+  if (!words.listed)
+    says.push([
+      named,
+      (n) =>
+        words.gone
+          ? `${words.gone} goes; ${namesWith(n, 'stays where it is', 'stay where they are')}${root ? `, on ${words.on}` : ''}`
+          : keptWarning(n, words.of),
+    ]);
+  says.push([
+    stayed,
+    (n) =>
+      namesWith(n, 'stays where it was', 'stay where they were') +
+      `, not on ${words.on}: its scale would change ${n.length > 1 ? 'them' : 'it'} there`,
+  ]);
+  says.push([
+    unskewed,
+    (n) => {
+      const many = n.length > 1;
+      return (
+        namesWith(n, 'changes shape', 'change shape') +
+        ` on ${words.on}: the uneven scale of what ${many ? 'they' : 'it'} hung from skewed ${many ? 'them' : 'it'}, and no channels keep that skew there`
+      );
+    },
+  ]);
+  for (const [parent, g] of moved) {
     const where =
       parent === root ? words.on : parent ? `'${doc.getObject(parent)?.name ?? parent}'` : 'the scene';
-    out.push(
-      namesWith(names, 'is animated: its', 'are animated: their') + ` keyed motion now follows ${where}`,
-    );
+    says.push([
+      g,
+      (n) => namesWith(n, 'is animated: its', 'are animated: their') + ` keyed motion now follows ${where}`,
+    ]);
   }
-  for (const [name, names] of lost)
-    out.push(namesWith(names, 'no longer follows', 'no longer follow') + ` the animation of '${name}'`);
+  for (const [name, g] of lost)
+    says.push([
+      g,
+      (n) => namesWith(n, 'no longer follows', 'no longer follow') + ` the animation of '${name}'`,
+    ]);
+  const out: string[] = [];
+  for (const [g, say] of says) {
+    if (g.now.names.length) out.push(say(g.now.names));
+    if (g.held.names.length && words.later) words.later.push({ ...g.held, say });
+  }
   return out;
 }
 

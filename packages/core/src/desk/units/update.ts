@@ -385,7 +385,8 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       else report.kept.push({ ...refOf(d.pk), reason: 'dropped-but-used' });
     // a driver dropped with its part goes with it; one whose part stays is the scene's, as the part
     // is. One left on what the scene deleted (a lamp's light, its object deleted here) drove
-    // nothing: it goes, unnamed, so a version that only drops it changes nothing the shots see
+    // nothing: it goes, unnamed, so a version that only drops it is no set change for the update's
+    // cameras
     for (const d of withPart) {
       const live = doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id);
       if (going.has(partOf(d)) || !live) {
