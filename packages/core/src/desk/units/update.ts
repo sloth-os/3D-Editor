@@ -55,7 +55,9 @@ import { cloneJson } from '../../util/json';
  * drivers.ts); they are updated before the dropped parts go, so a driver the unit drops is no use of
  * the part it drives. One the new version drops together with the part it drives goes with that
  * part, or stays with it when the scene still uses the part (the scene's then, as the part is), and
- * what it reads stays with it.
+ * what it reads stays with it. The report names the drivers the update wrote or removed (`drivers`),
+ * as it names the parts it added, updated or removed: a version that changes only a driver changes
+ * the scene all the same.
  *
  * The same content (an equal body digest) changes no part: only the provenance moves (noop).
  */
@@ -73,6 +75,11 @@ export interface UnitUpdateReport {
   added: UnitPartRef[];
   removed: UnitPartRef[];
   kept: (UnitPartRef & { reason: UnitKeptReason })[];
+  /**
+   * The unit's drivers the update wrote or removed in the scene, by their scene keys (fcurveKey): a
+   * driver the scene edited or deleted, or one the new version gives as it was, is not among them.
+   */
+  drivers: { added: string[]; updated: string[]; removed: string[] };
   warnings: string[];
 }
 
@@ -213,6 +220,7 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     added: [],
     removed: [],
     kept: [],
+    drivers: { added: [], updated: [], removed: [] },
     warnings: [],
   };
   const writeProvenance = (parts: Map<string, UnitPartStamp>, drivers: Map<string, string>) => {
@@ -362,14 +370,12 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
     }
     // the unit's drivers, stamped as parts are (drivers.ts), before the dropped parts go: a driver
     // of the unit on a part it drops goes with it and does not keep it
-    const { table: drivers, withPart } = updateDrivers(
-      doc,
-      inst.drivers,
-      unit.body.drivers,
-      toSourceId(index),
-      mapOut,
-      report.warnings,
-    );
+    const {
+      table: drivers,
+      withPart,
+      changed,
+    } = updateDrivers(doc, inst.drivers, unit.body.drivers, toSourceId(index), mapOut, report.warnings);
+    report.drivers = changed;
     const going = unusedDrops(doc, new Set(drops.map((d) => dataKey(d.kind, d.id))), withPart);
     const gone = drops.filter((d) => going.has(dataKey(d.kind, d.id)));
     for (const d of drops)
@@ -377,8 +383,10 @@ export function updateUnit(doc: SceneDoc, root: string, unit: UnitPayload, pin: 
       else report.kept.push({ ...refOf(d.pk), reason: 'dropped-but-used' });
     // a driver dropped with its part goes with it; one whose part stays is the scene's, as the part is
     for (const d of withPart)
-      if (going.has(partOf(d)) || !doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id))
+      if (going.has(partOf(d)) || !doc.has(ANIM_TARGET_KINDS[d.target_type]!, d.target_id)) {
         doc.removeDriver(fcurveKey(d));
+        report.drivers.removed.push(fcurveKey(d));
+      }
     const objects = gone.filter((d) => d.kind === 'objects').map((d) => d.id);
     if (objects.length) doc.removeObjects(objects);
     for (const d of gone) {

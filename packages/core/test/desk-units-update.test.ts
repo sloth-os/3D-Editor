@@ -418,6 +418,36 @@ describe("a unit's drivers in an instance", () => {
     expect(unitStatus(doc, root)).toEqual({ edited: [], missing: [] });
   });
 
+  it('the report names the drivers the update wrote or removed, by their scene keys, and none it kept', () => {
+    const { sail, version } = kites();
+    const { doc, root, sail: id } = placed(version(null), sail);
+    const recoloured = (b: UnitBody) => {
+      const m = Object.values(b.blocks.materials!)[0];
+      m.base_color = [0.9, 0.1, 0.1, 1];
+    };
+    const added = updateUnit(doc, root, version('frame / 10'), pin(2, SHA2));
+    const key = fcurveKey(doc.listDrivers(id)[0]);
+    expect(added.drivers).toEqual({ added: [key], updated: [], removed: [] });
+    // no part changed: the driver alone did
+    expect([added.updated, added.added, added.removed]).toEqual([[], [], []]);
+    const updated = updateUnit(doc, root, version('frame / 20'), pin(3, '3'.repeat(64)));
+    expect(updated.drivers).toEqual({ added: [], updated: [key], removed: [] });
+    // a version that changes a part and gives the driver as it was names no driver
+    const same = updateUnit(doc, root, version('frame / 20', recoloured), pin(4, '4'.repeat(64)));
+    expect(same.updated).not.toEqual([]);
+    expect(same.drivers).toEqual({ added: [], updated: [], removed: [] });
+    // one edited in the scene is kept: neither written nor removed
+    doc.setDriver({ ...doc.listDrivers(id)[0], expression: 'frame / 5' });
+    const kept = updateUnit(doc, root, version('frame / 30'), pin(5, '5'.repeat(64)));
+    expect(kept.drivers).toEqual({ added: [], updated: [], removed: [] });
+    // put back as the unit last gave it (the stamp an edit kept), it is the unit's again, and a
+    // version that drops it removes it
+    doc.setDriver({ ...doc.listDrivers(id)[0], expression: 'frame / 20' });
+    const removed = updateUnit(doc, root, version(null), pin(6, '6'.repeat(64)));
+    expect(removed.drivers).toEqual({ added: [], updated: [], removed: [key] });
+    expect(doc.listDrivers()).toEqual([]);
+  });
+
   it('one deleted in the scene stays deleted at the next version', () => {
     const { sail, version } = kites();
     const { doc, root, sail: id } = placed(version('frame / 10'), sail);

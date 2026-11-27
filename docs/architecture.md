@@ -1022,19 +1022,24 @@ from the words, with its reason in the record, and the other slots, the shots an
 update go on; one the scene was in the way of is pending `unavailable`, tried again at the next open
 or update. A library set that does not go in changes no set for the shots' cameras, and the record
 keeps the set digest of the set the scene has, not the plan's (so a later brief is told from that
-set); its report row names the set's root only while a set instance stands there or the set was
+set), as it does through an update that does not act on the set (no slot acting, `BriefDiff.set`
+false); its report row names the set's root only while a set instance stands there or the set was
 made local. A library prop that does not go in, in an update that stages the prop again only for
 its slot (`BriefDiff.props.bySlot`: the words give no reason to), leaves the prop as the desk has it,
-keys, hold or flight and string (buildProp's `fallback` false); in one whose words stage it again,
-or for a prop the desk removed, the prop is staged as without the unit. A library set slot that
-goes in changes the set for an update's cameras only when it places, replaces or takes out a set,
-or its version changes a part (`updateUnit`'s report: not one with the same content, or whose
-changes all fall on parts edited in the scene, which are kept). A prop's version whose root is another type of object than the instance's (a set's root
-is always an empty, a figure's an armature) is no update in place: it takes the instance's place in
+keys, hold or flight and string (buildProp's `fallback` false); in one that stages it again for its
+own reasons (the words', a flight over shots staged again, or a holder whose actor the update
+stages anew), or for a prop the desk removed, the prop is staged as without the unit. A library set
+slot that goes in changes the set for an update's cameras only when it places, replaces or takes
+out a set, or its version changes a part or a driver (`updateUnit`'s report, which names the parts
+and the drivers it wrote or removed: not one with the same content, or whose changes all fall on
+parts and drivers edited in the scene, which are kept). A prop's version whose root is another type
+of object than the instance's (a set's root is always an empty, a figure's an armature) is no update
+in place: it takes the instance's place in
 the insert's transaction, as another item does; an instance the scene changed so that no version
 fits it (its root's type changed by other means) leaves the slot pending `unavailable`. What the
 person put on a set or a prop whose look goes (objects of their own below its root or its parts, not
-its look: remove.ts `oldLook`), for another item, a version of another type, a library set in place
+its look nor the desk's own string or tail of a flight hung there: remove.ts `oldLook`), for another
+item, a version of another type, a library set in place
 of the words' set, or the words' set or prop back when the pin is dropped, stays in the same
 transaction (insertUnit's `keep`, removeObjectTrees' `keep`): `hangKept` hangs it from what takes
 the look's place (the new root, the words' ground or prop) where it is in the world, or leaves it
@@ -1089,16 +1094,18 @@ was built anew, staged again or no longer moves as it did. Camera data that a ca
 shares with another shot's camera changes as the update solves that camera or fits its move: the
 lens, keyed or as a plain value (`CameraKeys`), the focus distance's keys and the depth of field
 (`applyCameraMove`). The update solves that camera only while the shared data is as staged (an edit
-of it makes that camera count as set by hand too), and the data's other settings, its sensor among
-them, stay as they are. The warning that an update took a camera off and solved it again
-(`updateCameraHold`) and the one that it kept a camera set by hand both name its parent as
-`hungFromName` does, against what the person hung it from (`cameraParents`, read before any piece is
-built anew): the same object by its name, or `'Mira' (now 'Mira Jones')` when renamed; another
-object alone while an object with the old one's id is still in the scene; otherwise
-`'kite' (built anew as 'balloon')`, or `'Set Ground' (built anew)` when what was built has the old
-name. The warning that the camera is kept as set by hand also names another object alone when that
-object was there before the update (the set's ground, or the root of a look or instance whose part
-went). An update replaces the parts the scene left untouched in place, ids kept, so shots, holds and
+of its settings or keys makes that camera count as set by hand too; a driver put on it does not, as
+`motionDigest` leaves drivers out), and the data's other settings, its sensor among them, stay as
+they are. The warning that an update took a camera off and solved it again (`updateCameraHold`) and
+the one that it kept a camera set by hand because what it hangs from was built anew, staged again or
+no longer moves as it did both name its parent as `hungFromName` does, against what the person hung
+it from (`cameraParents`, read before any piece is built anew): the same object by its name, or
+`'Mira' (now 'Mira Jones')` when renamed; another object alone while an object with the old one's id
+is still in the scene; otherwise `'kite' (built anew as 'balloon')`, or `'Set Ground' (built anew)`
+when what was built has the old name. That set-by-hand warning also names another object alone when
+that object was there before the update (the set's ground, or the root of a look or instance whose
+part went); the ones that keep a camera as set by hand because its shot's cast, camera plan or frame
+size changed, or the scene's set did, name no parent. An update replaces the parts the scene left untouched in place, ids kept, so shots, holds and
 F-curves keep resolving; it keeps parts edited or deleted in the scene, adds new parts at ids of the
 instance's generation (or of the next free one) and removes dropped untouched ones that nothing
 staying uses (a record that stays refers to it, such as another object, a camera's focus or a part

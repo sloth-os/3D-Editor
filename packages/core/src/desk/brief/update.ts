@@ -133,16 +133,18 @@ import {
  *   (units/remove.ts keepMotion); camera data it shares with another shot's camera changes as the
  *   update solves that camera or fits its move (the lens, keyed or as a plain value, the focus
  *   distance's keys and the depth of field: moves.ts CameraKeys, applyCameraMove; the update solves
- *   that camera only while the shared data is as staged, as an edit of it makes that camera count
- *   as set by hand too, and the data's other settings, its sensor among them, stay as they are); it
+ *   that camera only while the shared data is as staged, as an edit of its settings or keys makes
+ *   that camera count as set by hand too, though not a driver put on it, which the motion digests
+ *   leave out (rideo/import.ts motionDigest), and the data's other settings, its sensor among them,
+ *   stay as they are); it
  *   warns (one hung from or under another object also when what it hangs from was built anew,
  *   staged again or no longer moves in the shot as it did);
  * - a shot's camera hung from (or under) another object keeps its hang unless the update solves it:
  *   one still as staged in a shot it solves, and one the person only hung (rideo/import.ts
  *   cameraOwnAsStaged) from or under a piece the update built anew or staged again that now moves in
  *   the shot otherwise than it did. One only hung counts as set by hand when its shot's cast, camera
- *   plan or frame size changes or a library set is placed, replaced, updated or taken out (kept,
- *   with that warning), unless the update solves it so: then it is not kept, and the warning that
+ *   plan or frame size changes or a library set changes the scene's set (the library pins below;
+ *   kept, with that warning), unless the update solves it so: then it is not kept, and the warning that
  *   it is set by hand does not name it (the one that it was taken off and solved again does). A
  *   camera it solves stays on what it hangs from while that stands still through the shot, scaled
  *   evenly, not mirrored and shown; off one that moves in the shot, is scaled unevenly or is hidden
@@ -161,7 +163,9 @@ import {
  *   still the desk's own); one whose kind or height the brief changes stays the actor staged, with a
  *   warning;
  * - props whose element went go, new ones are placed, and a held prop whose holder or holder's shots
- *   changed is held (or flown) again; the set is rebuilt when its plan changed;
+ *   changed, or whose holder the update stages anew (an actor removed in the desk, staged again for
+ *   a shot the brief recasts or the update stages again), is held (or flown) again; the set is
+ *   rebuilt when its plan changed;
  * - what the person put on a piece that goes or is built anew (objects of their own below a shot's
  *   camera, an actor, a prop, a landmark, the ground, a wall or the sun: not the piece's own look)
  *   stays where it is in the world, hung from the piece built in its place, or from the set's ground
@@ -185,12 +189,12 @@ import {
  *   is lit; a new version updates the instance (its root and the parts not edited here keep their
  *   ids); another item replaces it; no pin brings the words' set back. The cameras still as staged
  *   are solved again (one set by hand is kept, with a warning) when the slot changed the scene's
- *   set: a set placed, replaced or taken out, or a version that changes a part of it (not one with
- *   the same content, or whose changes all fall on parts edited here, which are kept). A set that
- *   does not go in leaves the scene's set, and the set the record keeps of it, as they were (a later
- *   brief is told from the set the scene has); its report row names the set's root only while a
- *   set instance stands there or the set was made local (an object of the person's at that id is
- *   not the set);
+ *   set: a set placed, replaced or taken out, or a version that changes a part or a driver of it
+ *   (not one with the same content, or whose changes all fall on parts and drivers edited here,
+ *   which are kept). A set that does not go in leaves the scene's set, and the set the record keeps
+ *   of it, as they were, as does an update that does not act on the set (a later brief is told from
+ *   the set the scene has); its report row names the set's root only while a set instance stands
+ *   there or the set was made local (an object of the person's at that id is not the set);
  * - a figure restyles its member's actor in place (same armature, keys, holds, shots) when its kind
  *   and height are the actor's; a member the update adds stands as the figure; no pin brings back the
  *   mannequin of the actor's kind and height (another kind or height is refused and the actor kept:
@@ -199,9 +203,10 @@ import {
  *   root id stays; a version whose root is another type of object than the instance's replaces it,
  *   as another item does), held or flown again; no pin brings back the words' prop. One that does
  *   not go in leaves the prop the desk has as it is (its keys, its hold or flight and its string,
- *   with what hangs on it) when the brief gives no other reason to stage the prop again; otherwise,
- *   or when the desk removed the prop, the prop is staged as without the unit (the version placed
- *   before, or the words' prop), as its slot's warning says;
+ *   with what hangs on it) when nothing else stages the prop again (its element or holder changed in
+ *   the brief, a flight over shots staged again, a holder the update stages anew); otherwise, or when
+ *   the desk removed the prop, the prop is staged as without the unit (the version placed before, or
+ *   the words' prop), as its slot's warning says;
  * - a unit not held changes nothing (the words, or the version placed, stay), a slot made local stays
  *   local, a refused pin is not tried again; the record says what each slot holds;
  * - a unit saved to the host's library from a slot whose answer the desk did not take in (library.ts
@@ -380,8 +385,8 @@ export function updateFromBriefIn(
   // hangs from the new one then): what the warnings name as what the person hung it from
   const hungBefore = cameraParents(doc);
   // the warnings that keep a shot's camera as set by hand (where in `warnings`, by desk shot): its
-  // shot's cast, camera plan or frame size changed or a library set was placed, replaced, updated
-  // or taken out, or (the camera loop below) what it hangs from was built anew, staged again or
+  // shot's cast, camera plan or frame size changed or a library set changed the scene's set
+  // (setChanged), or (the camera loop below) what it hangs from was built anew, staged again or
   // moves otherwise. One the camera loop takes off and solves after all is not kept, and those
   // warnings go, for every shot that uses it
   const keptByHand = new Map<string, number[]>();
@@ -745,8 +750,9 @@ export function updateFromBriefIn(
   const setSlot = units.set;
   const setAction = setSlot?.action ?? 'none';
   // whether the library set's slot changed the scene's set: a set placed, replaced or taken out, or a
-  // version that changes a part of it (not one with the same content, or whose changes all fall on
-  // parts edited here, which are kept); a set that does not go in changes nothing
+  // version that changes a part or a driver of it (not one with the same content, or whose changes
+  // all fall on parts and drivers edited here, which are kept); a set that does not go in changes
+  // nothing
   let setChanged = false;
   if (setSlot && (setAction === 'place' || setAction === 'replace' || setAction === 'update')) {
     // a set that does not go in (its update or insert throws before writing anything) leaves the
@@ -756,7 +762,10 @@ export function updateFromBriefIn(
       if (setAction === 'update') {
         const root = setSlot.inst!.root;
         const rep = updateUnit(doc, root, setSlot.payload!, setSlot.pin!);
-        parts = rep.updated.length + rep.added.length + rep.removed.length > 0;
+        const d = rep.drivers;
+        parts =
+          rep.updated.length + rep.added.length + rep.removed.length > 0 ||
+          d.added.length + d.updated.length + d.removed.length > 0;
         warnings.push(...rep.warnings.map((w) => `the library set: ${w}`));
         const info = setSlot.held!.info as SetPlanInfo;
         const o = doc.getObject(root)!;
@@ -803,7 +812,7 @@ export function updateFromBriefIn(
   for (const d of dropped) warnings.push(...hangOnGround(doc, d.kept, d.gone, setGround(doc)));
   // the cameras still as staged see the new set: solved again (one set by hand is kept). A library
   // set that did not go in (slotFailed made its action 'none'), or a version that changes none of
-  // its parts, left the set as it was: no camera sees a new set then
+  // its parts and drivers, left the set as it was: no camera sees a new set then
   if (setChanged)
     for (const d of hostShots(doc, sceneId).values()) {
       if (!d.camera || solve.has(d.id)) continue;
@@ -834,11 +843,14 @@ export function updateFromBriefIn(
     const holder = plan.holders.get(eid) ?? null;
     const flies = holder ? flyerKind(`${p.label} ${e.name}`) : null;
     // a prop the brief did not change stays as the desk has it (also one removed in the desk), but a
-    // flight over shots staged again flies again. The words' own reasons to stage it again (its
-    // element or holder, a flight over shots staged again) are told from its library prop's slot
+    // flight over shots staged again flies again, and one whose holder this update stages anew (its
+    // actor removed in the desk, its shot recast or staged again) is held or flown by the new actor,
+    // not by the one that went. The words' own reasons to stage it again (its element or holder, a
+    // flight over shots staged again, a holder staged anew) are told from its library prop's slot
     // acting alone (bySlot), which stages it again only once its unit goes in
     const words =
       (diff.props.restage.has(eid) && !diff.props.bySlot.has(eid)) ||
+      (holder !== null && created.has(holder)) ||
       (flies !== null &&
         holderRuns(shotsAfter, holder)
           .flat()
@@ -932,7 +944,7 @@ export function updateFromBriefIn(
   // cameraOwnAsStaged) from or under a piece it built anew or staged again that now moves in the
   // shot otherwise than it did: it would ride a motion no one framed (taken off only when what it
   // hangs from moves in the shot), also when its shot's cast, camera plan or frame size changed or
-  // a library set was placed, replaced, updated or taken out, which kept it as set by hand above:
+  // a library set changed the scene's set (setChanged), which kept it as set by hand above:
   // it is not kept then, and the warning that it was taken off and solved names it, not one that it
   // is set by hand (those go: notKept). Any other keeps its hang as the kept-objects rules
   // (hangKept) left it, on the piece built in place of what it hung from. Those rules name the
@@ -1034,11 +1046,14 @@ export function updateFromBriefIn(
     removedKept,
     recordPinsOf(units, done),
   );
-  // a library set that did not go in left the scene's set as it was: the record keeps that set's
-  // digest (the plan's is of a set never built), so that a later brief is told from the set the
+  // a library set that did not go in left the scene's set as it was, as does an update that does not
+  // act on the set (no slot acts and the plan's set is the record's, or the brief is the one staged: a
+  // set that did not go in before keeps the record's set apart from the plan's): the record keeps that
+  // set's digest (the plan's is of a set never built), so that a later brief is told from the set the
   // scene has
   const setFailed = setSlot !== null && setAction !== 'none' && setSlot.action === 'none';
-  const next = setFailed ? { ...planned, set: record.set } : planned;
+  const setKept = setFailed || (setAction === 'none' && !diff.set);
+  const next = setKept ? { ...planned, set: record.set } : planned;
   writeBriefRecord(doc, next);
   const objectOf = (s: SlotUnit): string | null =>
     'set' in s.slot

@@ -191,7 +191,10 @@ export interface OldLook {
   look: string[];
   /** The tops of what stays below the object: what the person put there, cameras, other actors. */
   kept: string[];
-  /** The names of the kept objects that are not cameras or actors, for a warning. */
+  /**
+   * The names of the kept objects that are not cameras, actors or a flight's string or tail (the
+   * desk's own, which the caller takes out), for a warning.
+   */
   named: string[];
 }
 
@@ -227,12 +230,19 @@ export function oldLook(doc: SceneDoc, root: string): OldLook {
         continue;
       }
       kept.push(child);
-      if (namedWhenKept(o)) named.push(o.name);
+      if (namedWhenKept(o) && !tetherPart(o)) named.push(o.name);
     }
   };
   walk(root);
   return { look: [...look], kept, named };
 }
+
+/**
+ * The string or tail desk.tether_fly made for a flight: the desk's own, not the person's, which a
+ * flight flown again makes anew (the caller takes the old ones out: rideo/import.ts dropTether).
+ */
+const tetherPart = (o: ObjectData): boolean =>
+  o.custom_props?.desk_string_to !== undefined || o.custom_props?.desk_tail_of !== undefined;
 
 /** Whether the warnings name an object that stays when a new look comes (cameras and actors are not named). */
 export const namedWhenKept = (o: ObjectData): boolean =>

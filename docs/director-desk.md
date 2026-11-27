@@ -591,13 +591,14 @@ and no other shot's keys are cut:
   of what the person put on such a piece change (below); camera data it shares with another shot's
   camera changes as the update solves that camera or fits its move (the lens, keyed or as a plain
   value, the focus distance's keys and the depth of field; the update solves that camera only while
-  the shared data is as staged, as an edit of it makes that camera count as set by hand too, and
+  the shared data is as staged, as an edit of its settings or keys makes that camera count as set
+  by hand too, though not a driver put on it, which what the desk records of a camera leaves out;
   the data's other settings, its sensor among them, stay as they are); it warns when its shot's
   cast, camera plan or frame size changes or a library set changes the scene's set (a set placed,
-  replaced or taken out, or a version that changes a part of it: not one with the same content, or
-  whose changes all fall on parts edited in the desk, nor a set that does not go in), and, for one
-  hung from or under another object, when what it hangs from was built anew or staged again or no
-  longer moves in the shot as it did:
+  replaced or taken out, or a version that changes a part or a driver of it: not one with the same
+  content, or whose changes all fall on parts and drivers edited in the desk, nor a set that does
+  not go in), and, for one hung from or under another object, when what it hangs from was built
+  anew or staged again or no longer moves in the shot as it did:
   `Shot 1: its camera was set by hand in the desk and is kept; what it hangs from, 'Red kite' (built anew as 'Red balloon'), no longer moves as it did, so check its framing (solve it again with desk.shot_solve)`;
 - a shot's camera the person only hung from, or under, another object (its keys and its lens's, its
   settings, constraints and what hangs below it as staging left them: a hang only sets its parent
@@ -634,7 +635,9 @@ and no other shot's keys are cut:
   keeps the desk's name, with a warning; one whose kind or height the brief changes stays the actor
   staged, with a warning;
 - props whose element went go and new ones are placed; a held prop whose holder or holder's shots
-  changed is held (or flown) again; the set is built again when its plan changed;
+  changed, or whose holder the update stages anew (an actor removed in the desk, staged again for a
+  shot the brief recasts or the update stages again), is held (or flown) again; the set is built
+  again when its plan changed;
 - what the person put on a piece the update builds anew or takes out (objects of their own below a
   prop the words describe anew or drop, a landmark, the ground, a wall or the sun lamp, a cast
   member or a shot's camera that goes, a kite's string flown again) stays, in the same undo step:
@@ -661,22 +664,23 @@ and no other shot's keys are cut:
   instance (its root and the parts not edited in the desk keep their ids), another item replaces it,
   and no pin brings the words' set back; what the person put on the set that goes stays, on the set
   that takes its place, and the warnings name it; when the slot changes the scene's set (a version
-  with the same content, or whose changes all fall on parts edited in the desk, changes none of its
-  parts), the cameras still as staged are then solved again (one set by hand is kept, with a
-  warning). A figure restyles its member's actor in place (the same
-  armature, keys, holds and shots) when its kind and height (within 5 mm) are the actor's; another
+  with the same content, or whose changes all fall on parts and drivers edited in the desk, changes
+  none of its parts and drivers), the cameras still as staged are then solved again (one set by hand
+  is kept, with a warning). A figure restyles its member's actor in place (the same armature, keys,
+  holds and shots) when its kind and height (within 5 mm) are the actor's; another
   kind or height is refused and the actor kept (stage the brief in a new project to rebuild it), and
   no pin brings back the mannequin of the actor's kind and height. A prop unit replaces the
   element's prop or updates it to a new version (its root id stays), and no pin brings the words'
   prop back. A unit not held changes nothing (the words, or the version placed, stay), a slot made
   local stays local, and a refused pin is not tried again. A unit the scene is in the way of does
   not go in and leaves its slot as it was, the rest of the update applied: a set's slot keeps the
-  scene's set, which the record keeps too, so a later brief is told from the set the scene has (its
-  report row names the set's root only while a set instance stands there or the set was made
-  local); a prop's slot keeps the prop the desk has (its keys, its hold or flight and its string,
-  and a camera on it) when the brief gives no other reason to stage the prop again, and otherwise,
-  or when the desk removed the prop, stages it as without the unit (the version placed before, or
-  the words' prop), as the warning says.
+  scene's set, which the record keeps too, also through later updates that do not act on the set,
+  so a later brief is told from the set the scene has (its report row names the set's root only
+  while a set instance stands there or the set was made local); a prop's slot keeps the prop the
+  desk has (its keys, its hold or flight and its string, and a camera on it) when nothing else
+  stages the prop again (its element or holder changed in the brief, a flight over shots staged
+  again, a holder the update stages anew), and otherwise, or when the desk removed the prop, stages
+  it as without the unit (the version placed before, or the words' prop), as the warning says.
 
 A ripple moves everything keyed after the edit: F-curve keys (where frames are cut or inserted, a
 curve keeps the values it had on both sides of the edit, so an actor a later shot hides stays shown

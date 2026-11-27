@@ -95,9 +95,11 @@ function driverName(doc: SceneDoc, d: DriverData): string {
  * Updates the unit's drivers in the scene (inside the update's transaction, after its parts) from the
  * instance's `stamps` to the new version's `next` drivers (source ids), as the module comment says.
  * `toSrc` maps scene ids to source ids, `toScene` source ids to the scene ids of the parts the update
- * keeps (null: none). Returns the new table (`table`) and the drivers the new version drops together
+ * keeps (null: none). Returns the new table (`table`), the drivers the new version drops together
  * with the part they drive, left in place (`withPart`: the update removes each with its part, or
- * leaves it to the scene with the part when the scene still uses that), and pushes warnings.
+ * leaves it to the scene with the part when the scene still uses that), and the scene keys
+ * (fcurveKey) of the drivers it wrote or removed (`changed`: a driver the scene edited or deleted, or
+ * one the new version gives as it was, is not among them), and pushes warnings.
  */
 export function updateDrivers(
   doc: SceneDoc,
@@ -106,15 +108,22 @@ export function updateDrivers(
   toSrc: IdMap,
   toScene: IdMap,
   warnings: string[],
-): { table: Map<string, string>; withPart: DriverData[] } {
+): {
+  table: Map<string, string>;
+  withPart: DriverData[];
+  changed: { added: string[]; updated: string[]; removed: string[] };
+} {
   const out = new Map<string, string>();
   const withPart: DriverData[] = [];
+  const changed = { added: [] as string[], updated: [] as string[], removed: [] as string[] };
   const current = sceneDrivers(doc, toSrc);
   const nextByKey = new Map(next.map((d) => [driverKeyOf(d), d]));
-  const write = (d: UnitRecord): boolean => {
+  const write = (d: UnitRecord, into: string[]): boolean => {
     const placed = mapDriverRefs(d, toScene);
     if (!placed) return false;
-    doc.setDriver(cloneJson(placed) as unknown as DriverData);
+    const driver = cloneJson(placed) as unknown as DriverData;
+    doc.setDriver(driver);
+    into.push(fcurveKey(driver));
     return true;
   };
   for (const key of [...new Set([...stamps.keys(), ...nextByKey.keys()])].sort()) {
@@ -123,7 +132,7 @@ export function updateDrivers(
     const cur = current.get(key);
     if (old === undefined) {
       // new in this version: added unless the scene drives that channel itself
-      if (nd && !cur && write(nd)) out.set(key, driverSum16(nd));
+      if (nd && !cur && write(nd, changed.added)) out.set(key, driverSum16(nd));
       continue;
     }
     if (!cur) {
@@ -147,10 +156,13 @@ export function updateDrivers(
     if (!nd) {
       const kind = ANIM_TARGET_KINDS[cur.src.target_type as AnimTargetType]!;
       if (toScene(kind, String(cur.src.target_id)) === null) withPart.push(cur.scene);
-      else doc.removeDriver(fcurveKey(cur.scene));
+      else {
+        doc.removeDriver(fcurveKey(cur.scene));
+        changed.removed.push(fcurveKey(cur.scene));
+      }
     } else if (driverSum16(nd) === old) out.set(key, old);
-    else if (write(nd)) out.set(key, driverSum16(nd));
+    else if (write(nd, changed.updated)) out.set(key, driverSum16(nd));
     else out.set(key, old);
   }
-  return { table: out, withPart };
+  return { table: out, withPart, changed };
 }
