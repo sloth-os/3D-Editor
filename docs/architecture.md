@@ -1063,15 +1063,17 @@ head part) hangs from the same bone of the new root when the root is that armatu
 place. One skewed by an uneven scale above it, which no parent holds, keeps its origin and is named
 as changing shape. A flight's string or tail of the desk's own (rideo/import.ts `tetherPartsOf`)
 hung there stays like the rest. A brief update takes out the string and tail of a flight it flies
-again only when it stages the props (`dropTether`, naming what the person hung on them), after the
-steps that keep what the person put on what goes or takes a new look: those steps (an actor's new
-look, the library set placed or taken out, a cast member's actor or a shot's camera that goes, a
-prop whose element goes, a landmark the words drop) hold back the warnings naming a string or tail
-(insertUnit's and `hangKept`'s `unnamed` and `later`) and write them once the props are staged, in
-the same words, naming only the ones still there (`laterWarnings`). The insert of a prop's slot
-acting alone, which takes its own flight's string and tail out right after, names none of them.
-A piece the words build anew in its place (a prop or a landmark described anew, the set's ground
-or walls built again) still names, at once, one hung on it. The same steps keep
+again only when it stages the props (`dropTether`, naming what the person hung on them), and any
+step of the update that keeps what the person put on a piece it builds anew, takes out or gives a
+new look can keep such a string first: an actor's new look, the library set placed or taken out,
+the set built or lit again, a landmark or a prop built anew or dropped, a cast member's actor or a
+shot's camera that goes, a prop whose element goes, and `dropTether` itself (another flight's
+string hung on the one it takes out). Each of them holds back the warnings naming a string or tail
+(insertUnit's and `hangKept`'s `unnamed` and `later`, handed down as `HeldBack` through set.ts
+`buildSet` and `lightSet` and rideo/import.ts `buildLandmark`, `buildProp`, `hangOnGround` and
+`dropTether`), and the update writes them once the props are staged, in the same words after the
+step's own prefix (remove.ts `heldWith`), naming only the ones still there (`laterWarnings`): it
+names no string or tail it takes out as kept or as staying. The same steps keep
 what the person put on what staging and updates build anew or
 take out without a library unit (`keptPlaces`, then `hangKept`): a words' prop or landmark built
 anew or dropped, the words' ground, walls and sun built again (`buildSet` and `lightSet`, which name

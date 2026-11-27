@@ -7,7 +7,17 @@ import { DESK_PROPS } from './props';
 import { deskProp, rideoSunVector } from './layout';
 import { setDeskSettings } from './shots';
 import { listUnits, unitOf } from './units/list';
-import { hangKept, keptPlaces, oldLook, restWorld, sameWorld, type KeptPlaces } from './units/remove';
+import {
+  hangKept,
+  heldWith,
+  keptPlaces,
+  oldLook,
+  restWorld,
+  sameWorld,
+  type HeldBack,
+  type KeptPlaces,
+  type LaterWarning,
+} from './units/remove';
 
 /*
  * The set of a scene (spec §4 desk.set_build, §1 sun): rideo's set rebuilt in the editor.
@@ -164,12 +174,15 @@ function keptOn(doc: SceneDoc, old: readonly ObjectData[]): KeptOnSet[] {
  * the new wall of its name, on the sun from the new sun, else (the new set has no such piece) from
  * `pieces.ground` (the scene when there is none). Returns the warnings naming it; what hangs from a
  * piece with the name and the place of the one it was on (a set built again as it was, as every
- * rideo import builds it) is not named, as nothing changed for it.
+ * rideo import builds it) is not named, as nothing changed for it. `held`: objects a later step of
+ * the caller may take out, whose warnings wait in `held.later`, in the same words (units/remove.ts
+ * KeptWords' `unnamed`).
  */
 function hangOnSet(
   doc: SceneDoc,
   kept: readonly KeptOnSet[],
   pieces: { ground: string | null; walls: readonly string[]; sun: string | null },
+  held: HeldBack = {},
 ): string[] {
   const out: string[] = [];
   for (const { on, places, was } of kept) {
@@ -189,7 +202,14 @@ function hangOnSet(
       on: root ? `'${doc.getObject(root)?.name}'` : 'the scene',
       listed: same,
     };
-    out.push(...hangKept(doc, root, places, words).map((w) => `the set: ${w}`));
+    const later: LaterWarning[] = [];
+    const named = hangKept(doc, root, places, {
+      ...words,
+      unnamed: held.unnamed,
+      later: held.later && later,
+    });
+    out.push(...named.map((w) => `the set: ${w}`));
+    held.later?.push(...heldWith(later, 'the set: '));
   }
   return out;
 }
@@ -204,15 +224,16 @@ export function setGround(doc: SceneDoc): string | null {
 
 /**
  * Builds the set: ground, sky or sun lamp, interior walls; replaces the set built before and records
- * the set's size in the desk settings.
+ * the set's size in the desk settings. `held`: as hangOnSet's, for what the person put on the set
+ * built before.
  */
-export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
+export function buildSet(doc: SceneDoc, o: DeskSetOptions, held: HeldBack = {}): DeskSetResult {
   const width = Math.max(0.01, o.width);
   const depth = Math.max(0.01, o.depth);
   const unitRoot = setUnitRoot(doc);
   if (unitRoot) {
     // a library set: its ground and walls are the unit's; only the light and the settings change
-    const lit = lightSet(doc, o);
+    const lit = lightSet(doc, o, held);
     setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
     return { ground: unitRoot, walls: [], sun: lit.sun, removed: lit.removed, warnings: lit.warnings };
   }
@@ -306,7 +327,7 @@ export function buildSet(doc: SceneDoc, o: DeskSetOptions): DeskSetResult {
 
   const sun = lightUp(doc, o);
   setDeskSettings(doc, { set_width: width, set_depth: depth, interior: o.interior });
-  const warnings = hangOnSet(doc, kept, { ground, walls, sun });
+  const warnings = hangOnSet(doc, kept, { ground, walls, sun }, held);
   return { ground, walls, sun, removed: old.map((x) => x.id), warnings };
 }
 
@@ -321,17 +342,18 @@ export function setUnitRoot(doc: SceneDoc): string | null {
  * environment (a SKY one becomes STUDIO) and a 'Set Sun' lamp. Sun lamps of an earlier set are
  * removed first, never one inside a unit instance (a library set's own lights stay); what the person
  * put on one stays, on the new sun lamp (the set's ground with `sky`). Returns the sun lamp (null with
- * `sky`), the objects removed and the warnings naming what stays.
+ * `sky`), the objects removed and the warnings naming what stays (`held`: as hangOnSet's).
  */
 export function lightSet(
   doc: SceneDoc,
   o: Pick<DeskSetOptions, 'sun_azimuth_deg' | 'sun_elevation_deg' | 'sky'>,
+  held: HeldBack = {},
 ): { sun: string | null; removed: string[]; warnings: string[] } {
   const old = setPieces(doc, SUN_LABELS);
   const kept = keptOn(doc, old);
   doc.removeObjects(old.map((x) => x.id));
   const sun = lightUp(doc, o);
-  const warnings = hangOnSet(doc, kept, { ground: setGround(doc), walls: [], sun });
+  const warnings = hangOnSet(doc, kept, { ground: setGround(doc), walls: [], sun }, held);
   return { sun, removed: old.map((x) => x.id), warnings };
 }
 

@@ -34,6 +34,7 @@ import {
   removeKeeping,
   removeObjectTrees,
   sameWorld,
+  type HeldBack,
   type KeptPlaces,
   type LaterWarning,
 } from '../units/remove';
@@ -387,7 +388,7 @@ export function hangOnGround(
   kept: KeptPlaces,
   gone: string,
   ground: string | null = setGround(doc),
-  held: { unnamed?: ReadonlySet<string>; later?: LaterWarning[] } = {},
+  held: HeldBack = {},
 ): string[] {
   const on = !ground
     ? 'the scene'
@@ -2290,13 +2291,19 @@ export function tetherPartsOf(doc: SceneDoc, flyer: string): string[] {
 /**
  * Takes out the string and tail desk.tether_fly made for flyer `flyer` (a flight flown again makes
  * new ones), but for what the person put on them, which stays on the ground (hangOnGround). Returns
- * the warnings naming it.
+ * the warnings naming it; those naming `held.unnamed` objects (another flight's string or tail the
+ * person hung on them) wait in `held.later`.
  */
-export function dropTether(doc: SceneDoc, flyer: string, ground?: string | null): string[] {
+export function dropTether(
+  doc: SceneDoc,
+  flyer: string,
+  ground?: string | null,
+  held: HeldBack = {},
+): string[] {
   const parts = tetherPartsOf(doc, flyer);
   if (!parts.length) return [];
   const gone = `'${doc.getObject(parts[0])?.name ?? parts[0]}'`;
-  return hangOnGround(doc, removeKeeping(doc, parts), gone, ground);
+  return hangOnGround(doc, removeKeeping(doc, parts), gone, ground, held);
 }
 
 /** Whether an earlier import's object (in the scene) was built as `build` says, to be kept; one built otherwise is built anew. */
@@ -2403,9 +2410,9 @@ const movesAlike = (was: PropMove | null, now: PropMove | null): boolean =>
  * a warning. What the person put on the prop a unit takes the place of (objects of their own below
  * it, not its look) stays, hung from the new root where it is in the world (insertUnit's `keep`), and
  * follows the root's motion where the staging moves it (`move`) as it moved that prop (movesAlike;
- * `byHand`: the person keyed that prop too, see buildProp). `unnamed`: what of that the caller
- * takes out right after (see buildProp), which the insert keeps like the rest but names in no
- * warning.
+ * `byHand`: the person keyed that prop too, see buildProp). `held.unnamed`: what of that the caller
+ * may take out after (see buildProp), which the insert keeps like the rest and names in a warning
+ * that waits in `held.later`, or in none without it.
  */
 function buildUnitProp(
   doc: SceneDoc,
@@ -2417,7 +2424,7 @@ function buildUnitProp(
   old: ObjectData | undefined,
   unit: StagedProp,
   byHand: boolean,
-  unnamed: readonly string[],
+  held: { unnamed: Iterable<string>; later?: LaterWarning[] },
 ): { root: string; baseScale: Vec3; model: string | null; created: boolean; warnings: string[] } {
   const model = `unit:${unit.pin.ref}@${unit.pin.version}`;
   const build = JSON.stringify(['prop', model, label, flies]);
@@ -2471,7 +2478,8 @@ function buildUnitProp(
           }
         : {}),
       rootProps: own,
-      unnamed,
+      unnamed: held.unnamed,
+      later: held.later,
     });
     root = r.root;
     // what the person put on the prop the unit replaces stays, named here
@@ -2526,6 +2534,10 @@ const stampFacts = (
  * out right after a unit went in, its own warning naming what goes (the string and tail of the
  * flight before, which an update acting for the prop's slot alone takes out only once its unit is
  * in: dropTether); the unit's insert keeps them like the rest but names them in no warning.
+ * `held`: objects a later step of the caller may take out (the desk's strings and tails, which an
+ * update takes out once its props are staged); what the person put on the prop that goes is hung
+ * like the rest, and the warnings naming them (and `unnamed`) wait in `held.later`, in the same
+ * words (units/remove.ts KeptWords' `unnamed`).
  */
 export function buildProp(
   doc: SceneDoc,
@@ -2540,6 +2552,7 @@ export function buildProp(
   byHand = false,
   fallback = true,
   unnamed: readonly string[] = [],
+  held: HeldBack = {},
 ): {
   root: string;
   baseScale: Vec3;
@@ -2551,7 +2564,12 @@ export function buildProp(
   const label = p.label || elementName || p.id;
   if (unit)
     try {
-      return buildUnitProp(
+      // held: the insert's warnings naming them wait, only once it went in
+      const later: LaterWarning[] = [];
+      const quiet = held.later
+        ? { unnamed: new Set([...unnamed, ...(held.unnamed ?? [])]), later }
+        : { unnamed };
+      const made = buildUnitProp(
         doc,
         p,
         label,
@@ -2567,12 +2585,28 @@ export function buildProp(
         old,
         unit,
         byHand,
-        unnamed,
+        quiet,
       );
+      held.later?.push(...later);
+      return made;
     } catch (err) {
       if (!fallback) throw err;
       return {
-        ...buildProp(doc, p, elementName, castNames, stamp, flies, move, old, undefined, byHand),
+        ...buildProp(
+          doc,
+          p,
+          elementName,
+          castNames,
+          stamp,
+          flies,
+          move,
+          old,
+          undefined,
+          byHand,
+          true,
+          [],
+          held,
+        ),
         failed: err,
       };
     }
@@ -2672,7 +2706,13 @@ export function buildProp(
   // what stays follows the new prop, and is named as no longer following the old one's motion unless
   // the staging moves the new one alike (held or flown again by the same holder, or hidden again)
   const warnings = kept
-    ? hangKept(doc, root, kept, { of, on: "the words' prop", restaged: movesAlike(was, move) })
+    ? hangKept(doc, root, kept, {
+        of,
+        on: "the words' prop",
+        restaged: movesAlike(was, move),
+        unnamed: held.unnamed,
+        later: held.later,
+      })
     : [];
   if (replaced) remapShotRefs(doc, replaced, root);
   const s = doc.getObject(root)!.scale;
@@ -2685,6 +2725,8 @@ export function buildProp(
  * what was added to it since) and put on its mark. One built otherwise goes for the one built in its
  * place, but for what the person put on it (objects of their own below it, not its look), which the
  * new landmark takes over where it is in the world; `warnings` names it (units/remove.ts hangKept).
+ * `held`: objects a later step of the caller may take out, whose warnings wait in `held.later`, in
+ * the same words (KeptWords' `unnamed`).
  */
 export function buildLandmark(
   doc: SceneDoc,
@@ -2693,6 +2735,7 @@ export function buildLandmark(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   old?: ObjectData,
+  held: HeldBack = {},
 ): {
   id: string;
   name: string;
@@ -2790,7 +2833,12 @@ export function buildLandmark(
   }
   doc.updateObject(id, { location, custom_props: { ...o.custom_props, ...props } });
   const warnings = kept
-    ? hangKept(doc, id, kept, { of: 'the landmark it replaces', on: 'the new landmark' })
+    ? hangKept(doc, id, kept, {
+        of: 'the landmark it replaces',
+        on: 'the new landmark',
+        unnamed: held.unnamed,
+        later: held.later,
+      })
     : [];
   return { id, name: o.name, shape, model, created, ...(warnings.length ? { warnings } : {}) };
 }

@@ -499,6 +499,20 @@ export function laterWarnings(doc: SceneDoc, later: readonly LaterWarning[]): st
   return out;
 }
 
+/**
+ * What a caller hands a step that keeps objects: the ones a later step of the caller may take out
+ * (KeptWords' `unnamed`) and where the warnings naming them wait (`later`).
+ */
+export interface HeldBack {
+  unnamed?: ReadonlySet<string>;
+  later?: LaterWarning[];
+}
+
+/** The warnings of `later`, each said after `prefix`, as the step that held them says its others. */
+export function heldWith(later: readonly LaterWarning[], prefix: string): LaterWarning[] {
+  return later.map((w) => ({ ...w, say: (names) => prefix + w.say(names) }));
+}
+
 /** "'A' is …" / "'A' and 'B' are …": `one` or `many` after the names. */
 const namesWith = (names: readonly string[], one: string, many: string): string =>
   `${quoted(names)} ${names.length > 1 ? many : one}`;

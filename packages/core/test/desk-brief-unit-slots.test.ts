@@ -76,8 +76,27 @@ interface Library {
   set: Lib;
   kite: Lib;
   mira: Lib;
-  units: { set: UnitPayload; kite: UnitPayload; mira: UnitPayload };
+  /** An interior set: open.json staged indoors. */
+  room: Lib;
+  /** The picnic blanket's library prop (withBlanket). */
+  blanket: Lib;
+  units: { set: UnitPayload; kite: UnitPayload; mira: UnitPayload; blanket: UnitPayload };
 }
+
+const BLANKET = 'ele_0123456789blnk';
+/**
+ * `b` with a picnic blanket, listed at `at` (before the kite by default: an update stages the props
+ * in the order of their elements).
+ */
+const withBlanket = (b: SceneBrief = openBrief(), at = 1): SceneBrief => {
+  b.elements.splice(at, 0, {
+    id: BLANKET,
+    name: 'Picnic blanket',
+    description: 'A red checked picnic blanket.',
+    kind: 'prop',
+  } as SceneBrief['elements'][number]);
+  return b;
+};
 
 let made: Library | null = null;
 /** The units made from open.json staged (once). */
@@ -88,11 +107,21 @@ function library(): Library {
   const kite = unitFrom(src, { kind: 'prop', root: propOf(src, KITE).id, name: 'Red kite' });
   const mira = unitFrom(src, { kind: 'figure', actor: actorOf(src, MIRA).id, name: 'Mira' });
   src.destroy();
+  const indoors = openBrief();
+  indoors.set.interior = true;
+  const inside = stagedDoc(indoors);
+  const room = unitFrom(inside, { kind: 'set', name: 'Room' });
+  inside.destroy();
+  const picnic = stagedDoc(withBlanket());
+  const blanket = unitFrom(picnic, { kind: 'prop', root: propOf(picnic, BLANKET).id, name: 'Blanket' });
+  picnic.destroy();
   made = {
     set: lib('lib_0123456789mead', 1, set.ex.data),
     kite: lib('lib_0123456789kite', 1, kite.ex.data),
     mira: lib('lib_0123456789mira', 1, mira.ex.data),
-    units: { set: set.unit, kite: kite.unit, mira: mira.unit },
+    room: lib('lib_0123456789room', 1, room.ex.data),
+    blanket: lib('lib_0123456789blnk', 1, blanket.ex.data),
+    units: { set: set.unit, kite: kite.unit, mira: mira.unit, blanket: blanket.unit },
   };
   return made;
 }
@@ -733,28 +762,29 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
   );
 
   it.each(['pins a library figure for Mira', 'then drops the pin (the mannequin back)'] as const)(
-    "Update shots: the desk's own string the person hung under Mira is named as kept when the update %s",
+    "Update shots: the desk's own string the person hung under Mira is named as kept, after the props, when the update %s",
     (how) => {
       const L = library();
-      const { doc } = staged(openBrief());
+      const figure = how === 'pins a library figure for Mira';
+      const { doc } = staged(withBlanket());
       const kite = propOf(doc, KITE).id;
       const string = doc.listObjects().find((o) => o.custom_props?.desk_string_to === kite)!;
       doc.setParent(string.id, actorOf(doc, MIRA).id, true);
-      let { r } = update(doc, withPins(openBrief(), { cast: { [MIRA]: L.mira } }), source(L.mira));
+      cupOnBlanket(doc);
+      // the update that names the string also builds the blanket anew (the props step names the cup)
+      const pinned = withPins(withBlanket(), { cast: { [MIRA]: L.mira } });
+      let { r } = update(doc, figure ? blanketAnew(pinned) : pinned, source(L.mira));
       expect(readInstance(doc, actorOf(doc, MIRA).id)).not.toBeNull();
-      if (how !== 'pins a library figure for Mira') {
-        ({ r } = update(doc, openBrief()));
+      if (!figure) {
+        ({ r } = update(doc, blanketAnew(withBlanket())));
         expect(readInstance(doc, actorOf(doc, MIRA).id)).toBeNull();
       }
-      // a new look for Mira does not take the string out: it stays under her, and is named (once the
-      // props are staged, under her name)
-      const of =
-        how === 'pins a library figure for Mira'
-          ? 'the look the library figure replaces'
-          : "the library figure's look";
-      expect(r.warnings.filter((w) => w.includes(`'${string.name}'`))).toEqual([
-        `Mira: keeps '${string.name}', which is not part of ${of}`,
-      ]);
+      // a new look for Mira does not take the string out: it stays under her, and is named once the
+      // props are staged, under her name
+      const of = figure ? 'the look the library figure replaces' : "the library figure's look";
+      const said = [`Mira: keeps '${string.name}', which is not part of ${of}`];
+      expect(r.warnings.filter((w) => w.includes(`'${string.name}'`))).toEqual(said);
+      saidAfterProps(r, said);
       expect(doc.getObject(string.id)?.parent).toBe(actorOf(doc, MIRA).id);
     },
   );
@@ -774,6 +804,24 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
     e.description = `${e.description} It has a long blue tail.`;
     return b;
   };
+  /** `b`, with the blanket, worded in another colour: the update builds the blanket anew. */
+  const blanketAnew = (b: SceneBrief): SceneBrief => {
+    b.elements.find((e) => e.id === BLANKET)!.description = 'A blue checked picnic blanket.';
+    return b;
+  };
+  /** A cup of the person's on the blanket, which the props step names when it builds the blanket anew. */
+  function cupOnBlanket(doc: SceneDoc): void {
+    const cup = doc.addObject({ type: 'EMPTY', name: 'Cup' });
+    doc.setParent(cup, propOf(doc, BLANKET).id, true);
+  }
+  const CUP_SAID = "Picnic blanket: keeps 'Cup', which is not part of the prop it replaces";
+  /** `said` are the last warnings of `r`, written once the props are staged: after `cupSaid`. */
+  function saidAfterProps(r: StageBriefReport, said: readonly string[], cupSaid = CUP_SAID): void {
+    expect(r.warnings.slice(-said.length)).toEqual(said);
+    const cup = r.warnings.indexOf(cupSaid);
+    expect(cup).toBeGreaterThanOrEqual(0);
+    expect(cup).toBeLessThan(r.warnings.length - said.length);
+  }
   /** The ways one update takes the kite's string out, each with what the person had on it said to stay. */
   const STRING_OUT = {
     'pins the kite (its slot acting alone)': (b: SceneBrief) =>
@@ -887,22 +935,26 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
   );
 
   it.each(['places the library set', "drops the library set's pin"] as const)(
-    "Update shots: the desk's own string the person hung on the set is named as kept, after the props, when the update only %s",
+    "Update shots: the desk's own string the person hung on the set is named as kept, after the props, when the update %s and the kite stays as it was",
     (how) => {
       const L = library();
       const unpin = how.startsWith('drops');
       const { doc } = unpin
-        ? staged(withPins(openBrief(), { set: L.set }), source(L.set))
-        : staged(openBrief());
+        ? staged(withPins(withBlanket(), { set: L.set }), source(L.set))
+        : staged(withBlanket());
       const ground = doc.listObjects().find((o) => prop(o, 'desk_label') === 'ground');
       const string = hangString(doc, unpin ? deriveUnitId('set', UNIT_ROOT) : ground!.id);
-      const { r } = update(doc, unpin ? openBrief() : withPins(openBrief(), { set: L.set }), source(L.set));
+      cupOnBlanket(doc);
+      const b = blanketAnew(unpin ? withBlanket() : withPins(withBlanket(), { set: L.set }));
+      const { r } = update(doc, b, source(L.set));
       expect(doc.has('objects', string.id)).toBe(true);
-      expect(aboutString(r, string.name)).toEqual([
+      const said = [
         unpin
           ? `the set: keeps '${string.name}', which is not part of the library set`
           : `the library set: keeps '${string.name}', which is not part of the set the library set replaces`,
-      ]);
+      ];
+      expect(aboutString(r, string.name)).toEqual(said);
+      saidAfterProps(r, said);
     },
   );
 
@@ -979,18 +1031,250 @@ describe('a unit the scene is in the way of (each slot on its own)', () => {
     "Update shots: the desk's own string on a piece that goes is named as staying on the ground, after the props, when %s and the kite stays as it was",
     (how, more) => {
       const g = GOES[how];
-      const { doc } = staged(g.first());
+      const { doc } = staged(withBlanket(g.first()));
       const gone = doc.getObject(g.piece(doc))!.name;
       const string = hangString(doc, g.piece(doc));
-      const { r } = update(doc, g.next());
+      cupOnBlanket(doc);
+      const { r } = update(doc, blanketAnew(withBlanket(g.next())));
       expect(doc.has('objects', string.id)).toBe(true);
       const said = [
         `'${gone}' goes; '${string.name}' stays where it is, on the words' ground`,
         more(string.name),
       ];
       expect(aboutString(r, string.name)).toEqual(said);
-      // written once the props are staged: after every warning of the props
-      expect(r.warnings.slice(-said.length)).toEqual(said);
+      saidAfterProps(r, said);
+    },
+  );
+
+  /** An interior set: walls and a 'Set Sun' lamp of its own. */
+  const indoors = (b: SceneBrief): SceneBrief => {
+    b.set.interior = true;
+    return b;
+  };
+  const named = (doc: SceneDoc, name: string) => doc.listObjects().find((o) => o.name === name)!.id;
+  /** `b` with the pond worded as a lake: the update builds the landmark anew. */
+  const lake = (b: SceneBrief): SceneBrief => {
+    b.set.description = 'A wide green meadow on a breezy afternoon, a lake on the left, an oak tree behind.';
+    return b;
+  };
+  /**
+   * Pieces an update builds anew or takes out, keeping what the person put on them, with the kite's
+   * string hung on them: the brief staged first and its units, the piece, the brief that changes it,
+   * where the string's bead stays when the props take the string out, and what the update says of
+   * the string when it keeps it.
+   */
+  const KEEPS = {
+    "the library set placed over an interior set (its 'Set Sun' lit anew)": {
+      first: (_: Library) => indoors(withBlanket()),
+      units: (_: Library): Lib[] => [],
+      piece: (doc: SceneDoc) => named(doc, 'Set Sun'),
+      next: (L: Library) => withPins(indoors(withBlanket()), { set: L.set }),
+      on: "the library set's root",
+      kept: (s: string) => [
+        `the set: keeps '${s}', which is not part of the set built before`,
+        `the set: '${s}' is animated: its keyed motion now follows 'Meadow'`,
+      ],
+      cup: CUP_SAID,
+    },
+    'the words making an interior set outdoors (its walls go)': {
+      first: (_: Library) => indoors(withBlanket()),
+      units: (_: Library): Lib[] => [],
+      piece: (doc: SceneDoc) => named(doc, 'Set Wall Back'),
+      next: (_: Library) => withBlanket(),
+      on: "the words' ground",
+      kept: (s: string) => [`the set: keeps '${s}', which is not part of the set built before`],
+      cup: CUP_SAID,
+    },
+    "an interior library set's pin dropped for the words' outdoor set (its 'Set Sun' goes)": {
+      first: (L: Library) => withPins(indoors(withBlanket()), { set: L.room }),
+      units: (L: Library): Lib[] => [L.room],
+      piece: (doc: SceneDoc) => named(doc, 'Set Sun'),
+      next: (_: Library) => withPins(withBlanket(), { set: null }),
+      on: "the words' ground",
+      kept: (s: string) => [
+        `the set: keeps '${s}', which is not part of the set built before`,
+        `the set: '${s}' is animated: its keyed motion now follows 'Set Ground'`,
+      ],
+      cup: CUP_SAID,
+    },
+    "an interior library set lit again (the brief's time of day changes, its 'Set Sun' built anew)": {
+      first: (L: Library) => withPins(indoors(withBlanket()), { set: L.room }),
+      units: (L: Library): Lib[] => [L.room],
+      piece: (doc: SceneDoc) => named(doc, 'Set Sun'),
+      next: (L: Library) => {
+        const b = withPins(indoors(withBlanket()), { set: L.room });
+        b.set.timeOfDay = 'dusk';
+        return b;
+      },
+      on: "the library set's root",
+      kept: (s: string) => [
+        `the set: keeps '${s}', which is not part of the set built before`,
+        `the set: '${s}' is animated: its keyed motion now follows 'Set Sun'`,
+      ],
+      cup: CUP_SAID,
+    },
+    'the pond worded as a lake (the landmark built anew)': {
+      first: (_: Library) => withBlanket(),
+      units: (_: Library): Lib[] => [],
+      piece: (doc: SceneDoc) => doc.listObjects().find((o) => prop(o, 'desk_role') === 'landmark')!.id,
+      next: (_: Library) => lake(withBlanket()),
+      on: "the words' ground",
+      kept: (s: string) => [
+        `lake: keeps '${s}', which is not part of the landmark it replaces`,
+        `lake: '${s}' is animated: its keyed motion now follows the new landmark`,
+      ],
+      cup: CUP_SAID,
+    },
+    'the blanket worded anew (a prop built anew, staged before the kite)': {
+      first: (_: Library) => withBlanket(),
+      units: (_: Library): Lib[] => [],
+      piece: (doc: SceneDoc) => propOf(doc, BLANKET).id,
+      next: (_: Library) => withBlanket(),
+      on: "the words' ground",
+      kept: (s: string) => [`Picnic blanket: keeps '${s}', which is not part of the prop it replaces`],
+      cup: CUP_SAID,
+    },
+    "the blanket's library prop placed (its unit goes in, staged before the kite)": {
+      first: (_: Library) => withBlanket(),
+      units: (L: Library): Lib[] => [L.blanket],
+      piece: (doc: SceneDoc) => propOf(doc, BLANKET).id,
+      next: (L: Library) => withPins(withBlanket(), { el: { [BLANKET]: L.blanket } }),
+      on: "the words' ground",
+      kept: (s: string) => [
+        `Picnic blanket: keeps '${s}', which is not part of the look the library prop replaces`,
+      ],
+      cup: "Picnic blanket: keeps 'Cup', which is not part of the look the library prop replaces",
+    },
+  } as const;
+  /** The update of KEEPS[how] staged on a scene of its own, the string and the cup hung there. */
+  function keeping(how: keyof typeof KEEPS, out?: keyof typeof STRING_OUT) {
+    const L = library();
+    const k = KEEPS[how];
+    const units = k.units(L);
+    const { doc } = staged(k.first(L), units.length ? source(...units) : undefined);
+    const kiteName = propOf(doc, KITE).name;
+    const string = hangString(doc, k.piece(doc));
+    cupOnBlanket(doc);
+    // the update also builds the blanket anew, so the props step names the cup
+    const b = blanketAnew(out ? STRING_OUT[out](k.next(L)) : k.next(L));
+    const { r } = update(doc, b, source(...units, L.set, L.kite));
+    return { doc, r, k, string, kiteName };
+  }
+
+  it.each(
+    (Object.keys(KEEPS) as (keyof typeof KEEPS)[]).flatMap((how) =>
+      (Object.keys(STRING_OUT) as (keyof typeof STRING_OUT)[]).map((out) => [how, out] as const),
+    ),
+  )(
+    "Update shots: the desk's own string the person hung on a piece is not named as kept by %s when the same update %s",
+    (how, out) => {
+      const { doc, r, k, string, kiteName } = keeping(how, out);
+      expect(doc.has('objects', string.id)).toBe(false);
+      const gone = out === 'drops the kite' ? `'${kiteName}'` : `'${string.name}'`;
+      expect(aboutString(r, string.name)).toEqual(goneSaid(string.name, gone, k.on));
+      expect(r.warnings).toContain(k.cup);
+    },
+  );
+
+  const BALLOON = 'ele_0123456789blon';
+  /** `b` with a red balloon Mira flies in the second shot (listed, and staged, after the kite). */
+  const withBalloon = (b: SceneBrief): SceneBrief => {
+    b.elements.push({
+      id: BALLOON,
+      name: 'Red balloon',
+      description: 'A red helium balloon on a string.',
+      kind: 'prop',
+    } as SceneBrief['elements'][number]);
+    b.shots[1].elementIds = [BALLOON];
+    b.shots[1].description = 'Close-up: Mira holds the red balloon and looks up at the kite.';
+    return b;
+  };
+
+  it.each([
+    'flies both again',
+    'flies only the kite again',
+    'pins the kite (its slot acting alone) and keeps the balloon as it was',
+  ] as const)(
+    "Update shots: the balloon's string the person hung on the kite's string is named only when it stays, after the props, when the update %s",
+    (how) => {
+      const L = library();
+      // the blanket after both flyers: the props step builds it anew, naming the cup, once the
+      // kite's string went
+      const brief = () => {
+        const b = withBalloon(openBrief());
+        return withBlanket(b, b.elements.length);
+      };
+      const { doc } = staged(brief());
+      const kiteString = doc
+        .listObjects()
+        .find((o) => o.custom_props?.desk_string_to === propOf(doc, KITE).id)!;
+      const balloon = propOf(doc, BALLOON).id;
+      const string = doc.listObjects().find((o) => o.custom_props?.desk_string_to === balloon)!;
+      doc.setParent(string.id, kiteString.id, true);
+      const bead = doc.addObject({ type: 'EMPTY', name: 'Bead' });
+      doc.setParent(bead, string.id, true);
+      cupOnBlanket(doc);
+      const pins = how.startsWith('pins');
+      const b = blanketAnew(pins ? withPins(brief(), { el: { [KITE]: L.kite } }) : reworded(brief()));
+      const both = how === 'flies both again';
+      if (both) b.elements.find((e) => e.id === BALLOON)!.description = 'A blue helium balloon on a string.';
+      const { r } = update(doc, b, pins ? source(L.kite) : undefined);
+      if (pins) expect(rowsOf(r)).toContain(`el:${KITE} unit`);
+      expect(doc.has('objects', kiteString.id)).toBe(false);
+      expect(doc.has('objects', string.id)).toBe(!both);
+      if (both) {
+        // the kite's string went first, keeping the balloon's, which the balloon's flight then took out
+        expect(aboutString(r, string.name)).toEqual(
+          goneSaid(string.name, `'${string.name}'`, "the words' ground"),
+        );
+        expect(r.warnings).toContain(CUP_SAID);
+        return;
+      }
+      const said = [
+        `'${kiteString.name}' goes; '${string.name}' stays where it is, on the words' ground`,
+        `'${string.name}' no longer follows the animation of '${kiteString.name}'`,
+      ];
+      expect(aboutString(r, string.name)).toEqual(said);
+      saidAfterProps(r, said);
+    },
+  );
+
+  it.each(['flies the kite again in a third shot', 'keeps the kite as it was'] as const)(
+    "Update shots: the words' blanket built anew in place of a library prop that does not go in names the desk's own string the person hung on the blanket only when it stays, after the props, when the update %s",
+    (how) => {
+      const L = library();
+      const { doc } = staged(withBlanket());
+      const string = hangString(doc, propOf(doc, BLANKET).id);
+      cupOnBlanket(doc);
+      // the scene is in the way of the library prop: the words' blanket, worded anew, is built instead
+      blockAll(doc, `el:${BLANKET}`, objectPart(L.units.blanket));
+      const pinned = blanketAnew(withPins(withBlanket(), { el: { [BLANKET]: L.blanket } }));
+      const flies = how === 'flies the kite again in a third shot';
+      const { r } = update(doc, flies ? STRING_OUT[how](pinned) : pinned, source(L.blanket));
+      expect(rowsOf(r)).toContain(`el:${BLANKET} words unavailable`);
+      expect(readInstance(doc, propOf(doc, BLANKET).id)).toBeNull();
+      expect(doc.has('objects', string.id)).toBe(!flies);
+      if (flies) {
+        expect(aboutString(r, string.name)).toEqual(
+          goneSaid(string.name, `'${string.name}'`, "the words' ground"),
+        );
+        expect(r.warnings).toContain(CUP_SAID);
+        return;
+      }
+      const said = [`Picnic blanket: keeps '${string.name}', which is not part of the prop it replaces`];
+      expect(aboutString(r, string.name)).toEqual(said);
+      saidAfterProps(r, said);
+    },
+  );
+
+  it.each(Object.keys(KEEPS) as (keyof typeof KEEPS)[])(
+    "Update shots: the desk's own string the person hung on a piece is named as kept by %s, after the props, when the kite stays as it was",
+    (how) => {
+      const { doc, r, k, string } = keeping(how);
+      expect(doc.has('objects', string.id)).toBe(true);
+      const said = k.kept(string.name);
+      expect(aboutString(r, string.name)).toEqual(said);
+      saidAfterProps(r, said, k.cup);
     },
   );
 

@@ -15,7 +15,15 @@ import { addDeskCamera, prepareDeskCamera, retimeCameraRange } from '../moves';
 import { DESK_PROPS } from '../props';
 import { buildSet, lightSet, setGround, setUnitRoot } from '../set';
 import { unitOf } from '../units/list';
-import { hangKept, laterWarnings, removeKeeping, type KeptPlaces, type LaterWarning } from '../units/remove';
+import {
+  hangKept,
+  heldWith,
+  laterWarnings,
+  removeKeeping,
+  type HeldBack,
+  type KeptPlaces,
+  type LaterWarning,
+} from '../units/remove';
 import { updateUnit } from '../units/update';
 import { FRAMING_TABLE } from '../solver';
 import { MAX_SHOT_SUBJECTS, getDeskSettings, getShots, newShotId, setDeskSettings, setShots } from '../shots';
@@ -172,10 +180,11 @@ import {
  *   stays where it is in the world, hung from the piece built in its place, or from the set's ground
  *   once the set is staged (a piece that goes with nothing in its place), its keyed motion kept where
  *   it can be, and the warnings name it, also when it no longer follows the animation of what went
- *   (units/remove.ts hangKept). Those naming a flight's own string or tail, kept by a step before
- *   the props (what goes, an actor's new look, the library set placed or taken out), wait until the
- *   props are staged and name only the ones still there: the props take out the string and tail of
- *   a flight flown again;
+ *   (units/remove.ts hangKept). Those naming a flight's own string or tail, whichever step keeps it
+ *   (what goes, an actor's new look, the library set placed or taken out, the set built or lit
+ *   again, a landmark or a prop built anew, another flight's string taken out), wait until the props
+ *   are staged and name only the ones still there: the props take out the string and tail of a
+ *   flight flown again;
  * - notes the desk did not edit follow the brief's words; shot names that are the desk's own
  *   ('Shot 3') follow the brief's order;
  * - riders are not seated by an update: a shot it stages, or whose words or cast change, that says
@@ -430,9 +439,10 @@ export function updateFromBriefIn(
   }
 
   // the strings and tails of flights (rideo/import.ts tetherPartsOf): the props below take out
-  // those of a flight flown again, so the steps before them that keep one (the person hung it on a
-  // piece that goes or takes a new look) hold back the warnings naming it, written after the props
-  // for the ones still there, each with the prefix its step gives its warnings
+  // those of a flight flown again, so every step that keeps one (the person hung it on a piece that
+  // goes, is built anew or takes a new look; the props' own steps too) holds back the warnings
+  // naming it, written after the props for the ones still there, each with the prefix its step
+  // gives its warnings
   const tethers = new Set(doc.listObjects().flatMap((o) => (isTetherPart(o) ? [o.id] : [])));
   const heldBack: { prefix: string; later: LaterWarning[] }[] = [];
   const holdBack = (prefix: string): { unnamed: ReadonlySet<string>; later: LaterWarning[] } => {
@@ -811,7 +821,7 @@ export function updateFromBriefIn(
         warnings.push(...placed.warnings.map((w) => `the library set: ${w}`));
         heldBack.push({ prefix: 'the library set: ', later: held.later });
       }
-      warnings.push(...relightSet(doc, blocking));
+      warnings.push(...relightSet(doc, blocking, holdBack('')));
       done.add(setSlot.key);
       setChanged = parts;
     } catch (err) {
@@ -833,7 +843,7 @@ export function updateFromBriefIn(
     );
   } else if (diff.set) {
     // a library set (or one made local) is relit; the words' set is built again
-    if (plan.set.unit) warnings.push(...relightSet(doc, blocking));
+    if (plan.set.unit) warnings.push(...relightSet(doc, blocking, holdBack('')));
     else warnings.push(...restageSet(doc, blocking, brief, castNames, stamp, sceneId, holdBack('')).warnings);
   }
   // the set is staged: what stays of the cameras and actors that went hangs from its ground
@@ -866,6 +876,9 @@ export function updateFromBriefIn(
       props.delete(eid);
     }
   const shotsAfter = brief.shots.map((s) => ({ id: s.id, castIds: shotCast(s) }));
+  // what the person put on a prop built anew stays on the new one: the warnings naming a string or
+  // tail wait (a prop staged later in this loop may fly again and take it out)
+  const propsHeld = holdBack('');
   for (const [eid, p] of plannedProps) {
     const e = elementById.get(eid)!;
     const old = props.get(eid);
@@ -895,8 +908,9 @@ export function updateFromBriefIn(
     const unit = slot?.action === 'remove' ? null : propHook(doc, slot, current?.id ?? null);
     const alone = !words && !!unit?.unit && !!current;
     // the string and tail of the flight before go (a flight flown again makes new ones): for the
-    // slot alone once its unit went in
-    if (old && !alone) warnings.push(...dropTether(doc, old.id));
+    // slot alone once its unit went in. What the person hung on them stays (dropTether); another
+    // flight's string or tail among it is named once the props are staged, as the others are
+    if (old && !alone) warnings.push(...dropTether(doc, old.id, undefined, propsHeld));
     if (unit?.unit) done.add(unit.key);
     // stageHeld below holds or flies it while its holder has an actor in a shot, else hides it
     const holderActor = p.heldBy ? actors.get(p.heldBy) : undefined;
@@ -906,18 +920,24 @@ export function updateFromBriefIn(
     // the insert keeps them like the rest without naming them
     const tether = old && alone ? tetherPartsOf(doc, old.id) : [];
     let made: ReturnType<typeof buildProp>;
+    const later: LaterWarning[] = [];
     try {
-      made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand, !alone, tether);
+      made = buildProp(doc, p, e.name, castNames, stamp, flies, move, current, unit, byHand, !alone, tether, {
+        unnamed: tethers,
+        later,
+      });
     } catch (err) {
       // a unit for the slot alone that does not go in (it throws before writing anything)
       if (!alone || !slot) throw err;
       warnings.push(...slotFailed(slot, err, done));
       continue;
     }
-    if (old && alone) warnings.push(...dropTether(doc, old.id));
+    if (old && alone) warnings.push(...dropTether(doc, old.id, undefined, propsHeld));
     restagedProps.add(made.root);
     if (slot && made.failed !== undefined) warnings.push(...slotFailed(slot, made.failed, done));
-    for (const w of made.warnings ?? []) warnings.push(`${doc.getObject(made.root)!.name}: ${w}`);
+    const name = doc.getObject(made.root)!.name;
+    for (const w of made.warnings ?? []) warnings.push(`${name}: ${w}`);
+    propsHeld.later.push(...heldWith(later, `${name}: `));
     const rest = { ...doc.getObject(made.root)!.custom_props };
     delete rest[RIDEO_PROPS.heldBy];
     doc.updateObject(made.root, {
@@ -1284,8 +1304,8 @@ function stageHeld(
  * Rebuilds the set as planned: ground, sky or sun, walls, and the landmarks (the water). What the
  * person put on a piece built anew stays on the new one, and on the ground when its landmark goes.
  * Returns the ground (a library set's root while the scene holds one) and the warnings naming what
- * stays; those naming `held.unnamed` objects on a landmark that goes wait in `held.later`
- * (rideo/import.ts hangOnGround).
+ * stays; those naming `held.unnamed` objects wait in `held.later`, said as the others are (set.ts
+ * buildSet, rideo/import.ts buildLandmark and hangOnGround).
  */
 function restageSet(
   doc: SceneDoc,
@@ -1294,18 +1314,22 @@ function restageSet(
   castNames: readonly string[],
   stamp: (o: Record<string, string | number | boolean>) => Record<string, string | number | boolean>,
   sceneId: string,
-  held: { unnamed?: ReadonlySet<string>; later?: LaterWarning[] } = {},
+  held: HeldBack = {},
 ): { ground: string; warnings: string[] } {
   const set = blocking.set;
-  const built = buildSet(doc, {
-    width: set.width,
-    depth: set.depth,
-    ground: set.ground,
-    interior: set.interior,
-    sun_azimuth_deg: set.sun.azimuthDeg,
-    sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
-    sky: !set.interior,
-  });
+  const built = buildSet(
+    doc,
+    {
+      width: set.width,
+      depth: set.depth,
+      ground: set.ground,
+      interior: set.interior,
+      sun_azimuth_deg: set.sun.azimuthDeg,
+      sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
+      sky: !set.interior,
+    },
+    held,
+  );
   const warnings = [...built.warnings];
   // a library set (an instance with key 'set', pinned or not) keeps its ground and pieces: lit only
   if (setUnitRoot(doc)) return { ground: built.ground, warnings };
@@ -1323,8 +1347,13 @@ function restageSet(
   const kept = new Set<string>();
   for (const l of set.landmarks) {
     const element = l.elementId ? (brief.elements.find((e) => e.id === l.elementId)?.name ?? null) : null;
-    const made = buildLandmark(doc, l, element, castNames, stamp, old.get(l.id));
+    const later: LaterWarning[] = [];
+    const made = buildLandmark(doc, l, element, castNames, stamp, old.get(l.id), {
+      unnamed: held.unnamed,
+      later: held.later && later,
+    });
     for (const w of made.warnings ?? []) warnings.push(`${made.name}: ${w}`);
+    held.later?.push(...heldWith(later, `${made.name}: `));
     kept.add(l.id);
   }
   // a landmark the words drop goes, but for what the person put on it, which stays on the ground
@@ -1336,15 +1365,24 @@ function restageSet(
 
 /**
  * Lights a set planned from a library unit (or made local) and records its size and interior: its
- * ground and pieces stay. Returns the warnings naming what the person put on the sun lamp lit anew.
+ * ground and pieces stay. Returns the warnings naming what the person put on the sun lamp lit anew;
+ * those naming `held.unnamed` objects wait in `held.later` (set.ts lightSet).
  */
-function relightSet(doc: SceneDoc, blocking: ReturnType<typeof parseRideoBlocking>): string[] {
+function relightSet(
+  doc: SceneDoc,
+  blocking: ReturnType<typeof parseRideoBlocking>,
+  held: HeldBack = {},
+): string[] {
   const set = blocking.set;
-  const lit = lightSet(doc, {
-    sun_azimuth_deg: set.sun.azimuthDeg,
-    sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
-    sky: !set.interior,
-  });
+  const lit = lightSet(
+    doc,
+    {
+      sun_azimuth_deg: set.sun.azimuthDeg,
+      sun_elevation_deg: Math.max(0, Math.min(90, set.sun.elevationDeg)),
+      sky: !set.interior,
+    },
+    held,
+  );
   setDeskSettings(doc, { set_width: set.width, set_depth: set.depth, interior: set.interior });
   return lit.warnings;
 }
