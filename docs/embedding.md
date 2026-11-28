@@ -783,15 +783,19 @@ serves the desk page without its headers and none stops the server:
 
 - a path with an empty or dot segment (`//desk.html`, `/desk.html//`, `/./x`, `/x/../y`, also
   spelled `%2e` or with a backslash): 403 for a `GET` or `HEAD`, as from the server's static file
-  server, and 404 for any other method;
-- any method but `GET` and `HEAD` outside the proxied routes: 404, as on the server (Vite serves
-  pages to a `POST` too);
-- a path that names a file only once its `%2F` are decoded (`/x%2f..%2fdesk`, `/%2fdesk.html`), one
-  that does not decode (`/%E0%A4%A`; at such an `.html` path Vite stops with an error) and, in
-  development, an HTML file other than the two pages (`/dist/desk.html`, `/@fs/…/desk.html`) or a
-  path in the build's folder (`/dist/desk`): they name no file Vite may serve, so they get the
-  editor's page when a browser opens one and 404 otherwise, and 404 under `/assets/` and the
-  development server's module paths.
+  server, and 404 for any other method but `OPTIONS`;
+- any method but `GET`, `HEAD` and `OPTIONS` outside the proxied routes: 404, as on the server
+  (Vite serves pages to a `POST` too);
+- a path that names a file only once its `%2F` are decoded (`/x%2f..%2fdesk`, `/%2fdesk.html`,
+  `/.%2fdesk.html`), one that does not decode (`/%E0%A4%A`; at such an `.html` path Vite stops with
+  an error) and, in development, an HTML file other than the two pages (`/dist/desk.html`,
+  `/@fs/…/desk.html`) or a path in the build's folder (`/dist/desk`): they name no file Vite may
+  serve, so they get the editor's page when a browser opens one and 404 otherwise, and 404 under
+  `/assets/` and the development server's module paths.
+
+An `OPTIONS` request gets none of these answers: Vite's CORS middleware (`server.cors` and
+`preview.cors`, left on) answers every one first, at any path, the proxied routes too (none reaches
+the editor server), with 204 and no body.
 
 ## What the desk does
 

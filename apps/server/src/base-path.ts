@@ -1,13 +1,16 @@
 /*
  * Serving under a subpath (docs/subpath.md): the base path of the server and of a request, the
  * paths from it, and the pages' `<base href>`. Pure (no imports, no Node or DOM types): the server
- * (config.ts, app.ts, static.ts, the WebDAV proxy, the MCP links), the web app (app/base-url.ts)
- * and its service worker (pwa/sw.ts, pwa/sw-desk.ts) use it alike.
+ * (config.ts, app.ts, static.ts, the WebDAV proxy, the MCP links), the web app's Vite config
+ * (vite.config.ts) and its service worker (pwa/sw-scope.ts) use it alike.
  *
  * A base path is '' (the root) or `/` followed by path segments of `A-Z a-z 0-9 . _ ~ -`, without a
- * trailing slash, at most MAX_BASE_PATH_LENGTH characters as given; no segment is `.` or `..`, and
- * the first is none of the server's own top-level paths (RESERVED_PREFIXES, BUILD_TOP_LEVEL), since
- * a path under it could then be read two ways.
+ * trailing slash, at most MAX_BASE_PATH_LENGTH characters as given, and no segment is `.` or `..`
+ * (prefixProblem). BASE_PATH's first segment is none of the server's own top-level paths either
+ * (RESERVED_PREFIXES, BUILD_TOP_LEVEL; basePathProblem): the server removes BASE_PATH from request
+ * paths, and a path under such a base could be read two ways. The base in X-Forwarded-Prefix may
+ * start with one (an editor at the root behind a stripping proxy at /api/): the server never removes
+ * the header's value from a path (request-base.ts), so no path is read two ways.
  *
  * X-Forwarded-Prefix comes with every request, upgrade and MCP call, so what reads it takes time
  * linear in its length and gives up at once on a value longer than a base path can be: no regular
@@ -34,7 +37,7 @@ export function isReservedPath(pathname: string): boolean {
 
 /**
  * Names at the top of the built web app (apps/web/dist) and the desk's clean URL: like the server's
- * own paths, never the first segment of a base path.
+ * own paths (RESERVED_PREFIXES), never the first segment of BASE_PATH (basePathProblem).
  */
 export const BUILD_TOP_LEVEL: readonly string[] = [
   'assets',
@@ -65,26 +68,53 @@ export function trimTrailingSlashes(s: string): string {
   return end === s.length ? s : s.slice(0, end);
 }
 
+/** The first segment of a path (`api` for `/api/v2`, '' for the root). */
+function firstSegment(path: string): string {
+  const slash = path.indexOf('/', 1);
+  return path.slice(1, slash === -1 ? path.length : slash);
+}
+
 /**
- * Why `raw` cannot be a base path, or null when it can. Trailing slashes are dropped first, so '/3d/'
- * is '/3d'; '' and '/' are the root.
+ * Whether a base path's first segment is one of the server's own top-level paths (RESERVED_PREFIXES,
+ * BUILD_TOP_LEVEL): `/api`, `/api/v2`, `/desk`, `/sw.js`; never `/apix`, `/x/api` or the root. No
+ * BASE_PATH is such a path; the base in X-Forwarded-Prefix may be one.
  */
-export function basePathProblem(raw: string): string | null {
+export function startsWithOwnPath(base: string): boolean {
+  if (!base.startsWith('/')) return false;
+  const first = firstSegment(base);
+  return RESERVED_PREFIXES.includes(`/${first}`) || BUILD_TOP_LEVEL.includes(first);
+}
+
+/**
+ * Why `raw` cannot be the base in an X-Forwarded-Prefix header, or null when it can: the rules of
+ * every base path (at most MAX_BASE_PATH_LENGTH characters as given, `/` and segments of
+ * `A-Z a-z 0-9 . _ ~ -`, none empty, `.` or `..`), whatever its first segment. Trailing slashes are
+ * dropped first, so '/3d/' is '/3d'; '' and '/' are the root.
+ */
+export function prefixProblem(raw: string): string | null {
   if (raw.length > MAX_BASE_PATH_LENGTH) return `is longer than ${MAX_BASE_PATH_LENGTH} characters`;
   const value = trimTrailingSlashes(raw.trim());
   if (value === '') return null;
   if (!value.startsWith('/')) return 'does not start with /';
-  const segments = value.slice(1).split('/');
-  for (const segment of segments) {
+  for (const segment of value.slice(1).split('/')) {
     if (segment === '') return 'has an empty path segment (//)';
     if (segment === '.' || segment === '..') return `has a '${segment}' segment`;
     if (!SEGMENT.test(segment))
       return 'has characters other than letters, digits and . _ ~ - in its path segments';
   }
-  const first = segments[0]!;
-  const owner = `/${first}`;
-  if (RESERVED_PREFIXES.includes(owner) || BUILD_TOP_LEVEL.includes(first))
-    return `starts with ${owner}, one of the server's own paths`;
+  return null;
+}
+
+/**
+ * Why `raw` cannot be a base path (BASE_PATH), or null when it can: prefixProblem's rules, and its
+ * first segment is none of the server's own top-level paths (startsWithOwnPath). Trailing slashes
+ * are dropped first, so '/3d/' is '/3d'; '' and '/' are the root.
+ */
+export function basePathProblem(raw: string): string | null {
+  const problem = prefixProblem(raw);
+  if (problem !== null) return problem;
+  const value = trimTrailingSlashes(raw.trim());
+  if (startsWithOwnPath(value)) return `starts with /${firstSegment(value)}, one of the server's own paths`;
   return null;
 }
 
@@ -111,9 +141,10 @@ export function parseBasePath(value: string | undefined): string {
 
 /**
  * The base path an `X-Forwarded-Prefix` header names: its first comma-separated value when that
- * is a usable base path ('' for `/`), else null (absent, empty, longer than MAX_BASE_PATH_LENGTH or
- * unusable: never a base that could steer links off the site). The base the server writes into a
- * request's pages and links, never one it removes from the request's path (request-base.ts).
+ * is a usable base (prefixProblem: '' for `/`, and its first segment may be one of the server's own
+ * paths), else null (absent, empty, longer than MAX_BASE_PATH_LENGTH or unusable: never a base that
+ * could steer links off the site). The base the server writes into a request's pages and links,
+ * never one it removes from the request's path (request-base.ts).
  */
 export function forwardedPrefix(header: string | readonly string[] | undefined): string | null {
   const raw = typeof header === 'string' ? header : header?.[0];
@@ -123,8 +154,8 @@ export function forwardedPrefix(header: string | readonly string[] | undefined):
   // a value longer than any base path is ignored before it is read any further
   if (first.length > MAX_BASE_PATH_LENGTH) return null;
   const value = first.trim();
-  if (value === '') return null;
-  return normalizeBasePath(value);
+  if (value === '' || prefixProblem(value) !== null) return null;
+  return trimTrailingSlashes(value);
 }
 
 /** A request URL (path and query) without its base path. */
@@ -167,7 +198,7 @@ const DOCTYPE = /<!doctype[^>]*>/i;
  * one added as the first element of its `<head>` (before anything that loads a URL). A page without
  * a `<head>` tag (it is optional) gets it after its `<html>` tag or its doctype, where the parser
  * opens the head, never before the doctype (which would put the page in quirks mode). `base` must
- * be a base path (basePathProblem): it then needs no escaping.
+ * be a base path or a header's (prefixProblem): it then needs no escaping.
  */
 export function withBaseHref(html: string, base: string): string {
   const tag = `<base href="${baseHref(base)}" />`;

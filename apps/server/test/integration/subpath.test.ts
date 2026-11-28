@@ -21,8 +21,10 @@ import { mkcolPath, startWebDAV, type TestWebDAV } from '../helpers/webdav';
  * is removed only from requests that carry no X-Forwarded-Prefix: a request that carries one (a
  * proxy that strips the prefix sends it, and clients can) is routed as it came, so the header never
  * moves a route and no prefix is removed twice; a proxy that keeps the prefix must not send it.
- * AUTH_TOKEN guards the routes whatever the spelling of the request target, and headers of any
- * length take the server linear time.
+ * The header's base may start with one of the server's own paths (an editor at the root behind a
+ * stripping proxy at /api/ or /desk/), which BASE_PATH may not. AUTH_TOKEN guards the routes
+ * whatever the spelling of the request target, and headers of any length take the server linear
+ * time.
  */
 
 const INDEX_HTML = `<!doctype html>
@@ -263,7 +265,6 @@ describe('a server without BASE_PATH behind a proxy that strips the prefix', () 
   it('ignores an X-Forwarded-Prefix it cannot use, and counts several values by the first', async () => {
     const cases: [string, string][] = [
       ['//evil.example', '/'],
-      ['/api', '/'],
       ['/a/../b', '/'],
       ['https://evil.example/x', '/'],
       ['/one, /two', '/one/'],
@@ -278,7 +279,7 @@ describe('a server without BASE_PATH behind a proxy that strips the prefix', () 
       const res = await fetch(`${root.url}/`, { headers: { 'x-forwarded-prefix': header } });
       expectBase(await page(res, header), href, INDEX_HTML, header);
     }
-    // a path that starts with an unusable value is served as it is
+    // a path that starts with the header's value is served as it is
     expect((await api(root.url, '/api/healthz', { headers: { 'x-forwarded-prefix': '/api' } })).status).toBe(
       404,
     );
@@ -759,6 +760,122 @@ describe('a proxy that strips the prefix in front of a server with BASE_PATH=/3d
       'bare',
     );
   });
+});
+
+describe('an editor at the root behind a stripping proxy at one of the server’s own paths', () => {
+  let dav: TestWebDAV;
+  let server: TestServer;
+  const logged: LogLine[] = [];
+  const warnings = () => logged.filter((l) => l.msg?.includes('X-Forwarded-Prefix'));
+
+  beforeAll(async () => {
+    dav = await startWebDAV({ username: 'bob', password: 'hunter2' });
+    await mkcolPath(dav, '/own');
+    server = await serve(
+      {
+        PUBLIC_DIR: publicDir,
+        WEBDAV_URL: `${dav.origin}/own`,
+        WEBDAV_USERNAME: 'bob',
+        WEBDAV_PASSWORD: 'hunter2',
+        SYNC_PERSISTENCE: 'memory',
+      },
+      {
+        logger: {
+          level: 'warn',
+          stream: { write: (line: string) => void logged.push(JSON.parse(line) as LogLine) },
+        },
+      },
+    );
+  });
+
+  afterAll(async () => {
+    await dav?.stop();
+  });
+
+  /** The first message of a sync WebSocket opened with these headers, or why there is none. */
+  const firstSyncMessage = (url: string, headers: Record<string, string>) =>
+    new Promise<string>((resolve) => {
+      const ws = new WebSocket(url.replace('http:', 'ws:'), { headers });
+      ws.once('message', (data: Buffer) => {
+        ws.close();
+        resolve(Buffer.from(data).toString('utf8'));
+      });
+      ws.once('unexpected-response', (_req, res) => resolve(`refused with ${res.statusCode}`));
+      ws.once('error', (err) => resolve(`error: ${err.message}`));
+    });
+  const davHrefs = (xml: string) => [...xml.matchAll(/<(?:\w+:)?href>([^<]*)</g)].map((m) => m[1]);
+
+  for (const prefix of ['/api', '/desk', '/dav']) {
+    const proxied = { 'x-forwarded-prefix': prefix };
+
+    it(`behind a proxy at ${prefix}/: the pages, the API, the live sync, /dav and MCP links, under ${prefix}`, async () => {
+      // what the proxy passes on for <prefix>/, <prefix>/index.html and a deeper page: the editor
+      for (const p of ['/', '/index.html', '/projects/abc?project=1']) {
+        const res = await fetch(`${server.url}${p}`, { headers: proxied });
+        expectBase(await page(res, `${prefix} ${p}`), `${prefix}/`, INDEX_HTML, `${prefix} ${p}`);
+      }
+      // <prefix>/desk.html and <prefix>/desk: the desk, with its headers
+      for (const p of ['/desk.html', '/desk', '/desk?embed=1']) {
+        const res = await fetch(`${server.url}${p}`, { headers: proxied });
+        expectBase(await page(res, `${prefix} ${p}`), `${prefix}/`, DESK_HTML, `${prefix} ${p}`);
+        expect(res.headers.get('cross-origin-embedder-policy'), p).toBe('require-corp');
+        expect(res.headers.get('cross-origin-resource-policy'), p).toBe('cross-origin');
+        expect(res.headers.get('content-security-policy'), p).toBe('frame-ancestors *');
+      }
+      // <prefix>/api/config: the API, as it came
+      const config = await api(server.url, '/api/config', { headers: proxied });
+      expect(config.status).toBe(200);
+      expect(config.body.webdav).toMatchObject({ url: '/dav' });
+      // <prefix>/sync/<id>: the live sync
+      expect(await firstSyncMessage(`${server.url}/sync/${newUuid()}`, proxied)).toContain('"kind":"hello"');
+      // <prefix>/dav/: the WebDAV proxy, its hrefs under the base, a Destination with or without it
+      const file = `${prefix.slice(1)}.txt`;
+      expect(
+        (await fetch(`${server.url}/dav/${file}`, { method: 'PUT', headers: proxied, body: 'own' })).status,
+      ).toBeLessThan(300);
+      const listing = await fetch(`${server.url}/dav/`, {
+        method: 'PROPFIND',
+        headers: { depth: '1', ...proxied },
+      });
+      expect(listing.status).toBe(207);
+      expect(davHrefs(await listing.text())).toEqual(
+        expect.arrayContaining([`${prefix}/dav/`, `${prefix}/dav/${file}`]),
+      );
+      // one that starts with the base is read under it: behind a proxy at /dav/, the site's
+      // /dav/b-dav.txt is /b-dav.txt under the base, no WebDAV path
+      for (const [destination, name, accepted] of [
+        [`https://example.com${prefix}/dav/a-${file}`, `a-${file}`, true],
+        [`${prefix}/dav/c-${file}`, `c-${file}`, true],
+        [`/dav/b-${file}`, `b-${file}`, prefix !== '/dav'],
+      ] as const) {
+        const res = await fetch(`${server.url}/dav/${file}`, {
+          method: 'COPY',
+          headers: { destination, ...proxied },
+        });
+        if (accepted) expect(res.status, destination).toBeLessThan(300);
+        else {
+          expect(res.status, destination).toBe(502);
+          expect((await res.json()).error, destination).toBe(`Destination must be inside ${prefix}/dav/`);
+        }
+        const upstream = await fetch(`${dav.origin}/own/${name}`, {
+          headers: { authorization: dav.authorization },
+        });
+        if (accepted) expect(await upstream.text(), name).toBe('own');
+        else expect(upstream.status, name).toBe(404);
+      }
+      // <prefix>/mcp: links under the base
+      await withMcp(
+        `${server.url}/mcp`,
+        { 'x-forwarded-proto': 'https', 'x-forwarded-host': 'example.com', ...proxied },
+        async (c) => {
+          const created = await tool(c, 'create_project', { name: `Behind ${prefix}` });
+          expect(created.editor_url).toBe(`https://example.com${prefix}/?project=${created.id}`);
+        },
+      );
+      // the editor's own requests are no sign of a proxy that keeps the prefix
+      expect(warnings()).toEqual([]);
+    });
+  }
 });
 
 describe('a proxy that keeps the prefix in front of a server with BASE_PATH=/3d', () => {

@@ -254,7 +254,7 @@ export interface ViteRoute {
 /**
  * What the web app's Vite dev (`dev`) and preview servers (vite.config.ts) do with a request, as the
  * editor server does with its files and its fallback, `pathname` read as the server reads it (in
- * origin form: request-base.ts originForm). In this order:
+ * origin form: request-target.ts originForm). In this order:
  * - a path that is not canonical (isCanonicalPath: an empty or dot segment, a backslash) gets 403
  *   for a GET or HEAD and 404 for any other method, as from the server, whatever it starts with:
  *   Vite would read it as another path (`//desk.html` as the desk page, without its headers);

@@ -186,10 +186,12 @@ function originOf(scheme: string, host: string | undefined): string | null {
  * Host header (the request URL the MCP transport builds from them: the scheme and authority of an
  * absolute-form request target are not read), then the base path (X-Forwarded-Prefix when usable,
  * else BASE_PATH), without a trailing slash: `https://example.com/3d` (docs/subpath.md). With an
- * HTTP request whose hosts are none of them usable (no Host, or one isHostAndPort refuses), the
- * base alone: the links are then paths under the editor's base (`/3d/?project=…`), never paths from
- * the root of a site the editor may share. '' without an HTTP request (an in-memory client): the
- * links are then paths from the server's root, as REST gives them.
+ * HTTP request whose hosts are none of them usable (a Host isHostAndPort refuses, `a"b`, and no
+ * usable X-Forwarded-Host), the base alone: the links are then paths under the editor's base
+ * (`/3d/?project=…`), never paths from the root of a site the editor may share. A request without a
+ * Host gets no links: the MCP transport answers it 400 before any tool runs (Node itself refuses
+ * HTTP/1.1 without one). '' without an HTTP request (an in-memory client): the links are then paths
+ * from the server's root, as REST gives them.
  */
 export function baseUrl(extra: ToolExtra, config: Pick<ServerConfig, 'basePath'>): string {
   const info = extra.requestInfo;

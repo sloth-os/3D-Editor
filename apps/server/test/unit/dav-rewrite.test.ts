@@ -128,6 +128,12 @@ describe('upstreamUrlFor', () => {
     expect(davSegment('%20')).toBe(' ');
     expect(davSegment('~')).toBe('~');
     expect(davSegment('%C2%80')).toBe('\u0080');
+    // so are the C1 controls, U+0080-U+009F (raw bytes 0x80-0x9F of a header value, which Node
+    // reads as Latin-1): they go upstream as %C2%80-%C2%9F
+    expect(davSegment('.\u0085.')).toBe('.\u0085.');
+    expect(rewriteDestination(guarded, '/dav/x/.\u0085./\u009f')).toBe(
+      'http://127.0.0.1:4470/guarded/x/.%C2%85./%C2%9F',
+    );
   });
 
   it('refuses a segment that is `.` or `..` up to its first `;`, as servlet containers read it (davSegment)', () => {
@@ -267,6 +273,17 @@ describe('the token in the query never reaches the WebDAV server', () => {
         'http://127.0.0.1:4470/guarded/y.txt',
       );
     }
+    // an absolute Destination keeps the other pairs of its query
+    expect(rewriteDestination(guarded, 'https://editor.example/dav/y.txt?keep=1&token=s3cret')).toBe(
+      'http://127.0.0.1:4470/guarded/y.txt?keep=1',
+    );
+  });
+
+  it('drops the token pairs of the query as the URL parser built it: a raw tab in a name hides none', () => {
+    // a header value may carry a raw tab, which the URL parser drops only after the name was read
+    expect(rewriteDestination(guarded, '/3d/dav/y.txt?to\tken=s3cret&k=1', ['/3d'])).toBe(
+      'http://127.0.0.1:4470/guarded/y.txt?k=1',
+    );
   });
 
   it('keeps every other pair as it is, in order, and drops a query left without pairs (withoutTokenPairs)', () => {
@@ -290,6 +307,8 @@ describe('the token in the query never reaches the WebDAV server', () => {
       ['?token&a=1', '?a=1'],
       // names that are not `token`, spelled as sent
       ['?tokens=1&atoken=2&to%6B=3&%74oke=4&token%3D=5', '?tokens=1&atoken=2&to%6B=3&%74oke=4&token%3D=5'],
+      // 16 characters, of which the first 15 spell `token`: read whole, it is `tokens`
+      ['?%74%6F%6B%65%6Es=1&a=2', '?%74%6F%6B%65%6Es=1&a=2'],
       ['?b=%41&a=%zz&token=s&c=+&d', '?b=%41&a=%zz&c=+&d'],
     ])
       expect(withoutTokenPairs(query), query).toBe(kept);

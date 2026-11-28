@@ -13,10 +13,13 @@ import {
   normalizeBasePath,
   parseBasePath,
   pathWithin,
+  prefixProblem,
+  startsWithOwnPath,
   stripBasePath,
   trimTrailingSlashes,
   withBaseHref,
 } from '../../src/base-path';
+import { KEPT_PREFIX_WARNING_INTERVAL_MS, keptPrefixWarning } from '../../src/app';
 import { loadConfig } from '../../src/config';
 import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
 import { baseUrl, isHostAndPort, type ToolExtra } from '../../src/mcp/tool-kit';
@@ -32,9 +35,10 @@ import {
 } from '../../src/request-base';
 
 /*
- * Serving under a subpath (docs/subpath.md): the parsing of BASE_PATH and X-Forwarded-Prefix, the
- * removal of BASE_PATH from request URLs (in origin form), the pages' <base href> and the links of
- * MCP results; and that what reads a request's headers takes time linear in their length.
+ * Serving under a subpath (docs/subpath.md): the parsing of BASE_PATH and X-Forwarded-Prefix (whose
+ * base, unlike BASE_PATH, may start with one of the server's own paths), the removal of BASE_PATH
+ * from request URLs (in origin form), the kept-prefix warning, the pages' <base href> and the links
+ * of MCP results; and that what reads a request's headers takes time linear in their length.
  */
 
 /** Values no base path can be, with the reason basePathProblem gives. */
@@ -157,6 +161,65 @@ describe('basePathProblem, normalizeBasePath and parseBasePath', () => {
     expect(() => parseBasePath('/a b')).toThrow(
       "Invalid configuration: BASE_PATH: '/a b' has characters other than letters, digits and . _ ~ - in its path segments",
     );
+  });
+});
+
+/** The server's own top-level paths, as bases: what BASE_PATH cannot start with. */
+const OWN_PATHS = [...RESERVED_PREFIXES, ...BUILD_TOP_LEVEL.map((name) => `/${name}`)];
+
+describe('the server’s own paths in a base', () => {
+  it('are a base’s first segment only (startsWithOwnPath)', () => {
+    for (const base of [...OWN_PATHS, '/api/v2', '/desk/x', '/sw.js/a'])
+      expect(startsWithOwnPath(base), base).toBe(true);
+    for (const base of ['', '/', '/3d', '/apix', '/x/api', '/desk2', '/assets-old', '/index.htm', 'api'])
+      expect(startsWithOwnPath(base), base).toBe(false);
+  });
+
+  it('may start the base of X-Forwarded-Prefix (prefixProblem), never BASE_PATH (basePathProblem)', () => {
+    // an editor at the root behind a stripping proxy at /api/ or /desk/: the header's value is
+    // never removed from a path, so no path is read two ways
+    for (const base of [...OWN_PATHS, '/api/v2', '/desk/x']) {
+      expect(prefixProblem(base), base).toBeNull();
+      expect(prefixProblem(`${base}/`), base).toBeNull();
+      expect(forwardedPrefix(base), base).toBe(base);
+      expect(forwardedPrefix(` ${base}/ , /other`), base).toBe(base);
+      expect(forwardedPrefix([base, '/other']), base).toBe(base);
+      expect(basePathProblem(base), base).toMatch(/one of the server's own paths$/);
+      expect(normalizeBasePath(base), base).toBeNull();
+      expect(() => parseBasePath(base), base).toThrow(
+        /^Invalid configuration: BASE_PATH: .* one of the server's own paths/,
+      );
+    }
+  });
+
+  it('leave every other rule of a base path to X-Forwarded-Prefix', () => {
+    for (const [value, reason] of REFUSED.filter(([v]) => !startsWithOwnPath(v))) {
+      expect(prefixProblem(value), value).toMatch(reason);
+      expect(forwardedPrefix(value), value).toBeNull();
+    }
+    for (const value of [
+      '//api',
+      '/api//x',
+      '/api/../x',
+      '/api/./x',
+      '/api/..',
+      '/api?x',
+      '/api#x',
+      '/api x',
+      '/api%2fx',
+      '/api\\x',
+      'api',
+      'https://evil.example/api',
+    ]) {
+      expect(prefixProblem(value), value).not.toBeNull();
+      expect(forwardedPrefix(value), value).toBeNull();
+    }
+    // at most 256 characters as sent
+    const longest = `/api/${'a'.repeat(251)}`;
+    expect(longest).toHaveLength(256);
+    expect(forwardedPrefix(longest)).toBe(longest);
+    expect(forwardedPrefix(`${longest}a`)).toBeNull();
+    expect(prefixProblem(`${longest}a`)).toBe('is longer than 256 characters');
   });
 });
 
@@ -299,16 +362,7 @@ describe('forwardedPrefix (X-Forwarded-Prefix)', () => {
   });
 
   it('ignores an absent, empty or unusable header: it never steers links off the site', () => {
-    for (const value of [
-      undefined,
-      '',
-      '  ',
-      '//evil.example',
-      '/api',
-      '/a/../b',
-      'https://evil.example',
-      '/a b',
-    ])
+    for (const value of [undefined, '', '  ', '//evil.example', '/a/../b', 'https://evil.example', '/a b'])
       expect(forwardedPrefix(value), String(value)).toBeNull();
   });
 
@@ -430,6 +484,24 @@ function rawLines(url: string, rawHeaders: string[]): IncomingMessage {
   return { url, headers, rawHeaders } as unknown as IncomingMessage;
 }
 
+/**
+ * Requests of an editor (or desk) at the root behind a stripping proxy at one of the server's own
+ * paths, as they reach the server: the path, then the X-Forwarded-Prefix the proxy sends.
+ */
+const OWN_PATH_REQUESTS: [string, string][] = [
+  ['/', '/api'],
+  ['/api/config', '/api'],
+  ['/api', '/api'],
+  ['/api/projects?x=1', '/api/'],
+  ['/sync/abc', '/sync'],
+  ['/desk', '/desk'],
+  ['/desk.html?embed=1', '/desk'],
+  ['/desk/x', '/desk'],
+  ['/assets/app.js', '/assets'],
+  ['/sw.js', '/sw.js'],
+  ['/api/v2/x', '/api/v2'],
+];
+
 describe('the prefix removal (rewriteRequestUrl)', () => {
   it('removes BASE_PATH from the URLs that start with it and remembers the URL as sent', () => {
     const req = rawRequest('/3d/api/config?x=1');
@@ -489,7 +561,7 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
 
   it('counts a header with any value that is not blank, in any of its lines', () => {
     const routed = (raw: string[]) => rewriteRequestUrl(rawLines('/3d/api/config', raw), '/3d');
-    // not usable, still carried: nothing removed
+    // usable (an own path too) or not, carried: nothing removed
     for (const value of ['//evil.example', '/api', 'x', ' /3d ', ',', '/3d, /other'])
       expect(routed(['X-Forwarded-Prefix', value]), value).toBe('/3d/api/config');
     // blank (spaces and tabs only) is no header: BASE_PATH removed
@@ -530,6 +602,53 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
     const plain = rawRequest('/3d/x');
     expect(keptPrefix(plain, rewriteRequestUrl(plain, '/3d'), '/3d')).toBeNull();
     expect(keptPrefix(rawRequest('/editor/x'), '/editor/x', '')).toBeNull();
+  });
+
+  it('takes a base under one of the server’s own paths from X-Forwarded-Prefix, and routes its request as it came', () => {
+    for (const basePath of ['', '/3d']) {
+      // an editor at the root behind a stripping proxy at /api/: its /api/api/config arrives as
+      // /api/config, its page /api/ as /
+      const config = rawRequest('/api/config', { 'x-forwarded-prefix': '/api' });
+      expect(rewriteRequestUrl(config, basePath), basePath).toBe('/api/config');
+      expect(requestBaseInfo(config), basePath).toMatchObject({
+        base: '/api',
+        bases: ['/api', basePath],
+        forwarded: true,
+        forwardedBase: '/api',
+        removed: '',
+        bare: false,
+      });
+      const page = rawRequest('/?project=x', { 'x-forwarded-prefix': '/api/' });
+      expect(rewriteRequestUrl(page, basePath), basePath).toBe('/?project=x');
+      expect(requestBase(page), basePath).toBe('/api');
+      // the desk behind a proxy at /desk/: /desk/desk.html arrives as /desk.html, /desk/desk as /desk
+      for (const url of ['/desk.html', '/desk', '/desk?embed=1']) {
+        const desk = rawRequest(url, { 'x-forwarded-prefix': '/desk' });
+        expect(rewriteRequestUrl(desk, basePath), `${basePath} ${url}`).toBe(url);
+        expect(requestBase(desk), `${basePath} ${url}`).toBe('/desk');
+      }
+    }
+    // a request it did not see: the header's base all the same
+    expect(requestBase(rawRequest('/x', { 'x-forwarded-prefix': '/api' }))).toBe('/api');
+    expect(requestBases(rawRequest('/x', { 'x-forwarded-prefix': '/desk/' }))).toEqual(['/desk']);
+  });
+
+  it('takes no header base under one of the server’s own paths for a kept prefix; BASE_PATH still counts', () => {
+    const kept = (url: string, header: string, basePath: string) => {
+      const req = rawRequest(url, { 'x-forwarded-prefix': header });
+      return keptPrefix(req, rewriteRequestUrl(req, basePath), basePath);
+    };
+    // the requests of an editor (or desk) behind a stripping proxy at an own path
+    for (const [url, header] of OWN_PATH_REQUESTS) {
+      expect(kept(url, header, ''), `${header} ${url}`).toBeNull();
+      expect(kept(url, header, '/3d'), `${header} ${url}, BASE_PATH=/3d`).toBeNull();
+    }
+    // with such a header, a path under BASE_PATH is still a sign
+    expect(kept('/3d/api/config', '/api', '/3d')).toBe('/3d');
+    expect(kept('/3d?x', '/desk', '/3d')).toBe('/3d');
+    // and a header base of another first segment is one, as before
+    expect(kept('/apix/y', '/apix', '')).toBe('/apix');
+    expect(kept('/x/api/y', '/x/api', '')).toBe('/x/api');
   });
 
   it('reads the request target in origin form, as the router does', () => {
@@ -576,7 +695,7 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
   });
 
   it('ignores an unusable X-Forwarded-Prefix for the base, and removes nothing from its request', () => {
-    for (const header of ['//evil.example', '/api', '/a/../b', 'https://evil.example']) {
+    for (const header of ['//evil.example', '/a b', '/a/../b', 'https://evil.example']) {
       const req = rawRequest('/a/b', { 'x-forwarded-prefix': header });
       expect(rewriteRequestUrl(req, '/3d'), header).toBe('/a/b');
       expect(requestBase(req), header).toBe('/3d');
@@ -598,6 +717,59 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
     expect(requestBase(rawRequest('/x', { 'x-forwarded-prefix': '/p' }))).toBe('/p');
     expect(requestBases(rawRequest('/x', { 'x-forwarded-prefix': '/p' }))).toEqual(['/p']);
     expect(originalUrlOf(rawRequest('/x?y'))).toBe('/x?y');
+  });
+});
+
+describe('the kept-prefix warning (keptPrefixWarning)', () => {
+  /** The warning of a server with BASE_PATH `basePath`, on a clock the test moves, and what it said. */
+  function warning(basePath: string) {
+    let clock = 5_000_000;
+    const said: { obj: unknown; msg?: string }[] = [];
+    const log = {
+      debug() {},
+      info() {},
+      error() {},
+      warn: (obj: unknown, msg?: string) => void said.push({ obj, msg }),
+    };
+    const warn = keptPrefixWarning(basePath, log, () => clock);
+    /** A request as the server reads it before routing it, then the warning. */
+    const send = (url: string, header: string) => {
+      const req = rawRequest(url, { 'x-forwarded-prefix': header });
+      warn(req, rewriteRequestUrl(req, basePath));
+    };
+    return { said, send, later: (ms: number) => void (clock += ms) };
+  }
+
+  it('stays quiet for header bases under the server’s own paths, window after window, while BASE_PATH counts', () => {
+    const { said, send, later } = warning('/3d');
+    for (let window = 1; window <= 4; window++) {
+      for (const [url, header] of OWN_PATH_REQUESTS) send(url, header);
+      expect(said, `window ${window}`).toEqual([]);
+      later(KEPT_PREFIX_WARNING_INTERVAL_MS);
+    }
+    // with such a header, a path under BASE_PATH
+    send('/3d/api/config', '/api');
+    expect(said).toHaveLength(1);
+    expect(said[0]!.obj).toMatchObject({ prefix: '/3d' });
+    expect(said[0]!.msg).toContain('the server needs BASE_PATH=/3d');
+    // the requests of the proxy at /api/ say nothing more, in this window or the next
+    for (const [url, header] of OWN_PATH_REQUESTS) send(url, header);
+    later(KEPT_PREFIX_WARNING_INTERVAL_MS);
+    for (const [url, header] of OWN_PATH_REQUESTS) send(url, header);
+    expect(said).toHaveLength(1);
+    // a header base of another first segment, as before
+    send('/editor/x', '/editor');
+    expect(said).toHaveLength(2);
+    expect(said[1]!.obj).toMatchObject({ prefix: '/editor' });
+  });
+
+  it('stays quiet for them at the root too (no BASE_PATH)', () => {
+    const { said, send, later } = warning('');
+    for (let window = 1; window <= 3; window++) {
+      for (const [url, header] of OWN_PATH_REQUESTS) send(url, header);
+      later(KEPT_PREFIX_WARNING_INTERVAL_MS);
+    }
+    expect(said).toEqual([]);
   });
 });
 
@@ -628,6 +800,13 @@ describe('the links of MCP results (baseUrl)', () => {
     // the header's base wins over BASE_PATH
     expect(baseUrl(httpCall({ ...proxied, 'x-forwarded-prefix': '/editor' }), under3d)).toBe(
       'https://example.com/editor',
+    );
+    // a stripping proxy at one of the server's own paths: its base all the same
+    expect(baseUrl(httpCall({ ...proxied, 'x-forwarded-prefix': '/api' }), root)).toBe(
+      'https://example.com/api',
+    );
+    expect(baseUrl(httpCall({ ...proxied, 'x-forwarded-prefix': '/desk/' }), under3d)).toBe(
+      'https://example.com/desk',
     );
     // a proxy that sets Host and X-Forwarded-Proto only (the nginx example)
     expect(baseUrl(httpCall({ 'x-forwarded-proto': 'https' }, 'http://example.com/mcp'), under3d)).toBe(

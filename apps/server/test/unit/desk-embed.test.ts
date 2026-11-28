@@ -377,7 +377,16 @@ describe("the web app's Vite servers (vite.config.ts)", () => {
   });
 
   it("in dev, answer a path Vite may not serve (it would read it as another path) as one that names no file: the editor's page for a page the browser opens, 404 otherwise", () => {
-    for (const p of ['/x%2f..%2fdesk', '/%2fdesk.html', '/dist/desk', '/dist/desk.html', '/%E0%A4%A.html']) {
+    for (const p of [
+      '/x%2f..%2fdesk',
+      '/%2fdesk.html',
+      // the desk page once decoded (//desk, /./desk): canonical as read, never servable in dev
+      '/%2fdesk',
+      '/.%2fdesk',
+      '/dist/desk',
+      '/dist/desk.html',
+      '/%E0%A4%A.html',
+    ]) {
       expect(route(p, true, opens), p).toEqual({ headers: {}, page: 'index.html' });
       expect(route(p, true, loads), p).toEqual({ headers: {}, notFound: true });
     }

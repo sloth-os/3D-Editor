@@ -1,14 +1,19 @@
 import type { IncomingMessage } from 'node:http';
 import type { FastifyRequest } from 'fastify';
-import { forwardedPrefix, stripBasePath } from './base-path';
+import { forwardedPrefix, startsWithOwnPath, stripBasePath } from './base-path';
+import { originForm } from './request-target';
+
+/** A request target in origin form, as the router reads it (request-target.ts). */
+export { originForm } from './request-target';
 
 /*
  * The base path of each request (docs/subpath.md). Before anything routes a request, HTTP requests
  * (Fastify's rewriteUrl, app.ts) and WebSocket upgrades (an 'upgrade' listener that runs before
- * the sync server's, app.ts) get their URL in origin form (originForm), and the raw request keeps
- * what was read: the base the server writes into the request's pages and links, the bases a path
- * the request names may start with, whether the request carries X-Forwarded-Prefix, whether the URL
- * was BASE_PATH without its slash, and the URL as the client sent it (for the logs).
+ * the sync server's, app.ts) get their URL in origin form (originForm, request-target.ts), and the
+ * raw request keeps what was read: the base the server writes into the request's pages and links,
+ * the bases a path the request names may start with, whether the request carries
+ * X-Forwarded-Prefix, whether the URL was BASE_PATH without its slash, and the URL as the client
+ * sent it (for the logs).
  *
  * A request that carries X-Forwarded-Prefix with a value that is not blank (usable or not, in any
  * number of header lines) came through a proxy that stripped the prefix: its URL is routed as it
@@ -18,6 +23,8 @@ import { forwardedPrefix, stripBasePath } from './base-path';
  * /metrics or /mcp, say) would otherwise let any client re-root routing under a prefix of its
  * choice; and a path a stripping proxy passed on is never stripped again (with BASE_PATH=/3d, a
  * client's /3d/3d/metrics reaches the server as /3d/metrics with the header, which no route serves).
+ * So the header's base may start with one of the server's own paths (an editor at the root behind a
+ * stripping proxy at /api/), which BASE_PATH may not: no path is read two ways.
  */
 
 /** What the server read of a request's base path before routing it (rewriteRequestUrl). */
@@ -48,9 +55,6 @@ const kRequestBase = Symbol('3d-editor.requestBase');
 
 type WithRequestBase = IncomingMessage & { [kRequestBase]?: RequestBase };
 
-const SLASH = 47;
-const QUESTION = 63;
-const HASH = 35;
 const SPACE = 32;
 const TAB = 9;
 
@@ -88,67 +92,6 @@ export function carriesForwardedPrefix(req: Pick<IncomingMessage, 'headers' | 'r
   return values.some((v) => !isBlank(v));
 }
 
-/** The value of a hexadecimal digit's char code, or -1. */
-function hexValue(c: number): number {
-  if (c >= 48 && c <= 57) return c - 48;
-  const lower = c | 0x20;
-  return lower >= 97 && lower <= 102 ? lower - 87 : -1;
-}
-
-/** Whether a char code is an unreserved character of RFC 3986: `A-Z a-z 0-9 - . _ ~`. */
-function isUnreserved(c: number): boolean {
-  const lower = c | 0x20;
-  return (
-    (lower >= 97 && lower <= 122) || (c >= 48 && c <= 57) || c === 45 || c === 46 || c === 95 || c === 126
-  );
-}
-
-/**
- * A request target in origin form, as the router reads it, so that what the server reads of the
- * path (its BASE_PATH, the page it falls back to) is the path the router routes:
- * - an absolute-form target (`http://host/path?q`, `HTTPS://host?q`: what a request to a proxy
- *   looks like, which servers must accept) loses its scheme and authority (`/path?q`, `/?q`), as
- *   the router does with it;
- * - a fragment (`#…`, which clients never send) is dropped, as the router ends the path there;
- * - the percent-encoded unreserved characters of the path are decoded (`/%61pi` is `/api`: RFC 3986
- *   6.2.2.2), as the router decodes them before it matches.
- * Any other target (`*`, `x`) is left as it is: no route serves it. Time linear in the target's
- * length.
- */
-export function originForm(url: string): string {
-  let target = url;
-  if (target.charCodeAt(0) !== SLASH) {
-    const scheme = target.slice(0, 8).toLowerCase();
-    const authority = scheme.startsWith('http://') ? 7 : scheme.startsWith('https://') ? 8 : -1;
-    if (authority === -1) return url;
-    let end = authority;
-    while (end < target.length) {
-      const c = target.charCodeAt(end);
-      if (c === SLASH || c === QUESTION || c === HASH) break;
-      end++;
-    }
-    target = target.charCodeAt(end) === SLASH ? target.slice(end) : `/${target.slice(end)}`;
-  }
-  const hash = target.indexOf('#');
-  if (hash !== -1) target = target.slice(0, hash);
-  const query = target.indexOf('?');
-  const pathEnd = query === -1 ? target.length : query;
-  let percent = target.indexOf('%');
-  if (percent === -1 || percent >= pathEnd) return target;
-  let out = '';
-  let from = 0;
-  for (; percent !== -1 && percent + 2 < pathEnd; percent = target.indexOf('%', percent + 1)) {
-    const high = hexValue(target.charCodeAt(percent + 1));
-    const low = hexValue(target.charCodeAt(percent + 2));
-    if (high < 0 || low < 0) continue;
-    const code = high * 16 + low;
-    if (!isUnreserved(code)) continue;
-    out += target.slice(from, percent) + String.fromCharCode(code);
-    from = percent + 3;
-  }
-  return from === 0 ? target : out + target.slice(from);
-}
-
 /**
  * The URL of `req` in origin form (originForm), without BASE_PATH (`basePath`) when it starts with
  * it and the request carries no X-Forwarded-Prefix (carriesForwardedPrefix); the request keeps what
@@ -181,7 +124,10 @@ export function rewriteRequestUrl(req: IncomingMessage, basePath: string): strin
  * (`url`, after rewriteRequestUrl): the header's usable base, else BASE_PATH (`basePath`), or null
  * (no header, or a URL under neither). Such a request reaches no route: a proxy that sends the
  * header and keeps the prefix in request paths, or a client that sent a path with the prefix twice
- * through a stripping proxy, or its own header (app.ts says so in the log).
+ * through a stripping proxy, or its own header (app.ts says so in the log). A header base whose
+ * first segment is one of the server's own paths (startsWithOwnPath) is no such sign, and only
+ * BASE_PATH counts with it: behind a stripping proxy at /api/, the editor's own requests arrive
+ * with paths under it (its /api/api/config as /api/config, with the header /api) and are served.
  */
 export function keptPrefix(
   request: FastifyRequest | IncomingMessage,
@@ -190,7 +136,8 @@ export function keptPrefix(
 ): string | null {
   const info = requestBaseInfo(request);
   if (!info?.forwarded) return null;
-  const bases = info.forwardedBase ? [info.forwardedBase, basePath] : [basePath];
+  const header = info.forwardedBase;
+  const bases = header && !startsWithOwnPath(header) ? [header, basePath] : [basePath];
   return stripBasePath(url, bases).base || null;
 }
 

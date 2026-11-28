@@ -7,7 +7,7 @@ import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withBaseHref } from '../server/src/base-path.ts';
 import { deskEmbedSettings, viteDeskRoute } from '../server/src/desk-embed.ts';
-import { originForm } from '../server/src/request-base.ts';
+import { originForm } from '../server/src/request-target.ts';
 import { withPageUnderBaseScript } from './src/app/base-url.ts';
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
@@ -99,7 +99,9 @@ function buildFolderOf(root: string, outDir: string): string | null {
  * answered here, never passed on: a path with an empty or dot segment gets 403 (any other method
  * 404), as from the server, and a path that names no file Vite may serve (isBuiltFile, isViteFile)
  * is answered as one that names no built file, so that no path serves the desk page without its
- * headers, and none that does not decode stops the server.
+ * headers, and none that does not decode stops the server. An OPTIONS never reaches this
+ * middleware: Vite's CORS middleware (server.cors and preview.cors, left on) answers every one
+ * before it, at any path, with 204 and no body.
  */
 function deskEmbedHeaders(): Plugin {
   const settings = deskEmbedSettings(process.env);

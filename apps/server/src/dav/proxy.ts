@@ -9,6 +9,7 @@ import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
 import { requestBase, requestBases } from '../request-base';
 import { addVary } from '../vary';
+import { rewriteIfHeader } from './if-header';
 import {
   DAV_PREFIX,
   parseUpstream,
@@ -32,10 +33,16 @@ export const WEBDAV_EXTRA_METHODS = [
 const PROXIED_METHODS = ['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', ...WEBDAV_EXTRA_METHODS];
 
 /**
- * Request headers forwarded upstream, as sent; everything else is dropped, the client's cookies and
- * credentials included (its `Authorization`: the WebDAV server gets the server's own, WEBDAV_USERNAME
- * and WEBDAV_PASSWORD). A token the client sends in the query (`?token=`, any spelling) is left out
- * of the URL and of the Destination sent upstream (rewrite.ts upstreamUrlFor).
+ * Request headers forwarded upstream as sent: none of them names a resource by URL or carries the
+ * editor's token (`Lock-Token` holds a state token the WebDAV server issued; `If-Match` and
+ * `If-None-Match` hold entity tags, `If-Range` an entity tag or a date). Everything else is
+ * dropped, the client's cookies and credentials included (its `Authorization`: the WebDAV server
+ * gets the server's own, WEBDAV_USERNAME and WEBDAV_PASSWORD), but for the two headers that name
+ * resources by URL in the editor's namespace, which are mapped into the WebDAV server's:
+ * `Destination` (rewrite.ts rewriteDestination) and the resource tags of `If` (if-header.ts
+ * rewriteIfHeader). A token the client sends in the query (`?token=`, any spelling) is left out of
+ * the URL, the Destination and the If header's resource tags sent upstream (rewrite.ts
+ * upstreamUrlFor).
  */
 const FORWARD_REQUEST_HEADERS = [
   'accept',
@@ -45,7 +52,6 @@ const FORWARD_REQUEST_HEADERS = [
   'content-language',
   'depth',
   'overwrite',
-  'if',
   'if-match',
   'if-none-match',
   'if-modified-since',
@@ -150,16 +156,21 @@ function isXml(contentType: string | undefined): boolean {
 
 /**
  * Same-origin WebDAV access for browsers: `/dav/*` is forwarded to WEBDAV_URL with the server's
- * credentials, never the client's (the query and a Destination lose their `token` pairs). Paths, and
- * the paths of Destination headers, are confined to the upstream base URL (never an open proxy): a
- * path segment that does not decode, or decodes to `.` or `..` (also before a `;`: `..;`) or to a
- * name with `/`, `\` or a control character in it (`..%2f`, `.%09.`), is refused, and the URL sent
- * upstream, decoded with its dot segments resolved, is the base or under it (rewrite.ts). URLs in
- * `Destination`, `Location` and PROPFIND multistatus bodies are translated between the two
- * namespaces: the hrefs given out are under the request's base path (`/3d/dav/...`, so that clients
- * behind a reverse proxy can follow them), and a Destination is accepted with or without it
- * (docs/subpath.md). Every answer carries PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix`
- * (with the WebDAV server's Vary), since the hrefs and Location depend on that header.
+ * credentials, never the client's (the query, a Destination and the resource tags of an If header
+ * lose their `token` pairs). Paths, and the paths of Destinations and of If resource tags, are
+ * confined to the upstream base URL (never an open proxy): a path segment that does not decode, or
+ * decodes to `.` or `..` (also before a `;`: `..;`) or to a name with `/`, `\`, an ASCII control
+ * character (U+0000-U+001F) or DEL in it (`..%2f`, `.%09.`), is refused, and the URL sent upstream,
+ * decoded with its dot segments resolved, is the base or under it (rewrite.ts). C1 controls
+ * (U+0080-U+009F, which a header carries as raw bytes 0x80-0x9F) are characters of a name like any
+ * other and go upstream percent-encoded (`%C2%80`-`%C2%9F`). URLs in `Destination`, the resource
+ * tags of `If`, `Location`, `Content-Location` and the XML the WebDAV server answers WebDAV methods
+ * with (multistatus, lock discovery, error conditions; never a GET's body, a stored file) are
+ * translated between the two namespaces: the hrefs given out are under the request's base path
+ * (`/3d/dav/...`, so that clients behind a reverse proxy can follow them), and a Destination or an If
+ * resource tag is accepted with or without it (docs/subpath.md). Every answer carries
+ * PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix` (with the WebDAV server's Vary), since the
+ * hrefs and Location depend on that header.
  */
 export async function registerDavProxy(
   app: FastifyInstance,
@@ -178,12 +189,25 @@ export async function registerDavProxy(
     const headers = upstreamHeaders(request.headers, settings);
     // the base path of the hrefs given out (docs/subpath.md)
     const base = requestBase(request);
+    const outside = { error: `Destination must be inside ${base}${DAV_PREFIX}/` };
     const destination = request.headers.destination;
     if (typeof destination === 'string') {
       const mapped = rewriteDestination(upstream, destination, requestBases(request));
       // RFC 4918: a destination on another server is refused with 502.
-      if (!mapped) return reply.code(502).send({ error: `Destination must be inside ${base}${DAV_PREFIX}/` });
+      if (!mapped) return reply.code(502).send(outside);
       headers.destination = mapped;
+    }
+    // the resource tags of If name resources as a Destination does (several If lines, which Node
+    // joins with `, `, are no If header the grammar allows)
+    const ifHeader = request.headers.if;
+    if (ifHeader !== undefined) {
+      const text = Array.isArray(ifHeader) ? ifHeader.join(', ') : ifHeader;
+      const mapped = rewriteIfHeader(upstream, text, requestBases(request));
+      if ('refused' in mapped) {
+        if (mapped.refused === 'outside') return reply.code(502).send(outside);
+        return reply.code(400).send({ error: 'invalid If header' });
+      }
+      headers.if = mapped.header;
     }
     const body =
       request.body instanceof Readable && method !== 'GET' && method !== 'HEAD' ? request.body : null;
@@ -223,7 +247,11 @@ export async function registerDavProxy(
     }
 
     const contentType = res.headers['content-type'];
-    if (method !== 'HEAD' && status === 207 && isXml(contentType)) {
+    // the XML a WebDAV method is answered with names resources by URL (a multistatus, the lockroot
+    // of a LOCK, the hrefs of an error condition such as lock-token-submitted); a GET's body is a
+    // stored file, sent as it is
+    const ownXml = method !== 'GET' && method !== 'HEAD' && status !== 204 && status !== 304;
+    if (ownXml && isXml(contentType)) {
       let xml: string;
       try {
         xml = (await readBody(res, MAX_REWRITE_BYTES)).toString('utf8');

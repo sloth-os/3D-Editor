@@ -238,8 +238,11 @@ Results are JSON text, except where noted (images, embedded files). Failures are
   `Camera` and a point `Light`) unless `empty` is true. Its `editor_url` (`list_projects` and
   `get_project` give it too) opens the project in the web editor: the address the client reached
   the server at, with the editor's base path, then `/?project=<id>`
-  (`https://example.com/3d/?project=<id>` for an editor served under `/3d`; see
-  [subpath](subpath.md)).
+  (`https://example.com/3d/?project=<id>` for an editor served under `/3d`). When the request
+  names no usable host (neither its `X-Forwarded-Host` nor its `Host` is a host name or address
+  with an optional port from 1 to 65535: `a"b` and `example.com:0` are not), it is a path under
+  the base instead (`/3d/?project=<id>`), never one from the root of the site; see
+  [subpath](subpath.md#what-the-server-writes-with-the-base).
 - `get_project` reports the server's persistence: `persistence` is `disk` or `webdav` (projects are
   saved and survive restarts) or `memory` (lost when the server stops); `persistence_note`
   explains it, and `stored_at` gives the directory or WebDAV location (not for `memory`).

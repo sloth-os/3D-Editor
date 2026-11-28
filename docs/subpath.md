@@ -20,16 +20,24 @@ desk](#the-desk-under-a-subpath) · [proxy configurations](#proxy-configurations
 
 A base path is `/` followed by path segments of `A-Z a-z 0-9 . _ ~ -`, without a trailing slash
 (`/3d/` is read as `/3d`; `/` or an empty value is the root), and at most 256 characters long as
-given (spaces and trailing slashes count). No segment is `.` or `..`, and the first segment is
-none of the server's own top-level paths, since a path under it could then be read two ways:
-`api`, `sync`, `mcp`, `dav`, `otlp`, `metrics`, `healthz`, `readyz`, `assets`, `icons`, `desk`,
-and the build's files at the top (`index.html`, `desk.html`, `sw.js`, `sw.js.map`,
-`manifest.webmanifest`, `favicon.svg`). The server refuses a `BASE_PATH` it cannot use when it
-starts, with the reason (`Invalid configuration: BASE_PATH: …`, such as
-`'…' is longer than 256 characters`). It writes no base from an `X-Forwarded-Prefix` it cannot use
-(the request's base is then `BASE_PATH`), so the header can never steer links off the site: a
-header with several comma-separated values counts by its first, and one whose first value is longer
-than 256 characters is ignored before anything else reads it.
+given (spaces and trailing slashes count). No segment is `.` or `..`. The first segment of
+`BASE_PATH` is none of the server's own top-level paths, `api`, `sync`, `mcp`, `dav`, `otlp`,
+`metrics`, `healthz`, `readyz`, `assets`, `icons`, `desk`, and the build's files at the top
+(`index.html`, `desk.html`, `sw.js`, `sw.js.map`, `manifest.webmanifest`, `favicon.svg`), since the
+server removes `BASE_PATH` from request paths and a path under such a base could be read two ways
+(with `BASE_PATH=/api`, `/api/config` would be the API's and `/config` under the base). The server
+refuses a `BASE_PATH` it cannot use when it starts, with the reason
+(`Invalid configuration: BASE_PATH: …`, such as `'…' is longer than 256 characters`).
+
+The base in `X-Forwarded-Prefix` follows the same rules, but its first segment may be one of the
+server's own paths: an editor at the root behind a stripping proxy at `/api/` or `/desk/` has the
+base `/api` or `/desk`. The server never removes the header's value from a path (a request that
+carries the header is routed as it came, [both proxy styles](#both-proxy-styles)), so no path is
+read two ways: through a proxy at `/api/`, `/api/api/config` reaches the server as `/api/config`,
+the API's, and `/api/` as `/`, the editor's page. The server writes no base from an
+`X-Forwarded-Prefix` it cannot use (the request's base is then `BASE_PATH`), so the header can
+never steer links off the site: a header with several comma-separated values counts by its first,
+and one whose first value is longer than 256 characters is ignored before anything else reads it.
 
 ### Both proxy styles
 
@@ -54,15 +62,17 @@ behind a stripping proxy at `/3d` with `BASE_PATH=/3d`, a client's `/3d/3d/metri
 server as `/3d/metrics` with the header, which no route serves, never as `/metrics` past the
 proxy's own path rules (`location /3d/metrics { deny all; }`). So:
 
-- a stripping proxy must send `X-Forwarded-Prefix`, in place of a client's (the
-  [configurations](#proxy-configurations) below do): without it, the server with `BASE_PATH` would
-  remove the prefix a second time;
+- a stripping proxy must send `X-Forwarded-Prefix`, in place of a client's, and deliver it
+  whatever the client sends, also when the client names the header in `Connection`
+  ([below](#a-stripping-proxy-delivers-its-header); the [configurations](#proxy-configurations)
+  do): without it, the server with `BASE_PATH` would remove the prefix a second time;
 - a keeping proxy must not send the header, must drop a client's (nginx
   `proxy_set_header X-Forwarded-Prefix "";`, Caddy `header_up -X-Forwarded-Prefix`, Apache httpd
   `RequestHeader unset X-Forwarded-Prefix`, where it proxies the prefix), and needs `BASE_PATH`. A
-  request that carries the header while its path starts with `BASE_PATH` or with the header's own
-  base reaches no route: it fails closed, with the editor's page for `GET` and `HEAD` (404 on a
-  server without the web app) and 404 for WebSocket upgrades and other methods;
+  request that carries the header while its path starts with `BASE_PATH`, or with the header's own
+  base when that is none of the server's own paths, reaches no route: it fails closed, with the
+  editor's page for `GET` and `HEAD` (404 on a server without the web app) and 404 for WebSocket
+  upgrades and other methods;
 - on the server's own port, requests without the prefix keep working: the Docker health check
   (`/healthz`), Prometheus (`/metrics`) and the API. With `BASE_PATH=/3d`, an editor or desk page
   opened there (`http://host:8080/`, `/?project=…`, `/desk.html?embed=1#…`) is written with
@@ -73,10 +83,13 @@ proxy's own path rules (`location /3d/metrics { deny all; }`). So:
 A request that carries `X-Forwarded-Prefix` while its path starts with `BASE_PATH` or with the
 header's usable base makes the server say so in its log, at warn, at most once in 10 minutes:
 `… if a proxy in front sends X-Forwarded-Prefix and keeps the prefix in request paths, it must not
-send the header, and the server needs BASE_PATH=/3d …`. Clients can send the header too, so a
-client can make the server write that line as well: it names the base the path starts with (the
-header's usable base or `BASE_PATH`), never the header's text, and the request's URL with its token
-redacted, as the access log gives it.
+send the header, and the server needs BASE_PATH=/3d …`. A header base whose first segment is one of
+the server's own paths is no such sign: behind a stripping proxy at `/api/`, the editor's own
+requests arrive with paths under it (`/api/api/config` as `/api/config`), so with such a header
+only `BASE_PATH` counts. Clients can send the header too, so a client can make the server write
+that line as well: it names the base the path starts with (the header's usable base or
+`BASE_PATH`), never the header's text, and the request's URL with its token redacted, as the access
+log gives it.
 
 A request for `BASE_PATH` without its slash (`/3d`, also with a query) that carries no
 `X-Forwarded-Prefix` is redirected to `/3d/` with status 308, so that the editor's pages are inside
@@ -89,20 +102,57 @@ under the prefix, and pages opened on the server's own port move under it. With 
 that sends the header this is safe: the server then removes nothing from the paths the proxy
 stripped.
 
+#### A stripping proxy delivers its header
+
+A stripping proxy must deliver its `X-Forwarded-Prefix` whatever the client sends, also when the
+client names the header in `Connection`. HTTP lets a client list there the headers that belong to
+its own connection (hop by hop), and a proxy that follows it drops them before it passes the
+request on; if it drops the `X-Forwarded-Prefix` it set itself, the request reaches the server as
+a keeping proxy's would, and the server removes `BASE_PATH` from it: with `BASE_PATH=/3d`, a
+client's `/3d/3d/metrics` with `Connection: X-Forwarded-Prefix` reaches `/metrics`, past the
+proxy's rule for `/3d/metrics`. Tested with the [configurations](#proxy-configurations) below and a
+rule that denies `/3d/metrics`, for `Connection` naming the header in any case, alone or in a list
+(commas, `;`, a tab, several `Connection` lines, a folded line, with `close`, `keep-alive` or
+`Upgrade`), with the client's own `X-Forwarded-Prefix`, and for HTTP/1.0 clients. Through Apache
+httpd without the line below, each of them lost the prefix, and `/3d/3d/metrics` reached `/metrics`
+(an upgrade got 404 there, as every upgrade outside the live sync does, and one to
+`/3d/3d/sync/<id>` reached the live sync); through the others, none did (nginx refuses a folded
+line with 400). `Proxy-Connection` naming the header made none of them drop it. HTTP/2 and HTTP/3
+have no `Connection` header: RFC 9113 and RFC 9114 make a request that carries one malformed.
+
+| Proxy (stripping the prefix) | Delivers its `X-Forwarded-Prefix` when a client names it in `Connection`                                                                                                                                                                                                           |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| nginx 1.24.0                 | yes: `proxy_set_header Connection` replaces the client's `Connection`, and nginx drops no header it names                                                                                                                                                                          |
+| Caddy v2.11.9, 2.6.2         | yes: Caddy drops the headers the client names first, then sets its `X-Forwarded-*` headers and those of `header_up`                                                                                                                                                                |
+| Apache httpd 2.4.58          | only with `RequestHeader unset Connection "expr=req_novary('Connection') =~ /x-forwarded-prefix/i"`: mod_proxy_http drops the headers a client names in `Connection` after mod_headers has set `X-Forwarded-Prefix`, so the configuration removes such a `Connection` header first |
+
+The Apache line removes the client's `Connection` only when it names `X-Forwarded-Prefix` (in any
+case, anywhere in it, so in every form mod_proxy_http would read as that name); the `close` or
+`keep-alive` of such a client goes with it. Removing `Connection` from every request also works,
+but then Apache ignores an HTTP/1.1 client's `Connection: close` (it keeps the connection open) and
+closes an HTTP/1.0 client's `keep-alive` connection after each answer. With the line, clients that
+do not name the header keep their `keep-alive` and `close` as before, the live sync still upgrades
+with the prefix delivered, also when the client's `Connection: Upgrade` names the header
+(`upgrade=websocket` follows the `Upgrade` header), and request bodies arrive whole (64 MiB with
+`Content-Length` or chunked, also with `Expect: 100-continue`).
+
 ## What the server writes with the base
 
-| Output                                                                                                                                                                                       | With base `/3d`                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html` and `desk.html`: the editor at `/` and at any other canonical page path (`//x`, `/./x` and `/x/../y` get 403 from the static file server), the desk at `/desk.html` and `/desk` | `<base href="/3d/">` as the first element of `<head>`, written per request; `Cache-Control: no-cache` and `Vary: X-Forwarded-Prefix`; the desk page keeps its [headers](embedding.md#headers)                                                                                                                                                                                                                                                        |
-| the redirect of `BASE_PATH` without its slash (`BASE_PATH=/3d`, a request without `X-Forwarded-Prefix`)                                                                                      | `Location: /3d/`                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| links in MCP results: `editor_url`, the download links of `export_scene`, renders and video exports, model store thumbnails                                                                  | `https://example.com/3d/?project=…`, `https://example.com/3d/api/…`: the scheme of the last value of `X-Forwarded-Proto` and the host of the last value of `X-Forwarded-Host` when a proxy sends usable ones, else `http` and the `Host` header, then the base; without a usable host (no `Host`, or one refused as [below](#caches-and-headers-behind-a-proxy)), the base alone: paths under it (`/3d/?project=…`), never from the root of the site |
-| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                                                                                              | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the request's base or `BASE_PATH`, spelled as a request target may be (`/%33d/dav/x` is `/3d/dav/x`)                                                                                                                                                                                                               |
-| the startup log                                                                                                                                                                              | `http://localhost:8080/3d/` and `http://localhost:8080/3d/mcp` with `BASE_PATH=/3d`                                                                                                                                                                                                                                                                                                                                                                  |
+| Output                                                                                                                                                                                       | With base `/3d`                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `index.html` and `desk.html`: the editor at `/` and at any other canonical page path (`//x`, `/./x` and `/x/../y` get 403 from the static file server), the desk at `/desk.html` and `/desk` | `<base href="/3d/">` as the first element of `<head>`, written per request; `Cache-Control: no-cache` and `Vary: X-Forwarded-Prefix`; the desk page keeps its [headers](embedding.md#headers)                                                                                                                                                                                                                            |
+| the redirect of `BASE_PATH` without its slash (`BASE_PATH=/3d`, a request without `X-Forwarded-Prefix`)                                                                                      | `Location: /3d/`                                                                                                                                                                                                                                                                                                                                                                                                         |
+| links in MCP results: `editor_url`, the download links of `export_scene`, renders and video exports, model store thumbnails                                                                  | `https://example.com/3d/?project=…`, `https://example.com/3d/api/…`: the scheme of the last value of `X-Forwarded-Proto` and the host of the last value of `X-Forwarded-Host` when a proxy sends usable ones, else `http` and the `Host` header, then the base; when no host is usable ([below](#caches-and-headers-behind-a-proxy)), the base alone: paths under it (`/3d/?project=…`), never from the root of the site |
+| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                                                                                              | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the request's base or `BASE_PATH`, spelled as a request target may be (`/%33d/dav/x` is `/3d/dav/x`)                                                                                                                                                                                   |
+| the startup log                                                                                                                                                                              | `http://localhost:8080/3d/` and `http://localhost:8080/3d/mcp` with `BASE_PATH=/3d`                                                                                                                                                                                                                                                                                                                                      |
 
 The base is the request's `X-Forwarded-Prefix` when it has a usable one, else `BASE_PATH`. That is
 all the header's value does: it sets what the server writes (this table) and a base a WebDAV
 `Destination` may start with, never what a request is routed to; that a request carries the header
-at all only keeps `BASE_PATH` on its path ([both proxy styles](#both-proxy-styles)).
+at all only keeps `BASE_PATH` on its path ([both proxy styles](#both-proxy-styles)). A
+`Destination` that starts with the request's base is read under it, also when the base is one of the
+server's own paths: behind a proxy at `/dav/`, the site's `/dav/x.txt` is `/x.txt` under the base,
+no WebDAV path, and the request is refused (502), while `/dav/dav/x.txt` is the WebDAV `/x.txt`.
 
 REST answers give the server's own routes as paths from its root, the same under every prefix:
 `webdav.url` of `GET /api/config` (`/dav`), `files[].url` of a [video export](video-export.md#rest),
@@ -192,10 +242,12 @@ the server writes it at the root: `vite preview` at every page path that names n
 dev server at `/desk/` and `/desk.html/` ([development](embedding.md#development)). Both read a
 request's path as the server does and answer as it does a path with an empty or dot segment
 (`//desk.html`, `/desk.html//`, `/./x`, `/x/../y`): 403 for a `GET` or `HEAD`, 404 for any other
-method; any method but `GET` and `HEAD` gets 404 outside the proxied routes, and a path that Vite
-would read another way (`/x%2f..%2fdesk`) is answered as one that names no file, so that no path
-serves the desk page without its headers. A subpath is a deployment concern, covered by the
-[tests](#tests) against the built app.
+method but `OPTIONS`; any method but `GET`, `HEAD` and `OPTIONS` gets 404 outside the proxied
+routes, and a path that Vite would read another way (`/x%2f..%2fdesk`, `/%2fdesk.html`) is answered
+as one that names no file, so that no path serves the desk page without its headers. An `OPTIONS`
+request gets 204 with no body from Vite's CORS middleware, which answers it first, at any path (the
+proxied routes too). A subpath is a deployment concern, covered by the [tests](#tests) against the
+built app.
 
 ### Static hosts
 
@@ -231,10 +283,12 @@ Copy-ready files are in `deploy/`: [`deploy/caddy/Caddyfile`](../deploy/caddy/Ca
 [`deploy/nginx/3d-editor.conf`](../deploy/nginx/3d-editor.conf) and
 [`deploy/httpd/3d-editor.conf`](../deploy/httpd/3d-editor.conf). Each serves `/3d/` from an editor
 server on `127.0.0.1:8080`, redirects `/3d` to `/3d/`, strips `/3d` and sends
-`X-Forwarded-Prefix: /3d` in place of a client's, forwards WebSocket upgrades (the live sync),
-passes the original host and scheme, buffers neither MCP streams nor downloads, leaves request size
-limits to the server (10 MB for `/api`, 100 MB for `/mcp`, 5 MB for `/otlp`; WebDAV bodies stream
-through) and allows long requests (MCP calls that wait for renders, export downloads).
+`X-Forwarded-Prefix: /3d` in place of a client's, whatever the client names in `Connection`
+([a stripping proxy delivers its header](#a-stripping-proxy-delivers-its-header)), forwards
+WebSocket upgrades (the live sync), passes the original host and scheme, buffers neither MCP
+streams nor downloads, leaves request size limits to the server (10 MB for `/api`, 100 MB for
+`/mcp`, 5 MB for `/otlp`; WebDAV bodies stream through) and allows long requests (MCP calls that
+wait for renders, export downloads).
 
 ```caddy
 # Caddy 2.9 or later ({?query}): handle_path strips /3d; the header tells the editor so and its base
@@ -281,6 +335,8 @@ RewriteRule ^/3d$ /3d/ [R=308,L,QSA]
 ProxyPreserveHost On
 <Location "/3d/">
     RequestHeader set X-Forwarded-Prefix "/3d"
+    # mod_proxy_http drops the headers a client names in Connection: one that names X-Forwarded-Prefix goes first
+    RequestHeader unset Connection "expr=req_novary('Connection') =~ /x-forwarded-prefix/i"
     RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}
     ProxyPass http://127.0.0.1:8080/ upgrade=websocket flushpackets=on timeout=3600
     ProxyPassReverse http://127.0.0.1:8080/
@@ -312,6 +368,15 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   port; with neither usable, a link is a path under the base (`/3d/?project=…`). The three
   configurations above do this (Caddy sets `X-Forwarded-Proto` and `X-Forwarded-Host` without being
   told).
+- A client that names `X-Forwarded-Proto` in `Connection` makes Apache httpd drop the one the
+  configuration sets, as it would drop `X-Forwarded-Prefix` without its line
+  ([a stripping proxy delivers its header](#a-stripping-proxy-delivers-its-header)); httpd adds
+  `X-Forwarded-Host` after it drops such headers, and nginx and Caddy deliver all of theirs. The
+  server reads `X-Forwarded-Proto` only for the links in MCP results, so that client's own links
+  then start with `http://`, the scheme the server assumes without the header, where they would
+  start with `https://` (measured through the Apache configuration over TLS; a `Connection` that
+  names `X-Forwarded-Prefix` as well is removed whole, and both headers arrive). Nothing else
+  changes, so the configuration guards `X-Forwarded-Prefix` only.
 - The pages, the redirect of `BASE_PATH` without its slash (for requests without the header only)
   and the WebDAV proxy's responses (the base in their `<href>`s, `Location` and
   `Content-Location`) depend on `X-Forwarded-Prefix` and say so (`Vary: X-Forwarded-Prefix`, added
@@ -339,15 +404,22 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   without one, the build's top-level names (every entry of `apps/web/public`, and of
   `apps/web/dist` when it is built, is in the server's list), the project links agents are told to
   open, and time linear in the length of what requests send (200,000 slashes before an `x`).
-  `auth.test.ts`, `cors.test.ts` and `dav-rewrite.test.ts` beside it: the scope a request is
-  checked against comes from the route that serves it, the token is redacted
+  `auth.test.ts`, `cors.test.ts`, `dav-rewrite.test.ts` and `dav-if-header.test.ts` beside it: the
+  scope a request is checked against comes from the route that serves it, the token is redacted
   from logged URLs in every spelling the server accepts (`?token=`, `?%74oken=`, `?to%6Ben=`), an
   `Origin` is compared with `CORS_ORIGINS` in linear time, and WebDAV paths and `Destination`s are
-  decoded segment by segment (a segment with a control character is refused, and so is one that is
-  `.` or `..` up to a `;`, which servlet containers such as Tomcat cut off: `..;`), checked against
-  `WEBDAV_URL` as the URL parser reads them, and sent without their `token` query pairs: they never
-  leave `WEBDAV_URL` on a WebDAV server that decodes a path once and reads no other spelling as `.`
-  or `..`.
+  decoded segment by segment (a segment with an ASCII control character, U+0000-U+001F, or DEL is
+  refused, and so is one that is `.` or `..` up to a `;`, which servlet containers such as Tomcat
+  cut off: `..;`; C1 controls, U+0080-U+009F, are characters of a name like any other and reach
+  the WebDAV server as `%C2%80`-`%C2%9F`), checked against `WEBDAV_URL` as the URL parser reads
+  them, and sent without their `token` query pairs, dropped from the query as the URL parser built
+  it (a raw tab in a pair's name hides none), and with every other pair (`%74%6F%6B%65%6Es`, which
+  is `tokens`, and those of an absolute `Destination`): they never leave `WEBDAV_URL` on a WebDAV
+  server that decodes a path once and reads no other spelling as `.` or `..`. The resource tags of
+  an `If` header are mapped as `Destination`s are, and the rest of it is kept as sent (no-tag
+  lists, state tokens, entity tags with `<`, `>`, `(`, `)`, `[` or `]` in them); a tag outside
+  `WEBDAV_URL` and a header that does not parse are refused, and a header is read in time linear in
+  its length.
 - `apps/server/test/integration/subpath.test.ts`: a server with `BASE_PATH`, both proxy styles
   (prefix kept with `BASE_PATH` and no header, prefix stripped with `X-Forwarded-Prefix` and
   `BASE_PATH` set too), the pages, the redirect, sync over WebSocket, the WebDAV proxy's `href`s and
@@ -361,14 +433,27 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   `X-Forwarded-Prefix` or `Origin` headers of slashes. `dav-confinement.test.ts` beside it: WebDAV
   requests and `Destination`s that try to leave `WEBDAV_URL` (`..%2f`, `%2e%2e%2f`,
   `x%2f..%2f..%2f`, `%%%%`, `..;`, `%2e%2e%3b`, `.%09.`; in a `Destination` also a raw tab, the one
-  control character Node lets into a header value, and a path that ends in a space before its
-  fragment, which the URL parser trims) are refused and reach nothing outside it, and names with
-  `%20`, `%C3%A9` and `;` still work. `dav-proxy.test.ts`: the proxy's `Content-Security-Policy`,
+  ASCII control character Node lets into a header value, and a path that ends in a space before
+  its fragment, which the URL parser trims) are refused and reach nothing outside it, and names
+  with `%20`, `%C3%A9` and `;` still work (raw bytes 0x80-0x9F of a header arrive as the C1
+  controls U+0080-U+009F, which go to the WebDAV server as `%C2%80`-`%C2%9F`, inside
+  `WEBDAV_URL`). `dav-proxy.test.ts`: the proxy's `Content-Security-Policy`,
   `X-Content-Type-Options` and `Vary` on uploaded `.html` and `.svg` files and on every other
   answer, and a token in the query (`?token=`, `?%74oken=`, `?to%6Ben=`) that lets GET, PUT,
   PROPFIND and COPY through but never reaches the WebDAV server, in a URL or in a `Destination`.
-  `sync-upgrades.test.ts`: the token, in each of its spellings, redacted from the access and
-  upgrade logs.
+  `dav-locks.test.ts`: through `/3d/dav` with `?token=` URLs, against a WebDAV server that holds
+  locks by their tokens as Apache httpd and Sabre/DAV do, a LOCK (its answer's `lockroot` under
+  `/3d/dav/`), then PUT, PROPPATCH and DELETE with tagged `If` lists that name the locked file in
+  the editor's namespace succeed, the WebDAV server getting the tags as its own URLs without the
+  token, while a write without the lock's token, or with it in a list tagged with another file,
+  gets 423 (its `lock-token-submitted` href under `/3d/dav/`); no-tag lists, entity tags that hold
+  `<`, `>`, `(`, `)`, `[` and `]`, and `Lock-Token` reach it as sent; an `If` tag outside
+  `WEBDAV_URL` gets 502 as a `Destination` outside does, a header that does not parse 400, and
+  neither reaches it. `sync-upgrades.test.ts`: the token, in each of its spellings, redacted from
+  the access and upgrade logs. `mcp-links.test.ts`: through the MCP transport, `editor_url` is a
+  path under the base (`/3d/?project=<id>`) when neither `Host` nor `X-Forwarded-Host` is a usable
+  host (`a"b`, `example.com:0`), and a request without a `Host` is answered 400, over HTTP/1.1 and
+  HTTP/1.0, before any tool runs.
 - `apps/web/test/base-url.test.ts`: the app's URLs under a base, and a page opened outside its
   base (`pageUnderBase`, the inline script built from it, and its place in both pages: after
   `<meta charset>`, before any script or link). `pwa-sw.test.ts` and `pwa-sw-messages.test.ts`
@@ -381,11 +466,14 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   `npm run dev` and `npm run preview` answer: the editor's page with `<base href="/">` at `/desk/`
   and `/desk.html/` (Vite's in development, the built one in preview) and, in preview, at every
   other page path that names no built file (a folder such as `/icons`, a path that climbs out of
-  the build once decoded such as `/..%2findex.html`, one that does not decode); a missing file 404,
-  never a page; a path with an empty or dot segment 403, any method but `GET` and `HEAD` outside
-  the proxied routes 404, as on the server, and at the paths Vite would read another way
-  (`/x%2f..%2fdesk`, in development `/dist/desk` and `/@fs/…/desk.html`) the editor's page or 404,
-  never the desk page without its headers.
+  the build once decoded such as `/..%2findex.html`, one with an empty or dot segment once decoded
+  such as `/%2fdesk.html` and `/.%2fdesk.html`, one that does not decode); a missing file 404,
+  never a page; a path with an empty or dot segment 403, any method but `GET`, `HEAD` and
+  `OPTIONS` outside the proxied routes 404, as on the server, and at the paths Vite would read
+  another way (`/x%2f..%2fdesk`, in development `/%2fdesk`, `/.%2fdesk`, `/dist/desk` and
+  `/@fs/…/desk.html`) the editor's page or 404, never the desk page without its headers; and, from
+  the dev and preview servers Vite starts with `apps/web/vite.config.ts`, 204 with no body for an
+  `OPTIONS` at any path, the proxied routes too.
 - `e2e/tests/subpath.spec.ts`: the built editor and desk under `/3d` with the prefix kept
   (`BASE_PATH`) and under `/editor` behind a stripping proxy (`e2e/fixtures/prefix-proxy.mjs`, which
   answers like the nginx configuration): the redirect of the bare prefix, every request of the

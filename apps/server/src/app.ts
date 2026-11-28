@@ -125,11 +125,13 @@ export const KEPT_PREFIX_WARNING_INTERVAL_MS = 10 * 60_000;
  * Says at warn, at most once per KEPT_PREFIX_WARNING_INTERVAL_MS (on `now`'s clock), that a request
  * carrying X-Forwarded-Prefix has a path that still starts with the header's usable base or with
  * BASE_PATH (keptPrefix), which reaches no route: a proxy in front that sends the header and keeps
- * the prefix in request paths must not send it (docs/subpath.md). Clients can send the header too,
- * so the line is worded as a condition and kept rare; it names a usable base only, never the
- * header's text, and the URL as the access log gives it (token redacted).
+ * the prefix in request paths must not send it (docs/subpath.md). A header base under one of the
+ * server's own paths (/api) is no such sign: the editor's own requests through a stripping proxy at
+ * /api/ have paths under it. Clients can send the header too, so the line is worded as a condition
+ * and kept rare; it names a usable base only, never the header's text, and the URL as the access log
+ * gives it (token redacted).
  */
-function keptPrefixWarning(
+export function keptPrefixWarning(
   basePath: string,
   log: Log,
   now: () => number,

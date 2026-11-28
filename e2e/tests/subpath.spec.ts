@@ -8,7 +8,9 @@ import { callJson, mcpConnect, mcpEndSession } from './helpers';
  *   keeps the prefix passes on
  * - /editor behind fixtures/prefix-proxy.mjs, which strips the prefix and sends X-Forwarded-Prefix
  *   to the plain server, as the nginx configuration does
- * For both: the bare prefix is redirected to the prefix with its slash; an unknown API path under
+ * - /api, one of the server's own paths, behind the same proxy in front of the plain server: the
+ *   header's base may be one (BASE_PATH may not), and the editor's own API is then /api/api/…
+ * For each: the bare prefix is redirected to the prefix with its slash; an unknown API path under
  * the prefix is the server's 404 in JSON, never the editor; the manifest is relative and has no id;
  * the editor's <base href> is the prefix, a project is created, synced live and reloaded under it,
  * an MCP agent gets the project's editor_url under it, the service worker's scope is the prefix and
@@ -38,6 +40,12 @@ const SETUPS: Setup[] = [
     name: 'prefix stripped by a proxy (X-Forwarded-Prefix: /editor)',
     origin: 'http://127.0.0.1:4183',
     prefix: '/editor',
+    serverPrefix: '',
+  },
+  {
+    name: "prefix stripped by a proxy at one of the server's own paths (X-Forwarded-Prefix: /api)",
+    origin: 'http://127.0.0.1:4185',
+    prefix: '/api',
     serverPrefix: '',
   },
 ];
@@ -340,9 +348,12 @@ test.describe('a page opened outside its base', () => {
       // the server at the root of its origin: <base href="/">
       'http://127.0.0.1:4180/?project=abc',
       'http://127.0.0.1:4180/desk.html?x=1',
-      // behind the stripping proxy (X-Forwarded-Prefix: /editor) and under BASE_PATH's own prefix
+      // behind the stripping proxies (X-Forwarded-Prefix: /editor, and /api, one of the server's own
+      // paths) and under BASE_PATH's own prefix
       'http://127.0.0.1:4183/editor/?project=abc',
       'http://127.0.0.1:4183/editor/desk',
+      'http://127.0.0.1:4185/api/?project=abc',
+      'http://127.0.0.1:4185/api/desk.html',
       `${OWN_PORT}/3d/?project=abc`,
       `${OWN_PORT}/3d/desk.html`,
     ]) {
@@ -371,6 +382,7 @@ test("the editor at a deeper path of its base registers the base's service worke
     ['http://127.0.0.1:4180/x/y', 'http://127.0.0.1:4180/sw.js'],
     [`${OWN_PORT}/3d/desk.html/`, `${OWN_PORT}/3d/sw.js`],
     ['http://127.0.0.1:4183/editor/x/y', 'http://127.0.0.1:4183/editor/sw.js'],
+    ['http://127.0.0.1:4185/api/x/y', 'http://127.0.0.1:4185/api/sw.js'],
   ]) {
     const context = await browser.newContext();
     const page = await context.newPage();

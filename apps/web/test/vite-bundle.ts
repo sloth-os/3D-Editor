@@ -16,6 +16,20 @@ import { build, type Plugin } from 'vite';
  */
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
+/**
+ * What of `process.env` the dev server replaces in the modules it serves a browser: NODE_ENV only,
+ * as its mode ('development'; Vite's client-inject), every other read left as written, for the
+ * browser to run (a worker has no `process`). A build would replace `process.env` itself with `{}`,
+ * so that a module reading `process.env.X` at load would run in the bundle but throw in the dev
+ * server's worker.
+ */
+const DEV_NODE_ENV = JSON.stringify('development');
+const DEV_PROCESS_ENV: Record<string, string> = {
+  'process.env.NODE_ENV': DEV_NODE_ENV,
+  'global.process.env.NODE_ENV': DEV_NODE_ENV,
+  'globalThis.process.env.NODE_ENV': DEV_NODE_ENV,
+};
+
 /** A module graph bundled by bundle(). */
 export interface Bundle {
   /** The code of its chunks: with every package bundled, one classic script (iife). */
@@ -47,7 +61,8 @@ function noNodeBuiltins(): Plugin {
  * entry imports is in the bundle:
  * - `packages: 'bundled'` (the default): every module, packages included, in one classic script
  *   (iife), as a browser loads a worker; a Node built-in imported anywhere in the graph fails the
- *   build (noNodeBuiltins);
+ *   build (noNodeBuiltins), and `process.env` is left as the dev server leaves it (DEV_PROCESS_ENV),
+ *   so that code run without Node's globals reads `process` where the dev server's worker would;
  * - `packages: 'external'`: the app's own modules only, every package left out.
  */
 export async function bundle(
@@ -60,6 +75,8 @@ export async function bundle(
     root: ROOT,
     logLevel: 'silent',
     plugins: bundled ? [noNodeBuiltins()] : [],
+    // the dev server's process.env (DEV_PROCESS_ENV): the build's own define of it left out
+    ...(bundled ? { define: DEV_PROCESS_ENV, environments: { client: { keepProcessEnv: true } } } : {}),
     build: {
       write: false,
       minify: false,

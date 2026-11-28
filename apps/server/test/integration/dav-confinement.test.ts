@@ -346,4 +346,20 @@ describe('the WebDAV proxy keeps to WEBDAV_URL', () => {
     }
     expect(await upstreamRoot()).toEqual(['/', '/guarded/', '/outside-secret.txt']);
   });
+
+  it('passes C1 controls on: raw bytes 0x80-0x9F of a Destination reach the WebDAV server as `%C2%80`-`%C2%9F`', async () => {
+    // Node reads the bytes of a header as Latin-1: 0x85 is U+0085, a character of a name like any
+    // other (`.\u0085.` is no dot segment), which the URL parser sends upstream as UTF-8
+    for (const [destination, sent] of [
+      ['/3d/dav/x/.\u0085.', '/guarded/x/.%C2%85.'],
+      ['/dav/x/c1-\u0080\u009f.txt', '/guarded/x/c1-%C2%80%C2%9F.txt'],
+    ] as const) {
+      const res = await request('/3d/dav/inside.txt', { method: 'COPY', headers: { destination } });
+      expect(res.status, JSON.stringify(destination)).toBe(201);
+      expect(upstream.map((r) => r.destination)).toEqual([`${dav.origin}${sent}`]);
+      expect(await upstreamFile(sent)).toBe('inside');
+      upstream.length = 0;
+    }
+    expect(await upstreamRoot()).toEqual(['/', '/guarded/', '/outside-secret.txt']);
+  });
 });

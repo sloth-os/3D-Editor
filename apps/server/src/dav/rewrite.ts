@@ -10,9 +10,10 @@ import { originForm } from '../request-base';
  * upstream server that decodes `%2F` or `%5C` (`..%2f`), cuts `;` path parameters off (`..;`) or
  * whose URL parser drops a tab (`.\t.`) can read it as a way out, and the path, as the URL parser
  * built it, decoded with its dot segments resolved, starts with the upstream base
- * (isInsideUpstream). The query goes upstream without the editor's token (withoutTokenPairs).
- * Under a base path (docs/subpath.md) the hrefs the proxy gives out start with it (`/3d/dav/...`),
- * and the paths clients send may carry it.
+ * (isInsideUpstream). The query goes upstream without the editor's token (withoutTokenPairs), and
+ * so do the URLs of a Destination and of an If header's resource tags (if-header.ts), which are
+ * mapped the same way. Under a base path (docs/subpath.md) the hrefs the proxy gives out start with
+ * it (`/3d/dav/...`), and the paths clients send may carry it.
  */
 
 export const DAV_PREFIX = '/dav';
@@ -63,8 +64,11 @@ const EQUALS = 0x3d;
  * - it does not decode (`%zz`, a lone `%C3`);
  * - its decoded form, which keeps every character of the raw one that is no `%XX`, contains `/` or
  *   `\` (`..%2f`, `x%5c..`), or an ASCII control character (U+0000-U+001F) or DEL: `.%09.`, or a
- *   raw tab, which a Destination header may carry (Node lets no other control character into a
- *   header value) and the URL parser drops, so that `.\t.` would be sent as `..`;
+ *   raw tab, which a Destination header may carry (Node lets no other ASCII control character into
+ *   a header value) and the URL parser drops, so that `.\t.` would be sent as `..`. The C1 controls
+ *   U+0080-U+009F (raw bytes 0x80-0x9F of a header value, which Node reads as Latin-1, or
+ *   `%C2%80`-`%C2%9F`) are characters of a name like any other: the URL parser keeps them, and they
+ *   go upstream as `%C2%80`-`%C2%9F`;
  * - it is `.` or `..` up to its first `;` (`%2e%2e`, `..;`, `..;x`, `..%3b`, `.;`): servlet
  *   containers such as Tomcat cut `;` path parameters off a segment before they resolve dot
  *   segments, so that `/guarded/..;/x` is `/x` there.
@@ -101,11 +105,11 @@ function decodeDavPath(raw: string): string | null {
 
 /**
  * Whether the path of an upstream URL as it is sent (`url.pathname`, encoded) is the upstream base or
- * under it: decoded segment by segment (decodeDavPath, so no segment hides a `/`, a control character
- * or a dot segment before a `;`) and with its dot segments resolved. upstreamUrlFor checks the URL it
- * built with it, whatever the URL parser made of the path: the parser trims spaces at the end of what
- * it reads, so that a Destination `/dav/.. #x` (its fragment cut off first) is built as
- * `/guarded/..`, that is `/`, and only this check refuses it.
+ * under it: decoded segment by segment (decodeDavPath, so no segment hides a `/` or `\`, an ASCII
+ * control character or DEL, or a dot segment before a `;`) and with its dot segments resolved.
+ * upstreamUrlFor checks the URL it built with it, whatever the URL parser made of the path: the parser
+ * trims spaces at the end of what it reads, so that a Destination `/dav/.. #x` (its fragment cut off
+ * first) is built as `/guarded/..`, that is `/`, and only this check refuses it.
  */
 export function isInsideUpstream(upstream: DavUpstream, pathname: string): boolean {
   const decoded = decodeDavPath(pathname);
@@ -248,8 +252,10 @@ function encodeXml(s: string): string {
 const HREF_RE = /(<(?:[\w.-]+:)?href\b[^>]*>)([\s\S]*?)(<\/(?:[\w.-]+:)?href\s*>)/gi;
 
 /**
- * Rewrites every `<href>` of a WebDAV multistatus document from upstream URLs to `/dav` paths
- * under `base` (toLocalHref).
+ * Rewrites every `<href>` of an XML body the WebDAV server answers a WebDAV method with (a
+ * multistatus, the lock discovery of a LOCK, an error condition) from upstream URLs to `/dav` paths
+ * under `base` (toLocalHref); hrefs that are no URL of WEBDAV_URL (a lock token's
+ * `urn:uuid:…`) are left as they are.
  */
 export function rewriteMultistatus(xml: string, upstream: DavUpstream, base = ''): string {
   return xml.replace(HREF_RE, (whole, open: string, inner: string, close: string) => {
@@ -259,12 +265,14 @@ export function rewriteMultistatus(xml: string, upstream: DavUpstream, base = ''
 }
 
 /**
- * Rewrites a `Destination` request header (absolute URL or path pointing into `/dav`, with or
- * without one of `bases`, the request's base paths) to the corresponding upstream URL. Its path is
- * read as a request target is (originForm: `/%33d/dav/x` is `/3d/dav/x`) and goes through the same
- * checks as request paths (upstreamUrlFor: a segment that does not decode, or that decodes to a
- * `/`, a control character or a dot segment, is refused), and its query loses its `token` pairs.
- * Returns null if it points anywhere else or is refused.
+ * Rewrites a `Destination` request header, or a resource tag of an `If` header (if-header.ts):
+ * an absolute URL or path pointing into `/dav`, with or without one of `bases`, the request's base
+ * paths, to the corresponding upstream URL. Its path is read as a request target is (originForm:
+ * `/%33d/dav/x` is `/3d/dav/x`) and goes through the same checks as request paths (upstreamUrlFor: a
+ * segment that does not decode, or that decodes to a name with `/`, `\`, an ASCII control character
+ * or DEL in it, or to `.` or `..` up to a `;`, is refused); its query, an absolute URL's as well as a
+ * path's, keeps every pair but the `token` ones (as the URL parser built the query). Returns null if
+ * it points anywhere else or is refused.
  */
 export function rewriteDestination(
   upstream: DavUpstream,

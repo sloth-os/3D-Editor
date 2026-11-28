@@ -15,14 +15,16 @@ export const PORTS = {
   subpath: 4182,
   prefixProxy: 4183,
   staticHost: 4184,
+  ownPathProxy: 4185,
   webdav: 4199,
 };
 export const WEBDAV = { url: `http://127.0.0.1:${PORTS.webdav}`, username: 'editor', password: 'secret' };
 /**
  * The prefixes of tests/subpath.spec.ts (docs/subpath.md): the server's own BASE_PATH on
- * PORTS.subpath, and the path under which the prefix proxy serves the plain server.
+ * PORTS.subpath, the path under which the prefix proxy serves the plain server, and the path, one
+ * of the server's own, under which the second prefix proxy (PORTS.ownPathProxy) serves it.
  */
-export const PREFIXES = { subpath: '/3d', prefixProxy: '/editor' };
+export const PREFIXES = { subpath: '/3d', prefixProxy: '/editor', ownPathProxy: '/api' };
 /** The folder of the static host (PORTS.staticHost) that serves the build besides its root. */
 export const STATIC_FOLDER = '/folder/';
 
@@ -76,6 +78,8 @@ const DESK_SPECS = /[\\/]desk-[^\\/]*\.spec\.ts$/;
  *  - :4183 a proxy that serves :4180 under /editor/, stripping the prefix and sending
  *    X-Forwarded-Prefix, as the nginx configuration of docs/subpath.md does
  *    (fixtures/prefix-proxy.mjs)
+ *  - :4185 the same proxy serving :4180 under /api/, one of the editor server's own paths, which
+ *    X-Forwarded-Prefix may name (BASE_PATH may not)
  *  - :4184 a static host without an editor server, serving the web app's build at / and under
  *    /folder/, files only (fixtures/static-host.mjs, as the nginx example of docs/embedding.md)
  *  - :4199 WebDAV server (basic auth editor/secret, CORS enabled)
@@ -174,6 +178,13 @@ export default defineConfig({
       // after the plain server it serves; ready once the plain server answers through it
       command: `node fixtures/prefix-proxy.mjs ${PORTS.prefixProxy} ${PREFIXES.prefixProxy} ${PORTS.plain}`,
       url: `http://127.0.0.1:${PORTS.prefixProxy}${PREFIXES.prefixProxy}/healthz`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+    },
+    {
+      // the editor under one of its own paths: /api/api/config is its API, /api/ its page
+      command: `node fixtures/prefix-proxy.mjs ${PORTS.ownPathProxy} ${PREFIXES.ownPathProxy} ${PORTS.plain}`,
+      url: `http://127.0.0.1:${PORTS.ownPathProxy}${PREFIXES.ownPathProxy}/healthz`,
       reuseExistingServer: false,
       timeout: 60_000,
     },
