@@ -54,6 +54,10 @@ function deskPageWithoutManifest(): Plugin {
 }
 
 export default defineConfig({
+  // a relative build: the pages load their files relative to the document's base URL, which the
+  // editor server sets with <base href> under a subpath (docs/subpath.md); the dev and preview
+  // servers serve it at the root
+  base: './',
   plugins: [
     preact(),
     deskEmbedHeaders(),
@@ -66,13 +70,14 @@ export default defineConfig({
       srcDir: 'src/pwa',
       filename: 'sw.ts',
       includeAssets: ['favicon.svg', 'icons/*.png', 'icons/*.svg'],
+      // relative URLs, resolved against the manifest's own (<base>manifest.webmanifest), and no id:
+      // an installed editor is identified by its start URL, one per base (docs/subpath.md)
       manifest: {
-        id: '/',
         name: '3D Editor',
         short_name: '3D Editor',
         description: 'Collaborative, offline-capable 3D modeling, animation and rendering in the browser.',
-        start_url: '/',
-        scope: '/',
+        start_url: './',
+        scope: './',
         display: 'standalone',
         display_override: ['window-controls-overlay', 'standalone'],
         orientation: 'any',
@@ -80,14 +85,14 @@ export default defineConfig({
         theme_color: '#232323',
         categories: ['graphics', 'productivity', 'design'],
         icons: [
-          { src: '/icons/icon-192.png', sizes: '192x192', type: 'image/png' },
-          { src: '/icons/icon-512.png', sizes: '512x512', type: 'image/png' },
-          { src: '/icons/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
-          { src: '/icons/icon.svg', sizes: 'any', type: 'image/svg+xml' },
+          { src: 'icons/icon-192.png', sizes: '192x192', type: 'image/png' },
+          { src: 'icons/icon-512.png', sizes: '512x512', type: 'image/png' },
+          { src: 'icons/icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+          { src: 'icons/icon.svg', sizes: 'any', type: 'image/svg+xml' },
         ],
         file_handlers: [
           {
-            action: '/',
+            action: './',
             accept: {
               'model/gltf-binary': ['.glb'],
               'model/gltf+json': ['.gltf'],

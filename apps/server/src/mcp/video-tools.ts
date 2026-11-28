@@ -16,15 +16,16 @@ import {
  * The video export tools (SPEC §9): an export is a background job (start, then poll), because a
  * film takes minutes and MCP clients time out after 60 s. The handlers read ctx.exports when they
  * run (registration reads nothing of ctx). Projects are named as in every other tool (id or name);
- * the jobs' download links are made absolute with the request's origin (they carry no token).
+ * the jobs' download links are made absolute with the server's address as the client reached it,
+ * base path included (tool-kit.ts baseUrl; they carry no token).
  */
 
 const exportArg = z.string().min(1).describe('Export id (from export_video or list_exports)');
 
 /** A job as the tools return it: its files' links absolute. */
-function withLinks(job: ExportJob, extra: ToolExtra): Record<string, unknown> {
-  const origin = baseUrl(extra);
-  return { ...job, files: job.files.map((f) => ({ ...f, url: `${origin}${f.url}` })) };
+function withLinks(job: ExportJob, extra: ToolExtra, ctx: ToolContext): Record<string, unknown> {
+  const base = baseUrl(extra, ctx.config);
+  return { ...job, files: job.files.map((f) => ({ ...f, url: `${base}${f.url}` })) };
 }
 
 export function registerVideoTools(tool: ToolRegistrar, ctx: ToolContext): void {
@@ -70,7 +71,7 @@ export function registerVideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
         ),
     },
     async (a, extra) =>
-      withLinks(await ctx.exports.status(a.export, { waitS: a.wait_s, signal: extra.signal }), extra),
+      withLinks(await ctx.exports.status(a.export, { waitS: a.wait_s, signal: extra.signal }), extra, ctx),
   );
 
   tool(
@@ -85,7 +86,8 @@ export function registerVideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
       export: exportArg,
       delete_files: z.boolean().default(false).describe('Also delete the export and its files'),
     },
-    async (a, extra) => withLinks(await ctx.exports.cancel(a.export, { deleteFiles: a.delete_files }), extra),
+    async (a, extra) =>
+      withLinks(await ctx.exports.cancel(a.export, { deleteFiles: a.delete_files }), extra, ctx),
   );
 
   tool(
@@ -99,7 +101,7 @@ export function registerVideoTools(tool: ToolRegistrar, ctx: ToolContext): void 
     { project: projectArg.optional() },
     async (a, extra) => {
       const project = a.project ? await ctx.agent.resolveProjectId(a.project) : undefined;
-      return { exports: (await ctx.exports.list(project)).map((j) => withLinks(j, extra)) };
+      return { exports: (await ctx.exports.list(project)).map((j) => withLinks(j, extra, ctx)) };
     },
   );
 }

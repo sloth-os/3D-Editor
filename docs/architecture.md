@@ -969,13 +969,15 @@ The server, the Vite dev and preview servers and the PWA's service worker share
 `apps/server/src/desk-embed.ts` (no imports): `DESK_EMBED_COEP` and `DESK_EMBED_ORIGINS` become the
 page's COEP, CORP and CSP `frame-ancestors` and the built files' COEP and CORP, and `/desk` maps
 to `desk.html`, never to the editor's `index.html` (`/desk/` and `/desk.html/` are the editor's,
-as any other path). The PWA's service worker (`apps/web/src/pwa/sw.ts`: Workbox's precaching and
+as any other path). These paths, and those below, are paths from the base path the editor is served
+under ([serving under a subpath](subpath.md)): under the base `/3d` the desk is at `/3d/desk.html`
+and `/3d/desk`. The PWA's service worker (`apps/web/src/pwa/sw.ts`: Workbox's precaching and
 routing, the desk's rules in `sw-desk.ts`) precaches `desk.html` and answers it (also at `/desk`,
 with any query) with the precached copy and the server's current headers when the server answers
 within 4 s, else with the headers it was last served with, so a browser never freezes the
 deployment's settings; a worker script it serves without a COEP gets `require-corp`, and a new
-version refuses the editor's Update while a desk page is open and tells the editor, which says
-why (`update-waits.ts`). The build drops the web app manifest's link from `desk.html`.
+version refuses the editor's Update while a desk page is open and tells the editor, which says why
+(`update-waits.ts`). The build drops the web app manifest's link from `desk.html`.
 
 ## Library units
 
@@ -1197,6 +1199,17 @@ Extraction takes 24–117 ms, decoding the dressed set 51 ms and inserting it 11
   previs jobs) or `DATA_DIR/rideo-push` (what it pushed to each clip) any more, and both can be
   deleted by hand; the server deletes neither. Exports of that time may keep a `push` block in their
   `job.json`, which `export_status` and `list_exports` leave out (`video/jobs.ts`).
+- **Serving under a subpath** (`apps/server/src/base-path.ts`, `request-base.ts`;
+  [subpath.md](subpath.md)): a request's base is its `X-Forwarded-Prefix` when usable, else
+  `BASE_PATH`. Before anything routes a request, its URL loses the base it starts with (the
+  request's or `BASE_PATH`): HTTP requests in Fastify's `rewriteUrl`, WebSocket upgrades in an
+  `upgrade` listener that runs before the sync server's. Routes, hooks and the sync server see paths
+  from the server's root, requests without the prefix keep working, the logs give the URL as sent,
+  and the base without its slash is redirected to it with its slash (308). The two pages,
+  `index.html` and `desk.html`, are written per request with the request's `<base href>`
+  (`static.ts`), and the links that leave the server carry the base: those of MCP results
+  (`mcp/tool-kit.ts` `baseUrl`, with the scheme and host the client used) and the WebDAV proxy's
+  `href`s and `Location`. REST answers give paths from the root.
 
 ## Persistence & sync
 

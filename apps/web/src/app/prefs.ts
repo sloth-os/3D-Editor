@@ -13,9 +13,13 @@ export interface Preferences {
     webdav: { url: string; username: string; password: string; basePath: string };
   };
   sync: {
-    /** Connect to the real-time sync server (same origin by default). */
+    /** Connect to the real-time sync server (the editor server the page came from by default). */
     enabled: boolean;
-    /** Optional custom server origin, e.g. https://editor.example.com (empty = same origin). */
+    /**
+     * Optional URL of the editor server to use, with its path where it has one, e.g.
+     * https://editor.example.com or https://example.com/3d (empty: the server the page came from,
+     * under the app's base; app/base-url.ts serverBaseUrl).
+     */
     serverUrl: string;
     token: string;
   };

@@ -1,16 +1,20 @@
 import { isDeskPagePath } from '../../../server/src/desk-embed';
+import { pathInScope } from './sw-scope';
 
 /*
  * What the service worker (sw.ts) does for the embeddable desk (docs/embedding.md, "Offline" and
  * "Headers"), as functions of requests and responses that tests can run without a service worker.
  *
- * - The desk page (desk.html, also at /desk) carries the headers the server sends now whenever the
- *   server answers: its frame-ancestors and COEP are deployment settings (DESK_EMBED_ORIGINS,
- *   DESK_EMBED_COEP), and a copy cached when the service worker installed must not freeze them. Its
- *   content stays the copy this service worker precached, the version whose files it serves offline
- *   (a newer page from the server would load files that only a newer service worker serves). Offline,
- *   or when the server does not answer in time, the precached copy answers with the headers it was
- *   last served with.
+ * Every path here is a path from the service worker's scope, which is the app's base (sw-scope.ts,
+ * docs/subpath.md): the desk page is <scope>desk.html, '/desk.html' at the root.
+ *
+ * - The desk page (desk.html, also at its clean URL desk) carries the headers the server sends now
+ *   whenever the server answers: its frame-ancestors and COEP are deployment settings
+ *   (DESK_EMBED_ORIGINS, DESK_EMBED_COEP), and a copy cached when the service worker installed must
+ *   not freeze them. Its content stays the copy this service worker precached, the version whose
+ *   files it serves offline (a newer page from the server would load files that only a newer service
+ *   worker serves). Offline, or when the server does not answer in time, the precached copy answers
+ *   with the headers it was last served with.
  * - A worker script the service worker serves without a COEP gets `require-corp`, which suits a
  *   worker under any page: so a desk page whose COEP was turned on after its scripts were cached
  *   still starts its workers (a dedicated worker of a page with a COEP needs one of its own).
@@ -19,8 +23,12 @@ import { isDeskPagePath } from '../../../server/src/desk-embed';
  *   files of a running desk session.
  */
 
-/** The desk page's URL in the precache (it is served at /desk too). */
-export const DESK_PAGE = '/desk.html';
+/**
+ * The desk page in the precache, relative to the service worker (sw.ts resolves it against its own
+ * URL, as the precache resolves the build's file list): <base>desk.html. It is served at <base>desk
+ * too.
+ */
+export const DESK_PAGE = 'desk.html';
 
 /** How long a desk page waits for the server before the precached copy answers. */
 export const DESK_NETWORK_TIMEOUT_MS = 4000;
@@ -32,10 +40,18 @@ export const DESK_PAGE_SETTING_HEADERS = [
   'cross-origin-resource-policy',
 ] as const;
 
-/** A GET of the desk page (desk.html or /desk, with any query) on the service worker's origin. */
-export function isDeskPageRequest(request: Pick<Request, 'method' | 'url'>, origin: string): boolean {
-  const url = new URL(request.url);
-  return request.method === 'GET' && url.origin === origin && isDeskPagePath(url.pathname);
+/** Whether `url` is the desk page in `scope`: <scope>desk.html or <scope>desk, with any query. */
+function isDeskPageIn(url: string, scope: string): boolean {
+  const path = pathInScope(url, scope);
+  return path !== null && isDeskPagePath(path);
+}
+
+/**
+ * A GET of the desk page (desk.html or desk, with any query) within the service worker's `scope`
+ * (its registration's scope URL; an origin alone is the root scope).
+ */
+export function isDeskPageRequest(request: Pick<Request, 'method' | 'url'>, scope: string): boolean {
+  return request.method === 'GET' && isDeskPageIn(request.url, scope);
 }
 
 /** `base`'s headers with the desk page's setting headers of `from` (those `from` lacks removed). */
@@ -106,9 +122,12 @@ export function withWorkerCoep(response: Response, destination: string): Respons
  */
 export const UPDATE_WAITS_FOR_DESK = 'UPDATE_WAITS_FOR_DESK';
 
-/** Whether one of these window clients (their URLs) is a desk page. */
-export function deskPageOpen(clientUrls: readonly string[]): boolean {
-  return clientUrls.some((url) => isDeskPagePath(new URL(url).pathname));
+/**
+ * Whether one of these window clients (their URLs) is a desk page within `scope`: a desk of another
+ * base on the same origin is another service worker's.
+ */
+export function deskPageOpen(clientUrls: readonly string[], scope: string): boolean {
+  return clientUrls.some((url) => isDeskPageIn(url, scope));
 }
 
 /** A window client of the service worker: its id and URL. */
@@ -119,18 +138,21 @@ export interface WindowInfo {
 
 /**
  * The SKIP_WAITING message (the editor's Update, pwa/register.ts): this waiting version takes over
- * at once unless a desk page is open among the windows it would take over. Then it waits as
- * versions do, until every page of the active one is closed (or Update is pressed again once the
- * desk is closed). The window that asks (`senderId`) is never a desk, which has no Update: at a
- * desk path it is the editor that an older service worker answered there, which may update.
+ * at once unless a desk page is open among the windows it would take over (desk pages within its
+ * `scope`). Then it waits as versions do, until every page of the active one is closed (or Update is
+ * pressed again once the desk is closed). The window that asks (`senderId`) is never a desk, which
+ * has no Update: at a desk path it is the editor that an older service worker answered there, which
+ * may update.
  */
 export async function skipWaitingUnlessDeskOpen(
   windows: () => Promise<readonly WindowInfo[]>,
   senderId: string | undefined,
   skipWaiting: () => Promise<void>,
+  scope: string,
 ): Promise<boolean> {
   const others = (await windows()).filter((w) => w.id !== senderId);
-  if (deskPageOpen(others.map((w) => w.url))) return false;
+  const urls = others.map((w) => w.url);
+  if (deskPageOpen(urls, scope)) return false;
   await skipWaiting();
   return true;
 }
@@ -151,8 +173,9 @@ export async function answerSkipWaiting(
   windows: () => Promise<readonly WindowInfo[]>,
   sender: MessageSender | undefined,
   skipWaiting: () => Promise<void>,
+  scope: string,
 ): Promise<boolean> {
-  const took = await skipWaitingUnlessDeskOpen(windows, sender?.id, skipWaiting);
+  const took = await skipWaitingUnlessDeskOpen(windows, sender?.id, skipWaiting, scope);
   if (!took) sender?.postMessage({ type: UPDATE_WAITS_FOR_DESK });
   return took;
 }

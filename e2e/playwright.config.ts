@@ -9,8 +9,13 @@ const root = resolve(here, '..');
 const serverMain = resolve(root, 'apps/server/dist/main.js');
 const publicDir = resolve(root, 'apps/web/dist');
 
-export const PORTS = { plain: 4180, webdavServer: 4181, webdav: 4199 };
+export const PORTS = { plain: 4180, webdavServer: 4181, subpath: 4182, prefixProxy: 4183, webdav: 4199 };
 export const WEBDAV = { url: `http://127.0.0.1:${PORTS.webdav}`, username: 'editor', password: 'secret' };
+/**
+ * The prefixes of tests/subpath.spec.ts (docs/subpath.md): the server's own BASE_PATH on
+ * PORTS.subpath, and the path under which the prefix proxy serves the plain server.
+ */
+export const PREFIXES = { subpath: '/3d', prefixProxy: '/editor' };
 
 const common = { PUBLIC_DIR: publicDir, LOG_LEVEL: 'warn', HOST: '127.0.0.1' };
 
@@ -57,6 +62,11 @@ const DESK_SPECS = /[\\/]desk-[^\\/]*\.spec\.ts$/;
  * server, and real Chromium (WebGL via SwiftShader in headless mode).
  *  - :4180 editor server, in-memory sync rooms, no server-side WebDAV
  *  - :4181 editor server persisting to the WebDAV server and exposing the /dav proxy
+ *  - :4182 editor server with BASE_PATH=/3d, in-memory sync rooms: the editor at /3d/ (a proxy
+ *    that keeps the prefix passes requests on like this)
+ *  - :4183 a proxy that serves :4180 under /editor/, stripping the prefix and sending
+ *    X-Forwarded-Prefix, as the nginx configuration of docs/subpath.md does
+ *    (fixtures/prefix-proxy.mjs)
  *  - :4199 WebDAV server (basic auth editor/secret, CORS enabled)
  */
 export default defineConfig({
@@ -134,6 +144,27 @@ export default defineConfig({
         PERSIST_DEBOUNCE_MS: '300',
         DATA_DIR: mkdtempSync(resolve(tmpdir(), 'e2e-dav-')),
       },
+    },
+    {
+      command: `node ${serverMain}`,
+      // through the prefix: the server answers there (and at its root)
+      url: `http://127.0.0.1:${PORTS.subpath}${PREFIXES.subpath}/healthz`,
+      reuseExistingServer: false,
+      timeout: 60_000,
+      env: {
+        ...common,
+        PORT: String(PORTS.subpath),
+        BASE_PATH: PREFIXES.subpath,
+        SYNC_PERSISTENCE: 'memory',
+        DATA_DIR: mkdtempSync(resolve(tmpdir(), 'e2e-subpath-')),
+      },
+    },
+    {
+      // after the plain server it serves; ready once the plain server answers through it
+      command: `node fixtures/prefix-proxy.mjs ${PORTS.prefixProxy} ${PREFIXES.prefixProxy} ${PORTS.plain}`,
+      url: `http://127.0.0.1:${PORTS.prefixProxy}${PREFIXES.prefixProxy}/healthz`,
+      reuseExistingServer: false,
+      timeout: 60_000,
     },
   ],
 });

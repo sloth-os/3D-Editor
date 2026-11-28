@@ -10,16 +10,21 @@ import {
   skipWaitingUnlessDeskOpen,
   withWorkerCoep,
 } from '../src/pwa/sw-desk';
+import { navigationDenylist, pathInScope } from '../src/pwa/sw-scope';
 
 /*
  * The service worker's handling of the embeddable desk (src/pwa/sw-desk.ts, used by sw.ts;
  * docs/embedding.md "Headers" and "Offline"), on fetch API responses (Node's, as in a browser):
  * the desk page carries the server's current headers whenever the server answers, the precached
  * copy answers offline with the headers it was last served with, worker scripts get a COEP every
- * page accepts, and a new version does not take over while a desk page is open.
+ * page accepts, and a new version does not take over while a desk page is open. Its routes are
+ * paths from its scope, the app's base (src/pwa/sw-scope.ts, docs/subpath.md): at the root of the
+ * origin and under a subpath alike, never outside the scope.
  */
 
 const ORIGIN = 'https://desk.example.com';
+/** The scope of a service worker under a subpath (registration.scope: the base with its slash). */
+const SUB = `${ORIGIN}/3d/`;
 const PAGE_BODY = '<!doctype html><title>desk</title>';
 
 /** The desk page as the server sends it with `settings` headers (a 200 by default). */
@@ -50,7 +55,7 @@ describe('the desk page', () => {
       `${ORIGIN}/desk.html`,
       `${ORIGIN}/desk`,
       `${ORIGIN}/desk?scene=1`,
-      `${ORIGIN}${DESK_PAGE}?x`,
+      `${new URL(DESK_PAGE, `${ORIGIN}/sw.js`).href}?x`,
     ])
       expect(isDeskPageRequest(req(url), ORIGIN), url).toBe(true);
     for (const url of [
@@ -63,6 +68,40 @@ describe('the desk page', () => {
     ])
       expect(isDeskPageRequest(req(url), ORIGIN), url).toBe(false);
     expect(isDeskPageRequest(req(`${ORIGIN}/desk.html`, 'HEAD'), ORIGIN)).toBe(false);
+    // the registration's scope at the root (with its slash) is the same as the origin alone
+    expect(isDeskPageRequest(req(`${ORIGIN}/desk?scene=1`), `${ORIGIN}/`)).toBe(true);
+    expect(isDeskPageRequest(req(`${ORIGIN}/desk/`), `${ORIGIN}/`)).toBe(false);
+  });
+
+  it('under a subpath is <scope>desk.html and <scope>desk, nothing outside the scope', () => {
+    const req = (url: string, method = 'GET') => ({ url, method });
+    for (const url of [`${SUB}desk.html`, `${SUB}desk`, `${SUB}desk?scene=1`, `${SUB}desk.html?x`])
+      expect(isDeskPageRequest(req(url), SUB), url).toBe(true);
+    for (const url of [
+      // the root's desk (another base on the same origin) and look-alikes of the scope
+      `${ORIGIN}/desk.html`,
+      `${ORIGIN}/desk`,
+      `${ORIGIN}/3dx/desk.html`,
+      `${ORIGIN}/3d`,
+      `${ORIGIN}/other/3d/desk.html`,
+      // the editor's paths and the built files under the scope
+      SUB,
+      `${SUB}index.html`,
+      `${SUB}desk/`,
+      `${SUB}desk.html/`,
+      `${SUB}3d/desk.html`,
+      `${SUB}assets/desk-1.js`,
+      'https://other.example/3d/desk.html',
+    ])
+      expect(isDeskPageRequest(req(url), SUB), url).toBe(false);
+    expect(isDeskPageRequest(req(`${SUB}desk.html`, 'POST'), SUB)).toBe(false);
+  });
+
+  it('is precached next to the service worker: its key is resolved against the script', () => {
+    // sw.ts resolves DESK_PAGE against its own URL, as Workbox resolves the build's file list
+    expect(DESK_PAGE).toBe('desk.html');
+    expect(new URL(DESK_PAGE, `${ORIGIN}/sw.js`).href).toBe(`${ORIGIN}/desk.html`);
+    expect(new URL(DESK_PAGE, `${SUB}sw.js`).href).toBe(`${SUB}desk.html`);
   });
 
   it("online: the precached page with the server's headers, a header the server drops dropped", async () => {
@@ -143,7 +182,7 @@ describe("a new version and the editor's Update", () => {
   it('takes over when no desk page is open', async () => {
     const skipWaiting = vi.fn(async () => undefined);
     const other = { id: 'other', url: `${ORIGIN}/desk/` };
-    expect(await skipWaitingUnlessDeskOpen(windows(editor, other), 'editor', skipWaiting)).toBe(true);
+    expect(await skipWaitingUnlessDeskOpen(windows(editor, other), 'editor', skipWaiting, ORIGIN)).toBe(true);
     expect(skipWaiting).toHaveBeenCalledOnce();
   });
 
@@ -151,22 +190,136 @@ describe("a new version and the editor's Update", () => {
     for (const url of [`${ORIGIN}/desk.html`, `${ORIGIN}/desk?scene=1`]) {
       const skipWaiting = vi.fn(async () => undefined);
       const desk = { id: 'desk', url };
-      expect(await skipWaitingUnlessDeskOpen(windows(editor, desk), 'editor', skipWaiting), url).toBe(false);
+      expect(await skipWaitingUnlessDeskOpen(windows(editor, desk), 'editor', skipWaiting, ORIGIN), url).toBe(
+        false,
+      );
       expect(skipWaiting).not.toHaveBeenCalled();
     }
-    expect(deskPageOpen([editor.url])).toBe(false);
+    expect(deskPageOpen([editor.url], ORIGIN)).toBe(false);
   });
 
   it('the window that asks is no desk: the editor an older version answered at a desk path updates', async () => {
     // an older service worker answered /desk.html with the editor, whose Update asks from there
     const there = { id: 'there', url: `${ORIGIN}/desk.html` };
     const skipWaiting = vi.fn(async () => undefined);
-    expect(await skipWaitingUnlessDeskOpen(windows(editor, there), 'there', skipWaiting)).toBe(true);
+    expect(await skipWaitingUnlessDeskOpen(windows(editor, there), 'there', skipWaiting, ORIGIN)).toBe(true);
     expect(skipWaiting).toHaveBeenCalledOnce();
     // another window at a desk path still holds it
     const desk = { id: 'desk', url: `${ORIGIN}/desk` };
     const held = vi.fn(async () => undefined);
-    expect(await skipWaitingUnlessDeskOpen(windows(editor, there, desk), 'there', held)).toBe(false);
+    expect(await skipWaitingUnlessDeskOpen(windows(editor, there, desk), 'there', held, ORIGIN)).toBe(false);
     expect(held).not.toHaveBeenCalled();
+  });
+
+  it('under a subpath, only desk windows within its scope hold it: not those of another base', async () => {
+    const subEditor = { id: 'editor', url: `${SUB}?project=abc` };
+    // a desk of the root's service worker, or of another base, on the same origin: matchAll lists
+    // every window of the origin, but those pages are not this version's to take over
+    for (const url of [`${ORIGIN}/desk.html`, `${ORIGIN}/desk`, `${ORIGIN}/other/desk.html`, `${SUB}desk/`]) {
+      const skipWaiting = vi.fn(async () => undefined);
+      const elsewhere = { id: 'elsewhere', url };
+      expect(
+        await skipWaitingUnlessDeskOpen(windows(subEditor, elsewhere), 'editor', skipWaiting, SUB),
+        url,
+      ).toBe(true);
+      expect(skipWaiting).toHaveBeenCalledOnce();
+    }
+    for (const url of [`${SUB}desk.html`, `${SUB}desk?scene=1`]) {
+      const skipWaiting = vi.fn(async () => undefined);
+      const desk = { id: 'desk', url };
+      expect(await skipWaitingUnlessDeskOpen(windows(subEditor, desk), 'editor', skipWaiting, SUB), url).toBe(
+        false,
+      );
+      expect(skipWaiting).not.toHaveBeenCalled();
+    }
+    // the root's service worker is not held back by a desk under the subpath either
+    expect(deskPageOpen([`${SUB}desk.html`], ORIGIN)).toBe(false);
+    expect(deskPageOpen([`${SUB}desk.html`], `${ORIGIN}/other/`)).toBe(false);
+  });
+});
+
+describe("the service worker's scope", () => {
+  it('gives paths from the scope, and none on another origin or outside it', () => {
+    expect(pathInScope(`${SUB}desk.html`, SUB)).toBe('/desk.html');
+    expect(pathInScope(SUB, SUB)).toBe('/');
+    expect(pathInScope(`${SUB}api/projects?x=1`, SUB)).toBe('/api/projects');
+    expect(pathInScope(`${ORIGIN}/desk.html`, ORIGIN)).toBe('/desk.html');
+    expect(pathInScope(`${ORIGIN}/desk.html`, `${ORIGIN}/`)).toBe('/desk.html');
+    expect(pathInScope(new URL(`${SUB}desk`), SUB)).toBe('/desk');
+    for (const url of [
+      `${ORIGIN}/desk.html`,
+      `${ORIGIN}/3d`,
+      `${ORIGIN}/3dx/desk.html`,
+      'https://other.example/3d/',
+    ])
+      expect(pathInScope(url, SUB), url).toBeNull();
+  });
+
+  /** Whether a navigation to `url` is left to the network (Workbox tests a path with its query). */
+  const denied = (list: RegExp[], url: string) => {
+    const u = new URL(url);
+    return list.some((r) => r.test(`${u.pathname}${u.search}`));
+  };
+
+  it("at the root is the denylist the service worker always had: the server's own paths", () => {
+    const before = [
+      /^\/api\//,
+      /^\/sync\//,
+      /^\/mcp/,
+      /^\/dav\//,
+      /^\/otlp\//,
+      /^\/metrics/,
+      /^\/healthz/,
+      /^\/readyz/,
+    ];
+    for (const scope of [ORIGIN, `${ORIGIN}/`])
+      expect(navigationDenylist(scope).map(String), scope).toEqual(before.map(String));
+    const list = navigationDenylist(`${ORIGIN}/`);
+    for (const path of [
+      '/api/projects',
+      '/sync/p1',
+      '/mcp',
+      '/mcp/x',
+      '/dav/',
+      '/otlp/v1/traces',
+      '/metrics',
+      '/healthz',
+      '/readyz',
+    ])
+      expect(denied(list, `${ORIGIN}${path}`), path).toBe(true);
+    // the editor's pages, also at the bare names of the server's route families (as before)
+    for (const path of ['/', '/?project=p1', '/index.html', '/desk/', '/api', '/dav', '/projects/api/'])
+      expect(denied(list, `${ORIGIN}${path}`), path).toBe(false);
+  });
+
+  it("under a subpath leaves the server's paths under the scope to the network, and only those", () => {
+    const list = navigationDenylist(SUB);
+    expect(list.map((r) => r.source)).toEqual([
+      '^\\/3d\\/api\\/',
+      '^\\/3d\\/sync\\/',
+      '^\\/3d\\/mcp',
+      '^\\/3d\\/dav\\/',
+      '^\\/3d\\/otlp\\/',
+      '^\\/3d\\/metrics',
+      '^\\/3d\\/healthz',
+      '^\\/3d\\/readyz',
+    ]);
+    for (const path of [
+      'api/projects',
+      'sync/p1',
+      'mcp',
+      'dav/3d-editor/',
+      'otlp/v1/logs',
+      'metrics',
+      'healthz',
+      'readyz',
+    ])
+      expect(denied(list, `${SUB}${path}`), path).toBe(true);
+    for (const path of ['', '?project=p1', 'index.html', 'desk/', 'api', 'dav', '3d/api/x'])
+      expect(denied(list, `${SUB}${path}`), path).toBe(false);
+    // a base with a dot is matched as written, not as a pattern
+    const dotted = navigationDenylist(`${ORIGIN}/v1.2/`);
+    expect(denied(dotted, `${ORIGIN}/v1.2/api/projects`)).toBe(true);
+    expect(denied(dotted, `${ORIGIN}/v1x2/api/projects`)).toBe(false);
   });
 });

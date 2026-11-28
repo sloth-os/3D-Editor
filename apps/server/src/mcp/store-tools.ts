@@ -45,13 +45,14 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
     },
     async (a, extra) => {
       const res = await ctx.store.search(a, { signal: extra.signal });
-      // the thumbnail routes as links on this server (they need the server's token like any route)
-      const origin = baseUrl(extra);
+      // the thumbnail routes as links on this server, under its base path (they need the server's
+      // token like any route)
+      const base = baseUrl(extra, ctx.config);
       return {
         ...res,
         results: res.results.map((r) => ({
           ...r,
-          thumbnail_url: r.thumbnail_url && origin ? `${origin}${r.thumbnail_url}` : r.thumbnail_url,
+          thumbnail_url: r.thumbnail_url && base ? `${base}${r.thumbnail_url}` : r.thumbnail_url,
         })),
       };
     },
@@ -110,7 +111,7 @@ export function registerStoreTools(tool: ToolRegistrar, ctx: ToolContext): void 
         ...call.warnings,
         ...res.reports.filter((r) => r.level !== 'INFO').map((r) => r.message),
       ];
-      return { ...insertReply(res.result, call.entry, warnings, baseUrl(extra)) };
+      return { ...insertReply(res.result, call.entry, warnings, baseUrl(extra, ctx.config)) };
     },
   );
 }

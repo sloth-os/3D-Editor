@@ -318,7 +318,7 @@ function PreferencesDialog() {
       <Row label="Server URL">
         <TextField
           value={p.sync.serverUrl}
-          placeholder="(same origin)"
+          placeholder="(where this page came from)"
           onChange={(v) => set((x) => (x.sync.serverUrl = v.trim()))}
         />
       </Row>

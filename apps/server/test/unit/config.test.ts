@@ -9,6 +9,7 @@ describe('loadConfig', () => {
     const c = loadConfig({}, noFiles);
     expect(c.port).toBe(8080);
     expect(c.host).toBe('0.0.0.0');
+    expect(c.basePath).toBe('');
     expect(c.dataDir).toBe(path.resolve('/srv/app', 'data'));
     expect(c.persistence).toBe('memory');
     expect(c.roomIdleTtlSeconds).toBe(3600);
@@ -66,6 +67,57 @@ describe('loadConfig', () => {
     expect(c.port).toBe(8080);
     expect(c.authToken).toBeNull();
     expect(c.webdav).toBeNull();
+  });
+
+  it('reads BASE_PATH, the path the server is served under (docs/subpath.md)', () => {
+    const basePath = (value: string) => loadConfig({ BASE_PATH: value }, noFiles).basePath;
+    expect(basePath('/3d')).toBe('/3d');
+    expect(basePath('/3d/')).toBe('/3d');
+    expect(basePath(' /tools/3d-editor// ')).toBe('/tools/3d-editor');
+    expect(basePath('/a/b.c~d-e_f')).toBe('/a/b.c~d-e_f');
+    expect(basePath('/x/api')).toBe('/x/api');
+    expect(basePath('/')).toBe('');
+    expect(basePath('')).toBe('');
+    expect(basePath('   ')).toBe('');
+  });
+
+  it('rejects a BASE_PATH it cannot serve under, saying why', () => {
+    const invalid = [
+      '3d',
+      'https://example.com/3d',
+      '//evil.example',
+      '/a//b',
+      '/a/../b',
+      '/./a',
+      '/a b',
+      '/3d?x=1',
+      '/3d#x',
+      '/ä',
+      '/api',
+      '/dav/x',
+      '/healthz',
+      '/assets',
+      '/desk',
+      '/index.html',
+    ];
+    for (const value of invalid)
+      expect(() => loadConfig({ BASE_PATH: value }, noFiles), value).toThrow(
+        /^Invalid configuration: BASE_PATH: '/,
+      );
+    expect(() => loadConfig({ BASE_PATH: '3d' }, noFiles)).toThrow(
+      "Invalid configuration: BASE_PATH: '3d' does not start with /",
+    );
+    expect(() => loadConfig({ BASE_PATH: '/a//b' }, noFiles)).toThrow('has an empty path segment (//)');
+    expect(() => loadConfig({ BASE_PATH: '/a/../b' }, noFiles)).toThrow("has a '..' segment");
+    expect(() => loadConfig({ BASE_PATH: '/a b' }, noFiles)).toThrow(
+      'has characters other than letters, digits and . _ ~ - in its path segments',
+    );
+    expect(() => loadConfig({ BASE_PATH: '/api/v2' }, noFiles)).toThrow(
+      "starts with /api, one of the server's own paths",
+    );
+    expect(() => loadConfig({ BASE_PATH: '/sw.js' }, noFiles)).toThrow(
+      "starts with /sw.js, one of the server's own paths",
+    );
   });
 
   it('defaults to WebDAV persistence and proxy when WEBDAV_URL is set', () => {

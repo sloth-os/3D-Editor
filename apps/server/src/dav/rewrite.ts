@@ -1,6 +1,10 @@
+import { stripBasePath } from '../base-path';
+
 /*
  * URL mapping between the server's WebDAV proxy (`/dav/...`) and the upstream WebDAV server
- * (`WEBDAV_URL/...`). Only paths below the configured upstream URL are ever reachable.
+ * (`WEBDAV_URL/...`). Only paths below the configured upstream URL are ever reachable. Under a
+ * base path (docs/subpath.md) the hrefs the proxy gives out start with it (`/3d/dav/...`), and the
+ * paths clients send may carry it.
  */
 
 export const DAV_PREFIX = '/dav';
@@ -71,10 +75,11 @@ export function upstreamUrlFor(upstream: DavUpstream, rawUrl: string): URL | nul
 }
 
 /**
- * Maps an upstream href (absolute URL or absolute path) to the corresponding `/dav` path.
- * Returns null for references outside of the upstream base (left untouched by callers).
+ * Maps an upstream href (absolute URL or absolute path) to the corresponding `/dav` path, under
+ * `base` (the request's base path, '' at the root: `/3d/dav/...`). Returns null for references
+ * outside of the upstream base (left untouched by callers).
  */
-export function toLocalHref(upstream: DavUpstream, href: string): string | null {
+export function toLocalHref(upstream: DavUpstream, href: string, base = ''): string | null {
   const value = href.trim();
   let pathname: string;
   if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
@@ -96,7 +101,7 @@ export function toLocalHref(upstream: DavUpstream, href: string): string | null 
     rest = decoded.slice(upstream.decodedBase.length);
   else return null;
   if (!rest) rest = pathname.endsWith('/') ? '/' : '';
-  return `${DAV_PREFIX}${encodePathSegments(rest)}`;
+  return `${base}${DAV_PREFIX}${encodePathSegments(rest)}`;
 }
 
 const XML_ENTITIES: Record<string, string> = {
@@ -122,19 +127,27 @@ function encodeXml(s: string): string {
 
 const HREF_RE = /(<(?:[\w.-]+:)?href\b[^>]*>)([\s\S]*?)(<\/(?:[\w.-]+:)?href\s*>)/gi;
 
-/** Rewrites every `<href>` of a WebDAV multistatus document from upstream URLs to `/dav` paths. */
-export function rewriteMultistatus(xml: string, upstream: DavUpstream): string {
+/**
+ * Rewrites every `<href>` of a WebDAV multistatus document from upstream URLs to `/dav` paths
+ * under `base` (toLocalHref).
+ */
+export function rewriteMultistatus(xml: string, upstream: DavUpstream, base = ''): string {
   return xml.replace(HREF_RE, (whole, open: string, inner: string, close: string) => {
-    const local = toLocalHref(upstream, decodeXml(inner));
+    const local = toLocalHref(upstream, decodeXml(inner), base);
     return local === null ? whole : `${open}${encodeXml(local)}${close}`;
   });
 }
 
 /**
- * Rewrites a `Destination` request header (absolute URL or path pointing into `/dav`) to the
- * corresponding upstream URL. Returns null if it points anywhere else.
+ * Rewrites a `Destination` request header (absolute URL or path pointing into `/dav`, with or
+ * without one of `bases`, the request's base paths) to the corresponding upstream URL. Returns null
+ * if it points anywhere else.
  */
-export function rewriteDestination(upstream: DavUpstream, destination: string): string | null {
+export function rewriteDestination(
+  upstream: DavUpstream,
+  destination: string,
+  bases: readonly string[] = [],
+): string | null {
   let raw = destination.trim();
   if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
     try {
@@ -146,5 +159,5 @@ export function rewriteDestination(upstream: DavUpstream, destination: string): 
     }
   }
   if (!raw.startsWith('/')) return null;
-  return upstreamUrlFor(upstream, raw)?.toString() ?? null;
+  return upstreamUrlFor(upstream, stripBasePath(raw, bases).url)?.toString() ?? null;
 }

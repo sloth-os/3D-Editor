@@ -615,7 +615,10 @@ Serve the desk from an origin of its own, such as `https://desk.example.com`. Th
 does that already: it serves the editor at `/` and the desk at `/desk.html` (also at `/desk`), and
 never the editor's `index.html` for the desk's paths. So does any static host serving
 `apps/web/dist` (`npm run build`) with the headers below. Several hosts can embed the same desk
-origin; each host's scenes stay apart ([projects](#projects-per-host-and-scene)).
+origin; each host's scenes stay apart ([projects](#projects-per-host-and-scene)). The server can
+also live under a path of the desk's site, the desk then at `https://desk.example.com/3d/desk.html`
+([serving under a subpath](subpath.md)): the paths below are then under that prefix, and the
+origin stays the desk's own.
 
 ### Headers
 
@@ -679,7 +682,9 @@ as well as `require-corp`; `off` is for a proxy in front of the server that sets
 
 Any static host works if it serves `apps/web/dist` with the [headers](#headers) for `desk.html`
 and `assets/`, revalidates the rest (`sw.js` above all), and never sends `X-Frame-Options`. Hosts
-then frame `/desk.html`, or `/desk` where the server maps it. With nginx:
+then frame `/desk.html`, or `/desk` where the server maps it. The build's URLs are relative, so the
+folder can sit under any path of the site; a static host answers deeper paths with 404 rather than
+`index.html` ([static hosts](subpath.md#static-hosts)). With nginx:
 
 ```nginx
 server {
@@ -704,10 +709,10 @@ server {
     add_header Cross-Origin-Resource-Policy "cross-origin" always;
     add_header Cache-Control "public, max-age=31536000, immutable" always;
   }
-  # the editor, sw.js and the rest
+  # the editor, sw.js and the rest; no index.html at deeper paths (its file URLs are relative)
   location / {
     add_header Cache-Control "no-cache" always;
-    try_files $uri /index.html;
+    try_files $uri $uri/ =404;
   }
 }
 ```
@@ -1047,14 +1052,15 @@ not offered. Send, Done and Close work as usual.
 
 `ready.capabilities.offline` is `true`: once loaded, the desk stages, edits, exports and keeps its
 copy without a network, and talks to nobody but its host. The page loads offline once the service
-worker has it: the web app's service worker (`sw.js`, scope `/`, built from
-`apps/web/src/pwa/sw.ts`) precaches `desk.html` and every file it loads, the desk registers it
-itself, and it answers `/desk.html` and `/desk` (with any query), never with the editor's
-`index.html`. It answers with its precached copy of the page, the version whose files it serves,
-and with the server's current [headers](#headers) when the server answers within 4 s; offline, or
-when the server does not answer in time, with the headers the page was last served with (a 5xx
-counts as no answer; a redirect or another error from the server is passed on). `/desk/` and
-`/desk.html/` are the editor's, as on the server.
+worker has it: the web app's service worker (the `sw.js` next to the page, built from
+`apps/web/src/pwa/sw.ts`, its scope the app's base: `/`, or `/3d/` for an editor [served under a
+subpath](subpath.md)) precaches `desk.html` and every file it loads, the desk registers it itself,
+and it answers `desk.html` and `desk` in its scope (`/desk.html` and `/desk` at the root), with any
+query, never with the editor's `index.html`. It answers with its precached copy of the page, the
+version whose files it serves, and with the server's current [headers](#headers) when the server
+answers within 4 s; offline, or when the server does not answer in time, with the headers the page
+was last served with (a 5xx counts as no answer; a redirect or another error from the server is
+passed on). `desk/` and `desk.html/` in its scope are the editor's, as on the server.
 
 A new version of the app installs in the background and waits until every page the old one serves
 is closed, then takes over at the next load, so a session in a host is never reloaded under the

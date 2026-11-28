@@ -7,6 +7,7 @@ import type {
   ToolAnnotations,
 } from '@modelcontextprotocol/sdk/types.js';
 import type { OperatorRegistry } from '@3d-editor/core';
+import { forwardedPrefix } from '../base-path';
 import type { ServerConfig } from '../config';
 import type { ServerMetrics } from '../observability/metrics';
 import type { Log } from '../observability/log';
@@ -113,10 +114,43 @@ export const DESTRUCTIVE: ToolAnnotations = {
 
 // ------------------------------------------------------------------ helpers
 
-/** Origin of the MCP request (used for editor and download links; links carry no token). */
-export function baseUrl(extra: ToolExtra): string {
-  const url = extra.requestInfo?.url;
-  if (url) return url.origin;
-  const host = extra.requestInfo?.headers?.host;
-  return typeof host === 'string' ? `http://${host}` : '';
+/** The last value of a header a proxy may append to (`a, b`: `b`), as Fastify reads them. */
+function lastHeaderValue(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[value.length - 1] : value;
+  return raw?.split(',').pop()?.trim() || undefined;
+}
+
+/** `scheme://host[:port]` as a URL origin (lowercased, default port dropped), or null when invalid. */
+function originOf(scheme: string, host: string | undefined): string | null {
+  // a host and port only: nothing that could end the authority and change the URL's meaning
+  if (!host || !/^[^\s/\\?#@]+$/.test(host)) return null;
+  try {
+    return new URL(`${scheme}://${host}`).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The address of this server as the MCP client reached it, for the links of results (editor and
+ * download links; links carry no token): the scheme and host the client used (the last values of
+ * X-Forwarded-Proto and X-Forwarded-Host when a proxy sends usable ones, as Fastify reads them with
+ * trustProxy, else the request URL's, else its Host header), then the base path
+ * (X-Forwarded-Prefix when usable, else BASE_PATH), without a trailing slash:
+ * `https://example.com/3d` (docs/subpath.md). '' without an HTTP request (an in-memory client):
+ * the links are then paths from the server's root, as REST gives them.
+ */
+export function baseUrl(extra: ToolExtra, config: Pick<ServerConfig, 'basePath'>): string {
+  const info = extra.requestInfo;
+  if (!info) return '';
+  const headers = info.headers;
+  const forwardedScheme = lastHeaderValue(headers['x-forwarded-proto'])?.toLowerCase();
+  const scheme =
+    forwardedScheme === 'http' || forwardedScheme === 'https'
+      ? forwardedScheme
+      : (info.url?.protocol.slice(0, -1) ?? 'http');
+  const host = info.url?.host ?? (typeof headers.host === 'string' ? headers.host : undefined);
+  const origin = originOf(scheme, lastHeaderValue(headers['x-forwarded-host'])) ?? originOf(scheme, host);
+  if (!origin) return '';
+  return `${origin}${forwardedPrefix(headers['x-forwarded-prefix']) ?? config.basePath}`;
 }

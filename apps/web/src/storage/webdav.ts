@@ -9,7 +9,7 @@ import {
 } from '@3d-editor/core';
 import { prefs } from '../app/prefs';
 import { serverConfig, toast } from '../app/store';
-import { authHeaders, serverBase } from '../app/server-config';
+import { authHeaders, serverRoute } from '../app/server-config';
 import { telemetry } from '../telemetry/telemetry';
 
 export interface WebDAVTarget {
@@ -32,8 +32,9 @@ export function resolveWebDAV(): WebDAVTarget | null {
   const cfg = serverConfig.value;
   const custom = p.webdav.url.trim();
   if (p.mode === 'auto' && cfg?.webdav) {
+    // the proxy's route ('/dav') under the server's base: https://example.com/3d/dav behind a proxy
     const client = new WebDAVClient({
-      url: `${serverBase() || location.origin}${cfg.webdav.url}`,
+      url: serverRoute(cfg.webdav.url),
       headers: authHeaders(),
       timeoutMs: 20_000,
     });

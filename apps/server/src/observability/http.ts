@@ -24,8 +24,10 @@ function isQuietRoute(route: string): boolean {
  * Request metrics (http_requests_total, http_request_duration_seconds), server spans (when
  * tracing is enabled) and one "request completed" log line per request. Uses the raw
  * response's `close` event so hijacked replies (MCP streams, WebDAV proxy) are covered too.
- * WebSocket upgrades never reach Fastify's hooks: the sync server logs ("upgrade completed") and
- * counts each handshake itself (sync/ws-server.ts).
+ * The log line and the span's url.path give the URL as the client sent it, base path included
+ * (request.originalUrl; routes see it without, docs/subpath.md); the metrics' route labels are the
+ * route patterns. WebSocket upgrades never reach Fastify's hooks: the sync server logs ("upgrade
+ * completed") and counts each handshake itself (sync/ws-server.ts).
  */
 export function registerHttpObservability(
   app: FastifyInstance,
@@ -45,7 +47,7 @@ export function registerHttpObservability(
             attributes: {
               'http.request.method': method,
               'http.route': route,
-              'url.path': pathnameOf(request.url),
+              'url.path': pathnameOf(request.originalUrl),
               'user_agent.original': String(request.headers['user-agent'] ?? ''),
             },
           },
@@ -86,7 +88,7 @@ export function registerHttpObservability(
         {
           ...(sc ? { trace_id: sc.traceId, span_id: sc.spanId } : {}),
           method,
-          url: redactUrl(request.url),
+          url: redactUrl(request.originalUrl),
           route,
           statusCode: status,
           responseTimeMs: Math.round(seconds * 1e5) / 100,

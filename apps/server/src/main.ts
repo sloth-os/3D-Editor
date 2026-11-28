@@ -35,10 +35,12 @@ async function main(): Promise<void> {
   const address = app.server.address();
   const port = typeof address === 'object' && address ? address.port : config.port;
   const shownHost = config.host === '0.0.0.0' || config.host === '::' ? 'localhost' : config.host;
+  // the editor's address under BASE_PATH (docs/subpath.md); the server also answers without it
+  const shownUrl = `http://${shownHost}:${port}${config.basePath}`;
   app.log.info(
     {
-      url: `http://${shownHost}:${port}/`,
-      mcp: config.mcpEnabled ? `http://${shownHost}:${port}/mcp` : null,
+      url: `${shownUrl}/`,
+      mcp: config.mcpEnabled ? `${shownUrl}/mcp` : null,
     },
     'server listening',
   );

@@ -155,12 +155,14 @@ MCP_URL=http://127.0.0.1:8080/mcp node examples/lighthouse-cove/build.mjs
 docker run -d -p 8080:8080 -v editor-data:/data ghcr.io/sloth-os/3d-editor:latest
 ```
 
-Open http://localhost:8080. Images are published for `linux/amd64`, `linux/arm64` and
-`linux/arm/v7`. The image stores projects on disk in `/data` and includes ffmpeg for the server's
-video exports, which adds about 130 MB to it (Alpine's ffmpeg and about 100 libraries). An image
-without them builds with `docker build --build-arg WITH_FFMPEG=0 .`; its `/api/config` then
-reports `features.videoExport: false` and the server refuses exports with `FFMPEG_UNAVAILABLE`
-(browsers still export on their device).
+Open http://localhost:8080. To serve it under a path of another site (`https://example.com/3d/`)
+behind Caddy, nginx or Apache httpd, see [serving under a subpath](docs/subpath.md). Images are
+published for `linux/amd64`, `linux/arm64` and `linux/arm/v7`. The image stores projects on disk in
+`/data` and includes ffmpeg for the server's video exports, which adds about 130 MB to it (Alpine's
+ffmpeg and about 100 libraries). An image without them builds with
+`docker build --build-arg WITH_FFMPEG=0 .`; its `/api/config` then reports
+`features.videoExport: false` and the server refuses exports with `FFMPEG_UNAVAILABLE` (browsers
+still export on their device).
 
 [`docker-compose.yml`](docker-compose.yml) adds an optional WebDAV server and an observability
 stack (OpenTelemetry Collector, Jaeger, Prometheus, Grafana). To store projects in the bundled
@@ -194,6 +196,7 @@ npm run dev            # terminal 2, http://localhost:5173
 | Variable                                           | Default                                                                                             | Description                                                                                                                                                                                                                                              |
 | -------------------------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `PORT` / `HOST`                                    | `8080` / `0.0.0.0`                                                                                  | Listen address                                                                                                                                                                                                                                           |
+| `BASE_PATH`                                        | the root                                                                                            | The path the editor is served under behind a reverse proxy that keeps it, such as `/3d` (one that strips it sends `X-Forwarded-Prefix` instead); requests without it still work; see [subpath](docs/subpath.md)                                          |
 | `PUBLIC_DIR`                                       | the built web app                                                                                   | Directory with the PWA build                                                                                                                                                                                                                             |
 | `DATA_DIR`                                         | `./data` (`/data` in Docker)                                                                        | Disk persistence location; setting it selects disk persistence                                                                                                                                                                                           |
 | `SYNC_PERSISTENCE`                                 | `webdav` if `WEBDAV_URL` is set, else `disk` if `DATA_DIR` is set (always in Docker), else `memory` | Where live projects are persisted: `memory` (lost on restart), `disk`, `webdav`; logged at startup and shown by the MCP `get_project` tool                                                                                                               |
@@ -240,7 +243,7 @@ calls), and the Vite dev server proxies to `EDITOR_SERVER_URL` (default `http://
 npm run test:unit         # core, web and server unit tests (Vitest)
 npm run test:coverage     # the same with coverage
 npm run test:integration  # server + real WebSocket clients + real MCP client + real WebDAV server
-npm run test:e2e          # Playwright: 46 tests in 17 specs; production builds (`npm run build` first), Chromium, WebDAV, MCP
+npm run test:e2e          # Playwright: 81 tests in 23 specs; production builds (`npm run build` first), Chromium, WebDAV, MCP
 npm run test:all          # unit, integration and e2e
 npm run lint && npm run format:check && npm run typecheck
 ```
@@ -259,6 +262,7 @@ images to GHCR on `main` and version tags.
 - [Building projects through MCP: a guide for AI agents](docs/agent-guide.md)
 - [The director's desk](docs/director-desk.md), [video export](docs/video-export.md),
   [model store](docs/model-store.md) and [embedding the desk](docs/embedding.md)
+- [Serving under a subpath](docs/subpath.md) behind a reverse proxy
 - [Observability](docs/observability.md)
 - [Example projects](examples/README.md)
 

@@ -488,7 +488,7 @@ function Welcome() {
     <div class="welcome" data-testid="welcome">
       <div class="welcome-inner">
         <h1>
-          <img src="/icons/icon.svg" width={32} height={32} alt="" /> 3D Editor
+          <img src="icons/icon.svg" width={32} height={32} alt="" /> 3D Editor
         </h1>
         <div class="tagline">
           Model, animate and render in the browser — works offline, saves to your browser or WebDAV, and syncs
@@ -527,7 +527,7 @@ export function App() {
   return (
     <div class="app">
       <div class="topbar" onPointerEnter={() => (hoveredArea.value = 'other')}>
-        <img class="logo" src="/icons/icon.svg" alt="3D Editor" />
+        <img class="logo" src="icons/icon.svg" alt="3D Editor" />
         <MenuButton label="File" items={FILE_MENU} />
         <MenuButton label="Edit" items={EDIT_MENU} />
         <MenuButton label="Render" items={RENDER_MENU} />

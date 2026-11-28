@@ -42,6 +42,7 @@ import type { RoomManager } from '../sync/room-manager';
 import { RpcError, type Room, type SyncConnection } from '../sync/room';
 import { ProjectNameTakenError, requireFreeProjectName, withProjectNames } from '../sync/project-names';
 import { isNotImplemented, safeFileName } from '../api/projects';
+import type { ServerConfig } from '../config';
 import { persistenceNote } from '../persistence';
 import {
   NotFoundError,
@@ -348,8 +349,9 @@ function withProjectNotes(out: ToolOutput, notes: string[]): CallToolResult {
   return { content: [...text(out).content, own] };
 }
 
-function editorUrl(extra: ToolExtra, projectId: string): string {
-  return `${baseUrl(extra)}/?project=${encodeURIComponent(projectId)}`;
+/** The editor's link to a project, under the server's base path (baseUrl). */
+function editorUrl(extra: ToolExtra, config: Pick<ServerConfig, 'basePath'>, projectId: string): string {
+  return `${baseUrl(extra, config)}/?project=${encodeURIComponent(projectId)}`;
 }
 
 function radians(rotation?: number[], degrees?: number[]): Vec3 | undefined {
@@ -781,7 +783,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
           peers: p.peers,
           loaded: p.live,
           ...(p.live && rooms.get(p.id)?.deletedFromStorage ? { deleted_from_storage: true } : {}),
-          editor_url: editorUrl(extra, p.id),
+          editor_url: editorUrl(extra, ctx.config, p.id),
         })),
         ...(listingFailed
           ? { storage_listing_failed: true, note: partial ? LIST_PARTIAL_NOTE : LIST_FAILED_NOTE }
@@ -811,7 +813,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       return {
         id: room.id,
         name: room.scene.name,
-        editor_url: editorUrl(extra, room.id),
+        editor_url: editorUrl(extra, ctx.config, room.id),
         objects: p.scene.listObjects().map((o) => ({ id: o.id, name: o.name, type: o.type })),
       };
     },
@@ -839,7 +841,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
         ...(p.room.deletedFromStorage
           ? { deleted_from_storage: true, deleted_from_storage_note: DELETED_ELSEWHERE_NOTE }
           : {}),
-        editor_url: editorUrl(extra, p.id),
+        editor_url: editorUrl(extra, ctx.config, p.id),
         clients: p.room.presence().map((e) => ({ name: e.state.user?.name ?? 'unknown', kind: e.kind })),
       };
     },
@@ -2596,7 +2598,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       if (objectIds) query.set('objects', objectIds.join(','));
       if (!a.apply_modifiers) query.set('apply_modifiers', 'false');
       if (a.bake_resolution !== undefined) query.set('bake_resolution', String(a.bake_resolution));
-      const downloadUrl = `${baseUrl(extra)}/api/projects/${encodeURIComponent(p.id)}/export?${query}`;
+      const downloadUrl = `${baseUrl(extra, ctx.config)}/api/projects/${encodeURIComponent(p.id)}/export?${query}`;
       const info = {
         format: a.format,
         filename,
@@ -3108,7 +3110,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       const tooLarge = bytes > MAX_EMBEDDED_EXPORT_BYTES;
       let renderId: string | null = null;
       if (a.store || tooLarge) renderId = renderStore.put(p.id, files);
-      const base = `${baseUrl(extra)}/api/projects/${encodeURIComponent(p.id)}/renders/${renderId}`;
+      const base = `${baseUrl(extra, ctx.config)}/api/projects/${encodeURIComponent(p.id)}/renders/${renderId}`;
       const info: Record<string, unknown> = {
         format: res.format,
         engine,
@@ -3269,7 +3271,7 @@ export function registerTools(server: McpServer, ctx: ToolContext): void {
       } catch (err) {
         if (err instanceof RpcError && err.code === 'NO_CLIENT') {
           throw new ToolError(
-            `No browser editor accepting UI commands is connected to this project. Open ${editorUrl(extra, p.id)} in a browser.`,
+            `No browser editor accepting UI commands is connected to this project. Open ${editorUrl(extra, ctx.config, p.id)} in a browser.`,
           );
         }
         if (err instanceof RpcError && err.code === 'TIMEOUT')

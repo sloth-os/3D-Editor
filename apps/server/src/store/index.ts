@@ -190,13 +190,15 @@ export interface StoreInsertResult {
 /**
  * The reply of an insert (store_add, REST): the operator's result without what the reply carries
  * once (core's store.add returns its catalog entry and its warnings too, which it also reports), the
- * entry as the model's credit, and the warnings. `origin` makes the thumbnail route absolute.
+ * entry as the model's credit, and the warnings. `serverUrl`, the server's address as the client
+ * reached it with its base path (`https://example.com/3d`, mcp/tool-kit.ts baseUrl), makes the
+ * thumbnail route absolute.
  */
 export function insertReply(
   result: unknown,
   entry: StoreModel,
   warnings: readonly string[],
-  origin = '',
+  serverUrl = '',
 ): StoreInsertResult {
   let rest: Record<string, unknown> | null = null;
   if (result && typeof result === 'object' && !Array.isArray(result)) {
@@ -213,7 +215,7 @@ export function insertReply(
       license: entry.license,
       author: entry.author,
       source_url: entry.source_url,
-      thumbnail_url: thumb && origin && thumb.startsWith('/') ? `${origin}${thumb}` : thumb,
+      thumbnail_url: thumb && serverUrl && thumb.startsWith('/') ? `${serverUrl}${thumb}` : thumb,
     },
     warnings: [...warnings],
   };

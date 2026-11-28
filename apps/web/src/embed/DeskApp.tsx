@@ -2,6 +2,7 @@ import type { ComponentChildren } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { signal } from '@preact/signals';
 import { getShots, type BriefChanges } from '@3d-editor/core';
+import { appBasePath } from '../app/base-url';
 import { session } from '../app/store';
 import { hoveredArea, type AreaKind } from '../editor/editor';
 import { PopupMenuHost } from '../ui/Menu';
@@ -403,7 +404,7 @@ function DeskHeader(p: { c: DeskController; lengthChecks: () => LengthCheck[] })
   return (
     <div class="desk-header" data-testid="desk-header" {...CHROME}>
       <div class="desk-title">
-        <img class="logo" src="/icons/icon.svg" alt="" width={18} height={18} />
+        <img class="logo" src="icons/icon.svg" alt="" width={18} height={18} />
         <span class="desk-scene" data-testid="desk-scene-name" title={brief?.name ?? ''}>
           {brief?.name ?? '3D director’s desk'}
         </span>
@@ -670,7 +671,7 @@ export function StandalonePage({ onTry }: { onTry: () => void }) {
     <div class="welcome desk-standalone" data-testid="desk-standalone">
       <div class="welcome-inner" style={{ maxWidth: '640px' }}>
         <h1>
-          <img src="/icons/icon.svg" width={28} height={28} alt="" /> 3D director&rsquo;s desk
+          <img src="icons/icon.svg" width={28} height={28} alt="" /> 3D director&rsquo;s desk
         </h1>
         <p class="tagline">
           This page is the 3D-Editor&rsquo;s director&rsquo;s desk for other applications. A host application,
@@ -682,7 +683,7 @@ export function StandalonePage({ onTry }: { onTry: () => void }) {
           <button class="btn primary" data-testid="desk-try-sample" onClick={onTry}>
             Try a sample scene
           </button>
-          <a class="btn" href="/" data-testid="desk-full-editor">
+          <a class="btn" href={appBasePath()} data-testid="desk-full-editor">
             Open the full editor
           </a>
         </div>

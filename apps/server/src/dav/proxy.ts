@@ -7,6 +7,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { WebDAVSettings } from '../config';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
+import { requestBase, requestBases } from '../request-base';
 import {
   DAV_PREFIX,
   parseUpstream,
@@ -134,7 +135,9 @@ function isXml(contentType: string | undefined): boolean {
  * Same-origin WebDAV access for browsers: `/dav/*` is forwarded to WEBDAV_URL with the server's
  * credentials. Paths are confined to the upstream base URL (never an open proxy), and URLs in
  * `Destination`, `Location` and PROPFIND multistatus bodies are translated between the two
- * namespaces.
+ * namespaces: the hrefs given out are under the request's base path (`/3d/dav/...`, so that
+ * clients behind a reverse proxy can follow them), and a Destination is accepted with or without
+ * it (docs/subpath.md).
  */
 export async function registerDavProxy(
   app: FastifyInstance,
@@ -148,11 +151,13 @@ export async function registerDavProxy(
     if (!target) return reply.code(400).send({ error: 'invalid WebDAV path' });
     const method = request.method;
     const headers = upstreamHeaders(request.headers, settings);
+    // the base path of the hrefs given out (docs/subpath.md)
+    const base = requestBase(request);
     const destination = request.headers.destination;
     if (typeof destination === 'string') {
-      const mapped = rewriteDestination(upstream, destination);
+      const mapped = rewriteDestination(upstream, destination, requestBases(request));
       // RFC 4918: a destination on another server is refused with 502.
-      if (!mapped) return reply.code(502).send({ error: `Destination must be inside ${DAV_PREFIX}/` });
+      if (!mapped) return reply.code(502).send({ error: `Destination must be inside ${base}${DAV_PREFIX}/` });
       headers.destination = mapped;
     }
     const body =
@@ -187,7 +192,7 @@ export async function registerDavProxy(
     for (const name of ['location', 'content-location']) {
       const v = res.headers[name];
       if (typeof v !== 'string') continue;
-      reply.header(name, toLocalHref(upstream, v) ?? v);
+      reply.header(name, toLocalHref(upstream, v, base) ?? v);
     }
 
     const contentType = res.headers['content-type'];
@@ -200,7 +205,7 @@ export async function registerDavProxy(
       }
       reply.removeHeader('content-length');
       reply.removeHeader('content-encoding');
-      return reply.send(rewriteMultistatus(xml, upstream));
+      return reply.send(rewriteMultistatus(xml, upstream, base));
     }
     if (method === 'HEAD' || status === 204 || status === 304) {
       res.resume();

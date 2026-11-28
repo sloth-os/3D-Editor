@@ -25,7 +25,7 @@ export type HelloMessage = Extract<ControlMessage, { kind: 'hello' }>;
 export type RpcHandler = (method: string, params: unknown) => unknown | Promise<unknown>;
 
 export interface SyncClientOptions {
-  /** Server base URL, e.g. http://127.0.0.1:1234 */
+  /** Server base URL, e.g. http://127.0.0.1:1234, or under a base path: http://127.0.0.1:1234/3d */
   baseUrl: string;
   projectId: string;
   token?: string;
@@ -74,7 +74,9 @@ export class SyncTestClient {
   }
 
   get url(): string {
-    const u = new URL(`/sync/${encodeURIComponent(this.opts.projectId)}`, this.opts.baseUrl);
+    // relative to the base URL, so that its path (a base path) is kept
+    const base = this.opts.baseUrl.endsWith('/') ? this.opts.baseUrl : `${this.opts.baseUrl}/`;
+    const u = new URL(`sync/${encodeURIComponent(this.opts.projectId)}`, base);
     u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
     if (this.opts.token) u.searchParams.set('token', this.opts.token);
     return u.toString();

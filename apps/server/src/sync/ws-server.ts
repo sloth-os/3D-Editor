@@ -10,6 +10,7 @@ import {
 } from '@3d-editor/core';
 import type { ServerConfig } from '../config';
 import { isAuthorized, pathnameOf, redactUrl } from '../auth';
+import { originalUrlOf } from '../request-base';
 import type { Log } from '../observability/log';
 import type { ServerMetrics } from '../observability/metrics';
 import { errorMessage } from '../observability/tracing';
@@ -36,9 +37,10 @@ interface HandshakeEnd {
 /**
  * One WebSocket upgrade request (handled outside Fastify, so outside its access log): its answer is
  * logged and counted once, as observability/http.ts does for HTTP requests. One 'upgrade completed'
- * line with the method, the redacted url, the route ('/sync/:projectId', else 'unmatched'), the
- * status (101 when the server takes the connection), the reason and the time to the answer: at debug
- * for 101, info for 4xx and warn for 5xx. The handshake counts in http_requests_total and
+ * line with the method, the redacted url as the client sent it (base path included: the server
+ * routes the URL without it, app.ts), the route ('/sync/:projectId', else 'unmatched'), the status
+ * (101 when the server takes the connection), the reason and the time to the answer: at debug for
+ * 101, info for 4xx and warn for 5xx. The handshake counts in http_requests_total and
  * http_request_duration_seconds under that route.
  */
 class Handshake {
@@ -72,7 +74,7 @@ class Handshake {
     this.log[level](
       {
         method,
-        url: redactUrl(this.req.url ?? '/'),
+        url: redactUrl(originalUrlOf(this.req)),
         route,
         statusCode,
         reason: e.reason,

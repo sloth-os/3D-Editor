@@ -8,9 +8,11 @@ export const offlineReady = signal(false);
 let updateSW: ((reload?: boolean) => Promise<void>) | null = null;
 
 /**
- * Registers the service worker for the editor (the desk registers it itself: embed/pwa.ts). A new
- * version waits (pwaUpdate) until Update asks it to take over; while a desk page is open in this
- * browser it answers that it keeps waiting, and the editor says why (update-waits.ts).
+ * Registers the service worker for the editor (the desk registers it itself: embed/pwa.ts): the
+ * build's ./sw.js with the scope ./, both relative to the document's base URL, so the app's base and
+ * its sw.js under a subpath (docs/subpath.md). A new version waits (pwaUpdate) until Update asks it
+ * to take over; while a desk page is open in this browser it answers that it keeps waiting, and the
+ * editor says why (update-waits.ts).
  */
 export async function registerPWA(): Promise<void> {
   if (!('serviceWorker' in navigator) || import.meta.env.DEV) return;

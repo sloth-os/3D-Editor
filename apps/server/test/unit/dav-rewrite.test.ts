@@ -62,6 +62,23 @@ describe('toLocalHref', () => {
     expect(toLocalHref(nextcloud, 'relative/path')).toBeNull();
     expect(toLocalHref(nextcloud, 'mailto:a@b')).toBeNull();
   });
+
+  it('puts the paths under the base path of the request (docs/subpath.md)', () => {
+    expect(
+      toLocalHref(nextcloud, '/remote.php/dav/files/alice%40example.com/3d-editor/a%20b.txt', '/3d'),
+    ).toBe('/3d/dav/3d-editor/a%20b.txt');
+    expect(
+      toLocalHref(
+        nextcloud,
+        'https://cloud.example.com/remote.php/dav/files/alice%40example.com/',
+        '/tools/3d-editor',
+      ),
+    ).toBe('/tools/3d-editor/dav/');
+    expect(toLocalHref(nextcloud, '/remote.php/dav/files/alice%40example.com', '/3d')).toBe('/3d/dav');
+    expect(toLocalHref(root, 'http://127.0.0.1:1900/x/y', '/3d')).toBe('/3d/dav/x/y');
+    expect(toLocalHref(root, '/x/y', '')).toBe('/dav/x/y');
+    expect(toLocalHref(nextcloud, '/remote.php/dav/files/bob/x', '/3d')).toBeNull();
+  });
 });
 
 describe('rewriteMultistatus', () => {
@@ -90,6 +107,17 @@ describe('rewriteMultistatus', () => {
     expect(parsed[0].isDir).toBe(true);
     expect(parsed[1].size).toBe(12);
   });
+
+  it('puts the hrefs under the base path given (docs/subpath.md)', () => {
+    const out = rewriteMultistatus(xml, nextcloud, '/3d');
+    expect(out).toContain('<D:href>/3d/dav/a%26b%20c.txt</D:href>');
+    expect(parseMultistatus(out).map((r) => r.href)).toEqual([
+      '/3d/dav/3d-editor/projects/',
+      '/3d/dav/3d-editor/projects/p1/document.ybin',
+      '/3d/dav/a%26b%20c.txt',
+      'https://elsewhere.example.com/x',
+    ]);
+  });
 });
 
 describe('rewriteDestination', () => {
@@ -105,5 +133,31 @@ describe('rewriteDestination', () => {
     expect(rewriteDestination(root, '/dav/../etc')).toBeNull();
     expect(rewriteDestination(root, 'ftp://x/dav/a')).toBeNull();
     expect(rewriteDestination(root, 'relative')).toBeNull();
+  });
+
+  it("accepts destinations with or without one of the request's base paths (docs/subpath.md)", () => {
+    const bases = ['/editor', '/3d'];
+    expect(rewriteDestination(root, 'https://example.com/3d/dav/x%20y', bases)).toBe(
+      'http://127.0.0.1:1900/x%20y',
+    );
+    expect(rewriteDestination(root, '/editor/dav/a/b.txt?x=1', bases)).toBe(
+      'http://127.0.0.1:1900/a/b.txt?x=1',
+    );
+    expect(rewriteDestination(root, '/dav/a', bases)).toBe('http://127.0.0.1:1900/a');
+    expect(rewriteDestination(nextcloud, '/3d/dav/3d-editor/b.txt', bases)).toBe(
+      'https://cloud.example.com/remote.php/dav/files/alice%40example.com/3d-editor/b.txt',
+    );
+  });
+
+  it('refuses destinations under another prefix, or outside /dav below the base', () => {
+    const bases = ['/3d'];
+    expect(rewriteDestination(root, '/other/dav/a', bases)).toBeNull();
+    expect(rewriteDestination(root, 'https://example.com/other/dav/a', bases)).toBeNull();
+    expect(rewriteDestination(root, '/3dx/dav/a', bases)).toBeNull();
+    expect(rewriteDestination(root, '/3d/api/projects', bases)).toBeNull();
+    expect(rewriteDestination(root, '/3d', bases)).toBeNull();
+    expect(rewriteDestination(root, '/3d/dav/../etc', bases)).toBeNull();
+    // at the root (no base) a path under a prefix is not under /dav
+    expect(rewriteDestination(root, '/3d/dav/a')).toBeNull();
   });
 });

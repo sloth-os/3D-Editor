@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
+import { parseBasePath } from './base-path';
 import { deskEmbedSettings, type DeskEmbedSettings } from './desk-embed';
 import { PACKAGE_VERSION } from './version';
 
@@ -29,6 +30,12 @@ export interface OtelSettings {
 export interface ServerConfig {
   port: number;
   host: string;
+  /**
+   * The path the server is served under behind a reverse proxy (`BASE_PATH`, e.g. `/3d`; '' = the
+   * root): removed from request paths that start with it, and written into the pages and links when
+   * a request has no usable `X-Forwarded-Prefix` (docs/subpath.md).
+   */
+  basePath: string;
   /** Directory holding the built PWA, or null when there is nothing to serve. */
   publicDir: string | null;
   /** Directory of disk persistence (`DATA_DIR`, default ./data). */
@@ -159,6 +166,8 @@ const httpUrl = z.string().refine((v) => {
 const envSchema = z.object({
   PORT: z.coerce.number().int().min(0).max(65535).default(8080),
   HOST: z.string().default('0.0.0.0'),
+  // checked by parseBasePath (base-path.ts)
+  BASE_PATH: z.string().optional(),
   PUBLIC_DIR: z.string().optional(),
   DATA_DIR: z.string().default('./data'),
   SYNC_PERSISTENCE: z.enum(['memory', 'disk', 'webdav']).optional(),
@@ -314,6 +323,7 @@ export function loadConfig(
   const cwd = opts.cwd ?? process.cwd();
   const exists = opts.exists ?? existsSync;
   const moduleDir = opts.moduleDir ?? defaultModuleDir();
+  const basePath = parseBasePath(e.BASE_PATH);
 
   const webdav: WebDAVSettings | null = e.WEBDAV_URL
     ? {
@@ -355,6 +365,7 @@ export function loadConfig(
   return {
     port: e.PORT,
     host: e.HOST,
+    basePath,
     publicDir,
     dataDir,
     persistence,

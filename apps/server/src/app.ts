@@ -5,9 +5,11 @@ import Fastify, {
   type FastifyRequest,
   type FastifyServerOptions,
 } from 'fastify';
+import type { IncomingMessage } from 'node:http';
 import { createOperatorRegistry } from '@3d-editor/core';
 import type { ServerConfig } from './config';
 import { isAuthorized, pathnameOf } from './auth';
+import { requestBaseInfo, rewriteRequestUrl } from './request-base';
 import { createPersistence, type Persistence } from './persistence';
 import { RoomManager } from './sync/room-manager';
 import { SyncServer } from './sync/ws-server';
@@ -26,6 +28,9 @@ import { loggerOptions } from './observability/logger';
 import { registerHttpObservability } from './observability/http';
 import { startOpenTelemetry } from './observability/tracing';
 import { OtlpForwarder, TelemetryIngestor } from './observability/telemetry-ingest';
+
+/** The base path a request's pages and links are written with (request-base.ts, docs/subpath.md). */
+export { requestBase } from './request-base';
 
 export interface AppOptions {
   /** Logger override (default: pino JSON logger at config.logLevel). */
@@ -90,6 +95,24 @@ class ServerLogController extends LogController {
   }
 }
 
+/**
+ * Answers a request for a base path without its slash (`/3d`, `/3d?x=1`) with a redirect to the
+ * base with its slash, so that the editor's pages are always inside the service worker's scope
+ * (docs/subpath.md). It depends on X-Forwarded-Prefix, as the pages do.
+ */
+function registerBareBaseRedirect(app: FastifyInstance): void {
+  app.addHook('onRequest', async (request, reply) => {
+    const info = requestBaseInfo(request);
+    if (!info?.bare) return;
+    // request.url is the URL from the base: '/' and the query
+    return reply
+      .code(308)
+      .header('location', `${info.removed}${request.url}`)
+      .header('vary', 'X-Forwarded-Prefix')
+      .send();
+  });
+}
+
 function registerCors(app: FastifyInstance, origins: string[]): void {
   if (origins.length === 0) return;
   const anyOrigin = origins.includes('*');
@@ -126,6 +149,9 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
     trustProxy: true,
     bodyLimit: 10 * 1024 * 1024,
     return503OnClosing: true,
+    // before routing, every request's URL loses its base (docs/subpath.md): routes, hooks and
+    // handlers see paths from the server's root; request.originalUrl keeps the URL as sent
+    rewriteUrl: (req) => rewriteRequestUrl(req, config.basePath),
   });
   const log = app.log;
 
@@ -133,8 +159,10 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
   const metrics = new ServerMetrics({ defaultMetrics: opts.defaultMetrics });
   if (otel.meter) metrics.attachMeter(otel.meter);
 
-  // Hooks first: they apply to every route registered afterwards.
+  // Hooks first: they apply to every route registered afterwards. The redirect of a bare base
+  // comes right after the access log's hook (which only observes), before anything else answers.
   registerHttpObservability(app, metrics, { tracing: otel.enabled });
+  registerBareBaseRedirect(app);
   registerCors(app, config.corsOrigins);
   app.addHook('onRequest', async (request, reply) => {
     if (isAuthorized(config, pathnameOf(request.url), request.headers, request.url)) return;
@@ -157,6 +185,12 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
     refreshIntervalMs: opts.refreshIntervalMs,
   });
   const sync = new SyncServer({ rooms, config, log, metrics, keepaliveMs: opts.keepaliveMs });
+  // WebSocket upgrades do not pass Fastify: their URL loses its base here, before the sync server
+  // (and any other 'upgrade' listener) reads it
+  const rewriteUpgrade = (req: IncomingMessage) => {
+    req.url = rewriteRequestUrl(req, config.basePath);
+  };
+  app.server.prependListener('upgrade', rewriteUpgrade);
   app.server.on('upgrade', sync.handleUpgrade);
 
   // the services of the MCP tools and REST routes (the operator registry is made now when MCP is
@@ -234,6 +268,7 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
   });
   app.addHook('onClose', async () => {
     app.server.off('upgrade', sync.handleUpgrade);
+    app.server.off('upgrade', rewriteUpgrade);
     await rooms.close();
     await forwarder?.drain();
     await otel.shutdown();
