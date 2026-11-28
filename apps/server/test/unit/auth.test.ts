@@ -92,4 +92,47 @@ describe('auth', () => {
     expect(redactUrl('/api?x=1&token=abc')).toBe('/api?x=1&token=[REDACTED]');
     expect(redactUrl('/api')).toBe('/api');
   });
+
+  it('accepts a token query parameter in any spelling of its name, and redacts every one of them', () => {
+    // extractToken reads names as URLSearchParams decodes them
+    for (const name of ['token', '%74oken', 'to%6Ben', 'to%6ben', '%74%6F%6B%65%6E']) {
+      expect(extractToken({}, `/mcp?${name}=s3cret`), name).toBe('s3cret');
+      expect(extractToken({}, `/sync/p?x=1&${name}=s3cret&y=2`), name).toBe('s3cret');
+      expect(redactUrl(`/mcp?${name}=s3cret`), name).toBe(`/mcp?${name}=[REDACTED]`);
+      expect(redactUrl(`/3d/sync/p?x=1&${name}=s%20cret&y=2`), name).toBe(
+        `/3d/sync/p?x=1&${name}=[REDACTED]&y=2`,
+      );
+    }
+    // every pair, the rest as sent: other names, encodings, an empty value, a fragment
+    expect(redactUrl('/a?%74oken=1&token=2&tok=3&tokens=4&x=%74oken')).toBe(
+      '/a?%74oken=[REDACTED]&token=[REDACTED]&tok=3&tokens=4&x=%74oken',
+    );
+    expect(redactUrl('/a?token=&b=1#f')).toBe('/a?token=[REDACTED]&b=1#f');
+    expect(redactUrl('/a?token=x#y&token=z')).toBe('/a?token=[REDACTED]#y&token=[REDACTED]');
+    // a value runs to the next '&': a '?' in it is part of it (as URLSearchParams reads it)
+    expect(redactUrl('/a?token=s?e=cret&b=1')).toBe('/a?token=[REDACTED]&b=1');
+    expect(extractToken({}, '/a?token=s?e=cret&b=1')).toBe('s?e=cret');
+    // '??token=' is read as token by URLSearchParams (one leading '?' dropped)
+    expect(extractToken({}, '/a??token=s3cret')).toBe('s3cret');
+    expect(redactUrl('/a??token=s3cret')).toBe('/a??token=[REDACTED]');
+    // in any case of its letters (the old redaction did so), never a name that only starts with it
+    expect(redactUrl('/a?TOKEN=x&ToKeN=y')).toBe('/a?TOKEN=[REDACTED]&ToKeN=[REDACTED]');
+    expect(redactUrl('/a?to+ken=x&%74oken%20=y&%zzoken=z')).toBe('/a?to+ken=x&%74oken%20=y&%zzoken=z');
+    // the path is never read for pairs
+    expect(redactUrl('/a&token=x/b?c=1')).toBe('/a&token=x/b?c=1');
+    // in time linear in the URL
+    for (const url of [
+      `/a?${'&'.repeat(200_000)}`,
+      `/a?${'?'.repeat(200_000)}token=x`,
+      `/a?${'%74oke'.repeat(40_000)}=x`,
+      `/a?${'&token='.repeat(30_000)}`,
+    ]) {
+      const start = performance.now();
+      redactUrl(url);
+      expect(performance.now() - start).toBeLessThan(1000);
+    }
+    expect(redactUrl(`/a?${'&token='.repeat(3)}`)).toBe(
+      '/a?&token=[REDACTED]&token=[REDACTED]&token=[REDACTED]',
+    );
+  });
 });

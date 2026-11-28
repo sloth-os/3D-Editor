@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { parseMultistatus } from '@3d-editor/core';
 import {
+  davSegment,
   parseUpstream,
   rewriteDestination,
   rewriteMultistatus,
@@ -38,6 +39,55 @@ describe('upstreamUrlFor', () => {
     const u = upstreamUrlFor(root, '/dav//evil.example.com/x')!;
     expect(u.origin).toBe('http://127.0.0.1:1900');
     expect(u.pathname).toBe('/evil.example.com/x');
+  });
+
+  it('refuses segments that decode to a slash, a backslash, NUL or a dot segment (..%2f), and keeps other names', () => {
+    const guarded = parseUpstream('http://127.0.0.1:4470/guarded');
+    for (const upstream of [guarded, nextcloud, root]) {
+      for (const path of [
+        '/dav/..%2foutside-secret.txt',
+        '/dav/..%2Foutside-secret.txt',
+        '/dav/x/..%2f..%2foutside-secret.txt',
+        '/dav/x%2f..%2f..%2fs',
+        '/dav/%2e%2e%2fs',
+        '/dav/.%2e/s',
+        '/dav/..%5cs',
+        '/dav/x%5C..%5C..%5Cs',
+        '/dav/x/..\\s',
+        '/dav/a%00b',
+        '/dav/..',
+        '/dav/x/.',
+      ])
+        expect(upstreamUrlFor(upstream, path), `${upstream.basePath} ${path}`).toBeNull();
+    }
+    // names with encoded spaces, UTF-8 and reserved characters other than the slash are kept
+    expect(upstreamUrlFor(guarded, '/dav/')!.toString()).toBe('http://127.0.0.1:4470/guarded/');
+    expect(upstreamUrlFor(guarded, '/dav/inside.txt')!.toString()).toBe(
+      'http://127.0.0.1:4470/guarded/inside.txt',
+    );
+    expect(upstreamUrlFor(guarded, '/dav/x/y%20z.json')!.toString()).toBe(
+      'http://127.0.0.1:4470/guarded/x/y%20z.json',
+    );
+    expect(upstreamUrlFor(guarded, '/dav/caf%C3%A9.txt')!.toString()).toBe(
+      'http://127.0.0.1:4470/guarded/caf%C3%A9.txt',
+    );
+    expect(upstreamUrlFor(guarded, '/dav/a%26b%3Fc%23d%25e')!.pathname).toBe('/guarded/a%26b%3Fc%23d%25e');
+    expect(upstreamUrlFor(guarded, '/dav/..x/x..')!.pathname).toBe('/guarded/..x/x..');
+  });
+
+  it('refuses segments that do not decode', () => {
+    const guarded = parseUpstream('http://127.0.0.1:4470/guarded');
+    for (const upstream of [guarded, nextcloud, root])
+      for (const path of ['/dav/%zz', '/dav/%', '/dav/a%2', '/dav/%C3', '/dav/%C3%28', '/dav/x/%E0%A4%A'])
+        expect(upstreamUrlFor(upstream, path), `${upstream.basePath} ${path}`).toBeNull();
+  });
+
+  it('reads one segment at a time (davSegment)', () => {
+    expect(davSegment('a%20b')).toBe('a b');
+    expect(davSegment('caf%C3%A9')).toBe('café');
+    expect(davSegment('')).toBe('');
+    for (const raw of ['..%2f', '%2F', '%5c', '%00', '.', '%2e', '..', '.%2E', '%zz', '%C3'])
+      expect(davSegment(raw), raw).toBeNull();
   });
 });
 
@@ -159,5 +209,38 @@ describe('rewriteDestination', () => {
     expect(rewriteDestination(root, '/3d/dav/../etc', bases)).toBeNull();
     // at the root (no base) a path under a prefix is not under /dav
     expect(rewriteDestination(root, '/3d/dav/a')).toBeNull();
+  });
+
+  it('refuses destinations that leave the upstream base through an encoded slash (..%2f)', () => {
+    const guarded = parseUpstream('http://127.0.0.1:4470/guarded');
+    for (const destination of [
+      '/dav/..%2fpwned.txt',
+      '/3d/dav/..%2fpwned.txt',
+      'http://h/dav/x/..%2f..%2fpwned.txt',
+      'https://h/3d/dav/x%2f..%2f..%2fpwned.txt',
+      '/dav/%2e%2e%2fpwned.txt',
+      '/dav/..%5cpwned.txt',
+    ])
+      expect(rewriteDestination(guarded, destination, ['/3d']), destination).toBeNull();
+  });
+
+  it('refuses destinations whose segments do not decode', () => {
+    const guarded = parseUpstream('http://127.0.0.1:4470/guarded');
+    for (const destination of ['/dav/%%%%', `/dav/${'%'.repeat(10_000)}`, '/dav/%zz', 'http://h/dav/a%C3'])
+      expect(rewriteDestination(guarded, destination), destination.slice(0, 20)).toBeNull();
+  });
+
+  it('reads the path of a destination as a request target is read (originForm)', () => {
+    const bases = ['/3d'];
+    expect(rewriteDestination(root, '/%33d/dav/x', bases)).toBe('http://127.0.0.1:1900/x');
+    expect(rewriteDestination(root, '/%64av/x')).toBe('http://127.0.0.1:1900/x');
+    expect(rewriteDestination(root, 'http://h/%33d/%64%61v/x%20y', bases)).toBe(
+      'http://127.0.0.1:1900/x%20y',
+    );
+    expect(rewriteDestination(root, '/3d/dav/caf%C3%A9.txt#f', bases)).toBe(
+      'http://127.0.0.1:1900/caf%C3%A9.txt',
+    );
+    // reserved characters keep their encoding: %2F is no slash
+    expect(rewriteDestination(root, '/3d%2Fdav/x', bases)).toBeNull();
   });
 });

@@ -14,6 +14,7 @@ import {
   type DeskEmbedSettings,
 } from './desk-embed';
 import { requestBase } from './request-base';
+import { addVary } from './vary';
 
 /** The server's own paths (base-path.ts): they never fall back to the editor's page. */
 export { RESERVED_PREFIXES, isReservedPath } from './base-path';
@@ -48,17 +49,6 @@ function notModified(ifNoneMatch: string | undefined, etag: string): boolean {
     .split(',')
     .map((tag) => tag.trim().replace(/^W\//, ''))
     .some((tag) => tag === '*' || tag === etag);
-}
-
-/** Adds a header name to the reply's Vary (kept with a Vary set before, e.g. Origin by CORS). */
-function addVary(reply: FastifyReply, name: string): void {
-  const before = reply.getHeader('vary');
-  const names = (Array.isArray(before) ? before.join(',') : String(before ?? ''))
-    .split(',')
-    .map((v) => v.trim())
-    .filter(Boolean);
-  if (!names.some((v) => v === '*' || v.toLowerCase() === name.toLowerCase())) names.push(name);
-  reply.header('vary', names.join(', '));
 }
 
 /**

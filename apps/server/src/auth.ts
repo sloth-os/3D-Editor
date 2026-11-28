@@ -100,7 +100,65 @@ export function isAuthorized(
   return ok;
 }
 
-/** Removes the `token` query parameter from a URL before it is logged. */
+const QUESTION = 63;
+const AMPERSAND = 38;
+const EQUALS = 61;
+const HASH = 35;
+const TOKEN_NAME = 'token';
+/** The longest spelling of a query name that decodes to `token`: each of its letters as `%HH`. */
+const TOKEN_NAME_MAX = TOKEN_NAME.length * 3;
+const REDACTED = '[REDACTED]';
+
+/**
+ * Whether a query name as sent decodes to `token`, in any letter case: `token`, `%74oken`,
+ * `to%6Ben`, `TOKEN` (extractToken reads names as URLSearchParams decodes them). Only a name of at
+ * most TOKEN_NAME_MAX characters can, so decoding it costs a bounded time; one that does not decode
+ * (`%zz`) is not `token`, as URLSearchParams keeps such a `%` as it is.
+ */
+function isTokenName(name: string): boolean {
+  if (name.length < TOKEN_NAME.length || name.length > TOKEN_NAME_MAX) return false;
+  try {
+    return decodeURIComponent(name).toLowerCase() === TOKEN_NAME;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A URL as it is logged: the value of every query pair whose name decodes to `token` (isTokenName)
+ * replaced by `[REDACTED]`, the rest as sent. A pair starts after any `?` or `&` from the query's
+ * `?` on (so `??token=`, which URLSearchParams reads as `token`, is one) and its value ends at the
+ * next `&` or `#`. Time linear in the URL's length: each `?` or `&` is followed by at most
+ * TOKEN_NAME_MAX + 1 characters of name.
+ */
 export function redactUrl(rawUrl: string): string {
-  return rawUrl.replace(/([?&]token=)[^&#]*/gi, '$1[REDACTED]');
+  const query = rawUrl.indexOf('?');
+  if (query === -1) return rawUrl;
+  let out = '';
+  let from = 0;
+  for (let i = query; i < rawUrl.length; i++) {
+    const c = rawUrl.charCodeAt(i);
+    if (c !== QUESTION && c !== AMPERSAND) continue;
+    // the pair's '=', within the longest name that can decode to `token`
+    let equals = -1;
+    for (let j = i + 1; j < rawUrl.length && j <= i + 1 + TOKEN_NAME_MAX; j++) {
+      const d = rawUrl.charCodeAt(j);
+      if (d === EQUALS) {
+        equals = j;
+        break;
+      }
+      if (d === AMPERSAND) break;
+    }
+    if (equals === -1 || !isTokenName(rawUrl.slice(i + 1, equals))) continue;
+    let end = equals + 1;
+    while (end < rawUrl.length) {
+      const d = rawUrl.charCodeAt(end);
+      if (d === AMPERSAND || d === HASH) break;
+      end++;
+    }
+    out += `${rawUrl.slice(from, equals + 1)}${REDACTED}`;
+    from = end;
+    i = end - 1;
+  }
+  return from === 0 ? rawUrl : out + rawUrl.slice(from);
 }

@@ -120,10 +120,54 @@ function lastHeaderValue(value: string | string[] | undefined): string | undefin
   return raw?.split(',').pop()?.trim() || undefined;
 }
 
+const COLON = 58;
+const OPEN_BRACKET = 91;
+
+/** Whether a char code is an ASCII letter or digit, `.` or `-`: what a host name or IPv4 address is made of. */
+function isHostNameChar(c: number): boolean {
+  const lower = c | 0x20;
+  return (lower >= 97 && lower <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 45;
+}
+
+/** Whether a char code may be in a bracketed IPv6 address: hex digits, `:` and `.` (an IPv4 tail). */
+function isIPv6Char(c: number): boolean {
+  const lower = c | 0x20;
+  return (lower >= 97 && lower <= 102) || (c >= 48 && c <= 57) || c === COLON || c === 46;
+}
+
+/**
+ * Whether a Host or X-Forwarded-Host value is a host and an optional port, and nothing else: a name
+ * or IPv4 address of ASCII letters, digits, `.` and `-` (`example.com`, `127.0.0.1`), or an IPv6
+ * address in brackets (`[::1]`), then `:port` with a port from 1 to 65535. A quote, a brace, `@`,
+ * `/` or a space never reaches a link. Time linear in the value's length.
+ */
+export function isHostAndPort(value: string): boolean {
+  let i = 0;
+  if (value.charCodeAt(0) === OPEN_BRACKET) {
+    const close = value.indexOf(']');
+    if (close < 3) return false;
+    for (i = 1; i < close; i++) if (!isIPv6Char(value.charCodeAt(i))) return false;
+    i = close + 1;
+  } else {
+    while (i < value.length && isHostNameChar(value.charCodeAt(i))) i++;
+    if (i === 0) return false;
+  }
+  if (i === value.length) return true;
+  if (value.charCodeAt(i) !== COLON) return false;
+  const port = value.slice(i + 1);
+  if (port.length === 0 || port.length > 5) return false;
+  for (let j = 0; j < port.length; j++) {
+    const c = port.charCodeAt(j);
+    if (c < 48 || c > 57) return false;
+  }
+  const n = Number(port);
+  return n >= 1 && n <= 65535;
+}
+
 /** `scheme://host[:port]` as a URL origin (lowercased, default port dropped), or null when invalid. */
 function originOf(scheme: string, host: string | undefined): string | null {
-  // a host and port only: nothing that could end the authority and change the URL's meaning
-  if (!host || !/^[^\s/\\?#@]+$/.test(host)) return null;
+  // a host and port only (isHostAndPort), then what the URL parser accepts of it
+  if (!host || !isHostAndPort(host)) return null;
   try {
     return new URL(`${scheme}://${host}`).origin;
   } catch {
@@ -133,12 +177,14 @@ function originOf(scheme: string, host: string | undefined): string | null {
 
 /**
  * The address of this server as the MCP client reached it, for the links of results (editor and
- * download links; links carry no token): the scheme and host the client used (the last values of
- * X-Forwarded-Proto and X-Forwarded-Host when a proxy sends usable ones, as Fastify reads them with
- * trustProxy, else the request URL's, else its Host header), then the base path
- * (X-Forwarded-Prefix when usable, else BASE_PATH), without a trailing slash:
- * `https://example.com/3d` (docs/subpath.md). '' without an HTTP request (an in-memory client):
- * the links are then paths from the server's root, as REST gives them.
+ * download links; links carry no token): the scheme and host of the last values of
+ * X-Forwarded-Proto and X-Forwarded-Host when a proxy sends usable ones (as Fastify reads them
+ * with trustProxy; a host as isHostAndPort accepts it), else the scheme of the connection and the
+ * Host header (the request URL the MCP transport builds from them: the scheme and authority of an
+ * absolute-form request target are not read), then the base path (X-Forwarded-Prefix when usable,
+ * else BASE_PATH), without a trailing slash: `https://example.com/3d` (docs/subpath.md). '' without
+ * an HTTP request (an in-memory client): the links are then paths from the server's root, as REST
+ * gives them.
  */
 export function baseUrl(extra: ToolExtra, config: Pick<ServerConfig, 'basePath'>): string {
   const info = extra.requestInfo;

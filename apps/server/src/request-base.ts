@@ -5,15 +5,19 @@ import { forwardedPrefix, stripBasePath } from './base-path';
 /*
  * The base path of each request (docs/subpath.md). Before anything routes a request, HTTP requests
  * (Fastify's rewriteUrl, app.ts) and WebSocket upgrades (an 'upgrade' listener that runs before
- * the sync server's, app.ts) get their URL in origin form (originForm) and lose BASE_PATH when
- * they start with it, and the raw request keeps what was read: the base the server writes into the
- * request's pages and links, the bases a path the request names may start with, whether the URL
+ * the sync server's, app.ts) get their URL in origin form (originForm), and the raw request keeps
+ * what was read: the base the server writes into the request's pages and links, the bases a path
+ * the request names may start with, whether the request carries X-Forwarded-Prefix, whether the URL
  * was BASE_PATH without its slash, and the URL as the client sent it (for the logs).
  *
- * Only BASE_PATH is removed from request paths. X-Forwarded-Prefix sets the base the server writes,
- * never what a request routes to: clients can send it, and a proxy in front that passes it on (and
- * denies /metrics or /mcp, say) would otherwise let any client re-root routing under a prefix of
- * its choice.
+ * A request that carries X-Forwarded-Prefix with a value that is not blank (usable or not, in any
+ * number of header lines) came through a proxy that stripped the prefix: its URL is routed as it
+ * came, and nothing is removed from it. Only from a request without the header is BASE_PATH removed,
+ * when its URL starts with it. The header's value sets the base the server writes, never what a
+ * request routes to: clients can send it, and a proxy in front that passes it on (and denies
+ * /metrics or /mcp, say) would otherwise let any client re-root routing under a prefix of its
+ * choice; and a path a stripping proxy passed on is never stripped again (with BASE_PATH=/3d, a
+ * client's /3d/3d/metrics reaches the server as /3d/metrics with the header, which no route serves).
  */
 
 /** What the server read of a request's base path before routing it (rewriteRequestUrl). */
@@ -25,7 +29,14 @@ export interface RequestBase {
   base: string;
   /** The bases a path the request names (a WebDAV Destination) may start with: `base`, then BASE_PATH. */
   bases: readonly string[];
-  /** BASE_PATH when the URL started with it and lost it, else ''. */
+  /**
+   * The request carries X-Forwarded-Prefix with a value that is not blank (carriesForwardedPrefix):
+   * its URL was routed as it came.
+   */
+  forwarded: boolean;
+  /** The base its X-Forwarded-Prefix names when usable (forwardedPrefix), else null. */
+  forwardedBase: string | null;
+  /** BASE_PATH when the URL started with it and lost it (a request without the header), else ''. */
   removed: string;
   /** The URL was BASE_PATH without its slash (`/3d`, `/3d?x`): its page is at `${removed}/`. */
   bare: boolean;
@@ -40,6 +51,42 @@ type WithRequestBase = IncomingMessage & { [kRequestBase]?: RequestBase };
 const SLASH = 47;
 const QUESTION = 63;
 const HASH = 35;
+const SPACE = 32;
+const TAB = 9;
+
+const FORWARDED_PREFIX = 'x-forwarded-prefix';
+
+/** Whether a header value is empty once spaces and tabs are trimmed from it. */
+function isBlank(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const c = value.charCodeAt(i);
+    if (c !== SPACE && c !== TAB) return false;
+  }
+  return true;
+}
+
+/**
+ * Whether a request carries X-Forwarded-Prefix with a value that is not blank (after trimming spaces
+ * and tabs), usable or not, in any of its header lines: then a proxy stripped the prefix from its
+ * path (docs/subpath.md). Read from the raw header lines, since Node joins several lines with ', '
+ * (two empty lines would read ', '); a request without them (built by hand) is read from its
+ * headers. Time linear in the size of the headers.
+ */
+export function carriesForwardedPrefix(req: Pick<IncomingMessage, 'headers' | 'rawHeaders'>): boolean {
+  const raw = req.rawHeaders as readonly string[] | undefined;
+  if (Array.isArray(raw)) {
+    for (let i = 0; i + 1 < raw.length; i += 2) {
+      const name = raw[i]!;
+      if (name.length === FORWARDED_PREFIX.length && name.toLowerCase() === FORWARDED_PREFIX) {
+        if (!isBlank(raw[i + 1]!)) return true;
+      }
+    }
+    return false;
+  }
+  const value = req.headers[FORWARDED_PREFIX];
+  const values = typeof value === 'string' ? [value] : (value ?? []);
+  return values.some((v) => !isBlank(v));
+}
 
 /** The value of a hexadecimal digit's char code, or -1. */
 function hexValue(c: number): number {
@@ -103,18 +150,25 @@ export function originForm(url: string): string {
 }
 
 /**
- * The URL of `req` in origin form (originForm) without BASE_PATH (`basePath`) when it starts with
- * it; the request keeps what was read (requestBase). X-Forwarded-Prefix is read for the base the
- * server writes, never removed from the URL.
+ * The URL of `req` in origin form (originForm), without BASE_PATH (`basePath`) when it starts with
+ * it and the request carries no X-Forwarded-Prefix (carriesForwardedPrefix); the request keeps what
+ * was read (requestBase). A request that carries the header is routed as it came: the proxy that
+ * sent it stripped the prefix. The header's value is read for the base the server writes, never
+ * removed from the URL.
  */
 export function rewriteRequestUrl(req: IncomingMessage, basePath: string): string {
   const originalUrl = req.url ?? '/';
-  const base = forwardedPrefix(req.headers['x-forwarded-prefix']) ?? basePath;
+  const forwardedBase = forwardedPrefix(req.headers[FORWARDED_PREFIX]);
+  const base = forwardedBase ?? basePath;
   const bases = base === basePath ? [base] : [base, basePath];
-  const stripped = stripBasePath(originForm(originalUrl), [basePath]);
+  const forwarded = carriesForwardedPrefix(req);
+  const target = originForm(originalUrl);
+  const stripped = forwarded ? { url: target, base: '', bare: false } : stripBasePath(target, [basePath]);
   (req as WithRequestBase)[kRequestBase] = {
     base,
     bases,
+    forwarded,
+    forwardedBase,
     removed: stripped.base,
     bare: stripped.bare,
     originalUrl,
@@ -123,18 +177,21 @@ export function rewriteRequestUrl(req: IncomingMessage, basePath: string): strin
 }
 
 /**
- * The X-Forwarded-Prefix base that a request's URL, as routed (`url`, after rewriteRequestUrl),
- * still starts with when that base is not BASE_PATH, else null: the request came through a proxy
- * that keeps the prefix in the path, which only BASE_PATH removes (app.ts says so in the log).
+ * The base that the URL of a request carrying X-Forwarded-Prefix still starts with, as routed
+ * (`url`, after rewriteRequestUrl): the header's usable base, else BASE_PATH (`basePath`), or null
+ * (no header, or a URL under neither). Such a request reaches no route: a proxy that sends the
+ * header and keeps the prefix in request paths, or a client that sent a path with the prefix twice
+ * through a stripping proxy, or its own header (app.ts says so in the log).
  */
-export function keptForwardedPrefix(
+export function keptPrefix(
   request: FastifyRequest | IncomingMessage,
   url: string,
   basePath: string,
 ): string | null {
   const info = requestBaseInfo(request);
-  if (!info || info.base === '' || info.base === basePath) return null;
-  return stripBasePath(url, [info.base]).base === '' ? null : info.base;
+  if (!info?.forwarded) return null;
+  const bases = info.forwardedBase ? [info.forwardedBase, basePath] : [basePath];
+  return stripBasePath(url, bases).base || null;
 }
 
 function rawOf(request: FastifyRequest | IncomingMessage): WithRequestBase {

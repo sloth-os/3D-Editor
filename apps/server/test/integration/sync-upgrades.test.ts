@@ -164,6 +164,33 @@ describe('WebSocket upgrades in the access log and the HTTP metrics', () => {
     expect(await counted('/sync/:projectId', 405, 'POST')).toBe(1);
   });
 
+  it('never logs a token, whatever the spelling of its query name, in upgrade and access lines', async () => {
+    for (const name of ['token', '%74oken', 'to%6Ben']) {
+      // accepted with the token (the name decodes to `token`), refused with another one
+      const id = newUuid();
+      expect(await rawUpgrade(`/sync/${id}?${name}=${TOKEN}`), name).toBe('HTTP/1.1 101 Switching Protocols');
+      expect(await lineOf(`/sync/${id}?${name}=[REDACTED]`)).toMatchObject({ statusCode: 101 });
+      const refused = newUuid();
+      expect(await rawUpgrade(`/sync/${refused}?x=1&${name}=not-the-token`), name).toBe(
+        'HTTP/1.1 401 Unauthorized',
+      );
+      expect(await lineOf(`/sync/${refused}?x=1&${name}=[REDACTED]`)).toMatchObject({ statusCode: 401 });
+      // HTTP requests' access lines
+      const res = await fetch(`${server.url}/api/projects?${name}=${TOKEN}`);
+      expect(res.status, name).toBe(200);
+      await res.arrayBuffer();
+      await eventually(
+        () =>
+          lines.find((l) => l.msg === 'request completed' && l.url === `/api/projects?${name}=[REDACTED]`),
+        5000,
+        `access line of ${name}`,
+      );
+    }
+    const logged = JSON.stringify(lines);
+    expect(logged).not.toContain(TOKEN);
+    expect(logged).not.toContain('not-the-token');
+  });
+
   it('logs an accepted upgrade at debug and counts it as 101, and a server fault at warn as 500', async () => {
     const before = await counted('/sync/:projectId', 101);
     const c = new SyncTestClient({ baseUrl: server.url, projectId: newUuid(), token: TOKEN });

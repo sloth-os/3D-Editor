@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { isAbsolute, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'esbuild';
+import { build } from 'vite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { render } from '@testing-library/preact';
@@ -452,19 +452,30 @@ describe("the desk's own page", () => {
 });
 
 describe("the app's Web Workers", () => {
-  /** The app's own modules a worker entry imports, from the source tree (packages left out). */
+  /**
+   * The app's own modules a worker entry imports, from the source tree (packages left out): every
+   * module Vite's bundler puts in the worker's chunks, none of them tree-shaken away, with no
+   * config of the app's (only its root) and nothing written.
+   */
   async function ownModules(entry: string): Promise<string[]> {
-    const r = await build({
-      entryPoints: [fileURLToPath(new URL(entry, import.meta.url))],
-      bundle: true,
-      write: false,
-      metafile: true,
-      platform: 'browser',
-      format: 'esm',
-      packages: 'external',
+    const output = await build({
+      configFile: false,
+      root: resolve(__dirname, '..'),
       logLevel: 'silent',
+      build: {
+        write: false,
+        rolldownOptions: {
+          input: fileURLToPath(new URL(entry, import.meta.url)),
+          // a package, not a path: left out ('\0…' is one of Vite's own modules)
+          external: (id) => /^[\w@]/.test(id) && !isAbsolute(id),
+          treeshake: false,
+        },
+      },
     });
-    return Object.keys(r.metafile.inputs);
+    const outputs = Array.isArray(output) ? output : [output];
+    return outputs.flatMap((o) =>
+      'output' in o ? o.output.flatMap((chunk) => (chunk.type === 'chunk' ? chunk.moduleIds : [])) : [],
+    );
   }
 
   it("import neither the app's base nor the server's URLs: a worker has no base of its own", async () => {

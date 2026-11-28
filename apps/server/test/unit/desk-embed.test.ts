@@ -11,7 +11,9 @@ import {
   isDeskPagePath,
   parseDeskEmbedCoep,
   parseDeskEmbedOrigins,
+  VITE_SERVER_ROUTES,
   viteDeskRoute,
+  type ViteRequest,
 } from '../../src/desk-embed';
 
 /*
@@ -201,59 +203,115 @@ describe('the headers', () => {
 describe("the web app's Vite servers (vite.config.ts)", () => {
   const page = deskPageHeaders(DEFAULT_DESK_EMBED);
   const asset = deskAssetHeaders(DEFAULT_DESK_EMBED);
+  const route = (pathname: string, dev: boolean, request: ViteRequest) =>
+    viteDeskRoute(pathname, dev, DEFAULT_DESK_EMBED, request);
+  /** A page the browser opens: a GET whose Accept names text/html. */
+  const opens: ViteRequest = { read: true, html: true, builtFile: false };
+  /** A file a page loads (a script, a style, an image, a fetch): a GET that accepts no HTML. */
+  const loads: ViteRequest = { read: true, html: false, builtFile: false };
+  /** A request that changes something (POST, PUT, DELETE …). */
+  const writes: ViteRequest = { read: false, html: false, builtFile: false };
+  const built = (request: ViteRequest): ViteRequest => ({ ...request, builtFile: true });
 
-  it('give the desk page its headers at /desk.html and /desk (served as desk.html)', () => {
-    for (const dev of [true, false]) {
-      expect(viteDeskRoute('/desk.html', dev, DEFAULT_DESK_EMBED)).toEqual({
-        headers: page,
-        rewrite: undefined,
-      });
-      expect(viteDeskRoute('/desk', dev, DEFAULT_DESK_EMBED)).toEqual({
-        headers: page,
-        rewrite: '/desk.html',
-      });
-    }
+  it('give the desk page its headers at /desk.html and /desk (served as desk.html), whatever the request', () => {
+    for (const dev of [true, false])
+      for (const request of [opens, loads, writes, built(opens)]) {
+        expect(route('/desk.html', dev, request)).toEqual({ headers: page, rewrite: undefined });
+        expect(route('/desk', dev, request)).toEqual({ headers: page, rewrite: '/desk.html' });
+      }
   });
 
   it('give the asset headers only to the built files (in dev, to its modules), as the server does', () => {
     for (const dev of [true, false])
-      expect(viteDeskRoute('/assets/desk-1a2b.js', dev, DEFAULT_DESK_EMBED).headers).toEqual(asset);
+      for (const request of [built(loads), built(opens)])
+        expect(route('/assets/desk-1a2b.js', dev, request)).toEqual({ headers: asset });
     for (const p of [
       '/src/embed/stage.worker.ts',
       '/@vite/client',
       '/@fs/home/x/packages/core/src/index.ts',
       '/node_modules/.vite/deps/preact.js',
     ]) {
-      expect(viteDeskRoute(p, true, DEFAULT_DESK_EMBED).headers, p).toEqual(asset);
-      expect(viteDeskRoute(p, false, DEFAULT_DESK_EMBED).headers, p).toEqual({});
+      expect(route(p, true, loads), p).toEqual({ headers: asset });
+      // in preview no file of the build: never the asset headers, and never a page either
+      expect(route(p, false, loads), p).toEqual({ headers: {}, notFound: true });
     }
   });
 
   it("never give desk headers to the editor's pages, the service worker or the manifest", () => {
     for (const dev of [true, false])
-      for (const p of [
-        '/',
-        '/index.html',
-        '/sw.js',
-        '/manifest.webmanifest',
-        '/favicon.svg',
-        '/api/config',
-        '/x',
-      ])
-        expect(viteDeskRoute(p, dev, DEFAULT_DESK_EMBED), `${p} dev=${dev}`).toEqual({ headers: {} });
+      for (const p of ['/', '/index.html', '/sw.js', '/manifest.webmanifest', '/favicon.svg'])
+        for (const request of [opens, loads])
+          expect(route(p, dev, dev ? request : built(request)), `${p} dev=${dev}`).toEqual({ headers: {} });
   });
 
-  it('serve the editor at /desk/ and /desk.html/ as the server does: Vite\'s in dev, the built page with <base href="/"> in preview', () => {
-    for (const p of ['/desk/', '/desk.html/', '/desk//', '/desk.html///']) {
-      // in dev, index.html as Vite makes it, whose URLs are paths from the root
-      expect(viteDeskRoute(p, true, DEFAULT_DESK_EMBED), p).toEqual({ headers: {}, rewrite: '/index.html' });
-      // in preview, the built index.html (relative URLs), which the preview server answers with the
-      // root's <base href> (vite.config.ts), as the server writes it: never the file as it is
-      expect(viteDeskRoute(p, false, DEFAULT_DESK_EMBED), p).toEqual({ headers: {}, page: 'index.html' });
-    }
-    // no other path is the editor's page here: the desk's, files and look-alikes keep their routes
-    for (const p of ['/desk', '/desk.html', '/desks/', '/x/desk/', '/desk/x'])
-      expect(viteDeskRoute(p, false, DEFAULT_DESK_EMBED).page, p).toBeUndefined();
+  it("leave the editor server's routes to the proxy: never a page, a 404 or desk headers", () => {
+    expect(VITE_SERVER_ROUTES).toEqual(['/api', '/dav', '/otlp', '/mcp', '/sync']);
+    // Vite's proxy takes every path that starts with one (/apix too)
+    for (const p of [
+      '/api',
+      '/api/config',
+      '/apix',
+      '/dav/3d-editor/projects',
+      '/otlp/v1/traces',
+      '/mcp',
+      '/sync/p1',
+    ])
+      for (const dev of [true, false])
+        for (const request of [opens, loads, writes])
+          expect(route(p, dev, request), `${p} dev=${dev}`).toEqual({ headers: {} });
+  });
+
+  it('serve the editor at /desk/ and /desk.html/ for a GET or HEAD, in dev and preview alike: Vite\'s page or the built one, with <base href="/">', () => {
+    for (const p of ['/desk/', '/desk.html/', '/desk//', '/desk.html///'])
+      for (const dev of [true, false])
+        for (const request of [opens, loads])
+          expect(route(p, dev, request), `${p} dev=${dev}`).toEqual({ headers: {}, page: 'index.html' });
+    // a request that changes something is Vite's (it answers 404)
+    for (const dev of [true, false]) expect(route('/desk/', dev, writes)).toEqual({ headers: {} });
+  });
+
+  it('in dev, leave every other path to Vite: its own page at deeper paths, its files, the root', () => {
+    for (const p of ['/x/y', '/desks/', '/x/desk/', '/desk/x', '/3d/', '/index.html/', '/', '/index.html'])
+      for (const request of [opens, loads, writes])
+        expect(route(p, true, request), p).toEqual({ headers: {} });
+  });
+
+  it("in preview, serve the editor's page at every page the browser opens at a path that names no built file, as the server's fallback does", () => {
+    for (const p of [
+      '/x/y',
+      '/x/',
+      '/desks/',
+      '/x/desk/',
+      '/desk/x',
+      '/3d/',
+      '/icons/',
+      '/assets',
+      '/index.html/',
+      '/sw.js/',
+      '/missing.js',
+    ])
+      expect(route(p, false, opens), p).toEqual({ headers: {}, page: 'index.html' });
+    // the root and the built files are Vite's
+    for (const p of ['/', '/index.html', '/sw.js', '/manifest.webmanifest', '/icons/icon-192.png'])
+      expect(route(p, false, p === '/' ? opens : built(opens)), p).toEqual({ headers: {} });
+  });
+
+  it('in preview, answer a file the build does not have with 404, never with a page', () => {
+    // what a page loads at a deeper path: its relative files looked for in the wrong folder
+    for (const p of [
+      '/x/assets/main-Aq3A8fVw.js',
+      '/x/y',
+      '/missing.css',
+      '/favicon.ico',
+      '/icons/missing.png',
+    ])
+      expect(route(p, false, loads), p).toEqual({ headers: {}, notFound: true });
+    // under /assets/ also when it is opened as a page: the server's own 404 there
+    for (const request of [opens, loads])
+      expect(route('/assets/missing-1a2b.js', false, request)).toEqual({ headers: asset, notFound: true });
+    // a request that changes something is Vite's
+    for (const p of ['/x/y', '/assets/missing-1a2b.js'])
+      expect(route(p, false, writes).notFound, p).toBeUndefined();
   });
 });
 

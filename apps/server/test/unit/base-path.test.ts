@@ -19,9 +19,10 @@ import {
 } from '../../src/base-path';
 import { loadConfig } from '../../src/config';
 import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
-import { baseUrl, type ToolExtra } from '../../src/mcp/tool-kit';
+import { baseUrl, isHostAndPort, type ToolExtra } from '../../src/mcp/tool-kit';
 import {
-  keptForwardedPrefix,
+  carriesForwardedPrefix,
+  keptPrefix,
   originForm,
   originalUrlOf,
   requestBase,
@@ -189,6 +190,9 @@ describe('the length of a base path', () => {
     const req = rawRequest('/api/config', { 'x-forwarded-prefix': tooLong });
     expect(rewriteRequestUrl(req, '/3d')).toBe('/api/config');
     expect(requestBase(req)).toBe('/3d');
+    // the request still carries the header: nothing is removed from its path
+    const under3d = rawRequest('/3d/api/config', { 'x-forwarded-prefix': tooLong });
+    expect(rewriteRequestUrl(under3d, '/3d')).toBe('/3d/api/config');
   });
 });
 
@@ -242,9 +246,25 @@ describe('what reads request headers takes time linear in their length', () => {
   it('the base of a request or WebSocket upgrade with such a header (rewriteRequestUrl)', () => {
     const req = rawRequest('/3d/api/config', { 'x-forwarded-prefix': SLASH_RUN });
     const run = timed(() => rewriteRequestUrl(req, '/3d'));
-    expect(run.value).toBe('/api/config');
+    // the header is not usable, but the request carries it: routed as it came
+    expect(run.value).toBe('/3d/api/config');
     expect(requestBase(req)).toBe('/3d');
     expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+  });
+
+  it('whether a request carries X-Forwarded-Prefix, in long or many header lines', () => {
+    const blank = ' \t'.repeat(100_000);
+    const lines = Array.from({ length: 50_000 }, () => ['X-Forwarded-Prefix', blank.slice(0, 8)]).flat();
+    for (const [raw, carries] of [
+      [['X-Forwarded-Prefix', blank], false],
+      [['X-Forwarded-Prefix', `${blank}/3d`], true],
+      [lines, false],
+      [[...lines, 'x-forwarded-prefix', '/3d'], true],
+    ] as const) {
+      const run = timed(() => carriesForwardedPrefix(rawLines('/3d/x', [...raw])));
+      expect(run.value).toBe(carries);
+      expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+    }
   });
 
   it('the links of MCP results with such X-Forwarded-Prefix, -Host and -Proto headers (baseUrl)', () => {
@@ -396,6 +416,20 @@ function rawRequest(url: string, headers: Record<string, string | string[]> = {}
   return { url, headers } as unknown as IncomingMessage;
 }
 
+/**
+ * A raw request with these header lines (name, value, name, value...), as Node gives it: its
+ * rawHeaders, and its headers with the values of a repeated name joined by ', ' (an empty line
+ * included, so two empty lines read ', ').
+ */
+function rawLines(url: string, rawHeaders: string[]): IncomingMessage {
+  const headers: Record<string, string> = {};
+  for (let i = 0; i + 1 < rawHeaders.length; i += 2) {
+    const name = rawHeaders[i]!.toLowerCase();
+    headers[name] = name in headers ? `${headers[name]}, ${rawHeaders[i + 1]}` : rawHeaders[i + 1]!;
+  }
+  return { url, headers, rawHeaders } as unknown as IncomingMessage;
+}
+
 describe('the prefix removal (rewriteRequestUrl)', () => {
   it('removes BASE_PATH from the URLs that start with it and remembers the URL as sent', () => {
     const req = rawRequest('/3d/api/config?x=1');
@@ -403,6 +437,8 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
     expect(requestBaseInfo(req)).toEqual({
       base: '/3d',
       bases: ['/3d'],
+      forwarded: false,
+      forwardedBase: null,
       removed: '/3d',
       bare: false,
       originalUrl: '/3d/api/config?x=1',
@@ -415,12 +451,13 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
     expect(requestBaseInfo(plain)).toMatchObject({ base: '/3d', removed: '', bare: false });
   });
 
-  it("takes the request's base from X-Forwarded-Prefix, and removes BASE_PATH only", () => {
+  it("takes the request's base from X-Forwarded-Prefix, and removes nothing from a request that carries it", () => {
     // a proxy that strips the prefix: the path is from the base the header names
     const stripped = rawRequest('/api/config', { 'x-forwarded-prefix': '/editor' });
     expect(rewriteRequestUrl(stripped, '')).toBe('/api/config');
     expect(requestBase(stripped)).toBe('/editor');
     expect(requestBases(stripped)).toEqual(['/editor', '']);
+    expect(requestBaseInfo(stripped)).toMatchObject({ forwarded: true, forwardedBase: '/editor' });
     // a header a client sends never re-roots routing: a path under its base stays as it is
     for (const basePath of ['', '/3d']) {
       const sent = rawRequest('/editor/metrics', { 'x-forwarded-prefix': '/editor' });
@@ -430,30 +467,69 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
       expect(rewriteRequestUrl(bare, basePath), basePath).toBe('/editor?a=b');
       expect(requestBaseInfo(bare)?.bare, basePath).toBe(false);
     }
+    // nor is BASE_PATH removed from it: the proxy that sent it stripped the prefix already, and a
+    // path it passed on is never stripped twice (/3d/3d/metrics through it is /3d/metrics here)
+    for (const header of ['/editor', '/3d']) {
+      const twice = rawRequest('/3d/metrics', { 'x-forwarded-prefix': header });
+      expect(rewriteRequestUrl(twice, '/3d'), header).toBe('/3d/metrics');
+      expect(requestBaseInfo(twice), header).toMatchObject({ removed: '', bare: false });
+    }
     const configured = rawRequest('/3d/api/config', { 'x-forwarded-prefix': '/editor' });
-    expect(rewriteRequestUrl(configured, '/3d')).toBe('/api/config');
+    expect(rewriteRequestUrl(configured, '/3d')).toBe('/3d/api/config');
     expect(requestBaseInfo(configured)).toMatchObject({
       base: '/editor',
       bases: ['/editor', '/3d'],
-      removed: '/3d',
+      forwarded: true,
+      removed: '',
     });
+    const bareBase = rawRequest('/3d?a=b', { 'x-forwarded-prefix': '/3d' });
+    expect(rewriteRequestUrl(bareBase, '/3d')).toBe('/3d?a=b');
+    expect(requestBaseInfo(bareBase)?.bare).toBe(false);
   });
 
-  it('names an X-Forwarded-Prefix the path still starts with, which only BASE_PATH could remove', () => {
+  it('counts a header with any value that is not blank, in any of its lines', () => {
+    const routed = (raw: string[]) => rewriteRequestUrl(rawLines('/3d/api/config', raw), '/3d');
+    // not usable, still carried: nothing removed
+    for (const value of ['//evil.example', '/api', 'x', ' /3d ', ',', '/3d, /other'])
+      expect(routed(['X-Forwarded-Prefix', value]), value).toBe('/3d/api/config');
+    // blank (spaces and tabs only) is no header: BASE_PATH removed
+    for (const value of ['', ' ', '\t', ' \t '])
+      expect(routed(['X-Forwarded-Prefix', value]), JSON.stringify(value)).toBe('/api/config');
+    expect(routed([])).toBe('/api/config');
+    // several lines: one that is not blank is enough, whatever the case of its name; two blank
+    // lines (which Node joins as ', ') are none
+    expect(routed(['X-Forwarded-Prefix', '', 'x-forwarded-prefix', '/3d'])).toBe('/3d/api/config');
+    expect(routed(['x-forwarded-prefix', '/3d', 'X-FORWARDED-PREFIX', ''])).toBe('/3d/api/config');
+    expect(routed(['X-Forwarded-Prefix', '', 'X-Forwarded-Prefix', ' '])).toBe('/api/config');
+    expect(routed(['X-Forwarded-Prefix-Other', '/3d', 'X-Forwarded-Prefi', '/3d'])).toBe('/api/config');
+    // a request without raw lines (built by hand) is read from its headers
+    expect(carriesForwardedPrefix(rawRequest('/x', { 'x-forwarded-prefix': ['', ' /3d'] }))).toBe(true);
+    expect(carriesForwardedPrefix(rawRequest('/x', { 'x-forwarded-prefix': ' ' }))).toBe(false);
+  });
+
+  it('names the base the path of a request that carries X-Forwarded-Prefix still starts with', () => {
     const kept = (url: string, header: string, basePath: string) => {
       const req = rawRequest(url, { 'x-forwarded-prefix': header });
-      return keptForwardedPrefix(req, rewriteRequestUrl(req, basePath), basePath);
+      return keptPrefix(req, rewriteRequestUrl(req, basePath), basePath);
     };
-    // a proxy that keeps the prefix while BASE_PATH does not name it
+    // the header's usable base, else BASE_PATH
     expect(kept('/editor/api/config', '/editor', '')).toBe('/editor');
     expect(kept('/editor?a=b', '/editor', '')).toBe('/editor');
     expect(kept('/editor/x', '/editor', '/3d')).toBe('/editor');
-    // a proxy that strips it, BASE_PATH that removes it, a path that only looks like it
+    expect(kept('/3d/x', '/editor', '/3d')).toBe('/3d');
+    expect(kept('/3d/x', '/3d', '/3d')).toBe('/3d');
+    expect(kept('/3d?a', '/3d', '/3d')).toBe('/3d');
+    // an unusable header: BASE_PATH only, never the header's text
+    expect(kept('/3d/x', '//evil.example', '/3d')).toBe('/3d');
+    expect(kept('//evil.example/x', '//evil.example', '')).toBeNull();
+    // a path under neither, one that only looks like it, a request without the header
     expect(kept('/api/config', '/editor', '')).toBeNull();
-    expect(kept('/editor/x', '/editor', '/editor')).toBeNull();
     expect(kept('/editorial', '/editor', '')).toBeNull();
+    expect(kept('/3dx/y', '/editor', '/3d')).toBeNull();
     expect(kept('/x', '/', '')).toBeNull();
-    expect(keptForwardedPrefix(rawRequest('/editor/x'), '/editor/x', '')).toBeNull();
+    const plain = rawRequest('/3d/x');
+    expect(keptPrefix(plain, rewriteRequestUrl(plain, '/3d'), '/3d')).toBeNull();
+    expect(keptPrefix(rawRequest('/editor/x'), '/editor/x', '')).toBeNull();
   });
 
   it('reads the request target in origin form, as the router does', () => {
@@ -499,11 +575,14 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
     expect(rewriteRequestUrl(rawRequest('http://x/api/config'), '')).toBe('/api/config');
   });
 
-  it('ignores an unusable X-Forwarded-Prefix', () => {
+  it('ignores an unusable X-Forwarded-Prefix for the base, and removes nothing from its request', () => {
     for (const header of ['//evil.example', '/api', '/a/../b', 'https://evil.example']) {
       const req = rawRequest('/a/b', { 'x-forwarded-prefix': header });
       expect(rewriteRequestUrl(req, '/3d'), header).toBe('/a/b');
       expect(requestBase(req), header).toBe('/3d');
+      expect(requestBaseInfo(req), header).toMatchObject({ forwarded: true, forwardedBase: null });
+      const under = rawRequest('/3d/a/b', { 'x-forwarded-prefix': header });
+      expect(rewriteRequestUrl(under, '/3d'), header).toBe('/3d/a/b');
     }
   });
 
@@ -570,8 +649,36 @@ describe('the links of MCP results (baseUrl)', () => {
   });
 
   it('ignore forwarded values they cannot use', () => {
-    for (const host of ['example.com/evil', 'user@example.com', 'exa mple.com', 'example.com:99999', '?x'])
+    for (const host of [
+      'example.com/evil',
+      'user@example.com',
+      'exa mple.com',
+      'example.com:99999',
+      '?x',
+      // characters the URL parser keeps in a host name
+      'a"b',
+      "a'b",
+      'a`b',
+      'a{b}',
+      'a_b',
+      'a%41b',
+      // not a host and port
+      '[::1',
+      '[zz]',
+      '[::1]x',
+      'example.com:0',
+      'example.com:',
+      'example.com:65536',
+      'example.com:+80',
+      ':80',
+    ])
       expect(baseUrl(httpCall({ 'x-forwarded-host': host }), root), host).toBe('http://127.0.0.1:8080');
+    expect(baseUrl(httpCall({ 'x-forwarded-host': '[::1]:8443' }), root)).toBe('http://[::1]:8443');
+    expect(baseUrl(httpCall({ 'x-forwarded-host': 'Editor-1.Example.com:65535' }), root)).toBe(
+      'http://editor-1.example.com:65535',
+    );
+    // the Host header is held to the same rule
+    expect(baseUrl(extraWith({ headers: { host: 'a"b' } }), root)).toBe('');
     expect(baseUrl(httpCall({ 'x-forwarded-proto': 'ftp' }), root)).toBe('http://127.0.0.1:8080');
     expect(baseUrl(httpCall({ 'x-forwarded-prefix': '//evil.example' }), under3d)).toBe(
       'http://127.0.0.1:8080/3d',
@@ -586,6 +693,44 @@ describe('the links of MCP results (baseUrl)', () => {
     expect(baseUrl(extraWith({ headers: {} }), under3d)).toBe('');
     // an in-memory client: links stay paths from the server's root, as REST gives them
     expect(baseUrl(extraWith(), under3d)).toBe('');
+  });
+});
+
+describe('the hosts of MCP links (isHostAndPort)', () => {
+  it('are a host name, an IPv4 address or a bracketed IPv6 address, and an optional port', () => {
+    for (const host of [
+      'example.com',
+      'EXAMPLE.com',
+      'a-b.c',
+      '127.0.0.1',
+      '[::1]',
+      '[2001:db8::1]:443',
+      'x:1',
+    ])
+      expect(isHostAndPort(host), host).toBe(true);
+    for (const host of [
+      '',
+      ':80',
+      'a b',
+      'a:b',
+      'a:123456',
+      'a:0',
+      '[]',
+      '[:]',
+      '[::1',
+      '[::1]:',
+      'a]',
+      'ä.de',
+    ])
+      expect(isHostAndPort(host), host).toBe(false);
+  });
+
+  it('are read in time linear in their length', () => {
+    for (const host of [`${'a'.repeat(200_000)}"`, `[${':'.repeat(200_000)}`, `a:${'1'.repeat(200_000)}`]) {
+      const run = timed(() => isHostAndPort(host));
+      expect(run.value).toBe(false);
+      expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+    }
   });
 });
 

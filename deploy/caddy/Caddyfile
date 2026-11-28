@@ -7,8 +7,12 @@
 # {?query} keeps the query of /3d?… in the redirect and needs Caddy 2.9 or later. An older Caddy
 # replaces {?query} with nothing, so its redirect drops the query; there, /3d/?{query} keeps the
 # query (and redirects /3d to /3d/? when there is none).
+# X-Forwarded-Prefix, set here in place of a client's, tells the editor server where it lives and
+# that the paths come without /3d: it then removes nothing from them. Set BASE_PATH=/3d on the
+# editor server as well (docs/subpath.md). A proxy that keeps the prefix (handle in place of
+# handle_path) sends no X-Forwarded-Prefix and drops a client's: header_up -X-Forwarded-Prefix.
 #
-# Caddy 2.9 or later ({?query}): handle_path strips /3d; the header tells the editor where it lives
+# Caddy 2.9 or later ({?query}): handle_path strips /3d; the header tells the editor so and its base
 example.com {
 	redir /3d /3d/{?query} 308
 	handle_path /3d/* {

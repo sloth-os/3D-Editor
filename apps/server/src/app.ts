@@ -10,7 +10,7 @@ import { createOperatorRegistry } from '@3d-editor/core';
 import type { ServerConfig } from './config';
 import { isAuthorized, redactUrl, routedPath } from './auth';
 import { trimTrailingSlashes } from './base-path';
-import { keptForwardedPrefix, originalUrlOf, requestBaseInfo, rewriteRequestUrl } from './request-base';
+import { keptPrefix, originalUrlOf, requestBaseInfo, rewriteRequestUrl } from './request-base';
 import type { Log } from './observability/log';
 import { createPersistence, type Persistence } from './persistence';
 import { RoomManager } from './sync/room-manager';
@@ -53,6 +53,8 @@ export interface AppOptions {
   serviceFetch?: typeof fetch;
   /** Disable Node default process metrics (tests creating many apps). */
   defaultMetrics?: boolean;
+  /** The clock of the kept-prefix warning's window, in ms (tests; default Date.now). */
+  now?: () => number;
 }
 
 export interface AppHandle {
@@ -100,35 +102,51 @@ class ServerLogController extends LogController {
 /**
  * Answers a request for BASE_PATH without its slash (`/3d`, `/3d?x=1`) with a redirect to it with
  * its slash, so that the editor's pages are inside the service worker's scope (docs/subpath.md).
- * The redirect depends on BASE_PATH alone, never on X-Forwarded-Prefix.
+ * Only a request without X-Forwarded-Prefix is redirected (one with it has nothing removed from its
+ * path, so it is never `bare`): the answer depends on the header and says so.
  */
 function registerBareBaseRedirect(app: FastifyInstance): void {
   app.addHook('onRequest', async (request, reply) => {
     const info = requestBaseInfo(request);
     if (!info?.bare) return;
     // request.url is the URL from BASE_PATH: '/' and the query
-    return reply.code(308).header('location', `${info.removed}${request.url}`).send();
+    return reply
+      .code(308)
+      .header('location', `${info.removed}${request.url}`)
+      .header('vary', 'X-Forwarded-Prefix')
+      .send();
   });
 }
 
+/** The kept-prefix warning is written at most once in this time (ms) per server. */
+export const KEPT_PREFIX_WARNING_INTERVAL_MS = 10 * 60_000;
+
 /**
- * Says once per server, at warn, that a request came through a proxy that keeps in the path a prefix
- * the server does not remove: its path (from BASE_PATH) starts with its own X-Forwarded-Prefix,
- * which is not BASE_PATH (docs/subpath.md). Only once, so that clients that send the header cannot
- * fill the log.
+ * Says at warn, at most once per KEPT_PREFIX_WARNING_INTERVAL_MS (on `now`'s clock), that a request
+ * carrying X-Forwarded-Prefix has a path that still starts with the header's usable base or with
+ * BASE_PATH (keptPrefix), which reaches no route: a proxy in front that sends the header and keeps
+ * the prefix in request paths must not send it (docs/subpath.md). Clients can send the header too,
+ * so the line is worded as a condition and kept rare; it names a usable base only, never the
+ * header's text, and the URL as the access log gives it (token redacted).
  */
-function keptPrefixWarning(basePath: string, log: Log): (req: IncomingMessage, url: string) => void {
-  let said = false;
+function keptPrefixWarning(
+  basePath: string,
+  log: Log,
+  now: () => number,
+): (req: IncomingMessage, url: string) => void {
+  let last = -Infinity;
   return (req, url) => {
-    if (said) return;
-    const prefix = keptForwardedPrefix(req, url, basePath);
+    const prefix = keptPrefix(req, url, basePath);
     if (prefix === null) return;
-    said = true;
+    const at = now();
+    if (at - last < KEPT_PREFIX_WARNING_INTERVAL_MS) return;
+    last = at;
     log.warn(
       { prefix, url: redactUrl(originalUrlOf(req)) },
-      `a request path starts with its X-Forwarded-Prefix ${prefix}, which the server does not remove ` +
-        `from paths (only BASE_PATH): a proxy that keeps the prefix needs BASE_PATH=${prefix} ` +
-        '(docs/subpath.md; said once)',
+      `a request that carries X-Forwarded-Prefix has a path that starts with ${prefix}, which no ` +
+        'route serves: if a proxy in front sends X-Forwarded-Prefix and keeps the prefix in request ' +
+        `paths, it must not send the header, and the server needs BASE_PATH=${prefix} ` +
+        '(docs/subpath.md; said at most once in 10 minutes)',
     );
   };
 }
@@ -172,10 +190,10 @@ function registerCors(app: FastifyInstance, origins: string[]): void {
 export async function createApp(config: ServerConfig, opts: AppOptions = {}): Promise<AppHandle> {
   const startedAt = Date.now();
   const serviceName = config.otel?.serviceName ?? '3d-editor-server';
-  // Before routing, every request's URL is put in origin form and loses BASE_PATH (request-base.ts,
-  // docs/subpath.md): routes, hooks and handlers see paths from the server's root, and
-  // request.originalUrl keeps the URL as sent. HTTP requests in Fastify's rewriteUrl, WebSocket
-  // upgrades in an 'upgrade' listener (below).
+  // Before routing, every request's URL is put in origin form and, when it carries no
+  // X-Forwarded-Prefix, loses BASE_PATH (request-base.ts, docs/subpath.md): routes, hooks and
+  // handlers see paths from the server's root, and request.originalUrl keeps the URL as sent. HTTP
+  // requests in Fastify's rewriteUrl, WebSocket upgrades in an 'upgrade' listener (below).
   let warnKeptPrefix = (_req: IncomingMessage, _url: string): void => {};
   const rewrite = (req: IncomingMessage): string => {
     const url = rewriteRequestUrl(req, config.basePath);
@@ -191,7 +209,7 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
     rewriteUrl: rewrite,
   });
   const log = app.log;
-  warnKeptPrefix = keptPrefixWarning(config.basePath, log);
+  warnKeptPrefix = keptPrefixWarning(config.basePath, log, opts.now ?? Date.now);
 
   const otel = await startOpenTelemetry(config.otel, log);
   const metrics = new ServerMetrics({ defaultMetrics: opts.defaultMetrics });

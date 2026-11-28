@@ -8,6 +8,7 @@ import type { WebDAVSettings } from '../config';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
 import { requestBase, requestBases } from '../request-base';
+import { addVary } from '../vary';
 import {
   DAV_PREFIX,
   parseUpstream,
@@ -68,6 +69,17 @@ const FORWARD_RESPONSE_HEADERS = [
   'lock-token',
   'ms-author-via',
 ];
+
+/**
+ * Headers of every answer of the proxy, in place of any the WebDAV server sends: what it stores is
+ * never active content on the editor's origin. A document (an uploaded .html or .svg opened in a
+ * tab) gets a sandbox of its own, with no scripts and no access to the editor's storage, and is
+ * never sniffed as another type. The editor reads WebDAV with fetch, which they leave alone.
+ */
+const PROXY_RESPONSE_HEADERS = {
+  'content-security-policy': 'sandbox',
+  'x-content-type-options': 'nosniff',
+} as const;
 
 /** Largest multistatus body buffered for href rewriting. */
 const MAX_REWRITE_BYTES = 32 * 1024 * 1024;
@@ -133,11 +145,15 @@ function isXml(contentType: string | undefined): boolean {
 
 /**
  * Same-origin WebDAV access for browsers: `/dav/*` is forwarded to WEBDAV_URL with the server's
- * credentials. Paths are confined to the upstream base URL (never an open proxy), and URLs in
- * `Destination`, `Location` and PROPFIND multistatus bodies are translated between the two
- * namespaces: the hrefs given out are under the request's base path (`/3d/dav/...`, so that
- * clients behind a reverse proxy can follow them), and a Destination is accepted with or without
- * it (docs/subpath.md).
+ * credentials. Paths, and the paths of Destination headers, are confined to the upstream base URL
+ * (never an open proxy): a path segment that does not decode, or decodes to `.`, `..` or a name with
+ * `/`, `\` or NUL in it (`..%2f`), is refused, and the URL sent upstream, decoded with its dot
+ * segments resolved, is the base or under it (rewrite.ts). URLs in `Destination`, `Location` and
+ * PROPFIND multistatus bodies are translated between the two namespaces: the hrefs given out are
+ * under the request's base path (`/3d/dav/...`, so that clients behind a reverse proxy can follow
+ * them), and a Destination is accepted with or without it (docs/subpath.md). Every answer carries
+ * PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix` (with the WebDAV server's Vary), since the
+ * hrefs and Location depend on that header.
  */
 export async function registerDavProxy(
   app: FastifyInstance,
@@ -147,6 +163,9 @@ export async function registerDavProxy(
   const upstream: DavUpstream = parseUpstream(settings.url);
 
   const handler = async (request: FastifyRequest, reply: FastifyReply) => {
+    reply.headers(PROXY_RESPONSE_HEADERS);
+    // the hrefs, Location and messages given out depend on the request's base (X-Forwarded-Prefix)
+    addVary(reply, 'X-Forwarded-Prefix');
     const target = upstreamUrlFor(upstream, request.url);
     if (!target) return reply.code(400).send({ error: 'invalid WebDAV path' });
     const method = request.method;
@@ -189,6 +208,8 @@ export async function registerDavProxy(
       const v = res.headers[name];
       if (v !== undefined) reply.header(name, v);
     }
+    const upstreamVary = res.headers.vary;
+    if (upstreamVary) addVary(reply, upstreamVary);
     for (const name of ['location', 'content-location']) {
       const v = res.headers[name];
       if (typeof v !== 'string') continue;

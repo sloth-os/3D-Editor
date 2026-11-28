@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import http, { type IncomingHttpHeaders } from 'node:http';
-import type { AddressInfo } from 'node:net';
+import net, { type AddressInfo } from 'node:net';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -17,10 +17,12 @@ import { mkcolPath, startWebDAV, type TestWebDAV } from '../helpers/webdav';
  * prefix, and the server's own port without it) and one without BASE_PATH behind a proxy that
  * strips the prefix and sends X-Forwarded-Prefix. The pages are written with the request's
  * <base href>, BASE_PATH without its slash is redirected, the API, the live sync, MCP and the
- * WebDAV proxy answer under the prefix and without it, and links and hrefs carry the base. Only
- * BASE_PATH is removed from request paths: an X-Forwarded-Prefix (which clients can send) never
- * moves a route. AUTH_TOKEN guards the routes whatever the spelling of the request target, and
- * headers of any length take the server linear time.
+ * WebDAV proxy answer under the prefix and without it, and links and hrefs carry the base. BASE_PATH
+ * is removed only from requests that carry no X-Forwarded-Prefix: a request that carries one (a
+ * proxy that strips the prefix sends it, and clients can) is routed as it came, so the header never
+ * moves a route and no prefix is removed twice; a proxy that keeps the prefix must not send it.
+ * AUTH_TOKEN guards the routes whatever the spelling of the request target, and headers of any
+ * length take the server linear time.
  */
 
 const INDEX_HTML = `<!doctype html>
@@ -143,7 +145,7 @@ describe('a server with BASE_PATH=/3d', () => {
     }
   });
 
-  it('redirects the base without its slash to /3d/ (308), query kept', async () => {
+  it('redirects the base without its slash to /3d/ (308), query kept, when the request has no X-Forwarded-Prefix', async () => {
     for (const [p, location] of [
       ['/3d', '/3d/'],
       ['/3d?x=1', '/3d/?x=1'],
@@ -152,15 +154,16 @@ describe('a server with BASE_PATH=/3d', () => {
         const res = await fetch(`${based.url}${p}`, { method, redirect: 'manual' });
         expect(res.status, `${method} ${p}`).toBe(308);
         expect(res.headers.get('location'), p).toBe(location);
-        // the redirect is BASE_PATH's: it depends on the URL alone
-        expect(res.headers.get('vary'), p).toBeNull();
+        // whether it is redirected depends on the header: a shared cache keys it on the header
+        expect(res.headers.get('vary'), p).toMatch(/\bX-Forwarded-Prefix\b/i);
       }
+      // a request that carries the header has nothing removed from its path: /3d is no base to
+      // redirect but a path of the editor's pages
       const proxied = await fetch(`${based.url}${p}`, {
         headers: { 'x-forwarded-prefix': '/editor' },
         redirect: 'manual',
       });
-      expect(proxied.status, p).toBe(308);
-      expect(proxied.headers.get('location'), p).toBe(location);
+      expectBase(await page(proxied, p), '/editor/', INDEX_HTML, p);
     }
     // logged and counted like every other request, with the URL as sent
     expect(await accessLine('/3d?x=1')).toMatchObject({ statusCode: 308 });
@@ -247,8 +250,8 @@ describe('a server without BASE_PATH behind a proxy that strips the prefix', () 
     const desk = await fetch(`${root.url}/desk`, { headers });
     expectBase(await page(desk, '/desk'), '/editor/', DESK_HTML, '/desk');
     expect(desk.headers.get('content-security-policy')).toBe('frame-ancestors *');
-    // the header's base is never removed from paths (only BASE_PATH is): /editor/… are paths of
-    // the editor's pages at the root, and /editor is no base to redirect
+    // nothing is removed from the path of a request that carries the header: /editor/… are paths
+    // of the editor's pages at the root, and /editor is no base to redirect
     for (const p of ['/editor/desk.html', '/editor/healthz', '/editor?a=b']) {
       const res = await fetch(`${root.url}${p}`, { headers, redirect: 'manual' });
       expectBase(await page(res, p), '/editor/', INDEX_HTML, p);
@@ -341,14 +344,18 @@ describe('live sync under a prefix', () => {
       ws.once('error', () => resolve(0));
     });
 
-  it("removes BASE_PATH from upgrades, never X-Forwarded-Prefix's base", async () => {
+  it('removes BASE_PATH from upgrades without X-Forwarded-Prefix, and nothing from those with it', async () => {
     const proxied = { 'x-forwarded-prefix': '/editor' };
     // a stripping proxy: the path without the prefix
     expect(await upgrade(`${root.url}/sync/${newUuid()}`, proxied)).toBe(101);
-    // the header alone does not make the server remove its base
+    expect(await upgrade(`${based.url}/sync/${newUuid()}`, proxied)).toBe(101);
+    // the header does not make the server remove its base
     expect(await upgrade(`${root.url}/editor/sync/${newUuid()}`, proxied)).toBe(404);
-    // BASE_PATH is removed, whatever the header says
-    expect(await upgrade(`${based.url}/3d/sync/${newUuid()}`, proxied)).toBe(101);
+    // nor BASE_PATH: a request with the header is routed as it came
+    expect(await upgrade(`${based.url}/3d/sync/${newUuid()}`, proxied)).toBe(404);
+    expect(await upgrade(`${based.url}/3d/sync/${newUuid()}`, { 'x-forwarded-prefix': '/3d' })).toBe(404);
+    // a request without it: BASE_PATH removed
+    expect(await upgrade(`${based.url}/3d/sync/${newUuid()}`, {})).toBe(101);
   });
 });
 
@@ -384,7 +391,8 @@ describe('MCP links under a prefix', () => {
       'x-forwarded-host': 'example.com',
       'x-forwarded-prefix': '/3d',
     };
-    await withMcp(`${based.url}/3d/mcp`, proxied, async (c) => {
+    // a stripping proxy in front of a server with BASE_PATH=/3d: the request at /mcp
+    await withMcp(`${based.url}/mcp`, proxied, async (c) => {
       const created = await tool(c, 'create_project', { name: 'Under a prefix' });
       expect(created.editor_url).toBe(`https://example.com/3d/?project=${created.id}`);
       const got = await tool(c, 'get_project', { project: created.id });
@@ -469,13 +477,18 @@ describe('the WebDAV proxy under a prefix', () => {
     // a path without the base
     res = await fetch(at('b.txt'), { method: 'COPY', headers: { destination: '/dav/3d-editor/c.txt' } });
     expect(res.status).toBeLessThan(300);
-    // a path under the base of X-Forwarded-Prefix
+    // a path under the base of X-Forwarded-Prefix, and one under BASE_PATH with that header
     res = await fetch(`${server.url}/dav/3d-editor/c.txt`, {
       method: 'COPY',
       headers: { destination: '/editor/dav/3d-editor/d.txt', 'x-forwarded-prefix': '/editor' },
     });
     expect(res.status).toBeLessThan(300);
-    for (const name of ['b.txt', 'c.txt', 'd.txt']) {
+    res = await fetch(`${server.url}/dav/3d-editor/c.txt`, {
+      method: 'COPY',
+      headers: { destination: '/3d/dav/3d-editor/e.txt', 'x-forwarded-prefix': '/editor' },
+    });
+    expect(res.status).toBeLessThan(300);
+    for (const name of ['b.txt', 'c.txt', 'd.txt', 'e.txt']) {
       const upstream = await fetch(`${dav.origin}/files/3d-editor/${name}`, {
         headers: { authorization: dav.authorization },
       });
@@ -607,28 +620,24 @@ const MCP_HEADERS = { 'content-type': 'application/json', accept: 'application/j
 describe('X-Forwarded-Prefix never moves a route', () => {
   it('serves /x/metrics and POST /x/mcp with X-Forwarded-Prefix: /x as any other path', async () => {
     const header = { 'x-forwarded-prefix': '/x' };
-    for (const [server, prefix] of [
-      [root, ''],
-      [based, ''],
-      [based, '/3d'],
-    ] as const) {
-      const what = `${server === root ? 'root' : 'BASE_PATH'} ${prefix}`;
+    for (const server of [root, based]) {
+      const what = server === root ? 'root' : 'BASE_PATH';
       // the editor's page, not the metrics
-      const metrics = await fetch(`${server.url}${prefix}/x/metrics`, { headers: header });
+      const metrics = await fetch(`${server.url}/x/metrics`, { headers: header });
       expect(await page(metrics, what)).not.toContain('# HELP');
       // not the MCP endpoint
-      const mcp = await rawRequest(server, `${prefix}/x/mcp`, {
+      const mcp = await rawRequest(server, '/x/mcp', {
         method: 'POST',
         headers: { ...MCP_HEADERS, ...header },
         body: MCP_INITIALIZE,
       });
       expect(mcp.status, what).toBe(404);
-      expect(JSON.parse(mcp.body), what).toEqual({ error: `not found: ${prefix}/x/mcp` });
+      expect(JSON.parse(mcp.body), what).toEqual({ error: 'not found: /x/mcp' });
       // the routes themselves still answer with the header
-      const real = await fetch(`${server.url}${prefix}/metrics`, { headers: header });
+      const real = await fetch(`${server.url}/metrics`, { headers: header });
       expect(real.status, what).toBe(200);
       expect(await real.text(), what).toContain('# HELP');
-      const initialize = await rawRequest(server, `${prefix}/mcp`, {
+      const initialize = await rawRequest(server, '/mcp', {
         method: 'POST',
         headers: { ...MCP_HEADERS, ...header },
         body: MCP_INITIALIZE,
@@ -637,34 +646,207 @@ describe('X-Forwarded-Prefix never moves a route', () => {
     }
   });
 
-  it('says once, at warn, that a proxy keeping its prefix needs BASE_PATH', async () => {
+  it('counts the header with any value that is not blank, in any of its lines', async () => {
+    /** The status of GET /3d/metrics on the server with BASE_PATH=/3d, with these raw header lines. */
+    const metricsWith = (lines: string[]) =>
+      new Promise<number>((resolve, reject) => {
+        const socket = net.connect(based.port, '127.0.0.1', () => {
+          socket.write(
+            `GET /3d/metrics HTTP/1.1\r\nHost: x\r\nConnection: close\r\n${lines.map((l) => `${l}\r\n`).join('')}\r\n`,
+          );
+        });
+        let data = '';
+        socket.on('data', (b: Buffer) => (data += b.toString('latin1')));
+        socket.on('end', () => {
+          const status = Number(/^HTTP\/1\.1 (\d+)/.exec(data)?.[1] ?? 0);
+          // the metrics, or the editor's page that answers paths no route serves
+          resolve(data.includes('# HELP') ? status : -status);
+        });
+        socket.on('error', reject);
+      });
+    // no header, or blank ones (spaces and tabs only, which Node trims away): BASE_PATH removed
+    expect(await metricsWith([])).toBe(200);
+    expect(await metricsWith(['X-Forwarded-Prefix:'])).toBe(200);
+    expect(await metricsWith(['X-Forwarded-Prefix: \t '])).toBe(200);
+    expect(await metricsWith(['X-Forwarded-Prefix:', 'x-forwarded-prefix:  '])).toBe(200);
+    // one that is not blank, usable or not, in any line: routed as it came (the editor's page)
+    for (const lines of [
+      ['X-Forwarded-Prefix: /3d'],
+      ['X-Forwarded-Prefix: //evil.example'],
+      ['X-Forwarded-Prefix: ,'],
+      ['X-Forwarded-Prefix:', 'X-FORWARDED-PREFIX: /3d'],
+      ['x-forwarded-prefix: x', 'X-Forwarded-Prefix:'],
+    ])
+      expect(await metricsWith(lines), lines.join(' | ')).toBe(-200);
+  });
+});
+
+describe('a proxy that strips the prefix in front of a server with BASE_PATH=/3d', () => {
+  let dav: TestWebDAV;
+  let server: TestServer;
+  const stripped = { 'x-forwarded-prefix': '/3d' };
+
+  beforeAll(async () => {
+    dav = await startWebDAV({ username: 'bob', password: 'hunter2' });
+    await mkcolPath(dav, '/files');
+    server = await serve({
+      PUBLIC_DIR: publicDir,
+      BASE_PATH: '/3d',
+      WEBDAV_URL: `${dav.origin}/files`,
+      WEBDAV_USERNAME: 'bob',
+      WEBDAV_PASSWORD: 'hunter2',
+      SYNC_PERSISTENCE: 'memory',
+    });
+  });
+
+  afterAll(async () => {
+    await dav?.stop();
+  });
+
+  it('serves the paths it passes on, and nothing under /3d: no prefix is removed twice', async () => {
+    // what the proxy passes on for /3d/metrics, /3d/api/config, /3d/mcp, /3d/sync/<id>, /3d/dav/
+    const metrics = await fetch(`${server.url}/metrics`, { headers: stripped });
+    expect(metrics.status).toBe(200);
+    expect(await metrics.text()).toContain('# HELP');
+    const config = await api(server.url, '/api/config', { headers: stripped });
+    expect(config.status).toBe(200);
+    expect(config.body.webdav).toMatchObject({ url: '/dav' });
+    const mcp = await rawRequest(server, '/mcp', {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, ...stripped },
+      body: MCP_INITIALIZE,
+    });
+    expect(mcp.status).toBe(200);
+    expect(await rawUpgrade(server, `/sync/${newUuid()}`, stripped)).toBe(101);
+    const listing = await fetch(`${server.url}/dav/`, {
+      method: 'PROPFIND',
+      headers: { depth: '1', ...stripped },
+    });
+    expect(listing.status).toBe(207);
+    expect(await listing.text()).toMatch(/<(?:\w+:)?href>\/3d\/dav\/<\/(?:\w+:)?href>/);
+    expectBase(
+      await page(await fetch(`${server.url}/`, { headers: stripped }), 'page'),
+      '/3d/',
+      INDEX_HTML,
+      'page',
+    );
+
+    // what it passes on for /3d/3d/…: paths that still start with BASE_PATH, which no route serves
+    // (a `location /3d/metrics { deny all; }` in front is never passed by)
+    for (const p of ['/3d/metrics', '/3d/api/config', '/3d/healthz']) {
+      const res = await fetch(`${server.url}${p}`, { headers: stripped });
+      const html = await page(res, p);
+      expect(html, p).not.toContain('# HELP');
+      expectBase(html, '/3d/', INDEX_HTML, p);
+    }
+    const underBase = await rawRequest(server, '/3d/mcp', {
+      method: 'POST',
+      headers: { ...MCP_HEADERS, ...stripped },
+      body: MCP_INITIALIZE,
+    });
+    expect(underBase.status).toBe(404);
+    expect(await rawUpgrade(server, `/3d/sync/${newUuid()}`, stripped)).toBe(404);
+    const davUnderBase = await fetch(`${server.url}/3d/dav/`, {
+      method: 'PROPFIND',
+      headers: { depth: '1', ...stripped },
+    });
+    expect(davUnderBase.status).toBe(404);
+    // nor is /3d a base to redirect
+    expectBase(
+      await page(await fetch(`${server.url}/3d`, { headers: stripped, redirect: 'manual' }), 'bare'),
+      '/3d/',
+      INDEX_HTML,
+      'bare',
+    );
+  });
+});
+
+describe('a proxy that keeps the prefix in front of a server with BASE_PATH=/3d', () => {
+  it('is served when it sends no X-Forwarded-Prefix, and reaches no route when it sends one', async () => {
+    // it drops a client's header and sends none: BASE_PATH is removed
+    const metrics = await fetch(`${based.url}/3d/metrics`);
+    expect(await metrics.text()).toContain('# HELP');
+    expect((await api(based.url, '/3d/api/config')).status).toBe(200);
+    const mcp = await rawRequest(based, '/3d/mcp', {
+      method: 'POST',
+      headers: MCP_HEADERS,
+      body: MCP_INITIALIZE,
+    });
+    expect(mcp.status).toBe(200);
+    expect(await rawUpgrade(based, `/3d/sync/${newUuid()}`)).toBe(101);
+    // one that sends the header (its own or a client's, usable or not): nothing is removed
+    for (const prefix of ['/3d', '/editor', '//evil.example']) {
+      const header = { 'x-forwarded-prefix': prefix };
+      const res = await fetch(`${based.url}/3d/metrics`, { headers: header });
+      expect(await page(res, prefix), prefix).not.toContain('# HELP');
+      const refused = await rawRequest(based, '/3d/mcp', {
+        method: 'POST',
+        headers: { ...MCP_HEADERS, ...header },
+        body: MCP_INITIALIZE,
+      });
+      expect(refused.status, prefix).toBe(404);
+      expect(await rawUpgrade(based, `/3d/sync/${newUuid()}`, header), prefix).toBe(404);
+    }
+  });
+});
+
+describe('the warning about a proxy that sends X-Forwarded-Prefix and keeps the prefix', () => {
+  it('is said at most once in 10 minutes, at warn, as a condition, with a usable base and the URL redacted', async () => {
+    let clock = 1_000_000;
     const logged: LogLine[] = [];
     const server = await serve(
-      { PUBLIC_DIR: publicDir },
+      { PUBLIC_DIR: publicDir, BASE_PATH: '/3d' },
       {
+        now: () => clock,
         logger: {
           level: 'warn',
           stream: { write: (line: string) => void logged.push(JSON.parse(line) as LogLine) },
         },
       },
     );
-    const warnings = () => logged.filter((l) => l.msg?.includes('needs BASE_PATH='));
-    // a path that does not start with the header's base, or a base the server removes: nothing to say
-    await fetch(`${server.url}/healthz`, { headers: { 'x-forwarded-prefix': '/editor' } });
-    expect(warnings()).toEqual([]);
-    for (const [p, prefix] of [
-      ['/editor/?token=abc', '/editor'],
-      ['/editor/api/config', '/editor'],
-      ['/other/', '/other'],
-    ]) {
+    const warnings = () => logged.filter((l) => l.msg?.includes('X-Forwarded-Prefix'));
+    const send = async (p: string, prefix: string) => {
       const res = await fetch(`${server.url}${p}`, { headers: { 'x-forwarded-prefix': prefix } });
       await res.arrayBuffer();
-    }
+    };
+    // paths that start with neither base, a request without the header: nothing to say
+    await send('/healthz', '/3d');
+    await send('/api/config', '/editor');
+    await fetch(`${server.url}/3d/healthz`).then((r) => r.arrayBuffer());
+    expect(warnings()).toEqual([]);
+    // a path under the header's base
+    await send('/editor/?token=abc', '/editor');
     expect(warnings()).toHaveLength(1);
     expect(warnings()[0]).toMatchObject({ level: 40, prefix: '/editor', url: '/editor/?token=[REDACTED]' });
-    expect(warnings()[0]!.msg).toContain('a proxy that keeps the prefix needs BASE_PATH=/editor');
+    expect(warnings()[0]!.msg).toContain(
+      'if a proxy in front sends X-Forwarded-Prefix and keeps the prefix in request paths, it must not ' +
+        'send the header, and the server needs BASE_PATH=/editor',
+    );
+    // nothing more within 10 minutes, whatever the base
+    clock += 10 * 60_000 - 1;
+    await send('/3d/api/config', '/3d');
+    await send('/editor/x', '/editor');
+    expect(warnings()).toHaveLength(1);
+    // then once more: BASE_PATH for a header that is not usable, never the header's text
+    clock += 1;
+    await send('/3d/x?%74oken=abc&y=1', '//evil.example');
+    await send('/3d/y', '/3d');
+    expect(warnings()).toHaveLength(2);
+    expect(warnings()[1]).toMatchObject({ prefix: '/3d', url: '/3d/x?%74oken=[REDACTED]&y=1' });
+    expect(warnings()[1]!.msg).toContain('the server needs BASE_PATH=/3d');
+    expect(JSON.stringify(logged)).not.toContain('evil');
+    // WebSocket upgrades are read the same way
+    clock += 10 * 60_000;
+    expect(
+      await rawUpgrade(server, `/3d/sync/${newUuid()}?to%6Ben=abc`, { 'x-forwarded-prefix': '/3d' }),
+    ).toBe(404);
+    expect(warnings()).toHaveLength(3);
+    expect(warnings()[2]!.url).toMatch(/^\/3d\/sync\/[\w-]+\?to%6Ben=\[REDACTED\]$/);
+    expect(JSON.stringify(logged)).not.toContain('abc');
   });
+});
 
+describe('a BASE_PATH of at most 256 characters', () => {
   it('refuses a BASE_PATH longer than 256 characters when it starts', async () => {
     const longest = `/${'a'.repeat(255)}`;
     const dataDir = await makeTempDir('3d-editor-subpath-long-');

@@ -1,4 +1,5 @@
 import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
 import { PreconditionFailedError, ProjectFileStore, SceneDoc, WebDAVClient, newUuid } from '@3d-editor/core';
@@ -172,6 +173,88 @@ describe('WebDAV proxy', () => {
     // credentials are required (AUTH_TOKEN)
     res = await fetch(`${server.url}/dav/3d-editor/copied.bin`);
     expect(res.status).toBe(401);
+  });
+
+  it('answers with a sandbox and nosniff: uploaded .html and .svg are never active on the editor’s origin', async () => {
+    const auth = { authorization: `Bearer ${TOKEN}` };
+    const files: [string, string, string][] = [
+      ['evil.html', 'text/html', '<html><body><script>parent.postMessage("x", "*")</script></body></html>'],
+      [
+        'evil.svg',
+        'image/svg+xml',
+        '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>',
+      ],
+    ];
+    for (const [name, type, body] of files) {
+      const put = await fetch(`${server.url}/dav/3d-editor/${name}`, {
+        method: 'PUT',
+        headers: { ...auth, 'content-type': type },
+        body,
+      });
+      expect(put.status, name).toBeLessThan(300);
+      const got = await fetch(`${server.url}/dav/3d-editor/${name}`, { headers: auth });
+      expect(got.status, name).toBe(200);
+      expect(await got.text(), name).toBe(body);
+      expect(got.headers.get('content-security-policy'), name).toBe('sandbox');
+      expect(got.headers.get('x-content-type-options'), name).toBe('nosniff');
+    }
+    // every answer of the proxy: listings, misses, refusals
+    const answers = [
+      await fetch(`${server.url}/dav/3d-editor/`, { method: 'PROPFIND', headers: { ...auth, depth: '1' } }),
+      await fetch(`${server.url}/dav/3d-editor/missing.txt`, { headers: auth }),
+      await fetch(`${server.url}/dav/3d-editor/evil.html`, {
+        method: 'COPY',
+        headers: { ...auth, destination: 'http://evil.example/x' },
+      }),
+      await fetch(`${server.url}/dav/..%2fx`, { headers: auth }),
+    ];
+    expect(answers.map((r) => r.status)).toEqual([207, 404, 502, 400]);
+    for (const res of answers) {
+      expect(res.headers.get('content-security-policy'), String(res.status)).toBe('sandbox');
+      expect(res.headers.get('x-content-type-options'), String(res.status)).toBe('nosniff');
+      expect(res.headers.get('vary'), String(res.status)).toMatch(/\bX-Forwarded-Prefix\b/);
+      await res.arrayBuffer();
+    }
+  });
+
+  it('puts its own Content-Security-Policy in place of the WebDAV server’s, and adds X-Forwarded-Prefix to its Vary', async () => {
+    // a WebDAV server that sends its own policy and Vary
+    const upstream = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, {
+        'content-type': 'text/html',
+        'content-security-policy': "default-src *; script-src 'unsafe-inline'",
+        vary: 'Accept-Encoding, Brief',
+        'content-length': '2',
+      });
+      res.end('hi');
+    });
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve));
+    const port = (upstream.address() as AddressInfo).port;
+    const proxy = await startServer({
+      WEBDAV_URL: `http://127.0.0.1:${port}/files`,
+      SYNC_PERSISTENCE: 'memory',
+      CORS_ORIGINS: 'https://app.example.com',
+    });
+    try {
+      const res = await fetch(`${proxy.url}/dav/page.html`, {
+        headers: { origin: 'https://app.example.com' },
+      });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe('hi');
+      expect(res.headers.get('content-security-policy')).toBe('sandbox');
+      expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+      // the WebDAV server's, the CORS hook's and the proxy's own
+      const vary = res.headers
+        .get('vary')!
+        .split(',')
+        .map((v) => v.trim().toLowerCase());
+      expect(vary.sort()).toEqual(['accept-encoding', 'brief', 'origin', 'x-forwarded-prefix']);
+    } finally {
+      await proxy.close();
+      await proxy.cleanup();
+      await new Promise<void>((resolve) => upstream.close(() => resolve()));
+    }
   });
 
   it('lets a browser-style ProjectFileStore save CRDT documents through the proxy', async () => {

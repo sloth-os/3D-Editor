@@ -3,8 +3,9 @@
 // Usage: node fixtures/prefix-proxy.mjs <port> <prefix> <upstream port>
 //
 //  - <prefix>/… goes to the editor server at 127.0.0.1:<upstream port> without the prefix (nginx's
-//    proxy_pass with a trailing slash), with X-Forwarded-Prefix: <prefix> and X-Forwarded-Proto:
-//    http, and with the Host header the client sent
+//    proxy_pass with a trailing slash), with the Host header the client sent, and with
+//    X-Forwarded-Prefix: <prefix>, X-Forwarded-Proto: http and X-Forwarded-Host: the client's Host
+//    header, each in place of any the client sent (never appended to it)
 //  - <prefix> alone, also with a query, is redirected to <prefix>/ (308), the query kept
 //  - any other path is answered with 404: nothing outside the prefix reaches the editor server
 //  - bodies stream both ways as they come (no buffering, no size limit), and WebSocket upgrades
@@ -48,9 +49,12 @@ function upstreamHeaders(req) {
   const headers = {};
   for (const [name, value] of Object.entries(req.headers))
     if (!HOP_BY_HOP.has(name) && value !== undefined) headers[name] = value;
-  // as nginx's proxy_set_header: they replace whatever the client sent
+  // as nginx's proxy_set_header: they replace whatever the client sent, and an empty value
+  // ($http_host of a request without Host) sends no header
   headers['x-forwarded-prefix'] = prefix;
   headers['x-forwarded-proto'] = 'http';
+  if (req.headers.host) headers['x-forwarded-host'] = req.headers.host;
+  else delete headers['x-forwarded-host'];
   return headers;
 }
 

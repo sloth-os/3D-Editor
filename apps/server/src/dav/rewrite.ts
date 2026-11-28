@@ -1,10 +1,15 @@
+import { posix } from 'node:path';
 import { stripBasePath } from '../base-path';
+import { originForm } from '../request-base';
 
 /*
  * URL mapping between the server's WebDAV proxy (`/dav/...`) and the upstream WebDAV server
- * (`WEBDAV_URL/...`). Only paths below the configured upstream URL are ever reachable. Under a
- * base path (docs/subpath.md) the hrefs the proxy gives out start with it (`/3d/dav/...`), and the
- * paths clients send may carry it.
+ * (`WEBDAV_URL/...`). Only paths below the configured upstream URL are ever reachable: every
+ * segment of a path the proxy sends upstream decodes to a name of its own (davSegment), so that no
+ * upstream server that decodes `%2F` or `%5C` (`..%2f`) can read it as a way out, and the path,
+ * decoded with its dot segments resolved, starts with the upstream base. Under a base path
+ * (docs/subpath.md) the hrefs the proxy gives out start with it (`/3d/dav/...`), and the paths
+ * clients send may carry it.
  */
 
 export const DAV_PREFIX = '/dav';
@@ -39,13 +44,46 @@ function encodePathSegments(decoded: string): string {
     .join('/');
 }
 
-/** Validates the raw (encoded) remainder of a proxied path: no dot segments, no NUL bytes. */
-function isSafeRawPath(rest: string): boolean {
-  for (const seg of rest.split('/')) {
-    const d = safeDecode(seg);
-    if (d === '.' || d === '..' || d.includes('\0') || d.includes('\\')) return false;
+/**
+ * The name a raw (percent-encoded) path segment stands for, or null when it is not one the proxy
+ * passes on: it does not decode (`%zz`, a lone `%C3`), or its decoded form contains `/`, `\` or NUL
+ * (`..%2f`, `x%5c..`), or is `.` or `..` (`%2e%2e`).
+ */
+export function davSegment(raw: string): string | null {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    return null;
   }
-  return true;
+  if (decoded === '.' || decoded === '..') return null;
+  if (decoded.includes('/') || decoded.includes('\\') || decoded.includes('\0')) return null;
+  return decoded;
+}
+
+/** A raw path (`/a/b%20c`) decoded segment by segment (davSegment), or null when a segment is refused. */
+function decodeDavPath(raw: string): string | null {
+  const out: string[] = [];
+  for (const seg of raw.split('/')) {
+    const decoded = davSegment(seg);
+    if (decoded === null) return null;
+    out.push(decoded);
+  }
+  return out.join('/');
+}
+
+/**
+ * Whether the path of an upstream URL as it is sent (`url.pathname`, encoded) is the upstream base or
+ * under it: decoded segment by segment (decodeDavPath, so no segment hides a `/`) and with its dot
+ * segments resolved.
+ */
+function isInsideUpstream(upstream: DavUpstream, pathname: string): boolean {
+  const decoded = decodeDavPath(pathname);
+  if (decoded === null) return false;
+  if (!upstream.decodedBase) return true;
+  const resolved = posix.normalize(decoded);
+  const base = posix.normalize(upstream.decodedBase);
+  return resolved === base || resolved.startsWith(`${base}/`);
 }
 
 /** Splits `/dav/a/b?x=1` into the part after the prefix ('/a/b') and the query ('?x=1'). */
@@ -57,21 +95,24 @@ function splitLocal(rawPath: string): { rest: string; query: string } | null {
   return { rest: pathname.slice(DAV_PREFIX.length), query };
 }
 
-/** Upstream URL for a proxied request URL (`/dav/...`), or null if it is not acceptable. */
+/**
+ * Upstream URL for a proxied request URL (`/dav/...`, as routed), or null if it is not acceptable:
+ * a segment after `/dav` is refused (davSegment), or the URL sent upstream would not be inside the
+ * upstream base (isInsideUpstream, checked on the URL as built, whatever the URL parser made of it).
+ * The path is passed on as the client spelled it, its repeated slashes collapsed.
+ */
 export function upstreamUrlFor(upstream: DavUpstream, rawUrl: string): URL | null {
   const parts = splitLocal(rawUrl);
-  if (!parts || !isSafeRawPath(parts.rest)) return null;
+  if (!parts) return null;
   const rest = parts.rest.replace(/\/{2,}/g, '/');
-  const url = new URL(`${upstream.origin}${upstream.basePath}${rest || '/'}${parts.query}`);
-  // Defense in depth: the resolved path must stay inside the upstream base.
-  const decoded = safeDecode(url.pathname);
-  if (
-    upstream.decodedBase &&
-    decoded !== upstream.decodedBase &&
-    !decoded.startsWith(`${upstream.decodedBase}/`)
-  )
+  if (decodeDavPath(rest) === null) return null;
+  let url: URL;
+  try {
+    url = new URL(`${upstream.origin}${upstream.basePath}${rest || '/'}${parts.query}`);
+  } catch {
     return null;
-  return url;
+  }
+  return isInsideUpstream(upstream, url.pathname) ? url : null;
 }
 
 /**
@@ -140,8 +181,10 @@ export function rewriteMultistatus(xml: string, upstream: DavUpstream, base = ''
 
 /**
  * Rewrites a `Destination` request header (absolute URL or path pointing into `/dav`, with or
- * without one of `bases`, the request's base paths) to the corresponding upstream URL. Returns null
- * if it points anywhere else.
+ * without one of `bases`, the request's base paths) to the corresponding upstream URL. Its path is
+ * read as a request target is (originForm: `/%33d/dav/x` is `/3d/dav/x`) and goes through the same
+ * checks as request paths (upstreamUrlFor: a segment that does not decode, or that decodes to a
+ * `/`, is refused). Returns null if it points anywhere else or is refused.
  */
 export function rewriteDestination(
   upstream: DavUpstream,
@@ -159,5 +202,5 @@ export function rewriteDestination(
     }
   }
   if (!raw.startsWith('/')) return null;
-  return upstreamUrlFor(upstream, stripBasePath(raw, bases).url)?.toString() ?? null;
+  return upstreamUrlFor(upstream, stripBasePath(originForm(raw), bases).url)?.toString() ?? null;
 }

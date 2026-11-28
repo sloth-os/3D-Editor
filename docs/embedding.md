@@ -766,10 +766,14 @@ workers it loads (`/src/`, `/@vite/`, `/@fs/`, `/@id/`, `/node_modules/`), none 
 pages, the proxied `/api`, `/dav`, `/otlp`, `/mcp` and `/sync`, or anything else. `npm run preview`
 does the same for the build, the built files' headers on `/assets/` only, so never on `index.html`,
 `sw.js` or the manifest, whoever asks for them. Both serve the editor at `/desk/` and
-`/desk.html/`, as the server does: the development server the editor's page as it is, the preview
-server the built `index.html` with `<base href="/">`, as the server writes it, so that its relative
-file URLs load from the root. In development the desk registers no service worker: it works online
-only.
+`/desk.html/` with `<base href="/">`, as the server writes it at the root, so that its base is the
+root, where it finds its server (through the proxied routes) and, in preview, its relative file
+URLs: the development server Vite's page, the preview server the built `index.html`. The preview
+server answers the same way every other page a browser opens at a path that names no built file
+(the proxied routes and `/assets/` aside), as the server does, and a request for a missing file (a
+script, a style, an image, a fetch) with 404, never with a page. At its other deeper paths the
+development server answers Vite's own page without a `<base href>`, which looks for its server
+under that path. In development the desk registers no service worker: it works online only.
 
 ## What the desk does
 
@@ -1063,7 +1067,8 @@ version whose files it serves, and with the server's current [headers](#headers)
 answers within 4 s; offline, or when the server does not answer in time, with the headers the page
 was last served with (a 5xx counts as no answer; a redirect or another error from the server is
 passed on). Other paths in its scope, `desk/` and `desk.html/` among them, it leaves to the
-network: the server answers them with the editor, a static host with its own 404.
+network: the server answers them with the editor, a static host with its own 404, and offline they
+are the browser's offline page.
 
 A new version of the app installs in the background and waits until every page the old one serves
 is closed, then takes over at the next load, so a session in a host is never reloaded under the

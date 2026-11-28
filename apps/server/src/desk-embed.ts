@@ -189,6 +189,13 @@ export const VITE_DEV_MODULE_PREFIXES: readonly string[] = [
   '/@prefresh/',
 ];
 
+/**
+ * URL path prefixes the web app's Vite dev and preview servers proxy to the editor server
+ * (vite.config.ts server.proxy, which the preview server uses too). Vite's proxy takes every path
+ * that starts with one, so none of them is a page or a file of the app there.
+ */
+export const VITE_SERVER_ROUTES: readonly string[] = ['/api', '/dav', '/otlp', '/mcp', '/sync'];
+
 /** `pathname` without its trailing slashes, in one pass from its end. */
 function withoutTrailingSlashes(pathname: string): string {
   let end = pathname.length;
@@ -196,30 +203,68 @@ function withoutTrailingSlashes(pathname: string): string {
   return pathname.slice(0, end);
 }
 
+/** What viteDeskRoute needs to know of a request besides its path. */
+export interface ViteRequest {
+  /** A GET or a HEAD: only those are answered with the editor's page or a 404 here. */
+  read: boolean;
+  /** Its Accept names text/html: a page the browser opens (a navigation), not a file a page loads. */
+  html: boolean;
+  /** In preview, the path names a file of the build (a file in outDir); always false in dev. */
+  builtFile: boolean;
+}
+
+/** What the Vite dev or preview server does with a request (viteDeskRoute). */
+export interface ViteRoute {
+  /** The desk's headers on the answer. */
+  headers: Record<string, string>;
+  /** The path Vite serves in place of the request's: /desk as /desk.html. */
+  rewrite?: string;
+  /**
+   * The answer is the editor's page with `<base href="/">`, as the server writes it at the root: in
+   * dev index.html as Vite makes it, in preview the built one.
+   */
+  page?: 'index.html';
+  /** The answer is 404: a file the build does not have, never a page. */
+  notFound?: true;
+}
+
 /**
- * What the web app's Vite dev (`dev`) and preview servers do with a request path, as the server
- * does with its files: the page headers on the desk page (/desk served as /desk.html), the asset
- * headers on the built files under /assets/ (in dev also on the modules and workers it serves in
- * their place), the editor's page at /desk/ and /desk.html/ as at any path that is no desk page,
- * and no desk headers on anything else: never on the editor's pages, the service worker or the
- * manifest. The editor's page there is index.html: in dev the page Vite makes of it (`rewrite`),
- * whose URLs are paths from the root; in preview the built one (`page`), whose URLs are relative,
- * answered with `<base href="/">` as the server writes it at the root, so that it loads its files
- * from the root and not from under /desk/.
+ * What the web app's Vite dev (`dev`) and preview servers (vite.config.ts) do with a request, as the
+ * editor server does with its files and its fallback:
+ * - the desk page at /desk.html and /desk (served as /desk.html), with the page headers;
+ * - the editor server's routes (VITE_SERVER_ROUTES): left to the proxy;
+ * - the built files under /assets/ (in dev also the modules and workers it serves in their place):
+ *   the asset headers, and in preview a 404 for a GET or HEAD of one the build does not have;
+ * - the editor's page for a GET or HEAD of /desk/ or /desk.html/, and in preview of any other path
+ *   that names no built file when its Accept names text/html (a page the browser opens), as the
+ *   server's fallback answers them. A GET or HEAD there that accepts no HTML (a script, a style, an
+ *   image, a fetch) asks for a file the build does not have: 404, never a page. The page carries
+ *   `<base href="/">`, as the server writes it at the root, so that its base is the root, where it
+ *   reaches its server (the proxied routes) and, in preview, loads its relative file URLs, and not
+ *   the path it was opened at. The root itself and the built files are Vite's to serve, as is, in
+ *   dev, every other path: Vite's own page there has no `<base href>`;
+ * - no desk headers on anything else: never on the editor's pages, the service worker or the
+ *   manifest.
  */
 export function viteDeskRoute(
   pathname: string,
   dev: boolean,
   settings: DeskEmbedSettings,
-): { headers: Record<string, string>; rewrite?: string; page?: 'index.html' } {
+  request: ViteRequest,
+): ViteRoute {
   if (isDeskPagePath(pathname))
     return {
       headers: deskPageHeaders(settings),
       rewrite: pathname === '/desk.html' ? undefined : '/desk.html',
     };
-  if (isDeskPagePath(withoutTrailingSlashes(pathname)))
-    return dev ? { headers: {}, rewrite: '/index.html' } : { headers: {}, page: 'index.html' };
+  if (VITE_SERVER_ROUTES.some((route) => pathname.startsWith(route))) return { headers: {} };
   const module = dev && VITE_DEV_MODULE_PREFIXES.some((prefix) => pathname.startsWith(prefix));
-  if (module || pathname.startsWith('/assets/')) return { headers: deskAssetHeaders(settings) };
-  return { headers: {} };
+  if (module || pathname.startsWith('/assets/')) {
+    const headers = deskAssetHeaders(settings);
+    return !dev && request.read && !request.builtFile ? { headers, notFound: true } : { headers };
+  }
+  if (!request.read) return { headers: {} };
+  if (isDeskPagePath(withoutTrailingSlashes(pathname))) return { headers: {}, page: 'index.html' };
+  if (dev || request.builtFile || pathname === '/') return { headers: {} };
+  return request.html ? { headers: {}, page: 'index.html' } : { headers: {}, notFound: true };
 }
