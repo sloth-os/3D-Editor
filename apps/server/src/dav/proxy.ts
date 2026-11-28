@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import zlib from 'node:zlib';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { redactUrl } from '../auth';
 import type { WebDAVSettings } from '../config';
 import type { Log } from '../observability/log';
 import { errorMessage } from '../observability/tracing';
@@ -168,9 +169,11 @@ function isXml(contentType: string | undefined): boolean {
  * with (multistatus, lock discovery, error conditions; never a GET's body, a stored file) are
  * translated between the two namespaces: the hrefs given out are under the request's base path
  * (`/3d/dav/...`, so that clients behind a reverse proxy can follow them), and a Destination or an If
- * resource tag is accepted with or without it (docs/subpath.md). Every answer carries
- * PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix` (with the WebDAV server's Vary), since the
- * hrefs and Location depend on that header.
+ * resource tag is accepted with or without it (docs/subpath.md). A Destination or If resource tag
+ * outside is refused with 502 and named; an If header that WebDAV servers could read with other tags,
+ * lists or conditions than the proxy reads (if-header.ts), or that does not parse, with 400. Every
+ * answer carries PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix` (with the WebDAV server's
+ * Vary), since the hrefs, Location and messages depend on that header.
  */
 export async function registerDavProxy(
   app: FastifyInstance,
@@ -189,12 +192,14 @@ export async function registerDavProxy(
     const headers = upstreamHeaders(request.headers, settings);
     // the base path of the hrefs given out (docs/subpath.md)
     const base = requestBase(request);
-    const outside = { error: `Destination must be inside ${base}${DAV_PREFIX}/` };
+    // the answer to a Destination or If resource tag outside (a tag named as sent, a token in its
+    // query redacted)
+    const outside = (what: string) => ({ error: `${what} must be inside ${base}${DAV_PREFIX}/` });
     const destination = request.headers.destination;
     if (typeof destination === 'string') {
       const mapped = rewriteDestination(upstream, destination, requestBases(request));
       // RFC 4918: a destination on another server is refused with 502.
-      if (!mapped) return reply.code(502).send(outside);
+      if (!mapped) return reply.code(502).send(outside('Destination'));
       headers.destination = mapped;
     }
     // the resource tags of If name resources as a Destination does (several If lines, which Node
@@ -204,7 +209,8 @@ export async function registerDavProxy(
       const text = Array.isArray(ifHeader) ? ifHeader.join(', ') : ifHeader;
       const mapped = rewriteIfHeader(upstream, text, requestBases(request));
       if ('refused' in mapped) {
-        if (mapped.refused === 'outside') return reply.code(502).send(outside);
+        if (mapped.refused === 'outside')
+          return reply.code(502).send(outside(`If header resource tag <${redactUrl(mapped.tag)}>`));
         return reply.code(400).send({ error: 'invalid If header' });
       }
       headers.if = mapped.header;

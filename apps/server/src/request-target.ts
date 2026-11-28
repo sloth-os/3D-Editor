@@ -1,8 +1,9 @@
 /*
  * A request target as the router reads it (docs/subpath.md, "Both proxy styles"): request-base.ts
- * reads every request's target with it before anything routes the request, the WebDAV proxy a
- * Destination's (dav/rewrite.ts, through request-base.ts), and the Vite dev and preview servers
- * every request's (apps/web/vite.config.ts), so that they all read a path as the server does.
+ * reads every request's target with it before anything routes the request, the WebDAV proxy the
+ * path of a Destination and of each resource tag of an If header (dav/rewrite.ts and
+ * dav/if-header.ts, through request-base.ts), and the Vite dev and preview servers every request's
+ * (apps/web/vite.config.ts), so that they all read a path as the server does.
  *
  * No imports: vite.config.ts imports this file, and Vite's 'native' config loader (Node's own
  * import) loads it and everything it imports as Node resolves ES modules, where an import names its

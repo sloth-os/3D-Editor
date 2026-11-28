@@ -31,21 +31,37 @@ export interface TestWebDAVOptions {
    */
   conditional?: boolean;
   /**
-   * Hold write locks as RFC 4918 says and Apache httpd's mod_dav does, against the user who took
-   * them too (webdav-server lets that user write without the lock's token, holds every condition of
-   * an If header true and fails on a list without a resource tag). A PUT, PROPPATCH, DELETE, MKCOL
-   * or MOVE of a locked path, or of a path under a collection locked with depth infinity, is answered
-   * 423 Locked, with the root of the lock in a `lock-token-submitted` error as Sabre/DAV writes it
-   * (`<d:href>/a/x.txt</d:href>`), unless its If header submits the lock's token in a list that
-   * applies to the path: a list without a tag, or one tagged with this server's URL of the path
-   * (`<http://127.0.0.1:<port>/a/x.txt>` or `</a/x.txt>`, its query aside); a tag that names another
-   * server's resource applies to none of them. A request whose If header has lists that apply to its
-   * path, none of which holds (its conditions: the tokens of the locks that cover the path, its
-   * ETag), is answered 412, and one whose If header does not parse 400. The front reads the If
-   * header and passes requests on without it (LOCK's, which renew a lock with it, with it); files
-   * get ETags that change with every write, as with `conditional`.
+   * Hold write locks by their tokens, against the user who took them too (webdav-server lets that
+   * user write without the lock's token, holds every condition of an If header true and fails on a
+   * list without a resource tag). A PUT, PROPPATCH, DELETE, MKCOL or MOVE of a locked path, or of a
+   * path under a collection locked with depth infinity, is answered 423 Locked, with the root of the
+   * lock in a `lock-token-submitted` error as Sabre/DAV writes it (`<d:href>/a/x.txt</d:href>`),
+   * unless its If header submits the lock's token in a list that applies to the path: a list without
+   * a tag, or one tagged with this server's URL of the path (`<http://127.0.0.1:<port>/a/x.txt>` or
+   * `</a/x.txt>`, its query aside); a tag that names another server's resource applies to none of
+   * them. That is stricter, on purpose, than Apache httpd's mod_dav and Sabre/DAV, which take a
+   * lock's token from any list of the header, one tagged with another resource too: a test then sees
+   * each tag arrive mapped, since a tag left in the editor's namespace would apply to nothing and the
+   * write would get 423. A request whose If header has lists that apply to its path, none of which
+   * holds (its conditions: the tokens of the locks that cover the path, its ETag), is answered 412,
+   * and one whose If header does not parse 400. The front reads the If header and passes requests on
+   * without it (LOCK's, which renew a lock with it, with it); files get ETags that change with every
+   * write, as with `conditional`.
    */
   locks?: boolean;
+  /**
+   * With `locks`: give out lock tokens as golang.org/x/net/webdav does, and so rclone, bare
+   * decimal numbers (`Lock-Token: <1795880655>`), in place of webdav-server's `urn:uuid:…`. The front
+   * then answers LOCK and UNLOCK itself, as x/net/webdav does. A LOCK with a body locks a path that
+   * holds a resource (404 for one that does not, where x/net/webdav creates an empty file; 423 for
+   * one a lock covers) and is answered 200 with the lock's token in `Lock-Token` and its lock
+   * discovery (`<D:lockroot><D:href>/a/x.txt</D:href>`); a LOCK without one renews the lock whose
+   * token is the one condition of the If header's one list, a list that applies to the path (400 for
+   * an If header of another shape, 412 when no such lock covers the path), and is answered 200 with
+   * its lock discovery and no `Lock-Token`. An UNLOCK takes off the lock its `Lock-Token` names (204;
+   * 409 for no such lock, 400 for a value not in `<` and `>`).
+   */
+  decimalLockTokens?: boolean;
   /**
    * Runs before a request is handled: tests let another writer save at an exact point between a
    * writer's requests (tell writers apart by a header their client sends). `path` is decoded,
@@ -57,7 +73,10 @@ export interface TestWebDAVOptions {
 
 /** A lock the front holds (option `locks`). */
 interface HeldLock {
-  /** The lock's token as webdav-server gives it out (`urn:uuid:…`, without `<` and `>`). */
+  /**
+   * The lock's token as webdav-server gives it out (`urn:uuid:…`), or the front with
+   * `decimalLockTokens` (`1795880655`), without `<` and `>`.
+   */
   token: string;
   /** Decoded path of the lock's root. */
   root: string;
@@ -118,10 +137,45 @@ function lockedBody(root: string): string {
 /** Methods that change the resource at the request's path, which a lock on it holds back. */
 const LOCKED_METHODS = new Set(['PUT', 'PROPPATCH', 'DELETE', 'MKCOL', 'MOVE']);
 
+/** The first lock token the front gives out with `decimalLockTokens` (one more for each later lock). */
+const FIRST_DECIMAL_TOKEN = 1_795_880_655;
+
+/**
+ * The answer to a LOCK as golang.org/x/net/webdav writes it (writeLockInfo): the lock's discovery,
+ * its root as a path (`/a/x.txt`).
+ */
+function lockInfoBody(lock: HeldLock, timeout: string): string {
+  const root = lock.root.split('/').map(encodeURIComponent).join('/');
+  return (
+    '<?xml version="1.0" encoding="utf-8"?>\n' +
+    '<D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock>\n' +
+    '\t<D:locktype><D:write/></D:locktype>\n' +
+    '\t<D:lockscope><D:exclusive/></D:lockscope>\n' +
+    `\t<D:depth>${lock.deep ? 'infinity' : '0'}</D:depth>\n` +
+    `\t<D:timeout>${timeout}</D:timeout>\n` +
+    `\t<D:locktoken><D:href>${lock.token}</D:href></D:locktoken>\n` +
+    `\t<D:lockroot><D:href>${root}</D:href></D:lockroot>\n` +
+    '</D:activelock></D:lockdiscovery></D:prop>'
+  );
+}
+
+/** Reads a request's body as text. */
+async function readText(req: http.IncomingMessage): Promise<string> {
+  let text = '';
+  req.setEncoding('utf8');
+  for await (const chunk of req) text += chunk as string;
+  return text;
+}
+
 /** Virtual file system whose ETags change with every write (a counter, like Nextcloud's). */
 class VersionedFileSystem extends webdav.VirtualFileSystem {
   private counter = 0;
   private readonly versions = new Map<string, number>();
+
+  /** Whether a resource, a file or a collection, is at the path. */
+  has(path: string): boolean {
+    return this.resources[path] !== undefined;
+  }
 
   /** The ETag of a file, or null when there is none at that path. */
   etagOf(path: string): string | null {
@@ -204,6 +258,64 @@ export async function startWebDAV(opts: TestWebDAVOptions = {}): Promise<TestWeb
       return null;
     }
   };
+  // option `decimalLockTokens`: the token of the next lock taken
+  let nextDecimalToken = FIRST_DECIMAL_TOKEN;
+  /** Option `decimalLockTokens`: answers a LOCK or an UNLOCK as golang.org/x/net/webdav does. */
+  const answerDecimalLock = async (
+    req: http.IncomingMessage,
+    res: ServerResponse,
+    method: string,
+    path: string,
+  ): Promise<void> => {
+    const body = await readText(req);
+    if (req.headers.authorization !== authorization) {
+      res.writeHead(401, { 'www-authenticate': 'Basic realm="test"' }).end();
+      return;
+    }
+    if (method === 'UNLOCK') {
+      const value = String(req.headers['lock-token'] ?? '');
+      if (value.length < 2 || !value.startsWith('<') || !value.endsWith('>')) res.writeHead(400).end();
+      else res.writeHead(held.delete(value.slice(1, -1)) ? 204 : 409).end();
+      return;
+    }
+    const timeout = String(req.headers.timeout ?? '');
+    let lock: HeldLock | undefined;
+    if (body.trim() === '') {
+      // a refresh: the If header's one list holds one condition, the lock's token
+      const sent = req.headers.if;
+      const lists = parseIfLists(Array.isArray(sent) ? sent.join(', ') : (sent ?? '')) ?? [];
+      const condition =
+        lists.length === 1 && lists[0].conditions.length === 1 ? lists[0].conditions[0] : null;
+      if (!condition?.token || condition.not) {
+        res.writeHead(400).end();
+        return;
+      }
+      const applies = (lists[0].tag === null ? path : pathOf(lists[0].tag)) === path;
+      lock = applies ? covering(path).find((l) => l.token === condition.token) : undefined;
+      if (!lock) {
+        res.writeHead(412).end();
+        return;
+      }
+    } else {
+      if (!versioned?.has(path)) {
+        res.writeHead(404).end();
+        return;
+      }
+      const covered = covering(path)[0];
+      if (covered) {
+        res
+          .writeHead(423, { 'content-type': 'application/xml; charset=utf-8' })
+          .end(lockedBody(covered.root));
+        return;
+      }
+      lock = { token: String(nextDecimalToken++), root: path, deep: req.headers.depth !== '0' };
+      held.set(lock.token, lock);
+      res.setHeader('lock-token', `<${lock.token}>`);
+    }
+    res
+      .writeHead(200, { 'content-type': 'application/xml; charset=utf-8' })
+      .end(lockInfoBody(lock, /^Second-\d+$/.test(timeout) ? timeout : 'Infinite'));
+  };
   /**
    * Option `locks`: whether the request may go on, else answers it (400, 412 or 423); keeps the
    * locks taken up to date when it may.
@@ -270,6 +382,10 @@ export async function startWebDAV(opts: TestWebDAVOptions = {}): Promise<TestWeb
       const method = req.method ?? 'GET';
       const path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname).replace(/(.)\/+$/, '$1');
       await opts.onRequest?.({ method, path, url: req.url ?? '/', headers: { ...req.headers } });
+      if (opts.locks && opts.decimalLockTokens && (method === 'LOCK' || method === 'UNLOCK')) {
+        await answerDecimalLock(req, res, method, path);
+        return;
+      }
       if (opts.locks && !checkLocks(req, res, method, path)) return;
       if (!versioned || !['GET', 'HEAD', 'PUT', 'DELETE'].includes(method)) {
         server.executeRequest(req, res);

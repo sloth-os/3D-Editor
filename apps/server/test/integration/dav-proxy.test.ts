@@ -282,6 +282,72 @@ describe('WebDAV proxy', () => {
     }
   });
 
+  it('gives a stored .xml or .svg back from GET and HEAD through /3d/dav as stored: its hrefs naming WEBDAV_URL, its Content-Length and ETag', async () => {
+    // the proxy maps the hrefs of the XML WebDAV methods are answered with, never a stored file's
+    const sub = await startServer({
+      WEBDAV_URL: `${dav.origin}/users/bob%20smith`,
+      WEBDAV_USERNAME: 'bob',
+      WEBDAV_PASSWORD: 'hunter2',
+      SYNC_PERSISTENCE: 'memory',
+      AUTH_TOKEN: TOKEN,
+      BASE_PATH: '/3d',
+    });
+    try {
+      const auth = { authorization: `Bearer ${TOKEN}` };
+      const upstreamBase = `${dav.origin}/users/bob%20smith`;
+      await proxiedClient().mkdirp('/stored-xml');
+      const files: [string, RegExp, string][] = [
+        [
+          'listing.xml',
+          /^application\/xml\b/,
+          '<?xml version="1.0" encoding="utf-8"?>\r\n<d:multistatus xmlns:d="DAV:">' +
+            `<d:response><d:href>${upstreamBase}/stored-xml/a.txt</d:href></d:response>` +
+            '<d:response><d:href>/users/bob%20smith/stored-xml/b%20c.txt</d:href></d:response>' +
+            '</d:multistatus>\r\n<!-- caf\u00e9 -->\n',
+        ],
+        [
+          'drawing.svg',
+          /^image\/svg\+xml\b/,
+          '<svg xmlns="http://www.w3.org/2000/svg" xmlns:d="DAV:">' +
+            `<d:href>${upstreamBase}/stored-xml/x.svg</d:href><href>/users/bob%20smith/y</href>` +
+            '<text>caf\u00e9</text></svg>',
+        ],
+      ];
+      for (const [name, type, text] of files) {
+        const bytes = Buffer.from(text, 'utf8');
+        const url = `${sub.url}/3d/dav/stored-xml/${name}`;
+        const put = await fetch(url, { method: 'PUT', headers: auth, body: bytes });
+        expect(put.status, name).toBeLessThan(300);
+        // what the WebDAV server itself answers
+        const direct = await fetch(`${upstreamBase}/stored-xml/${name}`, {
+          headers: { authorization: dav.authorization },
+        });
+        expect(Buffer.from(await direct.arrayBuffer()).equals(bytes), name).toBe(true);
+        const etag = direct.headers.get('etag');
+        expect(etag, name).toMatch(/^"w\d+"$/);
+        expect(direct.headers.get('content-type'), name).toMatch(type);
+
+        const got = await fetch(url, { headers: auth });
+        expect(got.status, name).toBe(200);
+        expect(got.headers.get('content-type'), name).toMatch(type);
+        expect(got.headers.get('content-length'), name).toBe(String(bytes.length));
+        expect(got.headers.get('etag'), name).toBe(etag);
+        const body = Buffer.from(await got.arrayBuffer());
+        expect(body.toString('utf8'), name).toBe(text);
+        expect(body.equals(bytes), name).toBe(true);
+
+        const head = await fetch(url, { method: 'HEAD', headers: auth });
+        expect(head.status, name).toBe(200);
+        expect(head.headers.get('content-type'), name).toMatch(type);
+        expect(head.headers.get('content-length'), name).toBe(String(bytes.length));
+        expect(head.headers.get('etag'), name).toBe(etag);
+      }
+    } finally {
+      await sub.close();
+      await sub.cleanup();
+    }
+  });
+
   it('puts its own Content-Security-Policy in place of the WebDAV server’s, and adds X-Forwarded-Prefix to its Vary', async () => {
     // a WebDAV server that sends its own policy and Vary
     const upstream = http.createServer((req, res) => {

@@ -8,6 +8,20 @@
 | Server started with `WEBDAV_URL`              | WebDAV, through the server's `/dav` proxy (the WebDAV credentials stay on the server, the client's own are not passed on: neither its `Authorization` nor the `token` pairs of the query, of a `Destination` or of the resource tags of an `If` header; no CORS needed). The server also persists the live sync rooms there. |
 | WebDAV URL entered in _Preferences → Storage_ | WebDAV, accessed directly from the browser (the WebDAV server must send CORS headers).                                                                                                                                                                                                                                       |
 
+Other WebDAV clients can use the `/dav` proxy too (a file manager, rclone). It maps the URLs they
+send in a `Destination` header and in the resource tags of an `If` header into `WEBDAV_URL`, and
+passes lock tokens of any form (`opaquelocktoken:…`, `urn:uuid:…`, the bare numbers rclone gives
+out) and entity tags on as sent. WebDAV servers read the `If` header each with a parser of its own,
+looser than RFC 4918 (Sabre/DAV, which Nextcloud runs, with one regular expression), so the proxy
+passes on only an `If` header that Sabre/DAV, Apache httpd's mod_dav and golang.org/x/net/webdav
+(rclone's) each read as RFC 4918 does, and refuses any other with 400: each list holds one lock
+token, one entity tag, or a lock token then an entity tag (with one space or tab between them, or
+none), or else `Not`, one space or tab and one lock token or entity tag, and nothing more between
+its parentheses; a resource tag is followed by one space or tab and its first list; an entity tag
+holds none of `<`, `>`, `(`, `)`, `[` and `]`, a lock token no `)`. The lists Finder and Windows
+send, and the tagged lists of davfs2 (neon), are of these forms. A resource tag outside `WEBDAV_URL`
+gets 502, with a message that names it.
+
 Projects are **always** cached in IndexedDB as well, which is what makes the app work offline.
 When WebDAV is configured the local copy is merged with the WebDAV copy on open, a moment
 after each change, every 20 s (to pick up other devices) and when the tab is hidden. A project

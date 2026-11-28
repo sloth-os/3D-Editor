@@ -120,21 +120,27 @@ httpd without the line below, each of them lost the prefix, and `/3d/3d/metrics`
 line with 400). `Proxy-Connection` naming the header made none of them drop it. HTTP/2 and HTTP/3
 have no `Connection` header: RFC 9113 and RFC 9114 make a request that carries one malformed.
 
-| Proxy (stripping the prefix) | Delivers its `X-Forwarded-Prefix` when a client names it in `Connection`                                                                                                                                                                                                           |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| nginx 1.24.0                 | yes: `proxy_set_header Connection` replaces the client's `Connection`, and nginx drops no header it names                                                                                                                                                                          |
-| Caddy v2.11.9, 2.6.2         | yes: Caddy drops the headers the client names first, then sets its `X-Forwarded-*` headers and those of `header_up`                                                                                                                                                                |
-| Apache httpd 2.4.58          | only with `RequestHeader unset Connection "expr=req_novary('Connection') =~ /x-forwarded-prefix/i"`: mod_proxy_http drops the headers a client names in `Connection` after mod_headers has set `X-Forwarded-Prefix`, so the configuration removes such a `Connection` header first |
+| Proxy (stripping the prefix) | Delivers its `X-Forwarded-Prefix` when a client names it in `Connection`                                                                                                                                                                                                                                         |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| nginx 1.24.0                 | yes: `proxy_set_header Connection` replaces the client's `Connection`, and nginx drops no header it names                                                                                                                                                                                                        |
+| Caddy v2.11.9, 2.6.2         | yes: Caddy drops the headers the client names first, then sets its `X-Forwarded-*` headers and those of `header_up`                                                                                                                                                                                              |
+| Apache httpd 2.4.58          | only with `RequestHeader unset Connection "expr=req_novary('Connection') =~ /x-forwarded-prefix/i"`: mod_proxy_http drops the headers a client names in `Connection` after mod_headers has set `X-Forwarded-Prefix`, so the configuration first removes a `Connection` header that contains `x-forwarded-prefix` |
 
-The Apache line removes the client's `Connection` only when it names `X-Forwarded-Prefix` (in any
-case, anywhere in it, so in every form mod_proxy_http would read as that name); the `close` or
-`keep-alive` of such a client goes with it. Removing `Connection` from every request also works,
-but then Apache ignores an HTTP/1.1 client's `Connection: close` (it keeps the connection open) and
-closes an HTTP/1.0 client's `keep-alive` connection after each answer. With the line, clients that
-do not name the header keep their `keep-alive` and `close` as before, the live sync still upgrades
-with the prefix delivered, also when the client's `Connection: Upgrade` names the header
-(`upgrade=websocket` follows the `Upgrade` header), and request bodies arrive whole (64 MiB with
-`Content-Length` or chunked, also with `Expect: 100-continue`).
+The Apache line removes the client's `Connection` when its value contains `x-forwarded-prefix`, in
+any case and anywhere in it: so in every form mod_proxy_http would read as that name, and also
+when it names a longer header that only contains the text (`X-Forwarded-Prefix-Old`,
+`Old-X-Forwarded-Prefix`). The `close` or `keep-alive` of such a client goes with it, and the
+other headers its `Connection` names reach the editor server, where mod_proxy_http would have
+dropped them. A narrower expression, the name alone between the delimiters mod_proxy_http reads,
+risks letting through a form that mod_proxy_http does read as the name; this one costs the few
+clients that name such a longer header their connection handling. Removing `Connection` from
+every request also works, but then Apache ignores an HTTP/1.1 client's `Connection: close` (it
+keeps the connection open) and closes an HTTP/1.0 client's `keep-alive` connection after each
+answer. With the line, clients whose `Connection` does not contain the text keep their
+`keep-alive` and `close` as before, the live sync still upgrades with the prefix delivered, also
+when the client's `Connection: Upgrade` names the header (`upgrade=websocket` follows the `Upgrade`
+header), and request bodies arrive whole (64 MiB with `Content-Length` or chunked, also with
+`Expect: 100-continue`).
 
 ## What the server writes with the base
 
@@ -143,16 +149,17 @@ with the prefix delivered, also when the client's `Connection: Upgrade` names th
 | `index.html` and `desk.html`: the editor at `/` and at any other canonical page path (`//x`, `/./x` and `/x/../y` get 403 from the static file server), the desk at `/desk.html` and `/desk` | `<base href="/3d/">` as the first element of `<head>`, written per request; `Cache-Control: no-cache` and `Vary: X-Forwarded-Prefix`; the desk page keeps its [headers](embedding.md#headers)                                                                                                                                                                                                                            |
 | the redirect of `BASE_PATH` without its slash (`BASE_PATH=/3d`, a request without `X-Forwarded-Prefix`)                                                                                      | `Location: /3d/`                                                                                                                                                                                                                                                                                                                                                                                                         |
 | links in MCP results: `editor_url`, the download links of `export_scene`, renders and video exports, model store thumbnails                                                                  | `https://example.com/3d/?project=…`, `https://example.com/3d/api/…`: the scheme of the last value of `X-Forwarded-Proto` and the host of the last value of `X-Forwarded-Host` when a proxy sends usable ones, else `http` and the `Host` header, then the base; when no host is usable ([below](#caches-and-headers-behind-a-proxy)), the base alone: paths under it (`/3d/?project=…`), never from the root of the site |
-| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                                                                                              | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the request's base or `BASE_PATH`, spelled as a request target may be (`/%33d/dav/x` is `/3d/dav/x`)                                                                                                                                                                                   |
+| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                                                                                              | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header and the resource tags of an `If` header are accepted with or without the request's base or `BASE_PATH`, spelled as a request target may be (`/%33d/dav/x` is `/3d/dav/x`)                                                                                                                                          |
 | the startup log                                                                                                                                                                              | `http://localhost:8080/3d/` and `http://localhost:8080/3d/mcp` with `BASE_PATH=/3d`                                                                                                                                                                                                                                                                                                                                      |
 
 The base is the request's `X-Forwarded-Prefix` when it has a usable one, else `BASE_PATH`. That is
 all the header's value does: it sets what the server writes (this table) and a base a WebDAV
-`Destination` may start with, never what a request is routed to; that a request carries the header
-at all only keeps `BASE_PATH` on its path ([both proxy styles](#both-proxy-styles)). A
-`Destination` that starts with the request's base is read under it, also when the base is one of the
-server's own paths: behind a proxy at `/dav/`, the site's `/dav/x.txt` is `/x.txt` under the base,
-no WebDAV path, and the request is refused (502), while `/dav/dav/x.txt` is the WebDAV `/x.txt`.
+`Destination` or `If` resource tag may start with, never what a request is routed to; that a request
+carries the header at all only keeps `BASE_PATH` on its path ([both proxy styles](#both-proxy-styles)).
+A `Destination` or tag that starts with the request's base is read under it, also when the base is
+one of the server's own paths: behind a proxy at `/dav/`, the site's `/dav/x.txt` is `/x.txt` under
+the base, no WebDAV path, and the request is refused (502), while `/dav/dav/x.txt` is the WebDAV
+`/x.txt`.
 
 REST answers give the server's own routes as paths from its root, the same under every prefix:
 `webdav.url` of `GET /api/config` (`/dav`), `files[].url` of a [video export](video-export.md#rest),
@@ -238,16 +245,18 @@ self.addEventListener('activate', (event) => {
 
 The Vite dev server and `vite preview` run at the root (both proxy `/api`, `/sync`, `/mcp`, `/dav`
 and `/otlp` to the server), and answer the editor's page at deeper paths with `<base href="/">`, as
-the server writes it at the root: `vite preview` at every page path that names no built file, the
-dev server at `/desk/` and `/desk.html/` ([development](embedding.md#development)). Both read a
-request's path as the server does and answer as it does a path with an empty or dot segment
-(`//desk.html`, `/desk.html//`, `/./x`, `/x/../y`): 403 for a `GET` or `HEAD`, 404 for any other
-method but `OPTIONS`; any method but `GET`, `HEAD` and `OPTIONS` gets 404 outside the proxied
-routes, and a path that Vite would read another way (`/x%2f..%2fdesk`, `/%2fdesk.html`) is answered
-as one that names no file, so that no path serves the desk page without its headers. An `OPTIONS`
-request gets 204 with no body from Vite's CORS middleware, which answers it first, at any path (the
-proxied routes too). A subpath is a deployment concern, covered by the [tests](#tests) against the
-built app.
+the server writes it at the root: `vite preview` at every page path that names no built file (a
+folder of the build such as `/icons` too, as the server does), the dev server at `/desk/` and
+`/desk.html/` ([development](embedding.md#development)). Both read a request's path as the server
+does and answer as it does a path with an empty or dot segment (`//desk.html`, `/desk.html//`,
+`/./x`, `/x/../y`): 403 for a `GET` or `HEAD`, 404 for any other method but `OPTIONS`; any method
+but `GET`, `HEAD` and `OPTIONS` gets 404 outside the proxied routes, and a path that Vite would read
+another way (`/x%2f..%2fdesk`, `/%2fdesk.html`) is answered as one that names no file, so that no
+path serves the desk page without its headers. An `OPTIONS` request to a path gets 204 with no body
+from Vite's CORS middleware, which answers it first (the proxied routes too); the asterisk form
+`OPTIONS *` reaches no middleware and gets 404. In development, a request target with a `#` gets
+400 with no body, whatever its method, before any of these answers. A subpath is a deployment
+concern, covered by the [tests](#tests) against the built app.
 
 ### Static hosts
 
@@ -335,7 +344,7 @@ RewriteRule ^/3d$ /3d/ [R=308,L,QSA]
 ProxyPreserveHost On
 <Location "/3d/">
     RequestHeader set X-Forwarded-Prefix "/3d"
-    # mod_proxy_http drops the headers a client names in Connection: one that names X-Forwarded-Prefix goes first
+    # mod_proxy_http drops the headers a client names in Connection: one containing x-forwarded-prefix goes first
     RequestHeader unset Connection "expr=req_novary('Connection') =~ /x-forwarded-prefix/i"
     RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}
     ProxyPass http://127.0.0.1:8080/ upgrade=websocket flushpackets=on timeout=3600
@@ -417,9 +426,14 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   is `tokens`, and those of an absolute `Destination`): they never leave `WEBDAV_URL` on a WebDAV
   server that decodes a path once and reads no other spelling as `.` or `..`. The resource tags of
   an `If` header are mapped as `Destination`s are, and the rest of it is kept as sent (no-tag
-  lists, state tokens, entity tags with `<`, `>`, `(`, `)`, `[` or `]` in them); a tag outside
-  `WEBDAV_URL` and a header that does not parse are refused, and a header is read in time linear in
-  its length.
+  lists, `Not`, state tokens of any form, digits alone among them as golang.org/x/net/webdav gives
+  them out, and entity tags); a tag outside `WEBDAV_URL` is refused and named; a header is refused
+  that does not parse or that a WebDAV server could read with other tags, lists or conditions (an
+  entity tag that holds `<`, `>`, `(`, `)`, `[` or `]`, or a `\` before a control character; an
+  empty `<>`, or a `<` in one; a state token that holds `)`; a list of two state tokens; `not` or
+  `NOT`, or `Not` before one of two conditions; other spaces than Sabre/DAV reads, such as two
+  between a tag and its list or one just inside a list's parentheses); and a header is read in
+  time linear in its length.
 - `apps/server/test/integration/subpath.test.ts`: a server with `BASE_PATH`, both proxy styles
   (prefix kept with `BASE_PATH` and no header, prefix stripped with `X-Forwarded-Prefix` and
   `BASE_PATH` set too), the pages, the redirect, sync over WebSocket, the WebDAV proxy's `href`s and
@@ -439,17 +453,27 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   controls U+0080-U+009F, which go to the WebDAV server as `%C2%80`-`%C2%9F`, inside
   `WEBDAV_URL`). `dav-proxy.test.ts`: the proxy's `Content-Security-Policy`,
   `X-Content-Type-Options` and `Vary` on uploaded `.html` and `.svg` files and on every other
-  answer, and a token in the query (`?token=`, `?%74oken=`, `?to%6Ben=`) that lets GET, PUT,
-  PROPFIND and COPY through but never reaches the WebDAV server, in a URL or in a `Destination`.
+  answer, a token in the query (`?token=`, `?%74oken=`, `?to%6Ben=`) that lets GET, PUT,
+  PROPFIND and COPY through but never reaches the WebDAV server, in a URL or in a `Destination`,
+  and an `.xml` and an `.svg` stored with hrefs that name `WEBDAV_URL` that come back from GET and
+  HEAD through `/3d/dav` as stored, byte for byte, with their `Content-Length` and `ETag` (the
+  proxy maps the hrefs of the XML that WebDAV methods are answered with, never a stored file's).
   `dav-locks.test.ts`: through `/3d/dav` with `?token=` URLs, against a WebDAV server that holds
-  locks by their tokens as Apache httpd and Sabre/DAV do, a LOCK (its answer's `lockroot` under
-  `/3d/dav/`), then PUT, PROPPATCH and DELETE with tagged `If` lists that name the locked file in
-  the editor's namespace succeed, the WebDAV server getting the tags as its own URLs without the
-  token, while a write without the lock's token, or with it in a list tagged with another file,
-  gets 423 (its `lock-token-submitted` href under `/3d/dav/`); no-tag lists, entity tags that hold
-  `<`, `>`, `(`, `)`, `[` and `]`, and `Lock-Token` reach it as sent; an `If` tag outside
-  `WEBDAV_URL` gets 502 as a `Destination` outside does, a header that does not parse 400, and
-  neither reaches it. `sync-upgrades.test.ts`: the token, in each of its spellings, redacted from
+  locks by their tokens, and on purpose more strictly than Apache httpd and Sabre/DAV, which take
+  a lock's token from any list (it counts only in a list that applies to the path, so that the test
+  sees each tag arrive mapped): a LOCK (its answer's `lockroot` under `/3d/dav/`), then PUT,
+  PROPPATCH and DELETE with tagged `If` lists that name the locked file in the editor's namespace
+  succeed, the WebDAV server getting the tags as its own URLs without the token, while a write
+  without the lock's token, or with it in a list tagged with another file, gets 423 (its
+  `lock-token-submitted` href under `/3d/dav/`); no-tag lists, `Not`, entity tags and `Lock-Token`
+  reach it as sent, and so do lock tokens that are bare numbers, as golang.org/x/net/webdav gives
+  them out, in the forms Finder and Windows send (`(<1795880655>)` with PUT, PROPPATCH and a LOCK
+  refresh, a tagged list, `Lock-Token` with UNLOCK); an `If` tag outside `WEBDAV_URL` gets 502
+  with a message that names it, a header that does not parse or that a WebDAV server could read
+  otherwise 400 (a tag outside hidden in an entity tag or in a list of two state tokens, or two
+  spaces before its list, where Sabre/DAV reads on to a later tag; `not`; `Not` before two
+  conditions; a tag with no space before its list), and neither reaches it.
+  `sync-upgrades.test.ts`: the token, in each of its spellings, redacted from
   the access and upgrade logs. `mcp-links.test.ts`: through the MCP transport, `editor_url` is a
   path under the base (`/3d/?project=<id>`) when neither `Host` nor `X-Forwarded-Host` is a usable
   host (`a"b`, `example.com:0`), and a request without a `Host` is answered 400, over HTTP/1.1 and
@@ -467,13 +491,20 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   and `/desk.html/` (Vite's in development, the built one in preview) and, in preview, at every
   other page path that names no built file (a folder such as `/icons`, a path that climbs out of
   the build once decoded such as `/..%2findex.html`, one with an empty or dot segment once decoded
-  such as `/%2fdesk.html` and `/.%2fdesk.html`, one that does not decode); a missing file 404,
-  never a page; a path with an empty or dot segment 403, any method but `GET`, `HEAD` and
-  `OPTIONS` outside the proxied routes 404, as on the server, and at the paths Vite would read
-  another way (`/x%2f..%2fdesk`, in development `/%2fdesk`, `/.%2fdesk`, `/dist/desk` and
-  `/@fs/…/desk.html`) the editor's page or 404, never the desk page without its headers; and, from
-  the dev and preview servers Vite starts with `apps/web/vite.config.ts`, 204 with no body for an
-  `OPTIONS` at any path, the proxied routes too.
+  such as `/%2fdesk.html` and `/.%2fdesk.html`, one that does not decode); in development Vite's
+  own page at the other deeper paths, also with a trailing slash (`/x/y`, `/x/y/`, `/3d/`); a
+  missing file 404, never a page; a path with an empty or dot segment 403, any method but `GET`,
+  `HEAD` and `OPTIONS` outside the proxied routes 404, as on the server, and at the paths Vite
+  would read another way (`/x%2f..%2fdesk`, in development `/%2fdesk`, `/.%2fdesk`, `/dist/desk`
+  and `/@fs/…/desk.html`) the editor's page or 404, never the desk page without its headers; and,
+  from the dev and preview servers Vite starts with `apps/web/vite.config.ts`, 204 with no body
+  for an `OPTIONS` to a path, the proxied routes too, 404 for the asterisk form `OPTIONS *`, and
+  in development 400 for a request target with `#`, whatever its method.
+  `apps/server/test/unit/static.test.ts`: the server's own answers there: a folder of the build
+  without its slash (`/icons`, `/assets`, and `/3d/icons` with `BASE_PATH`) gets the editor's page
+  for a `GET` or `HEAD`, as every other path that names no built file does (`/icons/` too), never
+  an empty answer, and `/assets/` gets 404; the build's files, also through linked folders, come
+  from the file server.
 - `e2e/tests/subpath.spec.ts`: the built editor and desk under `/3d` with the prefix kept
   (`BASE_PATH`) and under `/editor` behind a stripping proxy (`e2e/fixtures/prefix-proxy.mjs`, which
   answers like the nginx configuration): the redirect of the bare prefix, every request of the

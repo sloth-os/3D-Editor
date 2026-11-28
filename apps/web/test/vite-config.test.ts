@@ -26,8 +26,10 @@ import config from '../vite.config';
  * serve, a 403 for a path with an empty or dot segment and a 404 for any other method than GET and
  * HEAD outside the proxied routes, as the server answers them, and everything else left to Vite.
  * And the dev and preview servers Vite starts with this config, where Vite's CORS middleware
- * answers every OPTIONS before that middleware sees it. desk-embed.test.ts beside the server's
- * tests holds the decisions themselves (viteDeskRoute).
+ * answers an OPTIONS to a path before that middleware sees it, the asterisk form `OPTIONS *`
+ * reaches no middleware (404), and in dev Vite answers a request target with '#' with 400 before
+ * any middleware, whatever its method. desk-embed.test.ts beside the server's tests holds the
+ * decisions themselves (viteDeskRoute).
  */
 
 /** The plugin of vite.config.ts with the middleware. */
@@ -141,8 +143,8 @@ async function expectServerAnswersForNotCanonical(middleware: Connect.NextHandle
 
 /**
  * Expects any other method than GET and HEAD to get 404 outside the proxied routes, as on the server
- * (an OPTIONS never reaches the middleware on Vite's servers: their CORS middleware answers it
- * first, as the servers' own tests below show).
+ * (an OPTIONS to a path never reaches the middleware on Vite's servers: their CORS middleware
+ * answers it first, as the servers' own tests below show).
  */
 async function expectServerAnswersForWrites(middleware: Connect.NextHandleFunction) {
   for (const url of ['/', '/x/y', '/index.html', '/desk.html', '/desk', '/desk/', '/assets/main-1a2b.js'])
@@ -327,8 +329,8 @@ describe("the dev server's middleware", () => {
     expect(await run(middleware, 'HEAD', '/desk/', FILE)).toMatchObject({ status: 200, body: undefined });
   });
 
-  it('leaves every other path Vite may serve to it: its own page at deeper paths, the desk with its headers, the modules', async () => {
-    for (const url of ['/', '/x/y', '/index.html', '/src/main.tsx', '/api/config'])
+  it('leaves every other path Vite may serve to it: its own page at deeper paths, also with a trailing slash, the desk with its headers, the modules', async () => {
+    for (const url of ['/', '/x/y', '/x/', '/x/y/', '/3d/', '/index.html', '/src/main.tsx', '/api/config'])
       expect(await run(middleware, 'GET', url, PAGE), url).toMatchObject({ next: { url } });
     expect(await run(middleware, 'GET', '/desk', PAGE)).toMatchObject({
       next: { url: '/desk.html' },
@@ -417,12 +419,15 @@ describe('the dev and preview servers Vite starts with vite.config.ts', () => {
     });
 
   /**
-   * An OPTIONS gets 204 with no body from Vite's CORS middleware, which answers it before the
-   * middleware of this config and the proxy, at any path, with or without a preflight's headers; any
+   * An OPTIONS to a path gets 204 with no body from Vite's CORS middleware, which answers it before
+   * the middleware of this config and the proxy, at every path (an absolute-form target's too), with
+   * or without a preflight's headers; the asterisk form `OPTIONS *` names no path, and connect runs
+   * no middleware for it: 404. In dev a request target with '#' gets 400 with no body, whatever its
+   * method: Vite answers it before any middleware (in preview, an OPTIONS with one gets 204). Any
    * other method but GET and HEAD reaches the middleware, which answers it with 404 outside the
    * proxied routes (docs/embedding.md "Development").
    */
-  async function expectOptionsAndOtherMethods(port: number) {
+  async function expectOptionsAndOtherMethods(port: number, dev: boolean) {
     const preflight = { origin: 'https://host.example', 'access-control-request-method': 'PUT' };
     for (const path of [
       '/',
@@ -435,6 +440,7 @@ describe('the dev and preview servers Vite starts with vite.config.ts', () => {
       '/%2fdesk.html',
       '/api/config',
       '/dav/x',
+      `http://127.0.0.1:${port}/desk.html`,
     ])
       for (const headers of [{}, preflight]) {
         const got = await send(port, 'OPTIONS', path, headers);
@@ -447,6 +453,20 @@ describe('the dev and preview servers Vite starts with vite.config.ts', () => {
           },
         });
       }
+    for (const headers of [{}, preflight])
+      expect(await send(port, 'OPTIONS', '*', headers), 'OPTIONS *').toMatchObject({ status: 404 });
+    for (const path of ['/x#frag', '/desk.html#frag']) {
+      if (!dev) {
+        const got = await send(port, 'OPTIONS', path);
+        expect(got, `OPTIONS ${path}`).toMatchObject({ status: 204, body: '' });
+        continue;
+      }
+      for (const method of ['OPTIONS', 'GET', 'HEAD', 'POST'])
+        expect(await send(port, method, path), `${method} ${path}`).toMatchObject({
+          status: 400,
+          body: '',
+        });
+    }
     for (const method of ['POST', 'PUT', 'DELETE', 'PATCH'])
       for (const path of ['/', '/x/y', '/desk.html'])
         expect(await send(port, method, path), `${method} ${path}`).toMatchObject({
@@ -455,7 +475,7 @@ describe('the dev and preview servers Vite starts with vite.config.ts', () => {
         });
   }
 
-  it('npm run dev: answers OPTIONS with 204 at any path, the proxied routes too, and any other method but GET and HEAD with 404 outside them', async () => {
+  it("npm run dev: answers an OPTIONS to a path with 204, the proxied routes too, OPTIONS * with 404, a target with '#' with 400 whatever its method, and any other method but GET and HEAD with 404 outside the proxied routes", async () => {
     const server = await createServer({
       configFile,
       root: dirname(configFile),
@@ -467,13 +487,13 @@ describe('the dev and preview servers Vite starts with vite.config.ts', () => {
     });
     try {
       await server.listen();
-      await expectOptionsAndOtherMethods((server.httpServer!.address() as AddressInfo).port);
+      await expectOptionsAndOtherMethods((server.httpServer!.address() as AddressInfo).port, true);
     } finally {
       await server.close();
     }
   }, 60_000);
 
-  it('npm run preview: answers OPTIONS with 204 at any path, the proxied routes too, and any other method but GET and HEAD with 404 outside them', async () => {
+  it("npm run preview: answers an OPTIONS to a path with 204, the proxied routes too and with '#', OPTIONS * with 404, and any other method but GET and HEAD with 404 outside the proxied routes", async () => {
     const server = await preview({
       configFile,
       root: dirname(configFile),
@@ -481,7 +501,7 @@ describe('the dev and preview servers Vite starts with vite.config.ts', () => {
       preview: { host: '127.0.0.1', port: 0 },
     });
     try {
-      await expectOptionsAndOtherMethods((server.httpServer.address() as AddressInfo).port);
+      await expectOptionsAndOtherMethods((server.httpServer.address() as AddressInfo).port, false);
     } finally {
       await server.close();
     }

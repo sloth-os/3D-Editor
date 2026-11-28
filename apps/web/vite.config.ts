@@ -99,9 +99,11 @@ function buildFolderOf(root: string, outDir: string): string | null {
  * answered here, never passed on: a path with an empty or dot segment gets 403 (any other method
  * 404), as from the server, and a path that names no file Vite may serve (isBuiltFile, isViteFile)
  * is answered as one that names no built file, so that no path serves the desk page without its
- * headers, and none that does not decode stops the server. An OPTIONS never reaches this
- * middleware: Vite's CORS middleware (server.cors and preview.cors, left on) answers every one
- * before it, at any path, with 204 and no body.
+ * headers, and none that does not decode stops the server. An OPTIONS to a path never reaches this
+ * middleware: Vite's CORS middleware (server.cors and preview.cors, left on) answers it first, with
+ * 204 and no body. Nor does a target that is not a path, such as the asterisk form `OPTIONS *`
+ * (connect runs no middleware for it: 404), or in dev a target with a '#' (Vite answers it first
+ * with 400 and no body, whatever the method).
  */
 function deskEmbedHeaders(): Plugin {
   const settings = deskEmbedSettings(process.env);

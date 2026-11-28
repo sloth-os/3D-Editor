@@ -6,54 +6,78 @@ import { rewriteDestination, type DavUpstream } from './rewrite';
  * (`<http://editor.example/3d/dav/x.txt?token=…>`): sent on as they are, they would hand the WebDAV
  * server the editor's token and name resources it does not have, so that the lists they tag never
  * apply to its own (a lock-guarded write then fails). Each tag is mapped as a Destination is
- * (rewriteDestination: into WEBDAV_URL, its query without the `token` pairs); state tokens
- * (`<opaquelocktoken:…>`, `<urn:uuid:…>`, `<DAV:no-lock>`), entity tags and every other byte are
- * passed on as sent.
+ * (rewriteDestination: into WEBDAV_URL, its query without the `token` pairs); state tokens of any
+ * form (`<opaquelocktoken:…>`, `<urn:uuid:…>`, `<DAV:no-lock>`, the bare numbers that
+ * golang.org/x/net/webdav, and so rclone, gives out: `<1795880655>`), entity tags and every other
+ * byte are passed on as sent.
+ *
+ * The WebDAV server must find in what it gets the tags, lists and conditions the proxy read, and
+ * no others: a tag it found where the proxy saw none, or read to another end, would make it
+ * evaluate a condition on a resource the proxy never mapped, one outside WEBDAV_URL too (whether it
+ * exists, its ETag). WebDAV servers read the header each with a parser of its own, looser than
+ * RFC 4918:
+ * - Sabre/DAV (Nextcloud; Server::getIfConditions) looks for one regular expression anywhere in
+ *   the header,
+ *   `(?:<(?P<uri>.*?)>\s)?\((?P<not>Not\s)?(?:<(?P<token>[^>]*)>)?(?:\s?)(?:\[(?P<etag>[^\]]*)\])?\)`:
+ *   it reads a list only in that shape and a tag only one space or tab before one, and from any
+ *   other `<` (a state token's in a list of another shape, a tag two spaces before its list) it
+ *   reads a tag on to the next `>` that a space or tab and such a list follow, whatever lies
+ *   between: with a state token `<urn:a/../../x#>` in it, the path of that tag, cut at the `#` and
+ *   its `..` resolved, is outside WEBDAV_URL. Its `Not` negates the whole list;
+ * - Apache httpd's mod_dav (dav_process_if_header) ends a list at its first `)` and an entity tag
+ *   at its first `]`, and knows `Not` only so spelt;
+ * - golang.org/x/net/webdav ends an entity tag at its first `]` and reads `not` or `NOT` as a
+ *   state token;
+ * - webdav-server 2.6, the tests' WebDAV server, ends a list at its first `)`.
+ * So the proxy accepts RFC 4918's grammar narrowed to what they all read alike, and refuses any
+ * other header:
  *
  *   If            = 1*No-tag-list | 1*Tagged-list
  *   No-tag-list   = List
- *   Tagged-list   = Resource-Tag 1*List
- *   List          = "(" 1*Condition ")"
- *   Condition     = ["Not"] (State-token | "[" entity-tag "]")
- *   State-token   = Coded-URL = "<" absolute-URI ">"
- *   Resource-Tag  = "<" Simple-ref ">"   (an absolute URI, or an absolute path, with or without
- *                                         a query)
+ *   Tagged-list   = Resource-Tag WSP 1*List         one space or tab before the tag's first list
+ *   List          = "(" ["Not" WSP] Condition ")"    `Not` so spelt
+ *                 | "(" State-token [WSP] "[" entity-tag "]" ")"
+ *   Condition     = State-token | "[" entity-tag "]"
+ *   State-token   = "<" 1*(any character but a space, a control character, "<", ">" and ")") ">"
+ *   Resource-Tag  = "<" 1*(any character but a space, a control character, "<" and ">") ">"
+ *                   (a URL or a path that rewriteDestination maps, or else outside)
+ *   entity-tag    = ["W/"] quoted-string  (RFC 2616's, which RFC 4918 cites: `\` escapes the
+ *                   character after it; no "<", ">", "(", ")", "[" or "]" in it)
  *
- * with linear whitespace (spaces and tabs: Node lets no line break into a header value) between the
- * tokens, none inside `<…>` or between `[`, the entity tag and `]`. An entity tag is RFC 2616's,
- * which RFC 4918 cites (its own examples hold spaces: `["I am an ETag"]`): `W/` or not, then a
- * quoted string, which may hold spaces, `\`-escaped characters and any of `<`, `>`, `(`, `)`, `[`
- * and `]`, so it is read to its closing quote before anything else is looked for. A header that
- * does not follow this grammar (an empty one, a tag with no list, a no-tag list beside tagged ones,
- * several If lines that Node joined with `, `) is refused: what a WebDAV server would make of it is
- * anyone's guess. An entity tag is passed on whatever it holds, so a WebDAV server that does not
- * read it as a quoted string may find in it a resource tag the proxy did not map: webdav-server
- * 2.6, the tests' WebDAV server, ends a list at its first `)` and reads a `<…>` before a `(` as a
- * resource tag.
+ * with any spaces and tabs (Node lets no line break into a header value) before, between and after
+ * lists, and none elsewhere. The forms WebDAV clients send fit it (Finder's and Windows'
+ * `(<opaquelocktoken:…>)`, davfs2's `<http://…> (<opaquelocktoken:…>)`), and so do RFC 4918's own
+ * examples but one, `(Not <urn:a> <urn:b>)`, which Sabre/DAV reads as no list. The ETags servers
+ * give out hold none of the characters left out (Sabre/DAV's, Nextcloud's and x/net/webdav's are
+ * hex digits, Apache's and nginx's hex digits and `-`), and lock tokens no `)`. A header outside
+ * the grammar (an empty one, a tag with no list, a no-tag list beside tagged ones, several If lines
+ * that Node joined with `, `) is refused as malformed before any tag in it counts as outside.
  */
 
 /** What becomes of an `If` header: the header to send upstream, or why the request is refused. */
-export type IfHeaderResult = { header: string } | { refused: 'malformed' | 'outside' };
+export type IfHeaderResult =
+  | { header: string }
+  | { refused: 'malformed' }
+  /** `tag`: the first resource tag that names nothing in WEBDAV_URL, as sent */
+  | { refused: 'outside'; tag: string };
 
 const MALFORMED: IfHeaderResult = { refused: 'malformed' };
-const OUTSIDE: IfHeaderResult = { refused: 'outside' };
 
 const TAB = 0x09;
 const SPACE = 0x20;
 const DQUOTE = 0x22;
-const PLUS = 0x2b;
-const MINUS = 0x2d;
-const DOT = 0x2e;
+const LPAREN = 0x28;
+const RPAREN = 0x29;
 const SLASH = 0x2f;
-const COLON = 0x3a;
 const LT = 0x3c;
 const GT = 0x3e;
+const UPPER_N = 0x4e;
 const UPPER_W = 0x57;
 const LBRACKET = 0x5b;
 const BACKSLASH = 0x5c;
 const RBRACKET = 0x5d;
-const LPAREN = 0x28;
-const RPAREN = 0x29;
+const LOWER_O = 0x6f;
+const LOWER_T = 0x74;
 const DEL = 0x7f;
 
 function isSpace(c: number): boolean {
@@ -67,39 +91,28 @@ function skipSpaces(header: string, i: number): number {
 }
 
 /**
- * The index of the `>` that closes the `<` at `start` (a Coded-URL or a Resource-Tag), or -1: it
- * holds at least one character and no space, control character or `<`.
+ * The index of the `>` that closes the `<` at `start` (a Resource-Tag, or a State-token when
+ * `stateToken`), or -1: it holds at least one character and no space, control character or `<`,
+ * nor, in a state token, a `)`, which ends a list for mod_dav and webdav-server.
  */
-function angleEnd(header: string, start: number): number {
+function angleEnd(header: string, start: number, stateToken: boolean): number {
   for (let i = start + 1; i < header.length; i++) {
     const c = header.charCodeAt(i);
     if (c === GT) return i > start + 1 ? i : -1;
-    if (c <= SPACE || c === DEL || c === LT) return -1;
+    if (c <= SPACE || c === DEL || c === LT || (stateToken && c === RPAREN)) return -1;
   }
   return -1;
 }
 
-/** Whether `header[from, to)` starts with a URI scheme and its `:`, as an absolute URI does. */
-function startsWithScheme(header: string, from: number, to: number): boolean {
-  const first = header.charCodeAt(from) | 0x20;
-  if (first < 0x61 || first > 0x7a) return false;
-  for (let i = from + 1; i < to; i++) {
-    const c = header.charCodeAt(i);
-    if (c === COLON) return true;
-    const lower = c | 0x20;
-    const ok =
-      (lower >= 0x61 && lower <= 0x7a) || (c >= 0x30 && c <= 0x39) || c === PLUS || c === MINUS || c === DOT;
-    if (!ok) return false;
-  }
-  return false;
-}
-
 /**
- * Whether a char code is text of a quoted string (RFC 2616 TEXT): no control character but the tab,
- * a space or anything else up to U+00FF (a header value's bytes, as Node reads them).
+ * Whether a char code may stand in an entity tag's quoted string, escaped or not: RFC 2616 TEXT (no
+ * control character but the tab; a space or anything else up to U+00FF, a header value's bytes as
+ * Node reads them), but none of `<`, `>`, `(`, `)`, `[` and `]`, which other parsers take for the
+ * header's own structure there.
  */
-function isQuotedText(c: number): boolean {
-  return c === TAB || (c >= SPACE && c !== DEL && c <= 0xff);
+function isEntityTagText(c: number): boolean {
+  if (c !== TAB && (c < SPACE || c === DEL || c > 0xff)) return false;
+  return c !== LT && c !== GT && c !== LPAREN && c !== RPAREN && c !== LBRACKET && c !== RBRACKET;
 }
 
 /**
@@ -112,56 +125,60 @@ function entityTagEnd(header: string, start: number): number {
   if (header.charCodeAt(i) === UPPER_W && header.charCodeAt(i + 1) === SLASH) i += 2;
   if (header.charCodeAt(i) !== DQUOTE) return -1;
   for (i++; i < header.length; i++) {
-    const c = header.charCodeAt(i);
+    let c = header.charCodeAt(i);
     if (c === DQUOTE) return header.charCodeAt(i + 1) === RBRACKET ? i + 2 : -1;
-    if (!isQuotedText(c)) return -1;
     // a quoted pair: the character after the backslash, `"` too, is part of the string
-    if (c === BACKSLASH && !isQuotedText(header.charCodeAt(++i))) return -1;
+    if (c === BACKSLASH) c = header.charCodeAt(++i);
+    if (!isEntityTagText(c)) return -1;
   }
   return -1;
 }
 
-/** Whether `Not`, in any letter case (ABNF strings are), starts at `i`. */
+/** Whether `Not`, so spelt, starts at `i`. */
 function isNot(header: string, i: number): boolean {
   return (
-    (header.charCodeAt(i) | 0x20) === 0x6e &&
-    (header.charCodeAt(i + 1) | 0x20) === 0x6f &&
-    (header.charCodeAt(i + 2) | 0x20) === 0x74
+    header.charCodeAt(i) === UPPER_N &&
+    header.charCodeAt(i + 1) === LOWER_O &&
+    header.charCodeAt(i + 2) === LOWER_T
   );
 }
 
-/** The index after the `)` that ends the list opened by the `(` at `start`, or -1 when it is none. */
+/**
+ * The index after the `)` that ends the list opened by the `(` at `start`, or -1 when it is none:
+ * `Not`, one space or tab, and one condition; or a state token, an entity tag, or a state token and
+ * an entity tag with one space or tab between them or none. Nothing else, no space either, stands
+ * between the parentheses.
+ */
 function listEnd(header: string, start: number): number {
-  let conditions = 0;
   let i = start + 1;
-  for (;;) {
-    i = skipSpaces(header, i);
-    if (i === header.length) return -1;
-    let c = header.charCodeAt(i);
-    if (c === RPAREN) return conditions > 0 ? i + 1 : -1;
-    if (isNot(header, i)) {
-      i = skipSpaces(header, i + 3);
-      c = header.charCodeAt(i);
-    }
-    if (c === LT) {
-      // a state token: an absolute URI, passed on as sent
-      const end = angleEnd(header, i);
-      if (end === -1 || !startsWithScheme(header, i + 1, end)) return -1;
-      i = end + 1;
-    } else if (c === LBRACKET) {
-      i = entityTagEnd(header, i);
-      if (i === -1) return -1;
-    } else return -1;
+  const not = isNot(header, i);
+  if (not) {
+    if (!isSpace(header.charCodeAt(i + 3))) return -1;
+    i += 4;
+  }
+  let conditions = 0;
+  if (header.charCodeAt(i) === LT) {
+    const end = angleEnd(header, i, true);
+    if (end === -1) return -1;
+    i = end + 1;
+    conditions++;
+    if (!not && isSpace(header.charCodeAt(i)) && header.charCodeAt(i + 1) === LBRACKET) i++;
+  }
+  // `Not` negates one condition: Sabre/DAV would negate both
+  if (header.charCodeAt(i) === LBRACKET && !(not && conditions > 0)) {
+    i = entityTagEnd(header, i);
+    if (i === -1) return -1;
     conditions++;
   }
+  return conditions > 0 && header.charCodeAt(i) === RPAREN ? i + 1 : -1;
 }
 
 /**
  * An `If` request header with its resource tags mapped into the WebDAV server's namespace, as
  * Destinations are (rewriteDestination, with `bases`, the request's base paths), and every other
- * byte as sent; or `malformed` when it does not follow RFC 4918's grammar, `outside` when a tag
- * names nothing under `/dav` or a path that leaves WEBDAV_URL (the request is then refused as a
- * Destination outside is). Time linear in the header's length.
+ * byte as sent; or `malformed` when it does not follow the grammar above, `outside` when it does
+ * but a tag names nothing under `/dav` or a path that leaves WEBDAV_URL (the request is then
+ * refused as a Destination outside is). Time linear in the header's length.
  */
 export function rewriteIfHeader(
   upstream: DavUpstream,
@@ -173,33 +190,35 @@ export function rewriteIfHeader(
   let copied = 0;
   // whether the header's lists are tagged, once its first list or tag has told
   let tagged: boolean | undefined;
-  // lists since the last resource tag (since the start for no-tag lists)
   let lists = 0;
-  let i = 0;
-  for (;;) {
-    i = skipSpaces(header, i);
-    if (i === header.length) break;
-    const c = header.charCodeAt(i);
-    if (c === LT) {
-      // a resource tag: none among no-tag lists, and none without a list of its own before the next
-      if (tagged === false || (tagged === true && lists === 0)) return MALFORMED;
-      const end = angleEnd(header, i);
-      if (end === -1) return MALFORMED;
-      const mapped = rewriteDestination(upstream, header.slice(i + 1, end), bases);
-      if (mapped === null) return OUTSIDE;
-      out += header.slice(copied, i + 1) + mapped;
-      copied = end;
+  let outside: string | undefined;
+  let i = skipSpaces(header, 0);
+  while (i < header.length) {
+    if (header.charCodeAt(i) === LT) {
+      // a resource tag: none among no-tag lists, and one space or tab then its first list after it
+      if (tagged === false) return MALFORMED;
+      const end = angleEnd(header, i, false);
+      if (end === -1 || !isSpace(header.charCodeAt(end + 1)) || header.charCodeAt(end + 2) !== LPAREN)
+        return MALFORMED;
+      const tag = header.slice(i + 1, end);
+      const mapped = rewriteDestination(upstream, tag, bases);
+      if (mapped === null) outside ??= tag;
+      else {
+        out += header.slice(copied, i + 1) + mapped;
+        copied = end;
+      }
       tagged = true;
-      lists = 0;
-      i = end + 1;
-    } else if (c === LPAREN) {
-      tagged ??= false;
-      i = listEnd(header, i);
-      if (i === -1) return MALFORMED;
-      lists++;
-    } else return MALFORMED;
+      i = end + 2;
+    }
+    if (header.charCodeAt(i) !== LPAREN) return MALFORMED;
+    tagged ??= false;
+    i = listEnd(header, i);
+    if (i === -1) return MALFORMED;
+    lists++;
+    i = skipSpaces(header, i);
   }
-  // no list at all (an empty header), or a tag at the end without one
+  // no list at all: an empty header
   if (lists === 0) return MALFORMED;
+  if (outside !== undefined) return { refused: 'outside', tag: outside };
   return { header: copied === 0 ? header : out + header.slice(copied) };
 }

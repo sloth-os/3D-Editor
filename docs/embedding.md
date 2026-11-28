@@ -770,10 +770,11 @@ does the same for the build, the built files' headers on `/assets/` only, so nev
 root, where it finds its server (through the proxied routes) and, in preview, its relative file
 URLs: the development server Vite's page, the preview server the built `index.html`. The preview
 server answers the same way every other page a browser opens at a path that names no built file
-(the proxied routes and `/assets/` aside), as the server does, and a request for a missing file (a
-script, a style, an image, a fetch) with 404, never with a page. At its other deeper paths the
-development server answers Vite's own page without a `<base href>`, which looks for its server
-under that path. In development the desk registers no service worker: it works online only.
+(a folder of the build such as `/icons` too; the proxied routes and `/assets/` aside), as the
+server does, and a request for a missing file (a script, a style, an image, a fetch) with 404,
+never with a page. At its other deeper paths the development server answers Vite's own page
+without a `<base href>`, which looks for its server under that path. In development the desk
+registers no service worker: it works online only.
 
 Both read a request's path as the server does, an absolute-form target by its path and
 percent-encoded letters, digits and `- . _ ~` decoded (`/%64esk` is the desk), and hand Vite the
@@ -793,9 +794,11 @@ serves the desk page without its headers and none stops the server:
   serve, so they get the editor's page when a browser opens one and 404 otherwise, and 404 under
   `/assets/` and the development server's module paths.
 
-An `OPTIONS` request gets none of these answers: Vite's CORS middleware (`server.cors` and
-`preview.cors`, left on) answers every one first, at any path, the proxied routes too (none reaches
-the editor server), with 204 and no body.
+An `OPTIONS` request to a path gets none of these answers: Vite's CORS middleware (`server.cors`
+and `preview.cors`, left on) answers it first, the proxied routes too (none reaches the editor
+server), with 204 and no body. The asterisk form `OPTIONS *` reaches no middleware and gets 404. In
+development, a request target with a `#` gets 400 with no body, whatever its method, before any of
+these answers.
 
 ## What the desk does
 

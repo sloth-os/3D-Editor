@@ -162,6 +162,26 @@ describe('docs/subpath.md: a stripping proxy delivers its X-Forwarded-Prefix', (
       'whatever the client names in `Connection` ([a stripping proxy delivers its header](#a-stripping-proxy-delivers-its-header))',
     );
   });
+
+  /** The comments of a configuration file, without their `#`, as one line. */
+  const comments = (file: string) =>
+    flat(
+      repo(file)
+        .split('\n')
+        .filter((l) => l.trimStart().startsWith('#'))
+        .map((l) => l.trimStart().replace(/^#\s?/, ''))
+        .join('\n'),
+    );
+
+  it('says which clients the Apache line costs their close or keep-alive: those whose Connection contains the name, a longer header name that contains it too', () => {
+    const rule = flat(section(subpath, '#### A stripping proxy delivers its header'));
+    expect(rule).toContain(
+      'also when it names a longer header that only contains the text (`X-Forwarded-Prefix-Old`, `Old-X-Forwarded-Prefix`). The `close` or `keep-alive` of such a client goes with it',
+    );
+    expect(comments(DEPLOY_FILES.apache!)).toContain(
+      'and also one that names a longer header containing the text (X-Forwarded-Prefix-Old). The client loses its close or keep-alive with it',
+    );
+  });
 });
 
 describe('README.md', () => {
