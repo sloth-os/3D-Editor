@@ -1218,8 +1218,9 @@ Extraction takes 24–117 ms, decoding the dressed set 51 ms and inserting it 11
   refused (`BASE_PATH`) or ignored (the header). The two pages, `index.html` and `desk.html`, are
   written per request with the request's `<base href>` (`static.ts`), and the links that leave the
   server carry the base: those of MCP results (`mcp/tool-kit.ts` `baseUrl`, with the scheme and
-  host of `X-Forwarded-Proto` and `X-Forwarded-Host`, else of the `Host` header) and the WebDAV
-  proxy's `href`s and `Location`. REST answers give paths from the root.
+  host of `X-Forwarded-Proto` and `X-Forwarded-Host`, else of the `Host` header, else none: paths
+  under the base) and the WebDAV proxy's `href`s and `Location`. REST answers give paths from the
+  root.
 
 ## Persistence & sync
 

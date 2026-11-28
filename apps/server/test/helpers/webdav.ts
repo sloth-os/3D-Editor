@@ -32,9 +32,10 @@ export interface TestWebDAVOptions {
   conditional?: boolean;
   /**
    * Runs before a request is handled: tests let another writer save at an exact point between a
-   * writer's requests (tell writers apart by a header their client sends).
+   * writer's requests (tell writers apart by a header their client sends). `path` is decoded,
+   * without the query; `url` is the request target as the server got it.
    */
-  onRequest?: (req: { method: string; path: string; headers: IncomingHttpHeaders }) => unknown;
+  onRequest?: (req: { method: string; path: string; url: string; headers: IncomingHttpHeaders }) => unknown;
 }
 
 /** Virtual file system whose ETags change with every write (a counter, like Nextcloud's). */
@@ -112,7 +113,7 @@ export async function startWebDAV(opts: TestWebDAVOptions = {}): Promise<TestWeb
     void (async () => {
       const method = req.method ?? 'GET';
       const path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname).replace(/(.)\/+$/, '$1');
-      await opts.onRequest?.({ method, path, headers: req.headers });
+      await opts.onRequest?.({ method, path, url: req.url ?? '/', headers: req.headers });
       if (!versioned || !['GET', 'HEAD', 'PUT', 'DELETE'].includes(method)) {
         server.executeRequest(req, res);
         return;

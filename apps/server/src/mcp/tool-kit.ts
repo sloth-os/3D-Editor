@@ -123,10 +123,13 @@ function lastHeaderValue(value: string | string[] | undefined): string | undefin
 const COLON = 58;
 const OPEN_BRACKET = 91;
 
-/** Whether a char code is an ASCII letter or digit, `.` or `-`: what a host name or IPv4 address is made of. */
+/**
+ * Whether a char code is an ASCII letter or digit, `.`, `-` or `_`: what a host name or IPv4 address
+ * is made of (`_` in Docker's service names, `docker_svc`, which the URL parser keeps as they are).
+ */
 function isHostNameChar(c: number): boolean {
   const lower = c | 0x20;
-  return (lower >= 97 && lower <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 45;
+  return (lower >= 97 && lower <= 122) || (c >= 48 && c <= 57) || c === 46 || c === 45 || c === 95;
 }
 
 /** Whether a char code may be in a bracketed IPv6 address: hex digits, `:` and `.` (an IPv4 tail). */
@@ -137,9 +140,9 @@ function isIPv6Char(c: number): boolean {
 
 /**
  * Whether a Host or X-Forwarded-Host value is a host and an optional port, and nothing else: a name
- * or IPv4 address of ASCII letters, digits, `.` and `-` (`example.com`, `127.0.0.1`), or an IPv6
- * address in brackets (`[::1]`), then `:port` with a port from 1 to 65535. A quote, a brace, `@`,
- * `/` or a space never reaches a link. Time linear in the value's length.
+ * or IPv4 address of ASCII letters, digits, `.`, `-` and `_` (`example.com`, `127.0.0.1`,
+ * `docker_svc`), or an IPv6 address in brackets (`[::1]`), then `:port` with a port from 1 to 65535.
+ * A quote, a brace, `@`, `/` or a space never reaches a link. Time linear in the value's length.
  */
 export function isHostAndPort(value: string): boolean {
   let i = 0;
@@ -182,9 +185,11 @@ function originOf(scheme: string, host: string | undefined): string | null {
  * with trustProxy; a host as isHostAndPort accepts it), else the scheme of the connection and the
  * Host header (the request URL the MCP transport builds from them: the scheme and authority of an
  * absolute-form request target are not read), then the base path (X-Forwarded-Prefix when usable,
- * else BASE_PATH), without a trailing slash: `https://example.com/3d` (docs/subpath.md). '' without
- * an HTTP request (an in-memory client): the links are then paths from the server's root, as REST
- * gives them.
+ * else BASE_PATH), without a trailing slash: `https://example.com/3d` (docs/subpath.md). With an
+ * HTTP request whose hosts are none of them usable (no Host, or one isHostAndPort refuses), the
+ * base alone: the links are then paths under the editor's base (`/3d/?project=…`), never paths from
+ * the root of a site the editor may share. '' without an HTTP request (an in-memory client): the
+ * links are then paths from the server's root, as REST gives them.
  */
 export function baseUrl(extra: ToolExtra, config: Pick<ServerConfig, 'basePath'>): string {
   const info = extra.requestInfo;
@@ -197,6 +202,5 @@ export function baseUrl(extra: ToolExtra, config: Pick<ServerConfig, 'basePath'>
       : (info.url?.protocol.slice(0, -1) ?? 'http');
   const host = info.url?.host ?? (typeof headers.host === 'string' ? headers.host : undefined);
   const origin = originOf(scheme, lastHeaderValue(headers['x-forwarded-host'])) ?? originOf(scheme, host);
-  if (!origin) return '';
-  return `${origin}${forwardedPrefix(headers['x-forwarded-prefix']) ?? config.basePath}`;
+  return `${origin ?? ''}${forwardedPrefix(headers['x-forwarded-prefix']) ?? config.basePath}`;
 }

@@ -2,11 +2,11 @@
 
 ## Where projects are saved
 
-| Configuration                                 | Saved to                                                                                                                                        |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
-| No WebDAV configured (default)                | The browser (IndexedDB).                                                                                                                        |
-| Server started with `WEBDAV_URL`              | WebDAV, through the server's `/dav` proxy (credentials stay on the server, no CORS needed). The server also persists the live sync rooms there. |
-| WebDAV URL entered in _Preferences → Storage_ | WebDAV, accessed directly from the browser (the WebDAV server must send CORS headers).                                                          |
+| Configuration                                 | Saved to                                                                                                                                                                                                                                                     |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| No WebDAV configured (default)                | The browser (IndexedDB).                                                                                                                                                                                                                                     |
+| Server started with `WEBDAV_URL`              | WebDAV, through the server's `/dav` proxy (the WebDAV credentials stay on the server, the client's own are not passed on: neither its `Authorization` nor the `token` pairs of a query; no CORS needed). The server also persists the live sync rooms there. |
+| WebDAV URL entered in _Preferences → Storage_ | WebDAV, accessed directly from the browser (the WebDAV server must send CORS headers).                                                                                                                                                                       |
 
 Projects are **always** cached in IndexedDB as well, which is what makes the app work offline.
 When WebDAV is configured the local copy is merged with the WebDAV copy on open, a moment

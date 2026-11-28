@@ -31,7 +31,12 @@ export const WEBDAV_EXTRA_METHODS = [
 ] as const;
 const PROXIED_METHODS = ['GET', 'HEAD', 'PUT', 'DELETE', 'OPTIONS', ...WEBDAV_EXTRA_METHODS];
 
-/** Request headers forwarded upstream (everything else, incl. cookies and credentials, is dropped). */
+/**
+ * Request headers forwarded upstream, as sent; everything else is dropped, the client's cookies and
+ * credentials included (its `Authorization`: the WebDAV server gets the server's own, WEBDAV_USERNAME
+ * and WEBDAV_PASSWORD). A token the client sends in the query (`?token=`, any spelling) is left out
+ * of the URL and of the Destination sent upstream (rewrite.ts upstreamUrlFor).
+ */
 const FORWARD_REQUEST_HEADERS = [
   'accept',
   'accept-language',
@@ -145,15 +150,16 @@ function isXml(contentType: string | undefined): boolean {
 
 /**
  * Same-origin WebDAV access for browsers: `/dav/*` is forwarded to WEBDAV_URL with the server's
- * credentials. Paths, and the paths of Destination headers, are confined to the upstream base URL
- * (never an open proxy): a path segment that does not decode, or decodes to `.`, `..` or a name with
- * `/`, `\` or NUL in it (`..%2f`), is refused, and the URL sent upstream, decoded with its dot
- * segments resolved, is the base or under it (rewrite.ts). URLs in `Destination`, `Location` and
- * PROPFIND multistatus bodies are translated between the two namespaces: the hrefs given out are
- * under the request's base path (`/3d/dav/...`, so that clients behind a reverse proxy can follow
- * them), and a Destination is accepted with or without it (docs/subpath.md). Every answer carries
- * PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix` (with the WebDAV server's Vary), since the
- * hrefs and Location depend on that header.
+ * credentials, never the client's (the query and a Destination lose their `token` pairs). Paths, and
+ * the paths of Destination headers, are confined to the upstream base URL (never an open proxy): a
+ * path segment that does not decode, or decodes to `.` or `..` (also before a `;`: `..;`) or to a
+ * name with `/`, `\` or a control character in it (`..%2f`, `.%09.`), is refused, and the URL sent
+ * upstream, decoded with its dot segments resolved, is the base or under it (rewrite.ts). URLs in
+ * `Destination`, `Location` and PROPFIND multistatus bodies are translated between the two
+ * namespaces: the hrefs given out are under the request's base path (`/3d/dav/...`, so that clients
+ * behind a reverse proxy can follow them), and a Destination is accepted with or without it
+ * (docs/subpath.md). Every answer carries PROXY_RESPONSE_HEADERS and `Vary: X-Forwarded-Prefix`
+ * (with the WebDAV server's Vary), since the hrefs and Location depend on that header.
  */
 export async function registerDavProxy(
   app: FastifyInstance,

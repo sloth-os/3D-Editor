@@ -1,4 +1,4 @@
-import http from 'node:http';
+import http, { type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as Y from 'yjs';
@@ -9,10 +9,22 @@ import { mkcolPath, startWebDAV, type TestWebDAV } from '../helpers/webdav';
 let dav: TestWebDAV;
 let server: TestServer;
 const TOKEN = 'proxy-token';
+/** Every request the WebDAV server got from the editor server, as it got it. */
+const upstream: { method: string; url: string; headers: IncomingHttpHeaders }[] = [];
 
 beforeAll(async () => {
   // like Nextcloud: ETags with GET, HEAD and PUT responses, If-Match and If-None-Match checked
-  dav = await startWebDAV({ username: 'bob', password: 'hunter2', etagHeaders: true, conditional: true });
+  dav = await startWebDAV({
+    username: 'bob',
+    password: 'hunter2',
+    etagHeaders: true,
+    conditional: true,
+    onRequest: ({ method, url, headers }) => {
+      // the proxy's own requests (this test reads the WebDAV server directly too)
+      if (headers['user-agent'] === '3d-editor-server (webdav proxy)')
+        upstream.push({ method, url, headers });
+    },
+  });
   await mkcolPath(dav, '/users/bob smith');
   server = await startServer({
     WEBDAV_URL: `${dav.origin}/users/bob%20smith`,
@@ -173,6 +185,59 @@ describe('WebDAV proxy', () => {
     // credentials are required (AUTH_TOKEN)
     res = await fetch(`${server.url}/dav/3d-editor/copied.bin`);
     expect(res.status).toBe(401);
+  });
+
+  it('lets a token in the query authorize GET, PUT, PROPFIND and COPY, and never passes it on to the WebDAV server', async () => {
+    await proxiedClient().mkdirp('/in-query');
+    upstream.length = 0;
+    // every spelling of the name extractToken reads as `token`
+    const names = ['token', '%74oken', 'to%6Ben'];
+    for (const [i, name] of names.entries()) {
+      const pair = `${name}=${TOKEN}`;
+      let res = await fetch(`${server.url}/dav/in-query/f${i}.txt?${pair}`, {
+        method: 'PUT',
+        body: `file ${i}`,
+      });
+      expect(res.status, name).toBe(201);
+      res = await fetch(`${server.url}/dav/in-query/f${i}.txt?a=1&${pair}&b=%41`);
+      expect(res.status, name).toBe(200);
+      expect(await res.text(), name).toBe(`file ${i}`);
+      res = await fetch(`${server.url}/dav/in-query/?${pair}`, {
+        method: 'PROPFIND',
+        headers: { depth: '1' },
+      });
+      expect(res.status, name).toBe(207);
+      expect(await res.text(), name).toContain(`/dav/in-query/f${i}.txt`);
+      // the token in the URL and in the Destination
+      res = await fetch(`${server.url}/dav/in-query/f${i}.txt?${pair}`, {
+        method: 'COPY',
+        headers: { destination: `${server.url}/dav/in-query/c${i}.txt?${pair}` },
+      });
+      expect(res.status, name).toBe(201);
+      // without it the same request is refused: the query's token is what let them through
+      expect((await fetch(`${server.url}/dav/in-query/f${i}.txt`)).status, name).toBe(401);
+    }
+    // the WebDAV server never saw the token, in a URL or in a header
+    expect(upstream.length).toBe(names.length * 4);
+    for (const r of upstream) {
+      const seen = `${r.url} ${JSON.stringify(r.headers)}`;
+      expect(seen, `${r.method} ${r.url}`).not.toContain(TOKEN);
+      expect(seen, `${r.method} ${r.url}`).not.toMatch(/[?&](token|%74oken|to%6Ben)=/i);
+    }
+    const stored = await fetch(`${dav.origin}/users/bob%20smith/in-query/c2.txt`, {
+      headers: { authorization: dav.authorization },
+    });
+    expect(await stored.text()).toBe('file 2');
+    // the other pairs reach it as they were sent, in their order
+    expect(upstream.filter((r) => r.method === 'GET').map((r) => r.url)).toEqual(
+      names.map((_, i) => `/users/bob%20smith/in-query/f${i}.txt?a=1&b=%41`),
+    );
+    expect(upstream.filter((r) => r.method === 'COPY').map((r) => [r.url, r.headers.destination])).toEqual(
+      names.map((_, i) => [
+        `/users/bob%20smith/in-query/f${i}.txt`,
+        `${dav.origin}/users/bob%20smith/in-query/c${i}.txt`,
+      ]),
+    );
   });
 
   it('answers with a sandbox and nosniff: uploaded .html and .svg are never active on the editor’s origin', async () => {

@@ -775,6 +775,24 @@ script, a style, an image, a fetch) with 404, never with a page. At its other de
 development server answers Vite's own page without a `<base href>`, which looks for its server
 under that path. In development the desk registers no service worker: it works online only.
 
+Both read a request's path as the server does, an absolute-form target by its path and
+percent-encoded letters, digits and `- . _ ~` decoded (`/%64esk` is the desk), and hand Vite the
+path in that form (left to itself, Vite serves the editor's page for an absolute-form
+`http://…/desk.html`). They answer themselves what Vite would read another way, so that no path
+serves the desk page without its headers and none stops the server:
+
+- a path with an empty or dot segment (`//desk.html`, `/desk.html//`, `/./x`, `/x/../y`, also
+  spelled `%2e` or with a backslash): 403 for a `GET` or `HEAD`, as from the server's static file
+  server, and 404 for any other method;
+- any method but `GET` and `HEAD` outside the proxied routes: 404, as on the server (Vite serves
+  pages to a `POST` too);
+- a path that names a file only once its `%2F` are decoded (`/x%2f..%2fdesk`, `/%2fdesk.html`), one
+  that does not decode (`/%E0%A4%A`; at such an `.html` path Vite stops with an error) and, in
+  development, an HTML file other than the two pages (`/dist/desk.html`, `/@fs/…/desk.html`) or a
+  path in the build's folder (`/dist/desk`): they name no file Vite may serve, so they get the
+  editor's page when a browser opens one and 404 otherwise, and 404 under `/assets/` and the
+  development server's module paths.
+
 ## What the desk does
 
 ### Starting

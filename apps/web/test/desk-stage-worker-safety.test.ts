@@ -2,19 +2,20 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
-import { build } from 'esbuild';
 import * as Y from 'yjs';
 import { describe, expect, it } from 'vitest';
 import { SceneDoc, decodePNG, getShots, listUnits, readUnitHeader } from '@3d-editor/core';
 import { KITE, library, stagedDoc, withPins } from './desk-units-helpers';
+import { bundle as viteBundle } from './vite-bundle';
 
 /*
  * The desk's staging worker as the browser loads it (src/embed/stage.worker.ts): its own modules
  * (staging-engine.ts, state.ts with fflate, protocol.ts with zod), yjs, and what they import of
  * @3d-editor/core. The core's test (packages/core/test/desk-brief-worker.test.ts) bundles only the
- * core's exports; this one bundles the worker's entry as a browser bundle (esbuild, platform
- * browser: a Node built-in imported anywhere in the graph fails the build) and runs it in the same
- * realm, one with only what a worker has: Node's globals (process, Buffer, require …) and the page's
+ * core's exports; this one bundles the worker's entry as a browser loads it (Vite's build,
+ * vite-bundle.ts: one classic script of every module, none tree-shaken away; a Node built-in
+ * imported anywhere in the graph fails the build) and runs it in the same realm, one with only
+ * what a worker has: Node's globals (process, Buffer, require …) and the page's
  * (window, document, localStorage …) are not defined there, so a read of one, at module load or
  * while the worker stages, throws as it would in the worker. Then it drives the worker as the page
  * does (staging.ts): a stage, an update, the shot results and a check, each a message carrying the
@@ -48,20 +49,10 @@ function bundle(): Promise<{ code: string; inputs: string[] }> {
 }
 
 async function buildBundle(): Promise<{ code: string; inputs: string[] }> {
-  const r = await build({
-    entryPoints: [WORKER],
-    bundle: true,
-    format: 'iife',
-    platform: 'browser',
-    target: 'es2022',
-    // every module whole, as the worker loads them unbundled in development: a module-level read
-    // must not hide behind an unused export
-    treeShaking: false,
-    write: false,
-    metafile: true,
-    logLevel: 'silent',
-  });
-  return { code: r.outputFiles[0].text, inputs: Object.keys(r.metafile.inputs) };
+  // every module whole (no tree-shaking), as the worker loads them unbundled in development: a
+  // module-level read must not hide behind an unused export
+  const { code, modules } = await viteBundle(WORKER);
+  return { code, inputs: modules };
 }
 
 /**

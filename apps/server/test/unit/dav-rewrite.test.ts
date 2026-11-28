@@ -2,15 +2,33 @@ import { describe, expect, it } from 'vitest';
 import { parseMultistatus } from '@3d-editor/core';
 import {
   davSegment,
+  isInsideUpstream,
   parseUpstream,
   rewriteDestination,
   rewriteMultistatus,
   toLocalHref,
   upstreamUrlFor,
+  withoutTokenPairs,
 } from '../../src/dav/rewrite';
 
 const nextcloud = parseUpstream('https://cloud.example.com/remote.php/dav/files/alice%40example.com');
 const root = parseUpstream('http://127.0.0.1:1900');
+const guarded = parseUpstream('http://127.0.0.1:4470/guarded');
+
+/**
+ * Spellings of a query name that decodes to `token`: the ones extractToken reads (URLSearchParams
+ * decodes names) and other letter cases, which the logs redact too (isTokenName).
+ */
+const TOKEN_NAMES = ['token', '%74oken', 'to%6Ben', '%74%6F%6B%65%6E', 'TOKEN', 'Tok%45n'];
+
+function timed<T>(fn: () => T): { value: T; ms: number } {
+  const start = performance.now();
+  const value = fn();
+  return { value, ms: performance.now() - start };
+}
+
+/** 200 000 characters read in one pass take well under a millisecond each; quadratic reading takes minutes. */
+const LINEAR_BOUND_MS = 1000;
 
 describe('upstreamUrlFor', () => {
   it('maps /dav paths below the upstream base URL', () => {
@@ -88,6 +106,207 @@ describe('upstreamUrlFor', () => {
     expect(davSegment('')).toBe('');
     for (const raw of ['..%2f', '%2F', '%5c', '%00', '.', '%2e', '..', '.%2E', '%zz', '%C3'])
       expect(davSegment(raw), raw).toBeNull();
+  });
+
+  it('refuses a segment with an ASCII control character or DEL, raw or encoded (davSegment)', () => {
+    // the URL parser drops a tab, CR and LF: `.\t.` would be sent as `..`
+    for (const raw of [
+      '.\t.',
+      '.%09.',
+      '%09',
+      'a\tb',
+      '.%0A.',
+      'a%0db',
+      '%01',
+      'x%1F',
+      '\u0001',
+      '%7F',
+      'x\u007f',
+    ])
+      expect(davSegment(raw), JSON.stringify(raw)).toBeNull();
+    // the characters around them are names
+    expect(davSegment('%20')).toBe(' ');
+    expect(davSegment('~')).toBe('~');
+    expect(davSegment('%C2%80')).toBe('\u0080');
+  });
+
+  it('refuses a segment that is `.` or `..` up to its first `;`, as servlet containers read it (davSegment)', () => {
+    // Tomcat cuts `;` path parameters off a segment before it resolves dot segments
+    for (const raw of [
+      '..;',
+      '..;x',
+      '..;jsessionid=1',
+      '..%3b',
+      '..%3B',
+      '%2e%2e;',
+      '%2e%2e%3b',
+      '.%2E%3Bx',
+      '.;',
+      '%2e;',
+      '.;a;b',
+    ])
+      expect(davSegment(raw), raw).toBeNull();
+    // a name that merely holds a `;` is one
+    for (const [raw, name] of [
+      ['a;b.txt', 'a;b.txt'],
+      ['a%3Bb', 'a;b'],
+      [';', ';'],
+      [';..', ';..'],
+      ['...;', '...;'],
+      ['..x;y', '..x;y'],
+    ])
+      expect(davSegment(raw), raw).toBe(name);
+  });
+
+  it('refuses paths and Destinations with control characters or `..;` segments, for every upstream', () => {
+    for (const upstream of [guarded, nextcloud, root]) {
+      for (const path of [
+        '/dav/..;/outside-secret.txt',
+        '/dav/x/..;x/..;/s',
+        '/dav/..%3b/s',
+        '/dav/%2e%2e;/s',
+        '/dav/.;/s',
+        '/dav/.%09./s',
+        '/dav/x/%09/s',
+        '/dav/a%0Ab',
+      ])
+        expect(upstreamUrlFor(upstream, path), `${upstream.basePath} ${path}`).toBeNull();
+      for (const destination of [
+        '/dav/.\t./pwned.txt',
+        '/3d/dav/x/.\t./.\t./pwned.txt',
+        '/dav/.%09./pwned.txt',
+        '/3d/dav/..;/pwned.txt',
+        'http://h/dav/..%3B/pwned.txt',
+      ])
+        expect(
+          rewriteDestination(upstream, destination, ['/3d']),
+          `${upstream.basePath} ${destination}`,
+        ).toBeNull();
+    }
+    // names with a `;` are passed on
+    expect(upstreamUrlFor(guarded, '/dav/a;b.txt')!.pathname).toBe('/guarded/a;b.txt');
+    expect(rewriteDestination(guarded, '/3d/dav/x/c;d.txt', ['/3d'])).toBe(
+      'http://127.0.0.1:4470/guarded/x/c;d.txt',
+    );
+  });
+});
+
+describe('isInsideUpstream', () => {
+  it('holds a path as sent upstream to the upstream base or under it, decoded and resolved', () => {
+    for (const p of ['/guarded', '/guarded/', '/guarded/a/b.txt', '/guarded/a%20b', '/guarded//a'])
+      expect(isInsideUpstream(guarded, p), p).toBe(true);
+    for (const p of [
+      '/guarded/../x',
+      '/guarded/..',
+      '/guarded/a/../../x',
+      // the URL parser resolves dot segments: a path that still holds one is refused, inside or not
+      '/guarded/a/../b',
+      '/guarded/./b',
+      '/guardedx/y',
+      '/guarded%2fx',
+      '/x',
+      '/',
+      '/guarded/..;/x',
+      '/guarded/.%09./x',
+      '/guarded/%zz',
+    ])
+      expect(isInsideUpstream(guarded, p), p).toBe(false);
+    // the root upstream holds every path whose segments are names
+    for (const p of ['/', '/x/y', '/a%20b/']) expect(isInsideUpstream(root, p), p).toBe(true);
+    for (const p of ['/%zz', '/a/../b', '/x/..;/y']) expect(isInsideUpstream(root, p), p).toBe(false);
+  });
+
+  it('compares with an encoded upstream base decoded', () => {
+    // `alice%40example.com` is `alice@example.com`
+    expect(isInsideUpstream(nextcloud, '/remote.php/dav/files/alice%40example.com/x')).toBe(true);
+    expect(isInsideUpstream(nextcloud, '/remote.php/dav/files/alice@example.com/x')).toBe(true);
+    expect(isInsideUpstream(nextcloud, '/remote.php/dav/files/alice%2540example.com/x')).toBe(false);
+    expect(isInsideUpstream(nextcloud, '/remote.php/dav/files/bob/x')).toBe(false);
+    const spaced = parseUpstream('http://h/a%20b/c');
+    expect(isInsideUpstream(spaced, '/a%20b/c/d')).toBe(true);
+    expect(isInsideUpstream(spaced, '/a b/c')).toBe(true);
+    expect(isInsideUpstream(spaced, '/a%20b/cd')).toBe(false);
+    expect(isInsideUpstream(spaced, '/a%2520b/c')).toBe(false);
+  });
+
+  it('is what refuses a Destination the URL parser reads as a way out (upstreamUrlFor checks the URL it built)', () => {
+    // `.. ` and `.%2e ` are names to the segment check, but the URL parser trims a space at the end
+    // of what it reads (the Destination's fragment is cut off first): `/guarded/.. ` is built as
+    // `/guarded/..`, that is `/`, outside the folder
+    for (const destination of ['/dav/.. #f', '/3d/dav/.. #x', '/dav/.%2e #f'])
+      expect(rewriteDestination(guarded, destination, ['/3d']), destination).toBeNull();
+    expect(rewriteDestination(nextcloud, '/dav/.. #f')).toBeNull();
+  });
+});
+
+describe('the token in the query never reaches the WebDAV server', () => {
+  it('is left out of the URL sent upstream, in every spelling, the other pairs kept as sent', () => {
+    for (const name of TOKEN_NAMES) {
+      expect(upstreamUrlFor(guarded, `/dav/x.txt?${name}=s3cret`)!.href, name).toBe(
+        'http://127.0.0.1:4470/guarded/x.txt',
+      );
+      expect(upstreamUrlFor(guarded, `/dav/x.txt?a=1&${name}=s3cret&b=%41&c`)!.href, name).toBe(
+        'http://127.0.0.1:4470/guarded/x.txt?a=1&b=%41&c',
+      );
+      expect(upstreamUrlFor(guarded, `/dav/?${name}=s3cret&z=9`)!.href, name).toBe(
+        'http://127.0.0.1:4470/guarded/?z=9',
+      );
+      expect(upstreamUrlFor(nextcloud, `/dav/x?${name}=s3cret#frag`)!.search, name).toBe('');
+      expect(upstreamUrlFor(root, `/dav/x?${name}=s3cret&${name}=again`)!.href, name).toBe(
+        'http://127.0.0.1:1900/x',
+      );
+    }
+  });
+
+  it('is left out of a Destination too', () => {
+    for (const name of TOKEN_NAMES) {
+      expect(rewriteDestination(guarded, `/3d/dav/y.txt?${name}=s3cret&keep=1`, ['/3d']), name).toBe(
+        'http://127.0.0.1:4470/guarded/y.txt?keep=1',
+      );
+      expect(rewriteDestination(guarded, `https://editor.example/dav/y.txt?${name}=s3cret#f`), name).toBe(
+        'http://127.0.0.1:4470/guarded/y.txt',
+      );
+    }
+  });
+
+  it('keeps every other pair as it is, in order, and drops a query left without pairs (withoutTokenPairs)', () => {
+    for (const [query, kept] of [
+      ['', ''],
+      ['?', '?'],
+      ['?a=1&b=2', '?a=1&b=2'],
+      ['?a=1&token=s&b=2', '?a=1&b=2'],
+      ['?token=s&a=1', '?a=1'],
+      ['?token=s', ''],
+      ['?token=s&%74oken=t&to%6Ben=u', ''],
+      // URLSearchParams reads `token` here too: a pair starts after any `?`, as redactUrl reads it
+      ['??token=s', ''],
+      ['?a=1?token=s', '?a=1'],
+      // a value runs to the next `&`
+      ['?token=s?a=1&b=2', '?b=2'],
+      ['?token=s&', ''],
+      ['?a&&token=s&&b', '?a&&&b'],
+      // a name without a value
+      ['?token', ''],
+      ['?token&a=1', '?a=1'],
+      // names that are not `token`, spelled as sent
+      ['?tokens=1&atoken=2&to%6B=3&%74oke=4&token%3D=5', '?tokens=1&atoken=2&to%6B=3&%74oke=4&token%3D=5'],
+      ['?b=%41&a=%zz&token=s&c=+&d', '?b=%41&a=%zz&c=+&d'],
+    ])
+      expect(withoutTokenPairs(query), query).toBe(kept);
+  });
+
+  it('reads a query in time linear in its length', () => {
+    for (const query of [
+      `?${'?'.repeat(200_000)}`,
+      `?${'&'.repeat(200_000)}token=s`,
+      `?${'%74'.repeat(70_000)}=s`,
+      `?a=${'b'.repeat(200_000)}&token=s`,
+      `?${'&token=s'.repeat(25_000)}`,
+    ]) {
+      const run = timed(() => withoutTokenPairs(query));
+      expect(run.value.includes('token=s')).toBe(false);
+      expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+    }
   });
 });
 

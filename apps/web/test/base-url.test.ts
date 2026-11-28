@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { build } from 'vite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { render } from '@testing-library/preact';
@@ -32,6 +31,7 @@ import { registerDeskServiceWorker } from '../src/embed/pwa';
 import { StandalonePage } from '../src/embed/DeskApp';
 import { setupTelemetry } from '../src/telemetry/setup';
 import { telemetry } from '../src/telemetry/telemetry';
+import { bundle } from './vite-bundle';
 
 /*
  * The web app's base URL and the URLs of the editor server's routes (src/app/base-url.ts,
@@ -454,29 +454,10 @@ describe("the desk's own page", () => {
 describe("the app's Web Workers", () => {
   /**
    * The app's own modules a worker entry imports, from the source tree (packages left out): every
-   * module Vite's bundler puts in the worker's chunks, none of them tree-shaken away, with no
-   * config of the app's (only its root) and nothing written.
+   * module Vite's bundler puts in the worker's chunks, none of them tree-shaken away (vite-bundle.ts).
    */
-  async function ownModules(entry: string): Promise<string[]> {
-    const output = await build({
-      configFile: false,
-      root: resolve(__dirname, '..'),
-      logLevel: 'silent',
-      build: {
-        write: false,
-        rolldownOptions: {
-          input: fileURLToPath(new URL(entry, import.meta.url)),
-          // a package, not a path: left out ('\0…' is one of Vite's own modules)
-          external: (id) => /^[\w@]/.test(id) && !isAbsolute(id),
-          treeshake: false,
-        },
-      },
-    });
-    const outputs = Array.isArray(output) ? output : [output];
-    return outputs.flatMap((o) =>
-      'output' in o ? o.output.flatMap((chunk) => (chunk.type === 'chunk' ? chunk.moduleIds : [])) : [],
-    );
-  }
+  const ownModules = async (entry: string) =>
+    (await bundle(fileURLToPath(new URL(entry, import.meta.url)), { packages: 'external' })).modules;
 
   it("import neither the app's base nor the server's URLs: a worker has no base of its own", async () => {
     for (const entry of [

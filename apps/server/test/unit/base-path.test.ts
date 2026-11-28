@@ -660,7 +660,6 @@ describe('the links of MCP results (baseUrl)', () => {
       "a'b",
       'a`b',
       'a{b}',
-      'a_b',
       'a%41b',
       // not a host and port
       '[::1',
@@ -686,13 +685,52 @@ describe('the links of MCP results (baseUrl)', () => {
     expect(baseUrl(httpCall({ 'x-forwarded-prefix': '/' }), under3d)).toBe('http://127.0.0.1:8080');
   });
 
-  it('fall back to the Host header, and are empty without an HTTP request', () => {
+  it('fall back to the Host header, then to the base alone, and are empty without an HTTP request', () => {
     expect(baseUrl(extraWith({ headers: { host: 'editor.local:9000' } }), under3d)).toBe(
       'http://editor.local:9000/3d',
     );
-    expect(baseUrl(extraWith({ headers: {} }), under3d)).toBe('');
+    // an HTTP request without a Host (HTTP/1.0): paths under the base
+    expect(baseUrl(extraWith({ headers: {} }), under3d)).toBe('/3d');
     // an in-memory client: links stay paths from the server's root, as REST gives them
     expect(baseUrl(extraWith(), under3d)).toBe('');
+  });
+
+  it('take a Docker service name as host (`_`)', () => {
+    expect(baseUrl(httpCall({}, 'http://docker_svc:8080/mcp'), under3d)).toBe('http://docker_svc:8080/3d');
+    expect(baseUrl(httpCall({}, 'http://editor_1/mcp'), root)).toBe('http://editor_1');
+    expect(baseUrl(httpCall({ 'x-forwarded-host': 'my_host.internal:9000' }), under3d)).toBe(
+      'http://my_host.internal:9000/3d',
+    );
+  });
+
+  it('are paths under the base when no host is usable, never paths from the root of the site', () => {
+    for (const host of ['a"b', 'a{b}', 'a b', '[::1', 'example.com:0']) {
+      // the Host header as the transport gives it, and the URL it built from it where it could
+      const calls = [
+        extraWith({ headers: { host } }),
+        ...(URL.canParse(`http://${host}/mcp`) ? [httpCall({}, `http://${host}/mcp`)] : []),
+      ];
+      for (const call of calls) {
+        expect(baseUrl(call, under3d), host).toBe('/3d');
+        expect(baseUrl(call, root), host).toBe('');
+      }
+      // a usable X-Forwarded-Prefix is the base, whatever BASE_PATH is
+      const prefixed = extraWith({ headers: { host, 'x-forwarded-prefix': '/editor' } });
+      expect(baseUrl(prefixed, under3d), host).toBe('/editor');
+      expect(baseUrl(prefixed, root), host).toBe('/editor');
+      // an unusable one is not
+      expect(
+        baseUrl(extraWith({ headers: { host, 'x-forwarded-prefix': '//evil.example' } }), under3d),
+        host,
+      ).toBe('/3d');
+    }
+    // a refused X-Forwarded-Host and a refused Host
+    expect(
+      baseUrl(
+        extraWith({ headers: { host: 'a{b}', 'x-forwarded-host': 'c"d', 'x-forwarded-proto': 'https' } }),
+        under3d,
+      ),
+    ).toBe('/3d');
   });
 });
 
@@ -706,6 +744,10 @@ describe('the hosts of MCP links (isHostAndPort)', () => {
       '[::1]',
       '[2001:db8::1]:443',
       'x:1',
+      // Docker's service names
+      'docker_svc',
+      'docker_svc:8080',
+      'my_host.internal:9000',
     ])
       expect(isHostAndPort(host), host).toBe(true);
     for (const host of [

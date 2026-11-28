@@ -91,13 +91,13 @@ stripped.
 
 ## What the server writes with the base
 
-| Output                                                                                                                                                                                       | With base `/3d`                                                                                                                                                                                                                                                |
-| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `index.html` and `desk.html`: the editor at `/` and at any other canonical page path (`//x`, `/./x` and `/x/../y` get 403 from the static file server), the desk at `/desk.html` and `/desk` | `<base href="/3d/">` as the first element of `<head>`, written per request; `Cache-Control: no-cache` and `Vary: X-Forwarded-Prefix`; the desk page keeps its [headers](embedding.md#headers)                                                                  |
-| the redirect of `BASE_PATH` without its slash (`BASE_PATH=/3d`, a request without `X-Forwarded-Prefix`)                                                                                      | `Location: /3d/`                                                                                                                                                                                                                                               |
-| links in MCP results: `editor_url`, the download links of `export_scene`, renders and video exports, model store thumbnails                                                                  | `https://example.com/3d/?project=…`, `https://example.com/3d/api/…`: the scheme of the last value of `X-Forwarded-Proto` and the host of the last value of `X-Forwarded-Host` when a proxy sends usable ones, else `http` and the `Host` header, then the base |
-| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                                                                                              | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the request's base or `BASE_PATH`, spelled as a request target may be (`/%33d/dav/x` is `/3d/dav/x`)                         |
-| the startup log                                                                                                                                                                              | `http://localhost:8080/3d/` and `http://localhost:8080/3d/mcp` with `BASE_PATH=/3d`                                                                                                                                                                            |
+| Output                                                                                                                                                                                       | With base `/3d`                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `index.html` and `desk.html`: the editor at `/` and at any other canonical page path (`//x`, `/./x` and `/x/../y` get 403 from the static file server), the desk at `/desk.html` and `/desk` | `<base href="/3d/">` as the first element of `<head>`, written per request; `Cache-Control: no-cache` and `Vary: X-Forwarded-Prefix`; the desk page keeps its [headers](embedding.md#headers)                                                                                                                                                                                                                                                        |
+| the redirect of `BASE_PATH` without its slash (`BASE_PATH=/3d`, a request without `X-Forwarded-Prefix`)                                                                                      | `Location: /3d/`                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| links in MCP results: `editor_url`, the download links of `export_scene`, renders and video exports, model store thumbnails                                                                  | `https://example.com/3d/?project=…`, `https://example.com/3d/api/…`: the scheme of the last value of `X-Forwarded-Proto` and the host of the last value of `X-Forwarded-Host` when a proxy sends usable ones, else `http` and the `Host` header, then the base; without a usable host (no `Host`, or one refused as [below](#caches-and-headers-behind-a-proxy)), the base alone: paths under it (`/3d/?project=…`), never from the root of the site |
+| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                                                                                              | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the request's base or `BASE_PATH`, spelled as a request target may be (`/%33d/dav/x` is `/3d/dav/x`)                                                                                                                                                                                                               |
+| the startup log                                                                                                                                                                              | `http://localhost:8080/3d/` and `http://localhost:8080/3d/mcp` with `BASE_PATH=/3d`                                                                                                                                                                                                                                                                                                                                                                  |
 
 The base is the request's `X-Forwarded-Prefix` when it has a usable one, else `BASE_PATH`. That is
 all the header's value does: it sets what the server writes (this table) and a base a WebDAV
@@ -189,8 +189,13 @@ self.addEventListener('activate', (event) => {
 The Vite dev server and `vite preview` run at the root (both proxy `/api`, `/sync`, `/mcp`, `/dav`
 and `/otlp` to the server), and answer the editor's page at deeper paths with `<base href="/">`, as
 the server writes it at the root: `vite preview` at every page path that names no built file, the
-dev server at `/desk/` and `/desk.html/` ([development](embedding.md#development)). A subpath is a
-deployment concern, covered by the [tests](#tests) against the built app.
+dev server at `/desk/` and `/desk.html/` ([development](embedding.md#development)). Both read a
+request's path as the server does and answer as it does a path with an empty or dot segment
+(`//desk.html`, `/desk.html//`, `/./x`, `/x/../y`): 403 for a `GET` or `HEAD`, 404 for any other
+method; any method but `GET` and `HEAD` gets 404 outside the proxied routes, and a path that Vite
+would read another way (`/x%2f..%2fdesk`) is answered as one that names no file, so that no path
+serves the desk page without its headers. A subpath is a deployment concern, covered by the
+[tests](#tests) against the built app.
 
 ### Static hosts
 
@@ -302,9 +307,11 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   cannot tell a client's value from the proxy's. It reads the first value of `X-Forwarded-Prefix`
   and the last of the other two, so a proxy that appends its own value to a client's, as httpd
   does with `X-Forwarded-Host`, is read right; a host (that of `X-Forwarded-Host` or of the `Host`
-  header) goes into a link only when it is a name or address of letters, digits, `.` and `-`, or an
-  IPv6 address in brackets, with an optional port. The three configurations above do this (Caddy sets
-  `X-Forwarded-Proto` and `X-Forwarded-Host` without being told).
+  header) goes into a link only when it is a name or address of letters, digits, `.`, `-` and `_`
+  (Docker's service names, `docker_svc:8080`), or an IPv6 address in brackets, with an optional
+  port; with neither usable, a link is a path under the base (`/3d/?project=…`). The three
+  configurations above do this (Caddy sets `X-Forwarded-Proto` and `X-Forwarded-Host` without being
+  told).
 - The pages, the redirect of `BASE_PATH` without its slash (for requests without the header only)
   and the WebDAV proxy's responses (the base in their `<href>`s, `Location` and
   `Content-Location`) depend on `X-Forwarded-Prefix` and say so (`Vary: X-Forwarded-Prefix`, added
@@ -328,14 +335,19 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   (with the 256-character limit), request targets read in origin form, the removal of `BASE_PATH`
   from requests without the header only (any value that is not blank, in any number of header
   lines, turns it off) and of nothing else, the base a kept prefix is reported with, the page's
-  `<base href>`, the MCP links and the hosts they take, the build's top-level names (every entry of
-  `apps/web/public`, and of `apps/web/dist` when it is built, is in the server's list), the project
-  links agents are told to open, and time linear in the length of what requests send (200,000
-  slashes before an `x`). `auth.test.ts`, `cors.test.ts` and `dav-rewrite.test.ts` beside it: the
-  scope a request is checked against comes from the route that serves it, the token is redacted
+  `<base href>`, the MCP links, the hosts they take (`docker_svc:8080` too) and the base alone
+  without one, the build's top-level names (every entry of `apps/web/public`, and of
+  `apps/web/dist` when it is built, is in the server's list), the project links agents are told to
+  open, and time linear in the length of what requests send (200,000 slashes before an `x`).
+  `auth.test.ts`, `cors.test.ts` and `dav-rewrite.test.ts` beside it: the scope a request is
+  checked against comes from the route that serves it, the token is redacted
   from logged URLs in every spelling the server accepts (`?token=`, `?%74oken=`, `?to%6Ben=`), an
   `Origin` is compared with `CORS_ORIGINS` in linear time, and WebDAV paths and `Destination`s are
-  decoded segment by segment and never leave `WEBDAV_URL`.
+  decoded segment by segment (a segment with a control character is refused, and so is one that is
+  `.` or `..` up to a `;`, which servlet containers such as Tomcat cut off: `..;`), checked against
+  `WEBDAV_URL` as the URL parser reads them, and sent without their `token` query pairs: they never
+  leave `WEBDAV_URL` on a WebDAV server that decodes a path once and reads no other spelling as `.`
+  or `..`.
 - `apps/server/test/integration/subpath.test.ts`: a server with `BASE_PATH`, both proxy styles
   (prefix kept with `BASE_PATH` and no header, prefix stripped with `X-Forwarded-Prefix` and
   `BASE_PATH` set too), the pages, the redirect, sync over WebSocket, the WebDAV proxy's `href`s and
@@ -348,11 +360,15 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   under `BASE_PATH`; and health checks answered promptly while clients send 15 KB
   `X-Forwarded-Prefix` or `Origin` headers of slashes. `dav-confinement.test.ts` beside it: WebDAV
   requests and `Destination`s that try to leave `WEBDAV_URL` (`..%2f`, `%2e%2e%2f`,
-  `x%2f..%2f..%2f`, `%%%%`) are refused and reach nothing outside it, and names with `%20` and
-  `%C3%A9` still work. `dav-proxy.test.ts`: the proxy's `Content-Security-Policy`,
+  `x%2f..%2f..%2f`, `%%%%`, `..;`, `%2e%2e%3b`, `.%09.`; in a `Destination` also a raw tab, the one
+  control character Node lets into a header value, and a path that ends in a space before its
+  fragment, which the URL parser trims) are refused and reach nothing outside it, and names with
+  `%20`, `%C3%A9` and `;` still work. `dav-proxy.test.ts`: the proxy's `Content-Security-Policy`,
   `X-Content-Type-Options` and `Vary` on uploaded `.html` and `.svg` files and on every other
-  answer. `sync-upgrades.test.ts`: the token, in each of its spellings, redacted from the access
-  and upgrade logs.
+  answer, and a token in the query (`?token=`, `?%74oken=`, `?to%6Ben=`) that lets GET, PUT,
+  PROPFIND and COPY through but never reaches the WebDAV server, in a URL or in a `Destination`.
+  `sync-upgrades.test.ts`: the token, in each of its spellings, redacted from the access and
+  upgrade logs.
 - `apps/web/test/base-url.test.ts`: the app's URLs under a base, and a page opened outside its
   base (`pageUnderBase`, the inline script built from it, and its place in both pages: after
   `<meta charset>`, before any script or link). `pwa-sw.test.ts` and `pwa-sw-messages.test.ts`
@@ -364,7 +380,12 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
   `apps/server/test/unit/desk-embed.test.ts` and `apps/web/test/vite-config.test.ts`: what
   `npm run dev` and `npm run preview` answer: the editor's page with `<base href="/">` at `/desk/`
   and `/desk.html/` (Vite's in development, the built one in preview) and, in preview, at every
-  other page path that names no built file; a missing file 404, never a page.
+  other page path that names no built file (a folder such as `/icons`, a path that climbs out of
+  the build once decoded such as `/..%2findex.html`, one that does not decode); a missing file 404,
+  never a page; a path with an empty or dot segment 403, any method but `GET` and `HEAD` outside
+  the proxied routes 404, as on the server, and at the paths Vite would read another way
+  (`/x%2f..%2fdesk`, in development `/dist/desk` and `/@fs/…/desk.html`) the editor's page or 404,
+  never the desk page without its headers.
 - `e2e/tests/subpath.spec.ts`: the built editor and desk under `/3d` with the prefix kept
   (`BASE_PATH`) and under `/editor` behind a stripping proxy (`e2e/fixtures/prefix-proxy.mjs`, which
   answers like the nginx configuration): the redirect of the bare prefix, every request of the

@@ -106,16 +106,17 @@ const EQUALS = 61;
 const HASH = 35;
 const TOKEN_NAME = 'token';
 /** The longest spelling of a query name that decodes to `token`: each of its letters as `%HH`. */
-const TOKEN_NAME_MAX = TOKEN_NAME.length * 3;
+export const TOKEN_NAME_MAX = TOKEN_NAME.length * 3;
 const REDACTED = '[REDACTED]';
 
 /**
  * Whether a query name as sent decodes to `token`, in any letter case: `token`, `%74oken`,
  * `to%6Ben`, `TOKEN` (extractToken reads names as URLSearchParams decodes them). Only a name of at
  * most TOKEN_NAME_MAX characters can, so decoding it costs a bounded time; one that does not decode
- * (`%zz`) is not `token`, as URLSearchParams keeps such a `%` as it is.
+ * (`%zz`) is not `token`, as URLSearchParams keeps such a `%` as it is. The logs (redactUrl) and the
+ * WebDAV proxy (dav/rewrite.ts, which leaves such pairs out of what it sends) read names by it.
  */
-function isTokenName(name: string): boolean {
+export function isTokenName(name: string): boolean {
   if (name.length < TOKEN_NAME.length || name.length > TOKEN_NAME_MAX) return false;
   try {
     return decodeURIComponent(name).toLowerCase() === TOKEN_NAME;

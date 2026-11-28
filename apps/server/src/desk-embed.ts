@@ -196,21 +196,42 @@ export const VITE_DEV_MODULE_PREFIXES: readonly string[] = [
  */
 export const VITE_SERVER_ROUTES: readonly string[] = ['/api', '/dav', '/otlp', '/mcp', '/sync'];
 
-/** `pathname` without its trailing slashes, in one pass from its end. */
-function withoutTrailingSlashes(pathname: string): string {
-  let end = pathname.length;
-  while (end > 0 && pathname[end - 1] === '/') end--;
-  return pathname.slice(0, end);
+/**
+ * Whether a request path is canonical as the editor server reads it: its static file server
+ * (fastify-static) decodes the path with decodeURI (`%2e` is a dot and `%5C` a backslash; `%2F`
+ * stays as it is) and answers a GET or HEAD of any other path with 403. A canonical path starts
+ * with `/` and has no backslash, no `.` or `..` segment (`/./x`, `/x/../y`, `/x/.`) and no empty
+ * segment but a last one (`//x`, `/x//y` and `/x//` are not canonical, `/x/` is). A path that does
+ * not decode is read as it is. Time linear in the path's length.
+ */
+export function isCanonicalPath(pathname: string): boolean {
+  let path = pathname;
+  try {
+    path = decodeURI(pathname);
+  } catch {
+    // a malformed escape: the path is read as it is
+  }
+  if (!path.startsWith('/') || path.includes('\\')) return false;
+  const segments = path.split('/');
+  return segments.every(
+    (segment, i) =>
+      segment !== '.' && segment !== '..' && (segment !== '' || i === 0 || i === segments.length - 1),
+  );
 }
 
 /** What viteDeskRoute needs to know of a request besides its path. */
 export interface ViteRequest {
-  /** A GET or a HEAD: only those are answered with the editor's page or a 404 here. */
+  /** A GET or a HEAD: only those are Vite's to answer outside the proxied routes. */
   read: boolean;
   /** Its Accept names text/html: a page the browser opens (a navigation), not a file a page loads. */
   html: boolean;
-  /** In preview, the path names a file of the build (a file in outDir); always false in dev. */
-  builtFile: boolean;
+  /**
+   * Vite may answer the path itself (a GET or HEAD only): in preview, the path names a file of the
+   * build (a file in outDir); in dev, Vite reads it as the path it is (decoded, `%2F` too, it has no
+   * empty or dot segment) and it is neither an HTML file other than the app's two pages nor a path
+   * in the build's folder (vite.config.ts).
+   */
+  servable: boolean;
 }
 
 /** What the Vite dev or preview server does with a request (viteDeskRoute). */
@@ -224,25 +245,33 @@ export interface ViteRoute {
    * dev index.html as Vite makes it, in preview the built one.
    */
   page?: 'index.html';
-  /** The answer is 404: a file the build does not have, never a page. */
+  /** The answer is 403: a path that is not canonical (isCanonicalPath), as the server answers it. */
+  forbidden?: true;
+  /** The answer is 404: a file Vite may not serve, never a page, or a method that no route takes. */
   notFound?: true;
 }
 
 /**
  * What the web app's Vite dev (`dev`) and preview servers (vite.config.ts) do with a request, as the
- * editor server does with its files and its fallback:
- * - the desk page at /desk.html and /desk (served as /desk.html), with the page headers;
+ * editor server does with its files and its fallback, `pathname` read as the server reads it (in
+ * origin form: request-base.ts originForm). In this order:
+ * - a path that is not canonical (isCanonicalPath: an empty or dot segment, a backslash) gets 403
+ *   for a GET or HEAD and 404 for any other method, as from the server, whatever it starts with:
+ *   Vite would read it as another path (`//desk.html` as the desk page, without its headers);
  * - the editor server's routes (VITE_SERVER_ROUTES): left to the proxy;
+ * - any other method than GET and HEAD: 404, as on the server, where no other route takes one
+ *   (Vite would answer a POST with a page too);
+ * - the desk page at /desk.html and /desk (served as /desk.html), with the page headers;
  * - the built files under /assets/ (in dev also the modules and workers it serves in their place):
- *   the asset headers, and in preview a 404 for a GET or HEAD of one the build does not have;
- * - the editor's page for a GET or HEAD of /desk/ or /desk.html/, and in preview of any other path
- *   that names no built file when its Accept names text/html (a page the browser opens), as the
- *   server's fallback answers them. A GET or HEAD there that accepts no HTML (a script, a style, an
- *   image, a fetch) asks for a file the build does not have: 404, never a page. The page carries
- *   `<base href="/">`, as the server writes it at the root, so that its base is the root, where it
- *   reaches its server (the proxied routes) and, in preview, loads its relative file URLs, and not
- *   the path it was opened at. The root itself and the built files are Vite's to serve, as is, in
- *   dev, every other path: Vite's own page there has no `<base href>`;
+ *   the asset headers, and 404 for one Vite may not serve (`request.servable`);
+ * - the editor's page for /desk/ and /desk.html/, and for any other path Vite may not serve (in
+ *   preview, one that names no built file) when its Accept names text/html (a page the browser
+ *   opens), as the server's fallback answers them. A GET or HEAD there that accepts no HTML (a
+ *   script, a style, an image, a fetch) asks for a file Vite may not serve: 404, never a page. The
+ *   page carries `<base href="/">`, as the server writes it at the root, so that its base is the
+ *   root, where it reaches its server (the proxied routes) and, in preview, loads its relative file
+ *   URLs, and not the path it was opened at. The root itself and the paths Vite may serve are
+ *   Vite's: in dev its own page at a deeper path, which has no `<base href>`;
  * - no desk headers on anything else: never on the editor's pages, the service worker or the
  *   manifest.
  */
@@ -252,19 +281,22 @@ export function viteDeskRoute(
   settings: DeskEmbedSettings,
   request: ViteRequest,
 ): ViteRoute {
+  if (!isCanonicalPath(pathname))
+    return request.read ? { headers: {}, forbidden: true } : { headers: {}, notFound: true };
+  if (VITE_SERVER_ROUTES.some((route) => pathname.startsWith(route))) return { headers: {} };
+  if (!request.read) return { headers: {}, notFound: true };
   if (isDeskPagePath(pathname))
     return {
       headers: deskPageHeaders(settings),
       rewrite: pathname === '/desk.html' ? undefined : '/desk.html',
     };
-  if (VITE_SERVER_ROUTES.some((route) => pathname.startsWith(route))) return { headers: {} };
   const module = dev && VITE_DEV_MODULE_PREFIXES.some((prefix) => pathname.startsWith(prefix));
   if (module || pathname.startsWith('/assets/')) {
     const headers = deskAssetHeaders(settings);
-    return !dev && request.read && !request.builtFile ? { headers, notFound: true } : { headers };
+    return request.servable ? { headers } : { headers, notFound: true };
   }
-  if (!request.read) return { headers: {} };
-  if (isDeskPagePath(withoutTrailingSlashes(pathname))) return { headers: {}, page: 'index.html' };
-  if (dev || request.builtFile || pathname === '/') return { headers: {} };
+  if (pathname.endsWith('/') && isDeskPagePath(pathname.slice(0, -1)))
+    return { headers: {}, page: 'index.html' };
+  if (request.servable || pathname === '/') return { headers: {} };
   return request.html ? { headers: {}, page: 'index.html' } : { headers: {}, notFound: true };
 }
