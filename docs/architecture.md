@@ -1200,12 +1200,18 @@ Extraction takes 24–117 ms, decoding the dressed set 51 ms and inserting it 11
   deleted by hand; the server deletes neither. Exports of that time may keep a `push` block in their
   `job.json`, which `export_status` and `list_exports` leave out (`video/jobs.ts`).
 - **Serving under a subpath** (`apps/server/src/base-path.ts`, `request-base.ts`;
-  [subpath.md](subpath.md)): a request's base is its `X-Forwarded-Prefix` when usable, else
-  `BASE_PATH`. Before anything routes a request, its URL loses the base it starts with (the
-  request's or `BASE_PATH`): HTTP requests in Fastify's `rewriteUrl`, WebSocket upgrades in an
-  `upgrade` listener that runs before the sync server's. Routes, hooks and the sync server see paths
-  from the server's root, requests without the prefix keep working, the logs give the URL as sent,
-  and the base without its slash is redirected to it with its slash (308). The two pages,
+  [subpath.md](subpath.md)): a request's base, the one the server writes into its pages and links,
+  is its `X-Forwarded-Prefix` when usable, else `BASE_PATH`. Before anything routes a request, its
+  target is put in origin form (an absolute-form target by its path, no fragment, percent-encoded
+  unreserved characters decoded) and loses `BASE_PATH` when it starts with it, and nothing else: an
+  `X-Forwarded-Prefix`, which clients can send, never moves a route. HTTP requests are rewritten in
+  Fastify's `rewriteUrl`, WebSocket upgrades in an `upgrade` listener that runs before the sync
+  server's. Routes, hooks and the sync server see paths from the server's root, requests without the
+  prefix keep working, the logs give the URL as sent, and `BASE_PATH` without its slash is
+  redirected to it with its slash (308). The auth hook checks a request against the scope of the
+  route that serves it (`auth.ts` `routedPath`), not against the spelling of its path. Header values
+  are read in time linear in their length, and a base longer than 256 characters is refused
+  (`BASE_PATH`) or ignored (the header). The two pages,
   `index.html` and `desk.html`, are written per request with the request's `<base href>`
   (`static.ts`), and the links that leave the server carry the base: those of MCP results
   (`mcp/tool-kit.ts` `baseUrl`, with the scheme and host the client used) and the WebDAV proxy's

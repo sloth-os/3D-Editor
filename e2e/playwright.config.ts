@@ -9,13 +9,22 @@ const root = resolve(here, '..');
 const serverMain = resolve(root, 'apps/server/dist/main.js');
 const publicDir = resolve(root, 'apps/web/dist');
 
-export const PORTS = { plain: 4180, webdavServer: 4181, subpath: 4182, prefixProxy: 4183, webdav: 4199 };
+export const PORTS = {
+  plain: 4180,
+  webdavServer: 4181,
+  subpath: 4182,
+  prefixProxy: 4183,
+  staticHost: 4184,
+  webdav: 4199,
+};
 export const WEBDAV = { url: `http://127.0.0.1:${PORTS.webdav}`, username: 'editor', password: 'secret' };
 /**
  * The prefixes of tests/subpath.spec.ts (docs/subpath.md): the server's own BASE_PATH on
  * PORTS.subpath, and the path under which the prefix proxy serves the plain server.
  */
 export const PREFIXES = { subpath: '/3d', prefixProxy: '/editor' };
+/** The folder of the static host (PORTS.staticHost) that serves the build besides its root. */
+export const STATIC_FOLDER = '/folder/';
 
 const common = { PUBLIC_DIR: publicDir, LOG_LEVEL: 'warn', HOST: '127.0.0.1' };
 
@@ -67,6 +76,8 @@ const DESK_SPECS = /[\\/]desk-[^\\/]*\.spec\.ts$/;
  *  - :4183 a proxy that serves :4180 under /editor/, stripping the prefix and sending
  *    X-Forwarded-Prefix, as the nginx configuration of docs/subpath.md does
  *    (fixtures/prefix-proxy.mjs)
+ *  - :4184 a static host without an editor server, serving the web app's build at / and under
+ *    /folder/, files only (fixtures/static-host.mjs, as the nginx example of docs/embedding.md)
  *  - :4199 WebDAV server (basic auth editor/secret, CORS enabled)
  */
 export default defineConfig({
@@ -165,6 +176,12 @@ export default defineConfig({
       url: `http://127.0.0.1:${PORTS.prefixProxy}${PREFIXES.prefixProxy}/healthz`,
       reuseExistingServer: false,
       timeout: 60_000,
+    },
+    {
+      command: `node fixtures/static-host.mjs ${PORTS.staticHost} ${publicDir} ${STATIC_FOLDER}`,
+      url: `http://127.0.0.1:${PORTS.staticHost}${STATIC_FOLDER}`,
+      reuseExistingServer: false,
+      timeout: 30_000,
     },
   ],
 });

@@ -243,10 +243,17 @@ describe("the web app's Vite servers (vite.config.ts)", () => {
         expect(viteDeskRoute(p, dev, DEFAULT_DESK_EMBED), `${p} dev=${dev}`).toEqual({ headers: {} });
   });
 
-  it('serve the editor at /desk/ and /desk.html/, as the server and the service worker do', () => {
-    for (const dev of [true, false])
-      for (const p of ['/desk/', '/desk.html/'])
-        expect(viteDeskRoute(p, dev, DEFAULT_DESK_EMBED), p).toEqual({ headers: {}, rewrite: '/index.html' });
+  it('serve the editor at /desk/ and /desk.html/ as the server does: Vite\'s in dev, the built page with <base href="/"> in preview', () => {
+    for (const p of ['/desk/', '/desk.html/', '/desk//', '/desk.html///']) {
+      // in dev, index.html as Vite makes it, whose URLs are paths from the root
+      expect(viteDeskRoute(p, true, DEFAULT_DESK_EMBED), p).toEqual({ headers: {}, rewrite: '/index.html' });
+      // in preview, the built index.html (relative URLs), which the preview server answers with the
+      // root's <base href> (vite.config.ts), as the server writes it: never the file as it is
+      expect(viteDeskRoute(p, false, DEFAULT_DESK_EMBED), p).toEqual({ headers: {}, page: 'index.html' });
+    }
+    // no other path is the editor's page here: the desk's, files and look-alikes keep their routes
+    for (const p of ['/desk', '/desk.html', '/desks/', '/x/desk/', '/desk/x'])
+      expect(viteDeskRoute(p, false, DEFAULT_DESK_EMBED).page, p).toBeUndefined();
   });
 });
 

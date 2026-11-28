@@ -12,54 +12,74 @@ desk](#the-desk-under-a-subpath) · [proxy configurations](#proxy-configurations
 
 ## The base path
 
-| Source                                                  | Example | Precedence         |
-| ------------------------------------------------------- | ------- | ------------------ |
-| `X-Forwarded-Prefix` request header (sent by the proxy) | `/3d`   | per request, first |
-| `BASE_PATH`                                             | `/3d`   |                    |
-| none                                                    |         | the root (default) |
+| Source                                                 | Example | The base the server writes into pages and links | Removed from request paths |
+| ------------------------------------------------------ | ------- | ----------------------------------------------- | -------------------------- |
+| `X-Forwarded-Prefix` request header (set by the proxy) | `/3d`   | per request, first                              | never                      |
+| `BASE_PATH`                                            | `/3d`   | when a request has no usable header             | when a path starts with it |
+| none                                                   |         | the root (default)                              |                            |
 
 A base path is `/` followed by path segments of `A-Z a-z 0-9 . _ ~ -`, without a trailing slash
-(`/3d/` is read as `/3d`; `/` or an empty value is the root). No segment is `.` or `..`, and the
-first segment is none of the server's own top-level paths, since a path under it could then be
-read two ways: `api`, `sync`, `mcp`, `dav`, `otlp`, `metrics`, `healthz`, `readyz`, `assets`,
-`icons`, `desk`, and the build's files at the top (`index.html`, `desk.html`, `sw.js`,
+(`/3d/` is read as `/3d`; `/` or an empty value is the root), and at most 256 characters long as
+given (spaces and trailing slashes count). No segment is `.` or `..`, and the first segment is
+none of the server's own top-level paths, since a path under it could then be read two ways:
+`api`, `sync`, `mcp`, `dav`, `otlp`, `metrics`, `healthz`, `readyz`, `assets`, `icons`, `desk`,
+and the build's files at the top (`index.html`, `desk.html`, `sw.js`, `sw.js.map`,
 `manifest.webmanifest`, `favicon.svg`). The server refuses a `BASE_PATH` it cannot use when it
-starts, with the reason (`Invalid configuration: BASE_PATH: …`). It ignores an
-`X-Forwarded-Prefix` it cannot use (a header with several comma-separated values counts by its
-first), so the header can never steer links off the site.
+starts, with the reason (`Invalid configuration: BASE_PATH: …`, such as
+`'…' is longer than 256 characters`). It ignores an `X-Forwarded-Prefix` it cannot use, so the
+header can never steer links off the site: a header with several comma-separated values counts by
+its first, and one whose first value is longer than 256 characters is ignored before anything else
+reads it.
 
 ### Both proxy styles
 
 A proxy either **strips** the prefix (nginx `proxy_pass http://127.0.0.1:8080/;` with its trailing
 slash, Caddy `handle_path`, Traefik `StripPrefix`) or **keeps** it (nginx
-`proxy_pass http://127.0.0.1:8080;`, Caddy `handle`). The server accepts both: before anything
-routes a request (HTTP requests and WebSocket upgrades alike), a path that starts with the
-request's base, or with `BASE_PATH`, has it removed; any other path is served as it is. So:
+`proxy_pass http://127.0.0.1:8080;`, Caddy `handle`). Before anything routes a request (HTTP
+requests and WebSocket upgrades alike), the server reads its target as the router does (an
+absolute-form `http://host/3d/x` by its path, without a fragment, with percent-encoded letters,
+digits and `- . _ ~` decoded: `/%33d/x` is `/3d/x`) and removes `BASE_PATH` from a path that starts
+with it. It removes nothing else: `X-Forwarded-Prefix` sets only the base the server
+[writes](#what-the-server-writes-with-the-base), never what a request is routed to. Clients can
+send the header too, and a proxy that passes theirs on (and denies `/metrics` or `/mcp`, say) would
+otherwise let any client move the server's routes under a prefix of its choice (`/x/metrics` with
+`X-Forwarded-Prefix: /x`). So:
 
-- a stripping proxy that sends `X-Forwarded-Prefix` needs no setting on the server (it needs the
-  header, or `BASE_PATH`, to write the [links](#what-the-server-writes-with-the-base));
-- a keeping proxy needs `BASE_PATH` (or the header);
-- requests to the server's own port without the prefix keep working: the Docker health check
-  (`/healthz`), Prometheus (`/metrics`), and the editor opened on the machine itself.
+- a stripping proxy that sets `X-Forwarded-Prefix` needs no setting on the server (it needs the
+  header, or `BASE_PATH`, to write the links);
+- a keeping proxy needs `BASE_PATH`: the header alone does not make the server remove the prefix.
+  The first request whose path starts with its own `X-Forwarded-Prefix`, while `BASE_PATH` names
+  another base or none, makes the server say so in its log, once, at warn:
+  `… a proxy that keeps the prefix needs BASE_PATH=/3d …`;
+- on the server's own port, requests without the prefix keep working: the Docker health check
+  (`/healthz`), Prometheus (`/metrics`) and the API. With `BASE_PATH=/3d`, an editor or desk page
+  opened there (`http://host:8080/`, `/?project=…`, `/desk.html?embed=1#…`) is written with
+  `<base href="/3d/">` and moves itself in the browser, before it starts, to the same page under
+  the base (`/3d/`, `/3d/?project=…`, `/3d/desk.html?embed=1#…`), inside the service worker's
+  scope ([the web app](#the-web-app)).
 
-A request for the base without its slash (`/3d`, also with a query) is redirected to `/3d/` with
-status 308, so the editor's pages are always inside the service worker's scope. With a stripping
+A request for `BASE_PATH` without its slash (`/3d`, also with a query) is redirected to `/3d/` with
+status 308, so that the editor's pages are inside the service worker's scope. The redirect is
+`BASE_PATH`'s: without `BASE_PATH` the server answers `/3d` as any other path, and with a stripping
 proxy that request never reaches the server; the [proxy configurations](#proxy-configurations)
 redirect it themselves.
 
 Set `BASE_PATH` with either style where you can: the startup log then shows the editor's address
-under the prefix, and pages opened on the server's own port load their files under it too (the
-server accepts both).
+under the prefix, and pages opened on the server's own port move under it.
 
 ## What the server writes with the base
 
 | Output                                                                                                                      | With base `/3d`                                                                                                                                                                               |
 | --------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `index.html` and `desk.html`: the editor at `/` and at any other page path, the desk at `/desk.html` and `/desk`            | `<base href="/3d/">` as the first element of `<head>`, written per request; `Cache-Control: no-cache` and `Vary: X-Forwarded-Prefix`; the desk page keeps its [headers](embedding.md#headers) |
-| the redirect of the bare base                                                                                               | `Location: /3d/`                                                                                                                                                                              |
+| the redirect of `BASE_PATH` without its slash (`BASE_PATH=/3d`)                                                             | `Location: /3d/`                                                                                                                                                                              |
 | links in MCP results: `editor_url`, the download links of `export_scene`, renders and video exports, model store thumbnails | `https://example.com/3d/?project=…`, `https://example.com/3d/api/…`: the scheme and host the client used (`X-Forwarded-Proto` and `X-Forwarded-Host` when a proxy sends them), then the base  |
-| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                             | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the base                                                    |
+| the WebDAV proxy's `<href>`s, `Location` and `Content-Location`                                                             | under `/3d/dav/`, so WebDAV clients (the editor's among them) can follow them; a `Destination` header is accepted with or without the request's base or `BASE_PATH`                           |
 | the startup log                                                                                                             | `http://localhost:8080/3d/` and `http://localhost:8080/3d/mcp` with `BASE_PATH=/3d`                                                                                                           |
+
+The base is the request's `X-Forwarded-Prefix` when it has a usable one, else `BASE_PATH`. That is
+all the header does: it sets what the server writes (this table) and a base a WebDAV `Destination`
+may start with, never what a request is routed to ([both proxy styles](#both-proxy-styles)).
 
 REST answers give the server's own routes as paths from its root, the same under every prefix:
 `webdav.url` of `GET /api/config` (`/dav`), `files[].url` of a [video export](video-export.md#rest),
@@ -73,17 +93,39 @@ workers, icons and the manifest relative to the document's base URL, which the s
 `<base href>`. At start the app reads its base from `document.baseURI`
 (`apps/web/src/app/base-url.ts`) and derives everything from it:
 
-| Use                                                 | URL                                                                                                                                                                                                |
-| --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| REST, model store, video exports, browser telemetry | `<base>api/…`, `<base>otlp/…`                                                                                                                                                                      |
-| live sync                                           | `ws(s)://<host><base>sync/<project>`                                                                                                                                                               |
-| WebDAV through the server                           | `<base>dav/`                                                                                                                                                                                       |
-| service worker                                      | `<base>sw.js` with scope `<base>`; its routes (the desk page, the editor's page for navigations, the server paths it leaves to the network) are paths relative to its scope                        |
-| web app manifest                                    | `<base>manifest.webmanifest` with relative `start_url`, `scope`, icons and file handler, and no `id`: an installed editor is identified by its start URL (`https://example.com/3d/`), one per base |
-| project links                                       | `?project=<id>` on the page's own path                                                                                                                                                             |
+| Use                                                 | URL                                                                                                                                                                                                                                                                             |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| REST, model store, video exports, browser telemetry | `<base>api/…`, `<base>otlp/…`                                                                                                                                                                                                                                                   |
+| live sync                                           | `ws(s)://<host><base>sync/<project>`                                                                                                                                                                                                                                            |
+| WebDAV through the server                           | `<base>dav/`                                                                                                                                                                                                                                                                    |
+| service worker                                      | `<base>sw.js` with scope `<base>`; from its precache it answers the editor's page (`<base>`, `<base>index.html`, with any query) and the desk page, offline too, and it leaves every other path in its scope to the network; it deletes only its own scope's outdated precaches |
+| web app manifest                                    | `<base>manifest.webmanifest` with relative `start_url`, `scope`, icons and file handler, and no `id`: an installed editor is identified by its start URL (`https://example.com/3d/`), one per base                                                                              |
+| project links                                       | `?project=<id>` on the page's own path                                                                                                                                                                                                                                          |
 
 **Preferences › Collaboration › Server URL**, when set, takes the place of the base for the
 server's routes; it may carry a path (`https://example.com/3d`).
+
+A page opened outside its base moves under it before anything of it runs. The server with
+`BASE_PATH=/3d` writes `<base href="/3d/">` into its pages on its own port at `/` too, where the
+editor would work online but outside its service worker's scope: `http://localhost:8080/` and
+`http://localhost:8080/?project=x` move to `/3d/` and `/3d/?project=x`, `/desk.html?embed=1` to
+`/3d/desk.html?embed=1` (in a host's frame too): the path from the root of the origin, under the
+base, with the query and the fragment. A small inline script at the top of both pages does it
+(`pageUnderBase` in `apps/web/src/app/base-url.ts`): it stops the page's loading, so that none of
+the app's scripts runs (no service worker, no storage, no connection), and replaces the address. It
+never moves a page at the root (`<base href="/">`), behind a proxy that serves the base (the page
+is under it already) or on a static host (no `<base href>`). The pages' own
+`Content-Security-Policy` (the desk's `frame-ancestors`) leaves scripts alone; a `script-src` added
+in front of the server must allow that inline script, or the page stays where it was opened.
+
+One origin can hold several editor deployments of this version, each under a base of its own (`/`
+and `/3d/`, `/a/` and `/b/`): each one's service worker answers only the pages of its own base
+(the editor's and the desk's) and deletes only the outdated precaches of its own scope, so a
+deployment at a parent path neither answers the pages of one under it nor deletes its precache.
+Any other service worker whose scope covers the base can answer the base's navigations or delete
+its caches: a site's own at `/`, or an editor of an earlier version at a parent path (it answers
+every navigation in its scope with its own page, and deletes every precache whose name holds its
+scope). Give the editor a host name of its own then.
 
 The Vite dev server and `vite preview` run at the root (`npm run dev` proxies `/api`, `/sync`,
 `/mcp`, `/dav` and `/otlp` to the server); a subpath is a deployment concern, covered by the
@@ -95,14 +137,18 @@ The Vite dev server and `vite preview` run at the root (`npm run dev` proxies `/
 `<folder>/` and `<folder>/desk.html` load everything relative to themselves. A static host writes no
 `<base href>`, so it must not answer deeper paths with `index.html`: such a page would look for its
 files in the wrong folder. The editor never links to deeper paths; answer them with 404 or a
-redirect to `<folder>/` (the [nginx example](embedding.md#static-hosts) does). Without the editor
-server, the clean URL `<folder>/desk` is the host's to map to `desk.html`.
+redirect to `<folder>/` (the [nginx example](embedding.md#static-hosts) does). The service worker
+leaves them to the host as well: once installed it answers `<folder>/` and `<folder>/index.html`
+(the editor) and `<folder>/desk.html` from its precache, offline too, and no other page. Without
+the editor server, the clean URL `<folder>/desk` is the host's to map to `desk.html`.
 
 ## The desk under a subpath
 
 The desk is at `<base>desk.html` (also `<base>desk`) with the same
 [headers](embedding.md#headers) (`DESK_EMBED_ORIGINS`, `DESK_EMBED_COEP`), and the base's service
-worker serves it offline. Hosts frame `https://desk.example.com/3d/desk.html`. The origin, not the
+worker serves it offline. Hosts frame `https://desk.example.com/3d/desk.html`; a frame of the
+server's own port without the prefix (`http://desk-host:8080/desk.html` with `BASE_PATH=/3d`)
+moves to `/3d/desk.html` before the desk starts ([the web app](#the-web-app)). The origin, not the
 path, is what browsers keep apart: pages under other paths of the desk's origin share its storage
 (IndexedDB, Cache Storage, cookies) and can script it. Give the desk a host name of its own, apart
 from the pages that frame it and from anything you do not trust. `DESK_EMBED_ORIGINS` lists
@@ -116,8 +162,8 @@ Copy-ready files are in `deploy/`: [`deploy/caddy/Caddyfile`](../deploy/caddy/Ca
 [`deploy/httpd/3d-editor.conf`](../deploy/httpd/3d-editor.conf). Each serves `/3d/` from an editor
 server on `127.0.0.1:8080`, redirects `/3d` to `/3d/`, forwards WebSocket upgrades (the live sync),
 passes the original host and scheme, buffers neither MCP streams nor downloads, leaves request size
-limits to the server (10 MB for JSON; WebDAV bodies stream through) and allows long requests (MCP
-calls that wait for renders, export downloads).
+limits to the server (10 MB for `/api`, 100 MB for `/mcp`, 5 MB for `/otlp`; WebDAV bodies stream
+through) and allows long requests (MCP calls that wait for renders, export downloads).
 
 ```caddy
 # Caddy 2.9 or later ({?query}): handle_path strips /3d; the header tells the editor where it lives
@@ -144,6 +190,7 @@ server {
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
         proxy_set_header Host $http_host;
+        proxy_set_header X-Forwarded-Host $http_host;
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_set_header X-Forwarded-Prefix /3d;
         proxy_buffering off;
@@ -163,7 +210,6 @@ ProxyPreserveHost On
 <Location "/3d/">
     RequestHeader set X-Forwarded-Prefix "/3d"
     RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}
-    LimitRequestBody 0
     ProxyPass http://127.0.0.1:8080/ upgrade=websocket flushpackets=on timeout=3600
     ProxyPassReverse http://127.0.0.1:8080/
 </Location>
@@ -177,8 +223,15 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
 
 ## Caches and headers behind a proxy
 
+- The proxy sets `X-Forwarded-Prefix`, `X-Forwarded-Proto` and `X-Forwarded-Host` itself, in place
+  of what clients send: the server writes the base of its pages and the scheme, host and base of
+  its links from them, and cannot tell a client's value from the proxy's. It reads the first value
+  of `X-Forwarded-Prefix` and the last of the other two, so a proxy that appends its own value to
+  a client's, as httpd does with `X-Forwarded-Host`, is read right. The three configurations above
+  do this (Caddy sets `X-Forwarded-Proto` and `X-Forwarded-Host` without being told).
 - The pages depend on `X-Forwarded-Prefix` and say so (`Vary: X-Forwarded-Prefix`): a shared cache
-  in front of the server keys them on it, or sits in front of the proxy that sets it.
+  in front of the server keys them on it, or sits in front of the proxy that sets it. The redirect
+  of `BASE_PATH` without its slash depends on the URL alone.
 - The desk's `Cross-Origin-Embedder-Policy`, `Cross-Origin-Resource-Policy` and
   `Content-Security-Policy` must reach the browser unchanged, and nothing may add
   `X-Frame-Options` ([headers](embedding.md#headers)); the three configurations above pass the
@@ -188,19 +241,48 @@ docker run -d -p 127.0.0.1:8080:8080 -v editor-data:/data -e BASE_PATH=/3d ghcr.
 
 ## Tests
 
-- `apps/server/test/unit/base-path.test.ts`: parsing of `BASE_PATH` and `X-Forwarded-Prefix`,
-  the prefix removal, the page's `<base href>` and the MCP links.
+- `apps/server/test/unit/base-path.test.ts`: parsing of `BASE_PATH` and `X-Forwarded-Prefix`
+  (with the 256-character limit), request targets read in origin form, the removal of `BASE_PATH`
+  and of nothing else, the page's `<base href>`, the MCP links, the build's top-level names (every
+  entry of `apps/web/public`, and of `apps/web/dist` when it is built, is in the server's list),
+  the project links agents are told to open, and time linear in the length of what requests send
+  (200,000 slashes before an `x`). `auth.test.ts` and `cors.test.ts` beside it: the scope a request
+  is checked against comes from the route that serves it, and an `Origin` is compared with
+  `CORS_ORIGINS` in linear time.
 - `apps/server/test/integration/subpath.test.ts`: a server with `BASE_PATH`, both proxy styles
-  (prefix kept, prefix stripped with `X-Forwarded-Prefix`), the pages, the redirect, sync over
-  WebSocket, the WebDAV proxy's `href`s and the MCP links.
-- `apps/web/test/base-url.test.ts` and the service worker's tests: the app's URLs and the service
-  worker's routes under a base.
+  (prefix kept with `BASE_PATH`, prefix stripped with `X-Forwarded-Prefix`), the pages, the
+  redirect, sync over WebSocket, the WebDAV proxy's `href`s and the MCP links; an
+  `X-Forwarded-Prefix` that never moves a route (`/x/metrics` and `POST /x/mcp` with
+  `X-Forwarded-Prefix: /x`) and the warning once a path starts with it; `AUTH_TOKEN` on every
+  spelling of the API, `/mcp`, `/dav`, `/otlp` and sync upgrades (percent-encoded letters, absolute
+  form, fragments), at the root and under `BASE_PATH`; and health checks answered promptly while
+  clients send 15 KB `X-Forwarded-Prefix` or `Origin` headers of slashes.
+- `apps/web/test/base-url.test.ts`: the app's URLs under a base, and a page opened outside its
+  base (`pageUnderBase`, the inline script built from it, and its place in both pages: after
+  `<meta charset>`, before any script or link). `pwa-sw.test.ts` and `pwa-sw-messages.test.ts`
+  beside it: the service worker's routes under a base (the editor's page only at `<base>` and
+  `<base>index.html`, with any query, at the root, under `/3d/` and under a dotted base, before the
+  precache's route) and the outdated precaches it deletes, only its own scope's.
+  `pwa-register.test.ts`: the editor registers the base's `sw.js` as an absolute URL, and offers
+  an update only for a version that waits or that another page installed.
+  `apps/server/test/unit/desk-embed.test.ts`: `npm run preview` answers `/desk/` and `/desk.html/`
+  with the built `index.html`, `npm run dev` with its own page.
 - `e2e/tests/subpath.spec.ts`: the built editor and desk under `/3d` with the prefix kept
   (`BASE_PATH`) and under `/editor` behind a stripping proxy (`e2e/fixtures/prefix-proxy.mjs`, which
   answers like the nginx configuration): the redirect of the bare prefix, every request of the
   pages, their workers and the service worker under the prefix, the live sync, a project created and
   reloaded and its `editor_url` from MCP, the desk page and its headers, the service worker's scope
-  and precache, the manifest, and an unknown API path answered by the server, not the editor.
+  and precache, the manifest, and an unknown API path answered by the server, not the editor. A
+  page opened outside its base (`/?project=abc`, `/desk.html`, `/desk`, and `/desk.html` in a
+  host's frame, on the `BASE_PATH` server's own port) moves under it before any of its scripts
+  runs, into its service worker's scope; root deployments, and proxies that serve the base, never
+  move a page; the editor at a deeper path of its base (`/desk/`, `/x/y`) registers the base's
+  service worker as its own and offers no update.
+- `e2e/tests/static-host.spec.ts`: the build on a static host without an editor server
+  (`e2e/fixtures/static-host.mjs`: files only, at `/` and under `/folder/` of one origin, its own
+  404 for anything else). Once the service worker is installed, a deeper path is the host's 404,
+  never an editor page, and the editor and the desk load offline; a root deployment's service
+  worker answers no page of the deployment under `/folder/` and deletes none of its precaches.
 - `apps/server/test/unit/subpath-docs.test.ts`: every directive of the [proxy
   configurations](#proxy-configurations) is in its file in `deploy/`, in the same order, and this
   page's links, files and list of the server's own paths are those of the repository.

@@ -2,8 +2,11 @@ import { defineConfig, type Connect, type Plugin } from 'vite';
 import preact from '@preact/preset-vite';
 import { VitePWA } from 'vite-plugin-pwa';
 import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { withBaseHref } from '../server/src/base-path.ts';
 import { deskEmbedSettings, viteDeskRoute } from '../server/src/desk-embed.ts';
+import { withPageUnderBaseScript } from './src/app/base-url.ts';
 
 const pkg = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as {
   version: string;
@@ -16,23 +19,46 @@ const serverTarget = process.env.EDITOR_SERVER_URL ?? 'http://127.0.0.1:8080';
  * by path as the server chooses them by file: desk.html, also at /desk, with COEP, CORP and CSP
  * frame-ancestors; the built files under /assets/ (in dev also its modules and workers) with COEP
  * and CORP; the editor's pages, the service worker and the rest with none of them, whoever asks
- * (the service worker's precache fetches index.html like a script, not as a page).
+ * (the service worker's precache fetches index.html like a script, not as a page). The editor's
+ * page at /desk/ and /desk.html/: in dev Vite's index.html, in preview the built one with
+ * `<base href="/">`, as the server writes it at the root (its URLs are relative).
  */
 function deskEmbedHeaders(): Plugin {
   const settings = deskEmbedSettings(process.env);
   const middleware =
-    (dev: boolean): Connect.NextHandleFunction =>
+    (dev: boolean, outDir = ''): Connect.NextHandleFunction =>
     (req, res, next) => {
       const url = new URL(req.url ?? '/', 'http://localhost');
       const route = viteDeskRoute(url.pathname, dev, settings);
       for (const [k, v] of Object.entries(route.headers)) res.setHeader(k, v);
+      if (route.page && (req.method === 'GET' || req.method === 'HEAD')) {
+        const page = withBaseHref(readFileSync(resolve(outDir, route.page), 'utf8'), '');
+        res.setHeader('content-type', 'text/html; charset=utf-8');
+        res.setHeader('cache-control', 'no-cache');
+        res.setHeader('content-length', Buffer.byteLength(page));
+        res.end(req.method === 'HEAD' ? undefined : page);
+        return;
+      }
       if (route.rewrite) req.url = `${route.rewrite}${url.search}`;
       next();
     };
   return {
     name: 'desk-embed-headers',
     configureServer: (server) => void server.middlewares.use(middleware(true)),
-    configurePreviewServer: (server) => void server.middlewares.use(middleware(false)),
+    configurePreviewServer: (server) =>
+      void server.middlewares.use(middleware(false, resolve(server.config.root, server.config.build.outDir))),
+  };
+}
+
+/**
+ * The pages move under their base before anything of them runs (docs/subpath.md, "The web app";
+ * src/app/base-url.ts pageUnderBase): index.html and desk.html carry the inline script that does
+ * it right after their `<meta charset>`, in the build and on the dev server alike.
+ */
+function pagesUnderTheirBase(): Plugin {
+  return {
+    name: 'pages-under-their-base',
+    transformIndexHtml: { order: 'post', handler: (html) => withPageUnderBaseScript(html) },
   };
 }
 
@@ -112,6 +138,7 @@ export default defineConfig({
       devOptions: { enabled: false },
     }),
     deskPageWithoutManifest(),
+    pagesUnderTheirBase(),
   ],
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),

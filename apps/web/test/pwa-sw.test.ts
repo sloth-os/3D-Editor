@@ -10,7 +10,7 @@ import {
   skipWaitingUnlessDeskOpen,
   withWorkerCoep,
 } from '../src/pwa/sw-desk';
-import { navigationDenylist, pathInScope } from '../src/pwa/sw-scope';
+import { editorPageNavigations, outdatedPrecaches, pathInScope } from '../src/pwa/sw-scope';
 
 /*
  * The service worker's handling of the embeddable desk (src/pwa/sw-desk.ts, used by sw.ts;
@@ -255,71 +255,134 @@ describe("the service worker's scope", () => {
       expect(pathInScope(url, SUB), url).toBeNull();
   });
 
-  /** Whether a navigation to `url` is left to the network (Workbox tests a path with its query). */
-  const denied = (list: RegExp[], url: string) => {
+  /** Whether the service worker answers a navigation to `url` with the editor's page (Workbox tests a path with its query). */
+  const answered = (list: RegExp[], url: string) => {
     const u = new URL(url);
     return list.some((r) => r.test(`${u.pathname}${u.search}`));
   };
 
-  it("at the root is the denylist the service worker always had: the server's own paths", () => {
-    const before = [
-      /^\/api\//,
-      /^\/sync\//,
-      /^\/mcp/,
-      /^\/dav\//,
-      /^\/otlp\//,
-      /^\/metrics/,
-      /^\/healthz/,
-      /^\/readyz/,
-    ];
-    for (const scope of [ORIGIN, `${ORIGIN}/`])
-      expect(navigationDenylist(scope).map(String), scope).toEqual(before.map(String));
-    const list = navigationDenylist(`${ORIGIN}/`);
-    for (const path of [
-      '/api/projects',
-      '/sync/p1',
-      '/mcp',
-      '/mcp/x',
-      '/dav/',
-      '/otlp/v1/traces',
-      '/metrics',
-      '/healthz',
-      '/readyz',
-    ])
-      expect(denied(list, `${ORIGIN}${path}`), path).toBe(true);
-    // the editor's pages, also at the bare names of the server's route families (as before)
-    for (const path of ['/', '/?project=p1', '/index.html', '/desk/', '/api', '/dav', '/projects/api/'])
-      expect(denied(list, `${ORIGIN}${path}`), path).toBe(false);
+  /**
+   * Navigations no editor's page answers: deeper paths, the desk's look-alikes, the server's own
+   * paths, the files and the clean URL of index.html, under `base` (a path with its slash).
+   */
+  const NOT_THE_EDITOR = (base: string) => [
+    `${base}x/y`,
+    `${base}x/y?project=p1`,
+    `${base}x/`,
+    `${base}desk/`,
+    `${base}desk.html/`,
+    `${base}desk/x`,
+    `${base}index`,
+    `${base}index.htm`,
+    `${base}index.html/`,
+    `${base}index.html/x`,
+    `${base}api`,
+    `${base}api/projects`,
+    `${base}dav/3d-editor/`,
+    `${base}mcp`,
+    `${base}healthz`,
+    `${base}sw.js`,
+    `${base}assets/main-1a2b.js`,
+  ];
+
+  it("at the root answers only the editor's page: / and /index.html, with any query", () => {
+    for (const scope of [ORIGIN, `${ORIGIN}/`]) {
+      const list = editorPageNavigations(scope);
+      expect(list.map(String), scope).toEqual([String(/^\/(?:index\.html)?(?:\?.*)?$/)]);
+      for (const path of ['/', '/?project=p1', '/?a=1&b=%2F', '/index.html', '/index.html?project=p1'])
+        expect(answered(list, `${ORIGIN}${path}`), path).toBe(true);
+      // the desk page has a route of its own; everything else goes to the network, the pages of a
+      // deployment nested under the root's scope among them (they load their own page)
+      for (const path of [
+        ...NOT_THE_EDITOR('/'),
+        '/desk.html',
+        '/desk',
+        '/3d/',
+        '/3d/index.html',
+        '/folder/',
+      ])
+        expect(answered(list, `${ORIGIN}${path}`), path).toBe(false);
+    }
   });
 
-  it("under a subpath leaves the server's paths under the scope to the network, and only those", () => {
-    const list = navigationDenylist(SUB);
-    expect(list.map((r) => r.source)).toEqual([
-      '^\\/3d\\/api\\/',
-      '^\\/3d\\/sync\\/',
-      '^\\/3d\\/mcp',
-      '^\\/3d\\/dav\\/',
-      '^\\/3d\\/otlp\\/',
-      '^\\/3d\\/metrics',
-      '^\\/3d\\/healthz',
-      '^\\/3d\\/readyz',
-    ]);
-    for (const path of [
-      'api/projects',
-      'sync/p1',
-      'mcp',
-      'dav/3d-editor/',
-      'otlp/v1/logs',
-      'metrics',
-      'healthz',
-      'readyz',
+  it("under a subpath answers only its own editor's page, never the root's or another base's", () => {
+    const list = editorPageNavigations(SUB);
+    expect(list.map((r) => r.source)).toEqual(['^\\/3d\\/(?:index\\.html)?(?:\\?.*)?$']);
+    for (const path of ['', '?project=p1', 'index.html', 'index.html?project=p1'])
+      expect(answered(list, `${SUB}${path}`), path).toBe(true);
+    for (const url of [
+      ...NOT_THE_EDITOR('/3d/').map((p) => `${ORIGIN}${p}`),
+      `${SUB}desk.html`,
+      `${SUB}desk`,
+      `${SUB}3d/`,
+      `${ORIGIN}/`,
+      `${ORIGIN}/index.html`,
+      `${ORIGIN}/?project=p1`,
+      `${ORIGIN}/3d`,
+      `${ORIGIN}/3d?project=p1`,
+      `${ORIGIN}/3dx/`,
+      `${ORIGIN}/other/3d/`,
     ])
-      expect(denied(list, `${SUB}${path}`), path).toBe(true);
-    for (const path of ['', '?project=p1', 'index.html', 'desk/', 'api', 'dav', '3d/api/x'])
-      expect(denied(list, `${SUB}${path}`), path).toBe(false);
+      expect(answered(list, url), url).toBe(false);
     // a base with a dot is matched as written, not as a pattern
-    const dotted = navigationDenylist(`${ORIGIN}/v1.2/`);
-    expect(denied(dotted, `${ORIGIN}/v1.2/api/projects`)).toBe(true);
-    expect(denied(dotted, `${ORIGIN}/v1x2/api/projects`)).toBe(false);
+    const dotted = editorPageNavigations(`${ORIGIN}/v1.2/`);
+    expect(answered(dotted, `${ORIGIN}/v1.2/`)).toBe(true);
+    expect(answered(dotted, `${ORIGIN}/v1.2/index.html?x=1`)).toBe(true);
+    for (const path of ['/v1x2/', '/v1.2x/', '/v1.2/x/y', '/v1.2/indexxhtml', '/v1.2/desk/'])
+      expect(answered(dotted, `${ORIGIN}${path}`), path).toBe(false);
+  });
+});
+
+describe("the service worker's cleanup of outdated precaches", () => {
+  /** The precache of the current Workbox under `scope` (workbox-core cacheNames.precache). */
+  const precacheOf = (scope: string) => `workbox-precache-v2-${scope}`;
+  const ROOT = `${ORIGIN}/`;
+
+  it('deletes the precaches earlier versions left under its own scope, and only those', () => {
+    const names = [
+      precacheOf(ROOT),
+      // an earlier Workbox's naming, and a precache of another prefix, under the same scope
+      `workbox-precache-${ROOT}`,
+      `my-app-precache-v1-${ROOT}`,
+      // not precaches
+      `workbox-runtime-${ROOT}`,
+      'images',
+      `my-cache-${ROOT}`,
+    ];
+    expect(outdatedPrecaches(names, ROOT, precacheOf(ROOT))).toEqual([
+      `workbox-precache-${ROOT}`,
+      `my-app-precache-v1-${ROOT}`,
+    ]);
+    expect(outdatedPrecaches([precacheOf(ROOT)], ROOT, precacheOf(ROOT))).toEqual([]);
+  });
+
+  it("never deletes the precache of another scope on the origin: a nested deployment's, a parent's", () => {
+    const nested = [
+      precacheOf(`${ROOT}folder/`),
+      precacheOf(SUB),
+      `workbox-precache-${SUB}`,
+      precacheOf(`${ORIGIN}/v1.2/`),
+      // a scope whose path ends with the root scope's URL is no precache of the root
+      precacheOf(`${ORIGIN}/a-${ROOT}`),
+      precacheOf('https://other.example/'),
+    ];
+    // Workbox's cleanupOutdatedCaches would delete every one of these on this origin (their names
+    // contain the root scope); this one deletes none
+    expect(nested.filter((n) => n.includes(ROOT) && n !== precacheOf(ROOT))).toHaveLength(5);
+    expect(outdatedPrecaches([precacheOf(ROOT), ...nested], ROOT, precacheOf(ROOT))).toEqual([]);
+    // under the subpath: its own earlier precaches, never the root's or a deeper scope's
+    expect(
+      outdatedPrecaches(
+        [
+          precacheOf(ROOT),
+          `workbox-precache-${ROOT}`,
+          precacheOf(SUB),
+          `workbox-precache-${SUB}`,
+          precacheOf(`${SUB}x/`),
+        ],
+        SUB,
+        precacheOf(SUB),
+      ),
+    ).toEqual([`workbox-precache-${SUB}`]);
   });
 });

@@ -5,10 +5,15 @@ import { forwardedPrefix, stripBasePath } from './base-path';
 /*
  * The base path of each request (docs/subpath.md). Before anything routes a request, HTTP requests
  * (Fastify's rewriteUrl, app.ts) and WebSocket upgrades (an 'upgrade' listener that runs before
- * the sync server's, app.ts) lose the base their URL starts with, and the raw request keeps what
- * was read: the base the server writes into the request's pages and links, the bases a path the
- * request names may start with, whether the URL was the base without its slash, and the URL as
- * the client sent it (for the logs).
+ * the sync server's, app.ts) get their URL in origin form (originForm) and lose BASE_PATH when
+ * they start with it, and the raw request keeps what was read: the base the server writes into the
+ * request's pages and links, the bases a path the request names may start with, whether the URL
+ * was BASE_PATH without its slash, and the URL as the client sent it (for the logs).
+ *
+ * Only BASE_PATH is removed from request paths. X-Forwarded-Prefix sets the base the server writes,
+ * never what a request routes to: clients can send it, and a proxy in front that passes it on (and
+ * denies /metrics or /mcp, say) would otherwise let any client re-root routing under a prefix of
+ * its choice.
  */
 
 /** What the server read of a request's base path before routing it (rewriteRequestUrl). */
@@ -18,11 +23,11 @@ export interface RequestBase {
    * X-Forwarded-Prefix when usable, else BASE_PATH.
    */
   base: string;
-  /** The bases a path of the request may start with: `base`, then BASE_PATH. */
+  /** The bases a path the request names (a WebDAV Destination) may start with: `base`, then BASE_PATH. */
   bases: readonly string[];
-  /** The base removed from the URL ('' when it started with none). */
+  /** BASE_PATH when the URL started with it and lost it, else ''. */
   removed: string;
-  /** The URL was the base without its slash (`/3d`, `/3d?x`): its page is at `${removed}/`. */
+  /** The URL was BASE_PATH without its slash (`/3d`, `/3d?x`): its page is at `${removed}/`. */
   bare: boolean;
   /** The URL as the client (or the proxy) sent it, base included. */
   originalUrl: string;
@@ -32,16 +37,81 @@ const kRequestBase = Symbol('3d-editor.requestBase');
 
 type WithRequestBase = IncomingMessage & { [kRequestBase]?: RequestBase };
 
+const SLASH = 47;
+const QUESTION = 63;
+const HASH = 35;
+
+/** The value of a hexadecimal digit's char code, or -1. */
+function hexValue(c: number): number {
+  if (c >= 48 && c <= 57) return c - 48;
+  const lower = c | 0x20;
+  return lower >= 97 && lower <= 102 ? lower - 87 : -1;
+}
+
+/** Whether a char code is an unreserved character of RFC 3986: `A-Z a-z 0-9 - . _ ~`. */
+function isUnreserved(c: number): boolean {
+  const lower = c | 0x20;
+  return (
+    (lower >= 97 && lower <= 122) || (c >= 48 && c <= 57) || c === 45 || c === 46 || c === 95 || c === 126
+  );
+}
+
 /**
- * The URL of `req` without its base, which the request keeps (requestBase): the base the URL starts
- * with, the request's (X-Forwarded-Prefix when usable, else `basePath`) or `basePath`. Any other URL
- * is returned as it is.
+ * A request target in origin form, as the router reads it, so that what the server reads of the
+ * path (its BASE_PATH, the page it falls back to) is the path the router routes:
+ * - an absolute-form target (`http://host/path?q`, `HTTPS://host?q`: what a request to a proxy
+ *   looks like, which servers must accept) loses its scheme and authority (`/path?q`, `/?q`), as
+ *   the router does with it;
+ * - a fragment (`#…`, which clients never send) is dropped, as the router ends the path there;
+ * - the percent-encoded unreserved characters of the path are decoded (`/%61pi` is `/api`: RFC 3986
+ *   6.2.2.2), as the router decodes them before it matches.
+ * Any other target (`*`, `x`) is left as it is: no route serves it. Time linear in the target's
+ * length.
+ */
+export function originForm(url: string): string {
+  let target = url;
+  if (target.charCodeAt(0) !== SLASH) {
+    const scheme = target.slice(0, 8).toLowerCase();
+    const authority = scheme.startsWith('http://') ? 7 : scheme.startsWith('https://') ? 8 : -1;
+    if (authority === -1) return url;
+    let end = authority;
+    while (end < target.length) {
+      const c = target.charCodeAt(end);
+      if (c === SLASH || c === QUESTION || c === HASH) break;
+      end++;
+    }
+    target = target.charCodeAt(end) === SLASH ? target.slice(end) : `/${target.slice(end)}`;
+  }
+  const hash = target.indexOf('#');
+  if (hash !== -1) target = target.slice(0, hash);
+  const query = target.indexOf('?');
+  const pathEnd = query === -1 ? target.length : query;
+  let percent = target.indexOf('%');
+  if (percent === -1 || percent >= pathEnd) return target;
+  let out = '';
+  let from = 0;
+  for (; percent !== -1 && percent + 2 < pathEnd; percent = target.indexOf('%', percent + 1)) {
+    const high = hexValue(target.charCodeAt(percent + 1));
+    const low = hexValue(target.charCodeAt(percent + 2));
+    if (high < 0 || low < 0) continue;
+    const code = high * 16 + low;
+    if (!isUnreserved(code)) continue;
+    out += target.slice(from, percent) + String.fromCharCode(code);
+    from = percent + 3;
+  }
+  return from === 0 ? target : out + target.slice(from);
+}
+
+/**
+ * The URL of `req` in origin form (originForm) without BASE_PATH (`basePath`) when it starts with
+ * it; the request keeps what was read (requestBase). X-Forwarded-Prefix is read for the base the
+ * server writes, never removed from the URL.
  */
 export function rewriteRequestUrl(req: IncomingMessage, basePath: string): string {
   const originalUrl = req.url ?? '/';
   const base = forwardedPrefix(req.headers['x-forwarded-prefix']) ?? basePath;
   const bases = base === basePath ? [base] : [base, basePath];
-  const stripped = stripBasePath(originalUrl, bases);
+  const stripped = stripBasePath(originForm(originalUrl), [basePath]);
   (req as WithRequestBase)[kRequestBase] = {
     base,
     bases,
@@ -50,6 +120,21 @@ export function rewriteRequestUrl(req: IncomingMessage, basePath: string): strin
     originalUrl,
   };
   return stripped.url;
+}
+
+/**
+ * The X-Forwarded-Prefix base that a request's URL, as routed (`url`, after rewriteRequestUrl),
+ * still starts with when that base is not BASE_PATH, else null: the request came through a proxy
+ * that keeps the prefix in the path, which only BASE_PATH removes (app.ts says so in the log).
+ */
+export function keptForwardedPrefix(
+  request: FastifyRequest | IncomingMessage,
+  url: string,
+  basePath: string,
+): string | null {
+  const info = requestBaseInfo(request);
+  if (!info || info.base === '' || info.base === basePath) return null;
+  return stripBasePath(url, [info.base]).base === '' ? null : info.base;
 }
 
 function rawOf(request: FastifyRequest | IncomingMessage): WithRequestBase {

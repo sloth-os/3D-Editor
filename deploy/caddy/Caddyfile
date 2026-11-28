@@ -4,8 +4,9 @@
 # To change: the host name (example.com), the prefix (/3d: in redir, handle_path and
 # X-Forwarded-Prefix) and the editor server's address (127.0.0.1:8080). Caddy gets the site's
 # certificate by itself; the rest of the site goes in the same site block (see the end).
-# {?query} keeps the query of /3d?… in the redirect and needs Caddy 2.9 or later; with an older
-# Caddy, redirect to /3d/ alone (the query is then dropped).
+# {?query} keeps the query of /3d?… in the redirect and needs Caddy 2.9 or later. An older Caddy
+# replaces {?query} with nothing, so its redirect drops the query; there, /3d/?{query} keeps the
+# query (and redirects /3d to /3d/? when there is none).
 #
 # Caddy 2.9 or later ({?query}): handle_path strips /3d; the header tells the editor where it lives
 example.com {

@@ -766,8 +766,10 @@ workers it loads (`/src/`, `/@vite/`, `/@fs/`, `/@id/`, `/node_modules/`), none 
 pages, the proxied `/api`, `/dav`, `/otlp`, `/mcp` and `/sync`, or anything else. `npm run preview`
 does the same for the build, the built files' headers on `/assets/` only, so never on `index.html`,
 `sw.js` or the manifest, whoever asks for them. Both serve the editor at `/desk/` and
-`/desk.html/`, as the server does. In development the desk registers no service worker: it works
-online only.
+`/desk.html/`, as the server does: the development server the editor's page as it is, the preview
+server the built `index.html` with `<base href="/">`, as the server writes it, so that its relative
+file URLs load from the root. In development the desk registers no service worker: it works online
+only.
 
 ## What the desk does
 
@@ -1060,7 +1062,8 @@ query, never with the editor's `index.html`. It answers with its precached copy 
 version whose files it serves, and with the server's current [headers](#headers) when the server
 answers within 4 s; offline, or when the server does not answer in time, with the headers the page
 was last served with (a 5xx counts as no answer; a redirect or another error from the server is
-passed on). `desk/` and `desk.html/` in its scope are the editor's, as on the server.
+passed on). Other paths in its scope, `desk/` and `desk.html/` among them, it leaves to the
+network: the server answers them with the editor, a static host with its own 404.
 
 A new version of the app installs in the background and waits until every page the old one serves
 is closed, then takes over at the next load, so a session in a host is never reloaded under the

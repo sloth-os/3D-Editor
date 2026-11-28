@@ -1,4 +1,7 @@
+import { existsSync, readdirSync } from 'node:fs';
 import type { IncomingMessage } from 'node:http';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import {
   BUILD_TOP_LEVEL,
@@ -11,10 +14,15 @@ import {
   parseBasePath,
   pathWithin,
   stripBasePath,
+  trimTrailingSlashes,
   withBaseHref,
 } from '../../src/base-path';
+import { loadConfig } from '../../src/config';
+import { MCP_INSTRUCTIONS } from '../../src/mcp/instructions';
 import { baseUrl, type ToolExtra } from '../../src/mcp/tool-kit';
 import {
+  keptForwardedPrefix,
+  originForm,
   originalUrlOf,
   requestBase,
   requestBaseInfo,
@@ -24,7 +32,8 @@ import {
 
 /*
  * Serving under a subpath (docs/subpath.md): the parsing of BASE_PATH and X-Forwarded-Prefix, the
- * removal of the base from request URLs, the pages' <base href> and the links of MCP results.
+ * removal of BASE_PATH from request URLs (in origin form), the pages' <base href> and the links of
+ * MCP results; and that what reads a request's headers takes time linear in their length.
  */
 
 /** Values no base path can be, with the reason basePathProblem gives. */
@@ -93,8 +102,27 @@ describe('the server’s own paths', () => {
         'index.html',
         'manifest.webmanifest',
         'sw.js',
+        'sw.js.map',
       ].sort(),
     );
+  });
+
+  it('names every top-level entry of the web app’s public files and, when it is built, of its build', () => {
+    const web = fileURLToPath(new URL('../../../web/', import.meta.url));
+    const entries = (dir: string): string[] => {
+      try {
+        return readdirSync(path.join(web, dir));
+      } catch (err) {
+        // the build is not always there (and another build may be replacing it)
+        if (dir === 'dist' && (err as NodeJS.ErrnoException).code === 'ENOENT') return [];
+        throw err;
+      }
+    };
+    const publicFiles = entries('public');
+    expect(publicFiles.length).toBeGreaterThan(0);
+    for (const entry of publicFiles) expect(BUILD_TOP_LEVEL, `public/${entry}`).toContain(entry);
+    if (!existsSync(path.join(web, 'dist'))) return;
+    for (const entry of entries('dist')) expect(BUILD_TOP_LEVEL, `dist/${entry}`).toContain(entry);
   });
 });
 
@@ -128,6 +156,117 @@ describe('basePathProblem, normalizeBasePath and parseBasePath', () => {
     expect(() => parseBasePath('/a b')).toThrow(
       "Invalid configuration: BASE_PATH: '/a b' has characters other than letters, digits and . _ ~ - in its path segments",
     );
+  });
+});
+
+describe('the length of a base path', () => {
+  /** 256 characters, the longest base path. */
+  const longest = `/${'a'.repeat(255)}`;
+  /** 257 characters. */
+  const tooLong = `/${'a'.repeat(256)}`;
+
+  it('is at most 256 characters: a longer BASE_PATH stops the server with the reason', () => {
+    expect(longest).toHaveLength(256);
+    expect(basePathProblem(longest)).toBeNull();
+    expect(parseBasePath(longest)).toBe(longest);
+    expect(loadConfig({ BASE_PATH: longest }).basePath).toBe(longest);
+    const refusal = `Invalid configuration: BASE_PATH: '${tooLong}' is longer than 256 characters`;
+    expect(basePathProblem(tooLong)).toBe('is longer than 256 characters');
+    expect(normalizeBasePath(tooLong)).toBeNull();
+    expect(() => parseBasePath(tooLong)).toThrow(refusal);
+    expect(() => loadConfig({ BASE_PATH: tooLong })).toThrow(refusal);
+    // as given: a trailing slash counts
+    expect(() => parseBasePath(`${longest}/`)).toThrow('is longer than 256 characters');
+  });
+
+  it('a longer X-Forwarded-Prefix value is ignored (as sent, spaces included)', () => {
+    expect(forwardedPrefix(longest)).toBe(longest);
+    expect(forwardedPrefix(`${longest}, /other`)).toBe(longest);
+    expect(forwardedPrefix(tooLong)).toBeNull();
+    expect(forwardedPrefix(`${tooLong}, /3d`)).toBeNull();
+    expect(forwardedPrefix(`/3d${' '.repeat(253)}`)).toBe('/3d');
+    expect(forwardedPrefix(`/3d${' '.repeat(254)}`)).toBeNull();
+    const req = rawRequest('/api/config', { 'x-forwarded-prefix': tooLong });
+    expect(rewriteRequestUrl(req, '/3d')).toBe('/api/config');
+    expect(requestBase(req)).toBe('/3d');
+  });
+});
+
+/** Runs `fn`: what it returned and the milliseconds it took. */
+function timed<T>(fn: () => T): { value: T; ms: number } {
+  const start = performance.now();
+  const value = fn();
+  return { value, ms: performance.now() - start };
+}
+
+/**
+ * 200 000 slashes and an `x`: a regular expression such as /\/+$/ takes quadratic time on it (about
+ * 20 s on a laptop), a scan from its end well under a millisecond. The bound leaves room for a busy
+ * machine.
+ */
+const SLASH_RUN = `${'/'.repeat(200_000)}x`;
+const LINEAR_BOUND_MS = 1000;
+
+describe('what reads request headers takes time linear in their length', () => {
+  it('trims trailing slashes in one pass', () => {
+    for (const [value, trimmed] of [
+      ['/3d/', '/3d'],
+      ['/3d//', '/3d'],
+      ['/', ''],
+      ['', ''],
+      ['/a/b', '/a/b'],
+      ['//x//', '//x'],
+    ])
+      expect(trimTrailingSlashes(value), value).toBe(trimmed);
+    const run = timed(() => [
+      trimTrailingSlashes(SLASH_RUN),
+      trimTrailingSlashes('/'.repeat(200_000)),
+      trimTrailingSlashes(`x${'/'.repeat(200_000)}`),
+    ]);
+    expect(run.value).toEqual([SLASH_RUN, '', 'x']);
+    expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+  });
+
+  it('X-Forwarded-Prefix, BASE_PATH: a long run of slashes is refused at once', () => {
+    const run = timed(() => [
+      forwardedPrefix(SLASH_RUN),
+      forwardedPrefix(`${SLASH_RUN}, /3d`),
+      forwardedPrefix([SLASH_RUN]),
+      normalizeBasePath(SLASH_RUN),
+      basePathProblem(SLASH_RUN),
+    ]);
+    expect(run.value).toEqual([null, null, null, null, 'is longer than 256 characters']);
+    expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+  });
+
+  it('the base of a request or WebSocket upgrade with such a header (rewriteRequestUrl)', () => {
+    const req = rawRequest('/3d/api/config', { 'x-forwarded-prefix': SLASH_RUN });
+    const run = timed(() => rewriteRequestUrl(req, '/3d'));
+    expect(run.value).toBe('/api/config');
+    expect(requestBase(req)).toBe('/3d');
+    expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+  });
+
+  it('the links of MCP results with such X-Forwarded-Prefix, -Host and -Proto headers (baseUrl)', () => {
+    const headers = {
+      'x-forwarded-prefix': SLASH_RUN,
+      'x-forwarded-host': `${'a'.repeat(200_000)}/`,
+      'x-forwarded-proto': `${' '.repeat(200_000)}x`,
+    };
+    const run = timed(() => baseUrl(httpCall(headers), { basePath: '/3d' }));
+    expect(run.value).toBe('http://127.0.0.1:8080/3d');
+    expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
+  });
+
+  it('a request target with long runs of what originForm scans for', () => {
+    const run = timed(() => [
+      originForm(`http://${'a'.repeat(200_000)}`),
+      originForm(`/${'%61'.repeat(70_000)}`),
+      originForm(`/${'%%'.repeat(100_000)}`),
+      originForm(SLASH_RUN),
+    ]);
+    expect(run.value).toEqual(['/', `/${'a'.repeat(70_000)}`, `/${'%%'.repeat(100_000)}`, SLASH_RUN]);
+    expect(run.ms).toBeLessThan(LINEAR_BOUND_MS);
   });
 });
 
@@ -276,21 +415,88 @@ describe('the prefix removal (rewriteRequestUrl)', () => {
     expect(requestBaseInfo(plain)).toMatchObject({ base: '/3d', removed: '', bare: false });
   });
 
-  it("takes the request's base from X-Forwarded-Prefix and removes it or BASE_PATH", () => {
+  it("takes the request's base from X-Forwarded-Prefix, and removes BASE_PATH only", () => {
+    // a proxy that strips the prefix: the path is from the base the header names
     const stripped = rawRequest('/api/config', { 'x-forwarded-prefix': '/editor' });
     expect(rewriteRequestUrl(stripped, '')).toBe('/api/config');
     expect(requestBase(stripped)).toBe('/editor');
     expect(requestBases(stripped)).toEqual(['/editor', '']);
-    const kept = rawRequest('/editor/api/config', { 'x-forwarded-prefix': '/editor' });
-    expect(rewriteRequestUrl(kept, '/3d')).toBe('/api/config');
-    expect(requestBaseInfo(kept)).toMatchObject({
-      base: '/editor',
-      bases: ['/editor', '/3d'],
-      removed: '/editor',
-    });
+    // a header a client sends never re-roots routing: a path under its base stays as it is
+    for (const basePath of ['', '/3d']) {
+      const sent = rawRequest('/editor/metrics', { 'x-forwarded-prefix': '/editor' });
+      expect(rewriteRequestUrl(sent, basePath), basePath).toBe('/editor/metrics');
+      expect(requestBaseInfo(sent), basePath).toMatchObject({ base: '/editor', removed: '', bare: false });
+      const bare = rawRequest('/editor?a=b', { 'x-forwarded-prefix': '/editor' });
+      expect(rewriteRequestUrl(bare, basePath), basePath).toBe('/editor?a=b');
+      expect(requestBaseInfo(bare)?.bare, basePath).toBe(false);
+    }
     const configured = rawRequest('/3d/api/config', { 'x-forwarded-prefix': '/editor' });
     expect(rewriteRequestUrl(configured, '/3d')).toBe('/api/config');
-    expect(requestBaseInfo(configured)).toMatchObject({ base: '/editor', removed: '/3d' });
+    expect(requestBaseInfo(configured)).toMatchObject({
+      base: '/editor',
+      bases: ['/editor', '/3d'],
+      removed: '/3d',
+    });
+  });
+
+  it('names an X-Forwarded-Prefix the path still starts with, which only BASE_PATH could remove', () => {
+    const kept = (url: string, header: string, basePath: string) => {
+      const req = rawRequest(url, { 'x-forwarded-prefix': header });
+      return keptForwardedPrefix(req, rewriteRequestUrl(req, basePath), basePath);
+    };
+    // a proxy that keeps the prefix while BASE_PATH does not name it
+    expect(kept('/editor/api/config', '/editor', '')).toBe('/editor');
+    expect(kept('/editor?a=b', '/editor', '')).toBe('/editor');
+    expect(kept('/editor/x', '/editor', '/3d')).toBe('/editor');
+    // a proxy that strips it, BASE_PATH that removes it, a path that only looks like it
+    expect(kept('/api/config', '/editor', '')).toBeNull();
+    expect(kept('/editor/x', '/editor', '/editor')).toBeNull();
+    expect(kept('/editorial', '/editor', '')).toBeNull();
+    expect(kept('/x', '/', '')).toBeNull();
+    expect(keptForwardedPrefix(rawRequest('/editor/x'), '/editor/x', '')).toBeNull();
+  });
+
+  it('reads the request target in origin form, as the router does', () => {
+    const cases: [string, string][] = [
+      ['http://x/api/projects?y=1', '/api/projects?y=1'],
+      ['HTTPS://Host.example:8080/a', '/a'],
+      ['hTtP://host', '/'],
+      ['http://host?q=1', '/?q=1'],
+      ['http://host/a#f', '/a'],
+      ['/a?b=1#c', '/a?b=1'],
+      ['/mcp#x', '/mcp'],
+      ['/%61pi/%70rojects', '/api/projects'],
+      ['/%41%5a%7E%2d%2E%5F', '/AZ~-._'],
+      // reserved characters, '%' itself and the query keep their encoding
+      ['/a%2Fb%3F%23%25%20', '/a%2Fb%3F%23%25%20'],
+      ['/%2561', '/%2561'],
+      ['/a?%61=%62', '/a?%61=%62'],
+      ['/a%6', '/a%6'],
+      ['/%%61', '/%a'],
+      // no route serves these: left as they are
+      ['*', '*'],
+      ['ftp://host/a', 'ftp://host/a'],
+      ['%61', '%61'],
+    ];
+    for (const [target, origin] of cases) expect(originForm(target), target).toBe(origin);
+  });
+
+  it('removes BASE_PATH from a target in any of its forms', () => {
+    for (const target of [
+      '/3d/api/config',
+      'http://x/3d/api/config',
+      'HTTP://x/3d/%61pi/config',
+      '/%33d/api/config',
+      '/3d/api/config#f',
+    ]) {
+      const req = rawRequest(target);
+      expect(rewriteRequestUrl(req, '/3d'), target).toBe('/api/config');
+      expect(requestBaseInfo(req), target).toMatchObject({ removed: '/3d', originalUrl: target });
+    }
+    const bare = rawRequest('http://x/3d?y');
+    expect(rewriteRequestUrl(bare, '/3d')).toBe('/?y');
+    expect(requestBaseInfo(bare)).toMatchObject({ removed: '/3d', bare: true, originalUrl: 'http://x/3d?y' });
+    expect(rewriteRequestUrl(rawRequest('http://x/api/config'), '')).toBe('/api/config');
   });
 
   it('ignores an unusable X-Forwarded-Prefix', () => {
@@ -380,5 +586,15 @@ describe('the links of MCP results (baseUrl)', () => {
     expect(baseUrl(extraWith({ headers: {} }), under3d)).toBe('');
     // an in-memory client: links stay paths from the server's root, as REST gives them
     expect(baseUrl(extraWith(), under3d)).toBe('');
+  });
+});
+
+describe('the project links agents are told to open', () => {
+  it('are the editor_url the tools give, never a path from the server root', () => {
+    // under a base path, /?project=<id> is the root of another site
+    expect(MCP_INSTRUCTIONS).not.toContain('/?project=');
+    expect(MCP_INSTRUCTIONS).toContain(
+      'a project opens in the web editor at its editor_url (list_projects, create_project and get_project give it)',
+    );
   });
 });

@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import http, { type IncomingHttpHeaders } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
@@ -7,7 +8,7 @@ import { WebSocket } from 'ws';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { WebDAVClient, newUuid } from '@3d-editor/core';
-import { api, eventually, makeTempDir, startServer, type TestServer } from '../helpers/app';
+import { api, eventually, makeTempDir, sleep, startServer, type TestServer } from '../helpers/app';
 import { SyncTestClient } from '../helpers/sync-client';
 import { mkcolPath, startWebDAV, type TestWebDAV } from '../helpers/webdav';
 
@@ -15,8 +16,11 @@ import { mkcolPath, startWebDAV, type TestWebDAV } from '../helpers/webdav';
  * Serving under a subpath (docs/subpath.md): a server with BASE_PATH=/3d (a proxy that keeps the
  * prefix, and the server's own port without it) and one without BASE_PATH behind a proxy that
  * strips the prefix and sends X-Forwarded-Prefix. The pages are written with the request's
- * <base href>, the bare base is redirected, the API, the live sync, MCP and the WebDAV proxy answer
- * under the prefix and without it, and links and hrefs carry the base.
+ * <base href>, BASE_PATH without its slash is redirected, the API, the live sync, MCP and the
+ * WebDAV proxy answer under the prefix and without it, and links and hrefs carry the base. Only
+ * BASE_PATH is removed from request paths: an X-Forwarded-Prefix (which clients can send) never
+ * moves a route. AUTH_TOKEN guards the routes whatever the spelling of the request target, and
+ * headers of any length take the server linear time.
  */
 
 const INDEX_HTML = `<!doctype html>
@@ -36,10 +40,12 @@ const DESK_HTML = INDEX_HTML.replace('<html lang="en">', '<html lang="en" data-r
 );
 
 interface LogLine {
+  level?: number;
   msg?: string;
   url?: string;
   route?: string;
   statusCode?: number;
+  prefix?: string;
 }
 
 let publicDir: string;
@@ -146,8 +152,15 @@ describe('a server with BASE_PATH=/3d', () => {
         const res = await fetch(`${based.url}${p}`, { method, redirect: 'manual' });
         expect(res.status, `${method} ${p}`).toBe(308);
         expect(res.headers.get('location'), p).toBe(location);
-        expect(res.headers.get('vary'), p).toMatch(/\bX-Forwarded-Prefix\b/i);
+        // the redirect is BASE_PATH's: it depends on the URL alone
+        expect(res.headers.get('vary'), p).toBeNull();
       }
+      const proxied = await fetch(`${based.url}${p}`, {
+        headers: { 'x-forwarded-prefix': '/editor' },
+        redirect: 'manual',
+      });
+      expect(proxied.status, p).toBe(308);
+      expect(proxied.headers.get('location'), p).toBe(location);
     }
     // logged and counted like every other request, with the URL as sent
     expect(await accessLine('/3d?x=1')).toMatchObject({ statusCode: 308 });
@@ -234,13 +247,12 @@ describe('a server without BASE_PATH behind a proxy that strips the prefix', () 
     const desk = await fetch(`${root.url}/desk`, { headers });
     expectBase(await page(desk, '/desk'), '/editor/', DESK_HTML, '/desk');
     expect(desk.headers.get('content-security-policy')).toBe('frame-ancestors *');
-    // the header's base is removed from the paths that carry it too
-    const kept = await fetch(`${root.url}/editor/desk.html`, { headers });
-    expectBase(await page(kept, 'kept'), '/editor/', DESK_HTML, 'kept');
-    expect((await api(root.url, '/editor/healthz', { headers })).status).toBe(200);
-    const bare = await fetch(`${root.url}/editor?a=b`, { headers, redirect: 'manual' });
-    expect(bare.status).toBe(308);
-    expect(bare.headers.get('location')).toBe('/editor/?a=b');
+    // the header's base is never removed from paths (only BASE_PATH is): /editor/… are paths of
+    // the editor's pages at the root, and /editor is no base to redirect
+    for (const p of ['/editor/desk.html', '/editor/healthz', '/editor?a=b']) {
+      const res = await fetch(`${root.url}${p}`, { headers, redirect: 'manual' });
+      expectBase(await page(res, p), '/editor/', INDEX_HTML, p);
+    }
     // without the header: the root
     expectBase(await page(await fetch(`${root.url}/`), 'root'), '/', INDEX_HTML, 'root');
   });
@@ -254,6 +266,10 @@ describe('a server without BASE_PATH behind a proxy that strips the prefix', () 
       ['/one, /two', '/one/'],
       ['//evil.example, /ok', '/'],
       ['/', '/'],
+      // at most 256 characters as sent: the longest base is used, a longer value ignored
+      [`/${'a'.repeat(255)}`, `/${'a'.repeat(255)}/`],
+      [`/${'a'.repeat(256)}`, '/'],
+      [`/${'a'.repeat(255)}, /ok`, `/${'a'.repeat(255)}/`],
     ];
     for (const [header, href] of cases) {
       const res = await fetch(`${root.url}/`, { headers: { 'x-forwarded-prefix': header } });
@@ -313,18 +329,26 @@ describe('live sync under a prefix', () => {
     expect(upgrade).toMatchObject({ route: '/sync/:projectId', statusCode: 101 });
   });
 
-  it("removes X-Forwarded-Prefix's base from upgrades too", async () => {
-    const id = newUuid();
-    const ws = new WebSocket(`${root.url.replace('http:', 'ws:')}/editor/sync/${id}`, {
-      headers: { 'x-forwarded-prefix': '/editor' },
+  /** Opens a WebSocket: 101 when it opened (then closed again), else the status of the refusal. */
+  const upgrade = (url: string, headers: Record<string, string>) =>
+    new Promise<number>((resolve) => {
+      const ws = new WebSocket(url.replace('http:', 'ws:'), { headers });
+      ws.once('open', () => {
+        ws.close();
+        resolve(101);
+      });
+      ws.once('unexpected-response', (_req, res) => resolve(res.statusCode ?? 0));
+      ws.once('error', () => resolve(0));
     });
-    const opened = await new Promise<boolean>((resolve) => {
-      ws.once('open', () => resolve(true));
-      ws.once('error', () => resolve(false));
-      ws.once('unexpected-response', () => resolve(false));
-    });
-    expect(opened).toBe(true);
-    ws.close();
+
+  it("removes BASE_PATH from upgrades, never X-Forwarded-Prefix's base", async () => {
+    const proxied = { 'x-forwarded-prefix': '/editor' };
+    // a stripping proxy: the path without the prefix
+    expect(await upgrade(`${root.url}/sync/${newUuid()}`, proxied)).toBe(101);
+    // the header alone does not make the server remove its base
+    expect(await upgrade(`${root.url}/editor/sync/${newUuid()}`, proxied)).toBe(404);
+    // BASE_PATH is removed, whatever the header says
+    expect(await upgrade(`${based.url}/3d/sync/${newUuid()}`, proxied)).toBe(101);
   });
 });
 
@@ -506,5 +530,299 @@ describe('the WebDAV proxy under a prefix', () => {
     } finally {
       await new Promise<void>((resolve) => upstream.close(() => resolve()));
     }
+  });
+});
+
+/** A request with this exact target, which fetch would normalise: absolute form, fragments. */
+function rawRequest(
+  server: TestServer,
+  target: string,
+  init: { method?: string; headers?: Record<string, string>; body?: string } = {},
+): Promise<{ status: number; headers: IncomingHttpHeaders; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: server.port,
+        method: init.method ?? 'GET',
+        path: target,
+        headers: init.headers,
+      },
+      (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk: string) => (body += chunk));
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, headers: res.headers, body }));
+      },
+    );
+    req.on('error', reject);
+    req.end(init.body);
+  });
+}
+
+/** The status of a WebSocket upgrade with this exact target: 101 when the server accepts it. */
+function rawUpgrade(
+  server: TestServer,
+  target: string,
+  headers: Record<string, string> = {},
+): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port: server.port,
+      path: target,
+      headers: {
+        connection: 'Upgrade',
+        upgrade: 'websocket',
+        'sec-websocket-version': '13',
+        'sec-websocket-key': randomBytes(16).toString('base64'),
+        ...headers,
+      },
+    });
+    req.on('upgrade', (res, socket) => {
+      socket.destroy();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on('response', (res) => {
+      res.resume();
+      resolve(res.statusCode ?? 0);
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
+
+const MCP_INITIALIZE = JSON.stringify({
+  jsonrpc: '2.0',
+  id: 1,
+  method: 'initialize',
+  params: {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'subpath-test', version: '1' },
+  },
+});
+const MCP_HEADERS = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+
+describe('X-Forwarded-Prefix never moves a route', () => {
+  it('serves /x/metrics and POST /x/mcp with X-Forwarded-Prefix: /x as any other path', async () => {
+    const header = { 'x-forwarded-prefix': '/x' };
+    for (const [server, prefix] of [
+      [root, ''],
+      [based, ''],
+      [based, '/3d'],
+    ] as const) {
+      const what = `${server === root ? 'root' : 'BASE_PATH'} ${prefix}`;
+      // the editor's page, not the metrics
+      const metrics = await fetch(`${server.url}${prefix}/x/metrics`, { headers: header });
+      expect(await page(metrics, what)).not.toContain('# HELP');
+      // not the MCP endpoint
+      const mcp = await rawRequest(server, `${prefix}/x/mcp`, {
+        method: 'POST',
+        headers: { ...MCP_HEADERS, ...header },
+        body: MCP_INITIALIZE,
+      });
+      expect(mcp.status, what).toBe(404);
+      expect(JSON.parse(mcp.body), what).toEqual({ error: `not found: ${prefix}/x/mcp` });
+      // the routes themselves still answer with the header
+      const real = await fetch(`${server.url}${prefix}/metrics`, { headers: header });
+      expect(real.status, what).toBe(200);
+      expect(await real.text(), what).toContain('# HELP');
+      const initialize = await rawRequest(server, `${prefix}/mcp`, {
+        method: 'POST',
+        headers: { ...MCP_HEADERS, ...header },
+        body: MCP_INITIALIZE,
+      });
+      expect(initialize.status, what).toBe(200);
+    }
+  });
+
+  it('says once, at warn, that a proxy keeping its prefix needs BASE_PATH', async () => {
+    const logged: LogLine[] = [];
+    const server = await serve(
+      { PUBLIC_DIR: publicDir },
+      {
+        logger: {
+          level: 'warn',
+          stream: { write: (line: string) => void logged.push(JSON.parse(line) as LogLine) },
+        },
+      },
+    );
+    const warnings = () => logged.filter((l) => l.msg?.includes('needs BASE_PATH='));
+    // a path that does not start with the header's base, or a base the server removes: nothing to say
+    await fetch(`${server.url}/healthz`, { headers: { 'x-forwarded-prefix': '/editor' } });
+    expect(warnings()).toEqual([]);
+    for (const [p, prefix] of [
+      ['/editor/?token=abc', '/editor'],
+      ['/editor/api/config', '/editor'],
+      ['/other/', '/other'],
+    ]) {
+      const res = await fetch(`${server.url}${p}`, { headers: { 'x-forwarded-prefix': prefix } });
+      await res.arrayBuffer();
+    }
+    expect(warnings()).toHaveLength(1);
+    expect(warnings()[0]).toMatchObject({ level: 40, prefix: '/editor', url: '/editor/?token=[REDACTED]' });
+    expect(warnings()[0]!.msg).toContain('a proxy that keeps the prefix needs BASE_PATH=/editor');
+  });
+
+  it('refuses a BASE_PATH longer than 256 characters when it starts', async () => {
+    const longest = `/${'a'.repeat(255)}`;
+    const dataDir = await makeTempDir('3d-editor-subpath-long-');
+    try {
+      await expect(startServer({ DATA_DIR: dataDir, BASE_PATH: `${longest}a` })).rejects.toThrow(
+        `Invalid configuration: BASE_PATH: '${longest}a' is longer than 256 characters`,
+      );
+    } finally {
+      await rm(dataDir, { recursive: true, force: true });
+    }
+    const server = await serve({ PUBLIC_DIR: publicDir, BASE_PATH: longest });
+    expectBase(
+      await page(await fetch(`${server.url}${longest}/`), 'longest'),
+      `${longest}/`,
+      INDEX_HTML,
+      'longest',
+    );
+  });
+});
+
+describe('AUTH_TOKEN on every spelling of a protected path', () => {
+  const TOKEN = 's3cret';
+  const auth = { authorization: `Bearer ${TOKEN}` };
+  let dav: TestWebDAV;
+  let guarded: TestServer;
+  let guardedBased: TestServer;
+
+  beforeAll(async () => {
+    dav = await startWebDAV({ username: 'bob', password: 'hunter2' });
+    await mkcolPath(dav, '/guarded');
+    const env = {
+      AUTH_TOKEN: TOKEN,
+      WEBDAV_URL: `${dav.origin}/guarded`,
+      WEBDAV_USERNAME: 'bob',
+      WEBDAV_PASSWORD: 'hunter2',
+      SYNC_PERSISTENCE: 'memory',
+    };
+    guarded = await serve(env);
+    guardedBased = await serve({ ...env, BASE_PATH: '/3d' });
+  });
+
+  afterAll(async () => {
+    await dav?.stop();
+  });
+
+  /** The servers and the prefixes their routes answer under. */
+  const targets = () =>
+    [
+      [guarded, ''],
+      [guardedBased, ''],
+      [guardedBased, '/3d'],
+    ] as const;
+
+  it('answers the API, MCP, the WebDAV proxy and telemetry only with the token', async () => {
+    const otlp = JSON.stringify({ resourceSpans: [] });
+    for (const [server, p] of targets()) {
+      const cases: [string, Parameters<typeof rawRequest>[2], number][] = [
+        // percent-encoded letters, which the router decodes before it matches
+        [`${p}/%61pi/projects`, {}, 200],
+        [`${p}/a%70i/config`, {}, 200],
+        [`${p}/%6dcp`, { method: 'POST', headers: MCP_HEADERS, body: MCP_INITIALIZE }, 200],
+        [`${p}/%64av/`, { method: 'PROPFIND', headers: { depth: '1' } }, 207],
+        [
+          `${p}/%6ftlp/v1/traces`,
+          { method: 'POST', headers: { 'content-type': 'application/json' }, body: otlp },
+          200,
+        ],
+        // absolute form, any case of the scheme, as a request to a proxy is sent
+        [`http://x${p}/api/projects`, {}, 200],
+        [`HTTP://X${p}/api/projects`, {}, 200],
+        [`https://x${p}/api/config?y=1`, {}, 200],
+        // a fragment, where the router ends the path
+        [`${p}/mcp#x`, { method: 'POST', headers: MCP_HEADERS, body: MCP_INITIALIZE }, 200],
+        [`${p}/api/projects#x`, {}, 200],
+      ];
+      for (const [target, init, ok] of cases) {
+        const what = `${server === guarded ? 'root' : 'BASE_PATH'} ${init?.method ?? 'GET'} ${target}`;
+        const denied = await rawRequest(server, target, init);
+        expect(denied.status, what).toBe(401);
+        expect(denied.headers['www-authenticate'], what).toMatch(/Bearer/);
+        const allowed = await rawRequest(server, target, { ...init, headers: { ...init?.headers, ...auth } });
+        expect(allowed.status, `${what} with the token`).toBe(ok);
+      }
+    }
+  });
+
+  it('accepts sync upgrades only with the token, whatever the spelling of their path', async () => {
+    for (const [server, p] of targets()) {
+      const what = `${server === guarded ? 'root' : 'BASE_PATH'} ${p}`;
+      for (const target of [
+        `${p}/%73ync/${newUuid()}`,
+        // an encoded letter of the project id
+        `${p}/sync/%61${newUuid().slice(1)}`,
+        `http://x${p}/sync/${newUuid()}`,
+        `HTTPS://X${p}/sync/${newUuid()}?y=1`,
+        `${p}/sync/${newUuid()}#x`,
+      ]) {
+        expect(await rawUpgrade(server, target), `${what} ${target}`).toBe(401);
+        const withToken = target.includes('?')
+          ? `${target}&token=${TOKEN}`
+          : target.replace(/(#.*)?$/, `?token=${TOKEN}$1`);
+        expect(await rawUpgrade(server, withToken), `${what} ${withToken}`).toBe(101);
+        expect(await rawUpgrade(server, target, auth), `${what} ${target} with the header`).toBe(101);
+      }
+      // no route: refused with or without the token
+      for (const target of [
+        `${p}//sync/${newUuid()}`,
+        `${p}/sync%2F${newUuid()}`,
+        `${p}/SYNC/${newUuid()}`,
+      ]) {
+        expect(await rawUpgrade(server, target), `${what} ${target}`).toBe(404);
+        expect(await rawUpgrade(server, target, auth), `${what} ${target} with the token`).toBe(404);
+      }
+    }
+  });
+});
+
+describe('headers that a regular expression would read in quadratic time', () => {
+  /**
+   * Sends `count` page requests with `headers` at once and, while the server works through them, a
+   * health check; gives the statuses and the time until the server answered all of them. A server
+   * that spends quadratic time on such a header (/\/+$/ on 15 KB of slashes before an `x`: about a
+   * tenth of a second per value on a laptop, for each request) takes seconds; the server reads the
+   * headers in linear time, in microseconds.
+   */
+  async function flood(server: TestServer, headers: Record<string, string>, count = 80) {
+    const start = performance.now();
+    const pages = Array.from({ length: count }, () =>
+      fetch(`${server.url}/`, { headers }).then(async (res) => {
+        await res.arrayBuffer();
+        return res.status;
+      }),
+    );
+    await sleep(10);
+    const health = fetch(`${server.url}/healthz`).then(async (res) => {
+      await res.arrayBuffer();
+      return res.status;
+    });
+    const [statuses, healthStatus] = await Promise.all([Promise.all(pages), health]);
+    return { statuses: new Set(statuses), healthStatus, ms: performance.now() - start };
+  }
+
+  const SLASHES = `${'/'.repeat(15_000)}x`;
+
+  it('answers a flood of 15 KB X-Forwarded-Prefix values of slashes, and a health check, at once', async () => {
+    for (const server of [root, based]) {
+      const { statuses, healthStatus, ms } = await flood(server, { 'x-forwarded-prefix': SLASHES });
+      // the header is ignored: the pages are written with the server's own base
+      expect(statuses).toEqual(new Set([200]));
+      expect(healthStatus).toBe(200);
+      expect(ms).toBeLessThan(2000);
+    }
+  });
+
+  it('answers a flood of 15 KB Origin headers of slashes (CORS_ORIGINS), and a health check, at once', async () => {
+    const { statuses, healthStatus, ms } = await flood(root, { origin: `https://app.example.com${SLASHES}` });
+    expect(statuses).toEqual(new Set([200]));
+    expect(healthStatus).toBe(200);
+    expect(ms).toBeLessThan(2000);
   });
 });

@@ -1,5 +1,6 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingHttpHeaders } from 'node:http';
+import type { FastifyRequest } from 'fastify';
 import type { ServerConfig } from './config';
 
 /** Areas of the server protected by the shared secret(s). */
@@ -55,6 +56,26 @@ export function pathnameOf(rawUrl: string | undefined): string {
   if (!rawUrl) return '/';
   const q = rawUrl.indexOf('?');
   return q >= 0 ? rawUrl.slice(0, q) : rawUrl;
+}
+
+/**
+ * The path a request's scope is read from (scopeForPath): the route that serves it, as Fastify
+ * matched it (`/api/projects/:id`, `/mcp`; a wildcard route with what its `*` matched, as the router
+ * decoded it: `/dav/x` for `/dav/*`, the whole path for the built files' `/*`), else, for a request
+ * no route serves (the not-found handler), its path. The router reads an absolute-form target by its
+ * path and decodes percent-encodings before it matches (`/%61pi/projects` is served by
+ * `/api/projects`), so the scope is that of the handler that answers, whatever the spelling of the
+ * request's path.
+ */
+export function routedPath(
+  request: Pick<FastifyRequest, 'is404' | 'routeOptions' | 'params' | 'url'>,
+): string {
+  const route = request.is404 ? undefined : request.routeOptions.url;
+  if (route === undefined) return pathnameOf(request.url);
+  if (!route.endsWith('*')) return route;
+  const params = request.params as Record<string, unknown> | undefined;
+  const rest = params?.['*'];
+  return `${route.slice(0, -1)}${typeof rest === 'string' ? rest : ''}`;
 }
 
 /**

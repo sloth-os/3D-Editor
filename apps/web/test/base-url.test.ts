@@ -1,10 +1,22 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build } from 'esbuild';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { render } from '@testing-library/preact';
 import { WebDAVClient } from '@3d-editor/core';
-import { appBasePath, appBaseUrl, pageUrl, serverBaseUrl, serverRouteUrl } from '../src/app/base-url';
+import {
+  appBasePath,
+  appBaseUrl,
+  pageUnderBase,
+  pageUnderBaseScript,
+  pageUrl,
+  serverBaseUrl,
+  serverRouteUrl,
+  withPageUnderBaseScript,
+} from '../src/app/base-url';
+import { withBaseHref } from '../../server/src/base-path';
 import { apiUrl, fetchServerConfig, serverBase, serverRoute, wsUrl } from '../src/app/server-config';
 import { defaultPreferences, prefs, updatePrefs } from '../src/app/prefs';
 import { serverConfig } from '../src/app/store';
@@ -95,6 +107,105 @@ describe("the app's base", () => {
     vi.stubGlobal('document', undefined);
     expect(() => appBaseUrl()).toThrow(/a worker has no document/);
     expect(appBaseUrl('https://example.com/3d/')).toBe('https://example.com/3d/');
+  });
+});
+
+describe('a page opened outside its base', () => {
+  /** The editor server with BASE_PATH=/3d on its own port: it writes <base href="/3d/"> at every path. */
+  const PORT = 'http://192.168.1.5:8080';
+  const BASE = `${PORT}/3d/`;
+
+  it('moves to the same page under its base: the path from the root under the base, query and fragment kept', () => {
+    for (const [page, moved] of [
+      ['/', '/3d/'],
+      ['/?project=abc', '/3d/?project=abc'],
+      ['/?project=abc#frag', '/3d/?project=abc#frag'],
+      ['/index.html', '/3d/index.html'],
+      ['/desk.html?embed=1#x', '/3d/desk.html?embed=1#x'],
+      ['/desk', '/3d/desk'],
+      ['/desk/', '/3d/desk/'],
+      ['/some/page?x=1', '/3d/some/page?x=1'],
+      // a look-alike of the base is outside it
+      ['/3dx/', '/3d/3dx/'],
+      // the base without its slash is the base
+      ['/3d', '/3d/'],
+      ['/3d?project=abc', '/3d/?project=abc'],
+      // a first segment with a colon is a path, not a scheme
+      ['/a:b/c', '/3d/a:b/c'],
+    ])
+      expect(pageUnderBase(`${PORT}${page}`, BASE), page).toBe(`${PORT}${moved}`);
+    // a base of more segments, and a base URL with a file name: its directory is the base
+    expect(pageUnderBase(`${PORT}/?p=1`, `${PORT}/tools/3d/`)).toBe(`${PORT}/tools/3d/?p=1`);
+    expect(pageUnderBase(`${PORT}/desk`, `${PORT}/3d/index.html`)).toBe(`${PORT}/3d/desk`);
+    // leading slashes stay a path on the page's own origin
+    expect(new URL(pageUnderBase(`${PORT}//evil.example/x`, BASE)!).origin).toBe(PORT);
+  });
+
+  it('never moves under its base, at the root, without a <base href> or to another origin', () => {
+    for (const [page, baseURI] of [
+      // under its base: the server behind a proxy that keeps or strips the prefix
+      [`${BASE}`, BASE],
+      [`${BASE}?project=abc`, BASE],
+      [`${BASE}desk.html?embed=1`, BASE],
+      [`${BASE}some/page`, BASE],
+      // at the root: <base href="/">
+      [`${PORT}/`, `${PORT}/`],
+      [`${PORT}/desk.html`, `${PORT}/`],
+      [`${PORT}/desk/`, `${PORT}/`],
+      [`${PORT}/some/page?x=1`, `${PORT}/`],
+      // no <base href>: a static host or the Vite dev server, the base is the page's own directory
+      ['https://static.example/folder/', 'https://static.example/folder/'],
+      ['https://static.example/folder/desk.html?x', 'https://static.example/folder/desk.html?x'],
+      ['https://static.example/folder/x/y', 'https://static.example/folder/x/y'],
+      ['http://localhost:5173/desk', 'http://localhost:5173/desk'],
+      // a base on another origin is never followed
+      [`${PORT}/`, 'https://cdn.example/3d/'],
+      [`${PORT}/`, 'http://192.168.1.5:8081/3d/'],
+    ])
+      expect(pageUnderBase(page, baseURI), `${page} with base ${baseURI}`).toBeNull();
+  });
+
+  /** Runs the inline script with this page's address and base URL; what it did, in order. */
+  function runScript(href: string, baseURI: string): string[] {
+    const did: string[] = [];
+    const location = { href, replace: (to: string) => did.push(`replace ${to}`) };
+    const window = { stop: () => did.push('stop') };
+    new Function('location', 'document', 'window', pageUnderBaseScript())(location, { baseURI }, window);
+    return did;
+  }
+
+  it("runs pageUnderBase in the page: stops the page's loading, then replaces it with the page under its base", () => {
+    expect(runScript(`${PORT}/?project=abc`, BASE)).toEqual(['stop', `replace ${BASE}?project=abc`]);
+    expect(runScript(`${PORT}/desk.html?embed=1#x`, BASE)).toEqual([
+      'stop',
+      `replace ${BASE}desk.html?embed=1#x`,
+    ]);
+    for (const [href, baseURI] of [
+      [`${BASE}?project=abc`, BASE],
+      [`${PORT}/`, `${PORT}/`],
+      ['https://static.example/folder/x/y', 'https://static.example/folder/x/y'],
+    ])
+      expect(runScript(href, baseURI), href).toEqual([]);
+  });
+
+  /** A page of the app as written, from apps/web. */
+  const sourcePage = (name: string) => readFileSync(resolve(__dirname, '..', name), 'utf8');
+
+  it("is in both pages right after <meta charset>, before their scripts and styles, after the server's <base href>", () => {
+    for (const name of ['index.html', 'desk.html']) {
+      const page = withPageUnderBaseScript(sourcePage(name));
+      const head = /<head>([\s\S]*)<\/head>/.exec(page)![1]!;
+      const script = `<script>${pageUnderBaseScript()}</script>`;
+      expect(head.indexOf(script), name).toBeGreaterThan(head.indexOf('<meta charset="UTF-8" />'));
+      expect(head.indexOf(script), name).toBeLessThan(head.search(/<link|<script(?!>\(function)/));
+      expect(page.split(script), name).toHaveLength(2);
+      // the server writes the base first into the <head>: the script reads it as document.baseURI
+      const served = withBaseHref(page, '/3d');
+      expect(served.indexOf('<base href="/3d/" />'), name).toBeLessThan(served.indexOf(script));
+    }
+    expect(() => withPageUnderBaseScript('<html><head><title>x</title></head></html>')).toThrow(
+      /no <meta charset>/,
+    );
   });
 });
 

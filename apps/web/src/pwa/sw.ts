@@ -1,11 +1,11 @@
 /// <reference lib="webworker" />
 import {
   addPlugins,
-  cleanupOutdatedCaches,
+  addRoute,
   createHandlerBoundToURL,
   getCacheKeyForURL,
   matchPrecache,
-  precacheAndRoute,
+  precache,
   type PrecacheEntry,
 } from 'workbox-precaching';
 import { NavigationRoute, registerRoute } from 'workbox-routing';
@@ -19,7 +19,7 @@ import {
   refreshedDeskCopy,
   withWorkerCoep,
 } from './sw-desk';
-import { navigationDenylist } from './sw-scope';
+import { editorPageNavigations, outdatedPrecaches } from './sw-scope';
 
 /*
  * The web app's service worker, for the editor and the embeddable desk alike, built by
@@ -29,9 +29,14 @@ import { navigationDenylist } from './sw-scope';
  * precaches the build, so both pages load and work offline (docs/embedding.md, "Offline"):
  * - the desk page (<scope>desk.html, <scope>desk): sw-desk.ts, its route first so that the
  *   precache's own cache-first route never answers it;
+ * - the editor's page: index.html from the precache for navigations to <scope> and
+ *   <scope>index.html (sw-scope.ts editorPageNavigations), before the precache's route;
  * - the built files: from the precache (worker scripts with a COEP, sw-desk.ts withWorkerCoep);
- * - the editor's pages: index.html from the precache, but never for the server's own paths under
- *   the scope;
+ * - every other navigation in the scope goes to the network: deeper paths (the editor server
+ *   answers them with the editor, a static host with its own 404 or redirect), the server's own
+ *   paths, and the pages of another deployment nested in the scope;
+ * - once active, it deletes the precaches earlier versions of itself left, never another scope's
+ *   (sw-scope.ts outdatedPrecaches);
  * - a new version waits until the pages of the old one are closed, or takes over when the editor's
  *   Update asks, unless a desk page is open: then it tells the editor, which says why
  *   (sw-desk.ts answerSkipWaiting).
@@ -83,15 +88,28 @@ addPlugins([
         : cachedResponse,
   },
 ]);
-precacheAndRoute(self.__WB_MANIFEST, { ignoreURLParametersMatching: [/.*/] });
-cleanupOutdatedCaches();
+precache(self.__WB_MANIFEST);
 
+// the editor's page (index.html next to this script) for navigations to <scope> and
+// <scope>index.html, with any query; every other navigation goes to the network
 registerRoute(
-  new NavigationRoute(createHandlerBoundToURL('index.html'), {
-    // the server's own paths under the scope (base-path.ts RESERVED_PREFIXES) are never the editor
-    denylist: navigationDenylist(SCOPE),
-  }),
+  new NavigationRoute(createHandlerBoundToURL('index.html'), { allowlist: editorPageNavigations(SCOPE) }),
 );
+// the precached files, whatever their query; without clean URLs, so that it answers no navigation
+// to <scope>index either (only files, and <scope> itself, which the route above answers first)
+addRoute({ ignoreURLParametersMatching: [/.*/], cleanURLs: false });
+
+// the precaches earlier versions of this service worker left, once this one is active (as
+// Workbox's cleanupOutdatedCaches, but never those of another scope on the same origin)
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches
+      .keys()
+      .then((names) =>
+        Promise.all(outdatedPrecaches(names, SCOPE, cacheNames.precache).map((name) => caches.delete(name))),
+      ),
+  );
+});
 
 self.addEventListener('message', (event) => {
   if ((event.data as { type?: unknown } | null)?.type !== 'SKIP_WAITING') return;

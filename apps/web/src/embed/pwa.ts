@@ -12,9 +12,8 @@ import { appBaseUrl } from '../app/base-url';
  */
 
 /**
- * Registers the service worker of the app's base (the same registration as the editor's, which
- * registers ./sw.js with the scope ./ relative to the same base); resolves with whether this page is
- * (or will be) served offline.
+ * Registers the service worker of the app's base (the same registration as the editor's,
+ * pwa/register.ts); resolves with whether this page is (or will be) served offline.
  */
 export async function registerDeskServiceWorker(): Promise<boolean> {
   if (import.meta.env.DEV || typeof navigator === 'undefined' || !('serviceWorker' in navigator))

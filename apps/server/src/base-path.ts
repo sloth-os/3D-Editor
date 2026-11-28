@@ -5,8 +5,14 @@
  * and its service worker (pwa/sw.ts, pwa/sw-desk.ts) use it alike.
  *
  * A base path is '' (the root) or `/` followed by path segments of `A-Z a-z 0-9 . _ ~ -`, without a
- * trailing slash; no segment is `.` or `..`, and the first is none of the server's own top-level
- * paths (RESERVED_PREFIXES, BUILD_TOP_LEVEL), since a path under it could then be read two ways.
+ * trailing slash, at most MAX_BASE_PATH_LENGTH characters as given; no segment is `.` or `..`, and
+ * the first is none of the server's own top-level paths (RESERVED_PREFIXES, BUILD_TOP_LEVEL), since
+ * a path under it could then be read two ways.
+ *
+ * X-Forwarded-Prefix comes with every request, upgrade and MCP call, so what reads it takes time
+ * linear in its length and gives up at once on a value longer than a base path can be: no regular
+ * expression that can backtrack (`/\/+$/` takes quadratic time on a run of slashes followed by
+ * another character).
  */
 
 /** Path prefixes that belong to the server API and never fall back to the editor's page. */
@@ -37,18 +43,35 @@ export const BUILD_TOP_LEVEL: readonly string[] = [
   'index.html',
   'desk.html',
   'sw.js',
+  'sw.js.map',
   'manifest.webmanifest',
   'favicon.svg',
 ];
 
+/**
+ * The longest base path, in characters as given (BASE_PATH, an X-Forwarded-Prefix value; spaces and
+ * trailing slashes count): a longer BASE_PATH is refused, a longer header value ignored, before
+ * anything else reads it.
+ */
+export const MAX_BASE_PATH_LENGTH = 256;
+
 const SEGMENT = /^[A-Za-z0-9._~-]+$/;
+const SLASH = 47;
+
+/** `s` without its trailing slashes, in one pass from its end (time linear in its length). */
+export function trimTrailingSlashes(s: string): string {
+  let end = s.length;
+  while (end > 0 && s.charCodeAt(end - 1) === SLASH) end--;
+  return end === s.length ? s : s.slice(0, end);
+}
 
 /**
  * Why `raw` cannot be a base path, or null when it can. Trailing slashes are dropped first, so '/3d/'
  * is '/3d'; '' and '/' are the root.
  */
 export function basePathProblem(raw: string): string | null {
-  const value = raw.trim().replace(/\/+$/, '');
+  if (raw.length > MAX_BASE_PATH_LENGTH) return `is longer than ${MAX_BASE_PATH_LENGTH} characters`;
+  const value = trimTrailingSlashes(raw.trim());
   if (value === '') return null;
   if (!value.startsWith('/')) return 'does not start with /';
   const segments = value.slice(1).split('/');
@@ -69,7 +92,7 @@ export function basePathProblem(raw: string): string | null {
 export function normalizeBasePath(raw: string | undefined | null): string | null {
   if (raw === undefined || raw === null) return null;
   if (basePathProblem(raw) !== null) return null;
-  return raw.trim().replace(/\/+$/, '');
+  return trimTrailingSlashes(raw.trim());
 }
 
 /**
@@ -88,15 +111,20 @@ export function parseBasePath(value: string | undefined): string {
 
 /**
  * The base path an `X-Forwarded-Prefix` header names: its first comma-separated value when that
- * is a usable base path ('' for `/`), else null (absent, empty or unusable: never a base that could
- * steer links off the site).
+ * is a usable base path ('' for `/`), else null (absent, empty, longer than MAX_BASE_PATH_LENGTH or
+ * unusable: never a base that could steer links off the site). The base the server writes into a
+ * request's pages and links, never one it removes from the request's path (request-base.ts).
  */
 export function forwardedPrefix(header: string | readonly string[] | undefined): string | null {
   const raw = typeof header === 'string' ? header : header?.[0];
   if (raw === undefined) return null;
-  const first = raw.split(',')[0]!.trim();
-  if (first === '') return null;
-  return normalizeBasePath(first);
+  const comma = raw.indexOf(',');
+  const first = comma === -1 ? raw : raw.slice(0, comma);
+  // a value longer than any base path is ignored before it is read any further
+  if (first.length > MAX_BASE_PATH_LENGTH) return null;
+  const value = first.trim();
+  if (value === '') return null;
+  return normalizeBasePath(value);
 }
 
 /** A request URL (path and query) without its base path. */

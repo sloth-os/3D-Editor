@@ -8,8 +8,10 @@ import Fastify, {
 import type { IncomingMessage } from 'node:http';
 import { createOperatorRegistry } from '@3d-editor/core';
 import type { ServerConfig } from './config';
-import { isAuthorized, pathnameOf } from './auth';
-import { requestBaseInfo, rewriteRequestUrl } from './request-base';
+import { isAuthorized, redactUrl, routedPath } from './auth';
+import { trimTrailingSlashes } from './base-path';
+import { keptForwardedPrefix, originalUrlOf, requestBaseInfo, rewriteRequestUrl } from './request-base';
+import type { Log } from './observability/log';
 import { createPersistence, type Persistence } from './persistence';
 import { RoomManager } from './sync/room-manager';
 import { SyncServer } from './sync/ws-server';
@@ -96,32 +98,59 @@ class ServerLogController extends LogController {
 }
 
 /**
- * Answers a request for a base path without its slash (`/3d`, `/3d?x=1`) with a redirect to the
- * base with its slash, so that the editor's pages are always inside the service worker's scope
- * (docs/subpath.md). It depends on X-Forwarded-Prefix, as the pages do.
+ * Answers a request for BASE_PATH without its slash (`/3d`, `/3d?x=1`) with a redirect to it with
+ * its slash, so that the editor's pages are inside the service worker's scope (docs/subpath.md).
+ * The redirect depends on BASE_PATH alone, never on X-Forwarded-Prefix.
  */
 function registerBareBaseRedirect(app: FastifyInstance): void {
   app.addHook('onRequest', async (request, reply) => {
     const info = requestBaseInfo(request);
     if (!info?.bare) return;
-    // request.url is the URL from the base: '/' and the query
-    return reply
-      .code(308)
-      .header('location', `${info.removed}${request.url}`)
-      .header('vary', 'X-Forwarded-Prefix')
-      .send();
+    // request.url is the URL from BASE_PATH: '/' and the query
+    return reply.code(308).header('location', `${info.removed}${request.url}`).send();
   });
+}
+
+/**
+ * Says once per server, at warn, that a request came through a proxy that keeps in the path a prefix
+ * the server does not remove: its path (from BASE_PATH) starts with its own X-Forwarded-Prefix,
+ * which is not BASE_PATH (docs/subpath.md). Only once, so that clients that send the header cannot
+ * fill the log.
+ */
+function keptPrefixWarning(basePath: string, log: Log): (req: IncomingMessage, url: string) => void {
+  let said = false;
+  return (req, url) => {
+    if (said) return;
+    const prefix = keptForwardedPrefix(req, url, basePath);
+    if (prefix === null) return;
+    said = true;
+    log.warn(
+      { prefix, url: redactUrl(originalUrlOf(req)) },
+      `a request path starts with its X-Forwarded-Prefix ${prefix}, which the server does not remove ` +
+        `from paths (only BASE_PATH): a proxy that keeps the prefix needs BASE_PATH=${prefix} ` +
+        '(docs/subpath.md; said once)',
+    );
+  };
+}
+
+/**
+ * The Origin a CORS answer allows (`*` when any origin is), or null: an origin is allowed when,
+ * without its trailing slashes, it is one of `origins` (CORS_ORIGINS). Linear in the header's length.
+ */
+export function corsAllowedOrigin(origin: string | undefined, origins: readonly string[]): string | null {
+  if (!origin || origins.length === 0) return null;
+  if (origins.includes('*')) return '*';
+  return origins.includes(trimTrailingSlashes(origin)) ? origin : null;
 }
 
 function registerCors(app: FastifyInstance, origins: string[]): void {
   if (origins.length === 0) return;
-  const anyOrigin = origins.includes('*');
   app.addHook('onRequest', async (request, reply) => {
-    const origin = request.headers.origin;
-    if (!origin || (!anyOrigin && !origins.includes(origin.replace(/\/+$/, '')))) return;
+    const allowed = corsAllowedOrigin(request.headers.origin, origins);
+    if (allowed === null) return;
     // Raw headers so they also apply to hijacked responses (MCP streams).
     const res = reply.raw;
-    res.setHeader('access-control-allow-origin', anyOrigin ? '*' : origin);
+    res.setHeader('access-control-allow-origin', allowed);
     res.setHeader('vary', 'Origin');
     res.setHeader('access-control-expose-headers', CORS_EXPOSE_HEADERS);
     if (request.method === 'OPTIONS' && request.headers['access-control-request-method']) {
@@ -143,17 +172,26 @@ function registerCors(app: FastifyInstance, origins: string[]): void {
 export async function createApp(config: ServerConfig, opts: AppOptions = {}): Promise<AppHandle> {
   const startedAt = Date.now();
   const serviceName = config.otel?.serviceName ?? '3d-editor-server';
+  // Before routing, every request's URL is put in origin form and loses BASE_PATH (request-base.ts,
+  // docs/subpath.md): routes, hooks and handlers see paths from the server's root, and
+  // request.originalUrl keeps the URL as sent. HTTP requests in Fastify's rewriteUrl, WebSocket
+  // upgrades in an 'upgrade' listener (below).
+  let warnKeptPrefix = (_req: IncomingMessage, _url: string): void => {};
+  const rewrite = (req: IncomingMessage): string => {
+    const url = rewriteRequestUrl(req, config.basePath);
+    warnKeptPrefix(req, url);
+    return url;
+  };
   const app = Fastify({
     logger: opts.logger ?? loggerOptions(config.logLevel, serviceName, config.version),
     logController: new ServerLogController(),
     trustProxy: true,
     bodyLimit: 10 * 1024 * 1024,
     return503OnClosing: true,
-    // before routing, every request's URL loses its base (docs/subpath.md): routes, hooks and
-    // handlers see paths from the server's root; request.originalUrl keeps the URL as sent
-    rewriteUrl: (req) => rewriteRequestUrl(req, config.basePath),
+    rewriteUrl: rewrite,
   });
   const log = app.log;
+  warnKeptPrefix = keptPrefixWarning(config.basePath, log);
 
   const otel = await startOpenTelemetry(config.otel, log);
   const metrics = new ServerMetrics({ defaultMetrics: opts.defaultMetrics });
@@ -164,8 +202,9 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
   registerHttpObservability(app, metrics, { tracing: otel.enabled });
   registerBareBaseRedirect(app);
   registerCors(app, config.corsOrigins);
+  // the scope of the route that serves the request, whatever the spelling of its path (auth.ts)
   app.addHook('onRequest', async (request, reply) => {
-    if (isAuthorized(config, pathnameOf(request.url), request.headers, request.url)) return;
+    if (isAuthorized(config, routedPath(request), request.headers, request.url)) return;
     reply.header('www-authenticate', 'Bearer realm="3d-editor"');
     return reply.code(401).send({
       error: 'unauthorized: provide the access token as "Authorization: Bearer <token>" or ?token=',
@@ -185,10 +224,10 @@ export async function createApp(config: ServerConfig, opts: AppOptions = {}): Pr
     refreshIntervalMs: opts.refreshIntervalMs,
   });
   const sync = new SyncServer({ rooms, config, log, metrics, keepaliveMs: opts.keepaliveMs });
-  // WebSocket upgrades do not pass Fastify: their URL loses its base here, before the sync server
+  // WebSocket upgrades do not pass Fastify: their URL is rewritten here, before the sync server
   // (and any other 'upgrade' listener) reads it
   const rewriteUpgrade = (req: IncomingMessage) => {
-    req.url = rewriteRequestUrl(req, config.basePath);
+    req.url = rewrite(req);
   };
   app.server.prependListener('upgrade', rewriteUpgrade);
   app.server.on('upgrade', sync.handleUpgrade);

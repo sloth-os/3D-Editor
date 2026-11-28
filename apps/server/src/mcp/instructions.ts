@@ -50,7 +50,7 @@ Recommended workflows
 - Director's desk: desk.set_build → desk.actor_add, store_add → desk.actor_move / actor_pose / actor_hold / actor_mount, desk.tether_fly, desk.physics_throw then desk.physics_bake → desk.shot_add {framing, angle, subjects, layout, move} per shot → desk.shot_solve → desk.check (fix its errors: ${DESK_CHECK_ERRORS.join(', ')}) → render_animation {camera: 'shots'} → export_video {quality: 'draft'} → export_status {wait_s: 50} until done. Fly kites with desk.tether_fly after the anchor actor's moves, poses and mounts (the string is tied where the hand is then): desk.check's tether_detached reports a string left behind, fly it again. From a host's brief: desk_stage_brief {brief} → fix desk.check's errors with the steps above → desk_shot_results → export_video {preset: 'reference'} → export_status until done; desk_stage_brief {project, brief} again with a later brief of the same scene updates it.
 
 Typical session
-1. list_projects or create_project (projects open in the editor at /?project=<id>).
+1. list_projects or create_project; a project opens in the web editor at its editor_url (list_projects, create_project and get_project give it).
 2. get_scene to inspect; list_operators {category} to find operators and their parameters.
 3. Build with the tools above (batch related operators; read the reports); check \`problems\` in get_scene.
 4. render_image / render_animation to look at the result, fix, repeat.`;

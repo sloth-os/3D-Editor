@@ -216,7 +216,9 @@ export class SyncServer {
       return reject(400, 'invalid project id');
     }
     if (!isValidProjectId(projectId)) return reject(400, 'invalid project id');
-    if (!isAuthorized(this.opts.config, pathname, req.headers, req.url)) {
+    // the scope of the route this serves (auth.ts routedPath), as for HTTP requests; the path it
+    // matched was put in origin form before (app.ts), so no spelling of it routes around this
+    if (!isAuthorized(this.opts.config, SYNC_ROUTE, req.headers, req.url)) {
       return reject(401, 'unauthorized', { 'WWW-Authenticate': 'Bearer realm="3d-editor"' });
     }
     // the client may leave while its project loads: the server would have taken the connection

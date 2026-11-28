@@ -1,4 +1,4 @@
-import { test, expect, type BrowserContext, type Page } from '@playwright/test';
+import { test, expect, type BrowserContext, type Frame, type Page, type Request } from '@playwright/test';
 import { callJson, mcpConnect, mcpEndSession } from './helpers';
 
 /*
@@ -212,3 +212,181 @@ for (const setup of SETUPS) {
     });
   });
 }
+
+/*
+ * A page opened outside its base moves under it before anything of it runs (docs/subpath.md, "The
+ * web app"; apps/web/src/app/base-url.ts pageUnderBase): the server with BASE_PATH=/3d writes
+ * <base href="/3d/"> into its pages on its own port at / too, where the editor would work online
+ * but outside its service worker's scope /3d/. Root deployments, and proxies that serve the base,
+ * never move a page.
+ */
+const OWN_PORT = 'http://127.0.0.1:4182';
+
+/** Whether a request is a navigation of a frame `ofFrame` picks (a new document in it). */
+function navigates(request: Request, ofFrame: (frame: Frame) => boolean): boolean {
+  try {
+    return request.isNavigationRequest() && ofFrame(request.frame());
+  } catch {
+    return false; // no frame (yet)
+  }
+}
+
+/**
+ * What happens to a page: the documents a frame of it loads (its main frame, or the one `ofFrame`
+ * picks), and, by the document they belong to (1 for the first), the requests of the app once it
+ * starts (its configuration, the live sync, the service worker's script) and the errors the page's
+ * frames log. A document follows a navigation request of the frame: a frame navigation without one
+ * stays in the document (the editor's history.replaceState of ?project=), and is no document.
+ */
+function journey(page: Page, ofFrame = (frame: Frame) => frame === page.mainFrame()) {
+  const navigations: string[] = [];
+  const started: string[] = [];
+  const errors: string[] = [];
+  let requested = false;
+  page.on('request', (request) => {
+    if (navigates(request, ofFrame)) requested = true;
+    else if (/\/api\/config|\/sync\/|\/sw\.js/.test(request.url()))
+      started.push(`${navigations.length}: ${request.url()}`);
+  });
+  page.on('framenavigated', (frame) => {
+    if (!ofFrame(frame) || !requested) return;
+    requested = false;
+    navigations.push(frame.url());
+  });
+  page.on('console', (message) => {
+    if (message.type() === 'error') errors.push(`${navigations.length}: ${message.text()}`);
+  });
+  page.on('pageerror', (error) => errors.push(`${navigations.length}: ${error.message}`));
+  /** What the first document did: it must have done nothing before it moved. */
+  const firstDocument = (list: string[]) => list.filter((entry) => entry.startsWith('1: '));
+  return { navigations, started, errors, firstDocument };
+}
+
+/** Waits until the page's service worker is `scriptURL` and controls the page. */
+const controlledBy = (page: Page, scriptURL: string) =>
+  page.waitForFunction((url) => navigator.serviceWorker.controller?.scriptURL === url, scriptURL, {
+    timeout: 30_000,
+  });
+
+test.describe('a page opened outside its base', () => {
+  test("the editor at the BASE_PATH server's own root moves under the base before it starts, into its service worker's scope", async ({
+    page,
+  }) => {
+    const seen = journey(page);
+    await page.goto(`${OWN_PORT}/?project=abc`, { waitUntil: 'commit' });
+    await page.waitForURL(`${OWN_PORT}/3d/?project=abc`);
+    await expect(page.getByTestId('viewport')).toBeVisible();
+    expect(seen.navigations).toEqual([`${OWN_PORT}/?project=abc`, `${OWN_PORT}/3d/?project=abc`]);
+    // the page at / registered no service worker, fetched no configuration, connected nothing
+    expect(seen.firstDocument(seen.started)).toEqual([]);
+    expect(seen.errors).toEqual([]);
+    expect(await pageBase(page)).toEqual(['/3d/', `${OWN_PORT}/3d/`]);
+    await controlledBy(page, `${OWN_PORT}/3d/sw.js`);
+  });
+
+  test('the desk at /desk.html and /desk of the own port moves under the base, query and fragment kept, and works there', async ({
+    browser,
+  }) => {
+    for (const path of ['/desk.html', '/desk']) {
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      const seen = journey(page);
+      await page.goto(`${OWN_PORT}${path}?x=1#top`, { waitUntil: 'commit' });
+      await page.waitForURL(`${OWN_PORT}/3d${path}?x=1#top`);
+      await expect(page.getByTestId('desk-standalone'), path).toBeVisible();
+      await expect(page.getByTestId('desk-full-editor'), path).toHaveAttribute('href', '/3d/');
+      expect(seen.navigations, path).toEqual([`${OWN_PORT}${path}?x=1#top`, `${OWN_PORT}/3d${path}?x=1#top`]);
+      expect(seen.firstDocument(seen.started), path).toEqual([]);
+      expect(seen.errors, path).toEqual([]);
+      // the desk registers the base's service worker, which takes the page over
+      await controlledBy(page, `${OWN_PORT}/3d/sw.js`);
+      await context.close();
+    }
+  });
+
+  test("the desk framed at the own port's /desk.html moves under the base inside its frame and says hello to its host", async ({
+    page,
+  }) => {
+    // the host: a page of another site (localhost against the desk's 127.0.0.1) on the loopback
+    // address, as browsers let a page frame loopback addresses only from there
+    const HOST_PAGE = 'http://localhost:4180/healthz';
+    await page.goto(HOST_PAGE);
+    const seen = journey(page, (frame) => frame !== page.mainFrame());
+    await page.evaluate((src) => {
+      const host = window as unknown as { received: unknown[] };
+      host.received = [];
+      addEventListener('message', (event) => host.received.push(event.data));
+      const frame = document.createElement('iframe');
+      frame.src = src;
+      document.body.append(frame);
+    }, `${OWN_PORT}/desk.html?embed=1`);
+    await expect
+      .poll(() => page.frames().map((frame) => frame.url()))
+      .toContain(`${OWN_PORT}/3d/desk.html?embed=1`);
+    await page.waitForFunction(() =>
+      (window as unknown as { received: { protocol?: string; type?: string }[] }).received.some(
+        (m) => m?.protocol === '3d-desk' && m.type === 'hello',
+      ),
+    );
+    expect(seen.navigations).toEqual([`${OWN_PORT}/desk.html?embed=1`, `${OWN_PORT}/3d/desk.html?embed=1`]);
+    expect(seen.firstDocument(seen.started)).toEqual([]);
+    expect(seen.errors).toEqual([]);
+    expect(page.url()).toBe(HOST_PAGE);
+  });
+
+  test('root deployments, and proxies that serve the base, never move a page', async ({ browser }) => {
+    const context = await browser.newContext();
+    for (const url of [
+      // the server at the root of its origin: <base href="/">
+      'http://127.0.0.1:4180/?project=abc',
+      'http://127.0.0.1:4180/desk.html?x=1',
+      // behind the stripping proxy (X-Forwarded-Prefix: /editor) and under BASE_PATH's own prefix
+      'http://127.0.0.1:4183/editor/?project=abc',
+      'http://127.0.0.1:4183/editor/desk',
+      `${OWN_PORT}/3d/?project=abc`,
+      `${OWN_PORT}/3d/desk.html`,
+    ]) {
+      const page = await context.newPage();
+      const seen = journey(page);
+      await page.goto(url);
+      await expect(page.getByTestId('viewport').or(page.getByTestId('desk-standalone')), url).toBeVisible();
+      expect(seen.navigations, url).toEqual([url]);
+      await page.close();
+    }
+    await context.close();
+  });
+});
+
+/*
+ * The editor at a deeper path of its base (the server answers any path that is not its own with the
+ * editor: /desk/, /desk.html/, /x/y) registers the base's service worker as its own (src/pwa/
+ * register.ts editorServiceWorker): Workbox resolved the build's relative ./sw.js against the page's
+ * address, took the base's worker for another page's and offered an update that was none.
+ */
+test("the editor at a deeper path of its base registers the base's service worker as its own: no update offered", async ({
+  browser,
+}) => {
+  for (const [url, scriptURL] of [
+    ['http://127.0.0.1:4180/desk/', 'http://127.0.0.1:4180/sw.js'],
+    ['http://127.0.0.1:4180/x/y', 'http://127.0.0.1:4180/sw.js'],
+    [`${OWN_PORT}/3d/desk.html/`, `${OWN_PORT}/3d/sw.js`],
+    ['http://127.0.0.1:4183/editor/x/y', 'http://127.0.0.1:4183/editor/sw.js'],
+  ]) {
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await page.goto(url);
+    await expect(page.getByTestId('welcome'), url).toBeVisible();
+    await controlledBy(page, scriptURL);
+    // its worker is activated: the page has had its installed event, and drawn what followed
+    await page.evaluate(async () => {
+      const worker = (await navigator.serviceWorker.ready).active!;
+      if (worker.state !== 'activated')
+        await new Promise<void>((resolve) =>
+          worker.addEventListener('statechange', () => worker.state === 'activated' && resolve()),
+        );
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    });
+    await expect(page.getByRole('button', { name: /Update available/ }), url).toHaveCount(0);
+    await context.close();
+  }
+});

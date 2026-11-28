@@ -61,7 +61,9 @@ can use a bridge such as `mcp-remote`:
 
 Send the token as `Authorization: Bearer <token>` or as a `?token=<token>` query parameter (the
 query parameter is redacted from logs). Without a valid token the server answers `401` with
-`WWW-Authenticate: Bearer realm="3d-editor"`.
+`WWW-Authenticate: Bearer realm="3d-editor"`. The token a request needs is that of the route the
+server serves it with, whatever the encoding of its path: `/%6dcp`, or `http://host/mcp` sent in
+absolute form, is served by `/mcp` and needs its token.
 
 ```bash
 claude mcp add --transport http 3d-editor http://localhost:8080/mcp --header "Authorization: Bearer <token>"
@@ -233,8 +235,11 @@ Results are JSON text, except where noted (images, embedded files). Failures are
   rule; projects that browser editors create (locally, then synced) and renames in the editor's
   Scene tab are not checked, so a duplicate name can still appear (pass the id then).
 - `create_project` starts with Blender's startup scene (a 2 m cube `Cube` with `Material`, a
-  `Camera` and a point `Light`) unless `empty` is true. `editor_url` (`/?project=<id>`) opens the
-  project in the web editor.
+  `Camera` and a point `Light`) unless `empty` is true. Its `editor_url` (`list_projects` and
+  `get_project` give it too) opens the project in the web editor: the address the client reached
+  the server at, with the editor's base path, then `/?project=<id>`
+  (`https://example.com/3d/?project=<id>` for an editor served under `/3d`; see
+  [subpath](subpath.md)).
 - `get_project` reports the server's persistence: `persistence` is `disk` or `webdav` (projects are
   saved and survive restarts) or `memory` (lost when the server stops); `persistence_note`
   explains it, and `stored_at` gives the directory or WebDAV location (not for `memory`).

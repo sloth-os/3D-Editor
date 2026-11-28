@@ -4,6 +4,7 @@ import {
   extractToken,
   isAuthorized,
   redactUrl,
+  routedPath,
   safeEqual,
   scopeForPath,
 } from '../../src/auth';
@@ -56,6 +57,32 @@ describe('auth', () => {
     expect(isAuthorized(mcpOnly, '/mcp', {}, '/mcp')).toBe(false);
     // no secrets: open
     expect(isAuthorized({ authToken: null, mcpToken: null }, '/mcp', {}, '/mcp')).toBe(true);
+  });
+
+  it('reads the scope from the route that serves a request, else from its path', () => {
+    /** A request as the auth hook sees it, routed to `route` (undefined: no route). */
+    const routed = (url: string, route: string | undefined, params: Record<string, string> = {}) =>
+      routedPath({
+        url,
+        params,
+        is404: route === undefined,
+        routeOptions: { url: route } as never,
+      });
+    // the route's pattern, whatever spelling of the path reached it
+    expect(routed('/%61pi/projects/p1', '/api/projects/:id', { id: 'p1' })).toBe('/api/projects/:id');
+    expect(routed('/%6dcp', '/mcp')).toBe('/mcp');
+    // a wildcard route with what its `*` matched (decoded by the router)
+    expect(routed('/%64av/x/y', '/dav/*', { '*': 'x/y' })).toBe('/dav/x/y');
+    expect(routed('/%61pi/nothing', '/*', { '*': 'api/nothing' })).toBe('/api/nothing');
+    expect(routed('/assets/app.js', '/*', { '*': 'assets/app.js' })).toBe('/assets/app.js');
+    expect(routed('/x', '/*')).toBe('/');
+    // no route (the not-found handler): the path, without its query
+    expect(routed('/api/nothing?x=1', undefined)).toBe('/api/nothing');
+    expect(scopeForPath(routed('/%61pi/projects/p1', '/api/projects/:id', { id: 'p1' }))).toBe('api');
+    expect(scopeForPath(routed('/%73ync/p1', '/sync/:projectId', { projectId: 'p1' }))).toBe('sync');
+    expect(scopeForPath(routed('/%6ftlp/v1/traces', '/otlp/v1/:signal', { signal: 'traces' }))).toBe('otlp');
+    expect(scopeForPath(routed('/%64av', '/dav'))).toBe('dav');
+    expect(scopeForPath(routed('/healthz', '/healthz'))).toBeNull();
   });
 
   it('compares in constant time and redacts tokens from URLs', () => {
